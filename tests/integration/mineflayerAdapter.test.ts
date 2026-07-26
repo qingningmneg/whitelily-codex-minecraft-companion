@@ -871,6 +871,35 @@ describe("MineflayerAdapter", () => {
     expect(bot.pathfinder.goto).not.toHaveBeenCalled();
   });
 
+  it.each(["disconnect", "outage"] as const)(
+    "does not start a queued action after connection-driven %s cancellation",
+    async (cancellationKind) => {
+      vi.useFakeTimers();
+      const bot = new FakeBot();
+      createBot.mockReturnValue(bot);
+      const adapter = new MineflayerAdapter(config());
+      const connecting = adapter.connect();
+      bot.emit("spawn");
+      await connecting;
+      const moving = adapter.moveTo({ x: 10, y: 64, z: 10 }, new AbortController().signal);
+      const rejected = expect(moving).rejects.toMatchObject({ name: "AbortError" });
+
+      if (cancellationKind === "disconnect") {
+        await adapter.disconnect();
+      } else {
+        bot.emit("end", "socket closed");
+      }
+
+      await rejected;
+      await flush();
+      await flush();
+      expect(bot.pathfinder.goto).not.toHaveBeenCalled();
+
+      await adapter.disconnect();
+      vi.useRealTimers();
+    },
+  );
+
   it("does not place after a deferred equip resolves following abort", async () => {
     const bot = new FakeBot();
     bot.inventoryItems = [{ name: "stone", type: 1, count: 1 }];

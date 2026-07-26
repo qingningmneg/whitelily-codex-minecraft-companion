@@ -527,6 +527,7 @@ export class MineflayerAdapter implements MinecraftPort {
       signal.addEventListener("abort", onAbort, { once: true });
       Promise.resolve()
         .then(() => {
+          if (aborted || settled) return;
           this.assertNotAborted(signal);
           started = true;
           return operation();
