@@ -24,6 +24,11 @@ import { ChatRouter } from "./chatRouter.js";
 import { TaskController, type ActiveTask, type TaskDisclosure } from "./taskController.js";
 
 const repairPrompt = "只返回符合既定结构的 JSON，不要使用 Markdown。";
+const recoveryRepairPrompt = [
+  repairPrompt,
+  "Recovery turns do not authorize Minecraft tools.",
+  "Do not call any minecraft_ tool during recovery.",
+].join("\n");
 const unavailableMessage =
   "Codex 暂时不可用，我已安全暂停。你仍可以使用 !status、!stop 和记忆命令。";
 
@@ -549,6 +554,7 @@ export class CompanionService {
     generation: number,
     failClosedOnError = true,
     task?: ActiveTask,
+    toolsEnabled = true,
   ): Promise<CodexTurnResult | undefined> {
     if (!this.threadId || !this.isCurrent(generation)) return undefined;
     let cancel!: () => void;
@@ -563,23 +569,23 @@ export class CompanionService {
       if (task && this.dependencies.taskController.current()?.id !== task.id) {
         return undefined;
       }
-      const toolLease = this.dependencies.budget.begin(task?.lease);
-      budgetStarted = true;
-      const original = this.dependencies.codex.sendTurn(
-        attemptThreadId,
-        attachToolLease(text, toolLease, task?.lease.id),
-        (turnId) => {
-          if (!this.isCurrent(generation) || this.activeTurn !== active) {
-            void this.dependencies.codex
-              .interrupt(attemptThreadId, turnId)
-              .catch((error: unknown) =>
-                this.logger.error("codex_interrupt_failed", { code: String(error) }),
-              );
-            return;
-          }
-          active.turnId = turnId;
-        },
-      );
+      let turnText = text;
+      if (toolsEnabled) {
+        const toolLease = this.dependencies.budget.begin(task?.lease);
+        budgetStarted = true;
+        turnText = attachToolLease(text, toolLease, task?.lease.id);
+      }
+      const original = this.dependencies.codex.sendTurn(attemptThreadId, turnText, (turnId) => {
+        if (!this.isCurrent(generation) || this.activeTurn !== active) {
+          void this.dependencies.codex
+            .interrupt(attemptThreadId, turnId)
+            .catch((error: unknown) =>
+              this.logger.error("codex_interrupt_failed", { code: String(error) }),
+            );
+          return;
+        }
+        active.turnId = turnId;
+      });
       const result = await Promise.race([original, cancelled]);
       if (!result) return undefined;
       if (!this.isCurrent(generation)) return undefined;
@@ -706,8 +712,10 @@ export class CompanionService {
       let recovered: CompanionTurnOutcome | undefined;
       for (let attempt = 0; attempt < 2; attempt += 1) {
         const result = await this.sendAttempt(
-          attempt === 0 ? prompt : repairPrompt,
+          attempt === 0 ? prompt : recoveryRepairPrompt,
           generation,
+          false,
+          undefined,
           false,
         );
         if (!result) throw new Error("Codex recovery turn failed");

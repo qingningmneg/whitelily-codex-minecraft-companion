@@ -67,17 +67,23 @@ export class TurnToolBudget {
     this.ownsTaskLease = false;
   }
 
+  checkLease(lease?: string): BudgetConsumeResult {
+    if (!this.active) {
+      return { ok: false, reason: this.ended ? "tool turn has ended" : "tool turn has not begun" };
+    }
+    if (lease === undefined || lease !== this.activeLease || this.taskLease === undefined) {
+      return { ok: false, reason: "tool turn lease is invalid" };
+    }
+    return { ok: true, snapshot: this.snapshot() };
+  }
+
   consume(
     kind: ToolActionKind,
     lease?: string,
     trustedConsumption: TrustedToolConsumption = {},
   ): BudgetConsumeResult {
-    if (!this.active) {
-      return { ok: false, reason: this.ended ? "tool turn has ended" : "tool turn has not begun" };
-    }
-    if (lease === undefined || lease !== this.activeLease) {
-      return { ok: false, reason: "tool turn lease is invalid" };
-    }
+    const authorization = this.checkLease(lease);
+    if (!authorization.ok) return authorization;
     const taskLease = this.taskLease;
     if (!taskLease) return { ok: false, reason: "tool turn lease is invalid" };
     const taskResult = this.taskBudget.consume({

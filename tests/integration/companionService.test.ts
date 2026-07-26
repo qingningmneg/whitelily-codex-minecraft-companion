@@ -138,6 +138,8 @@ describe("CompanionService lifecycle", () => {
       await startPlayerTurn(value, `trigger ${trigger}`);
       const activeTurnLease = value.budgetLeases[0];
       if (!activeTurnLease) throw new Error("expected an active turn lease");
+      const taskLeaseId = value.taskController.current()?.lease.id;
+      if (!taskLeaseId) throw new Error("expected an active task lease");
       let inFlightResult: unknown;
       let queuedResult: unknown;
       void value.executor
@@ -155,6 +157,24 @@ describe("CompanionService lifecycle", () => {
         });
       const pending = value.confirmations.create("pending", { kind: "memory_clear" });
       await value.untilActiveWaitStarted();
+      let cleanupBeforeAudit:
+        { stoppedAuditPending: boolean; taskInactive: boolean; leaseRejected: boolean } | undefined;
+      const stopAll = value.executor.stopAll.bind(value.executor);
+      value.executor.stopAll = () => {
+        cleanupBeforeAudit = {
+          stoppedAuditPending: !value.taskAuditEvents.some((event) =>
+            event.startsWith("task_stopped:"),
+          ),
+          taskInactive: value.taskController.current() === null,
+          leaseRejected:
+            value.taskController.consume({
+              leaseId: taskLeaseId,
+              kind: "say",
+              now: Date.now(),
+            }).ok === false,
+        };
+        stopAll();
+      };
 
       if (trigger === "deadline") {
         value.fireTaskDeadline();
@@ -181,6 +201,11 @@ describe("CompanionService lifecycle", () => {
       expect(value.confirmations.get(pending.id)).toBeUndefined();
       expect(value.budget.snapshot().active).toBe(false);
       expect(value.taskController.current()).toBeNull();
+      expect(cleanupBeforeAudit).toEqual({
+        stoppedAuditPending: true,
+        taskInactive: true,
+        leaseRejected: true,
+      });
       expect(value.taskAuditEvents).toEqual(["task_started", `task_stopped:${reason}`]);
       expect(value.taskTerminalReasons).toEqual([reason]);
       expect(() => value.fireTaskDeadline()).toThrow("no task deadline is pending");
@@ -612,6 +637,55 @@ describe("CompanionService lifecycle", () => {
 });
 
 describe("CompanionService recovery", () => {
+  it("keeps Minecraft tools disabled across recovery schema-repair attempts", async () => {
+    const value = await harness({
+      persistedState: {
+        lastMode: "autonomous",
+        paused: true,
+        unfinishedTaskSummary: '{"goal":"finish bridge","stop":"owner stops"}',
+      },
+      deferredTurns: [0, 1],
+      threadIds: ["thread-start", "thread-recovery"],
+    });
+    await value.start();
+
+    value.minecraft.emit({ kind: "chat", username: "TestOwner", message: "!resume" });
+    await value.untilCodexTurns(1);
+    const firstPrompt = value.codex.turns[0]?.text ?? "";
+    const firstLease = /"([A-Za-z0-9_-]{43})"/u.exec(firstPrompt)?.[1] ?? "a".repeat(43);
+    const firstToolAttempt = await value.executeRawTool("minecraft_jump", {
+      turnLease: firstLease,
+    });
+
+    value.codex.releaseTurnResult(0, "not json");
+    await value.untilCodexTurns(2);
+    const repairPrompt = value.codex.turns[1]?.text ?? "";
+    const repairLease = /"([A-Za-z0-9_-]{43})"/u.exec(repairPrompt)?.[1] ?? "b".repeat(43);
+    const repairToolAttempt = await value.executeRawTool("minecraft_jump", {
+      turnLease: repairLease,
+    });
+    value.codex.releaseTurnResult(1, outcome());
+    await value.untilChat("已恢复。");
+
+    expect(firstPrompt).not.toContain("turnLease");
+    expect(repairPrompt).not.toContain("turnLease");
+    expect(firstPrompt).toContain("Recovery turns do not authorize Minecraft tools.");
+    expect(repairPrompt).toContain("Recovery turns do not authorize Minecraft tools.");
+    expect(firstToolAttempt).toEqual({
+      text: '{"error":"tool turn has not begun"}',
+      isError: true,
+    });
+    expect(repairToolAttempt).toEqual({
+      text: '{"error":"tool turn has not begun"}',
+      isError: true,
+    });
+    expect(value.minecraft.calls).not.toContainEqual(expect.objectContaining({ method: "jump" }));
+    expect(value.budgetEvents).toEqual([]);
+    expect(value.budget.snapshot().active).toBe(false);
+    expect(value.taskController.current()).toBeNull();
+    expect(value.taskAuditEvents).toEqual([]);
+  });
+
   it("two concurrent resumes share one restart, thread, recovery turn, response, and budget pair", async () => {
     vi.useFakeTimers();
     const value = await harness({
@@ -638,7 +712,7 @@ describe("CompanionService recovery", () => {
     expect(value.codex.startedThreads[1]?.model).toBe("gpt-5.6-terra");
     expect(value.codex.turns).toHaveLength(2);
     expect(value.codex.turns[1]).toMatchObject({ threadId: "thread-recovery" });
-    expect(value.budgetEvents).toEqual(["begin", "end"]);
+    expect(value.budgetEvents).toEqual([]);
     expect(value.budget.snapshot().active).toBe(false);
     expect(value.minecraft.chatLog).toEqual(["已恢复。"]);
   });

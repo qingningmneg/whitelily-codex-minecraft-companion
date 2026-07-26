@@ -393,6 +393,7 @@ describe("system-owned recovery payload", () => {
     });
     const payload = /\{"systemOwnedRecoveryContext":"([\s\S]*?)"\}/.exec(prompt);
     expect(payload?.[1]).toBeDefined();
+    expect(prompt).toContain("Recovery turns do not authorize Minecraft tools.");
     expect(JSON.parse(`"${payload![1]}"`).length).toBeLessThanOrEqual(512);
     expect(prompt).not.toContain('"ownerMessage"');
     expect(sectionNames(prompt)).toEqual(sectionHeaders);

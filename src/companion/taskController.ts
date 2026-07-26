@@ -157,10 +157,6 @@ export class TaskController {
     this.activeTask = undefined;
     this.clearDeadline();
     if (!budgetAlreadyStopped) this.budget.invalidate(reason);
-    this.emitAudit("task_stopped", {
-      task: cloneActiveTask(active),
-      reason,
-    });
     try {
       this.dependencies.onTerminal?.(reason);
     } catch {
@@ -173,6 +169,10 @@ export class TaskController {
         // Terminal observers cannot affect task lifecycle or lease invalidation.
       }
     }
+    this.emitAudit("task_stopped", {
+      task: cloneActiveTask(active),
+      reason,
+    });
   }
 
   private scheduleDeadline(active: ActiveTask): void {

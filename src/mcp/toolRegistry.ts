@@ -129,13 +129,78 @@ function trustedTravel(start: Vec3, destination: Vec3): number {
   return Math.hypot(destination.x - start.x, destination.z - start.z);
 }
 
-function isTrustedPosition(position: Vec3 | undefined): position is Vec3 {
+function isTrustedPosition(position: unknown): position is Vec3 {
+  if (typeof position !== "object" || position === null || Array.isArray(position)) return false;
+  const candidate = position as Record<string, unknown>;
   return (
-    position !== undefined &&
-    Number.isFinite(position.x) &&
-    Number.isFinite(position.y) &&
-    Number.isFinite(position.z)
+    Number.isFinite(candidate.x) && Number.isFinite(candidate.y) && Number.isFinite(candidate.z)
   );
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isTrustedWorldSnapshot(snapshot: unknown): snapshot is WorldSnapshot {
+  if (!isRecord(snapshot)) return false;
+  if (!isTrustedPosition(snapshot.botPosition)) return false;
+  if (snapshot.ownerPosition !== undefined && !isTrustedPosition(snapshot.ownerPosition))
+    return false;
+  if (snapshot.worldSpawn !== undefined && !isTrustedPosition(snapshot.worldSpawn)) return false;
+  if (snapshot.botYaw !== undefined && !Number.isFinite(snapshot.botYaw)) return false;
+  if (snapshot.botPitch !== undefined && !Number.isFinite(snapshot.botPitch)) return false;
+  if (
+    !Number.isFinite(snapshot.health) ||
+    !Number.isFinite(snapshot.food) ||
+    !Number.isFinite(snapshot.timeOfDay) ||
+    (snapshot.weather !== "clear" &&
+      snapshot.weather !== "rain" &&
+      snapshot.weather !== "thunder") ||
+    !Array.isArray(snapshot.inventorySummary) ||
+    !Array.isArray(snapshot.nearbyHostiles)
+  ) {
+    return false;
+  }
+  if (
+    snapshot.inventorySummary.some(
+      (entry) =>
+        !isRecord(entry) || typeof entry.name !== "string" || !Number.isFinite(entry.count),
+    ) ||
+    snapshot.nearbyHostiles.some(
+      (entry) =>
+        !isRecord(entry) || typeof entry.kind !== "string" || !isTrustedPosition(entry.position),
+    )
+  ) {
+    return false;
+  }
+  if (
+    snapshot.nearbyBlocks !== undefined &&
+    (!Array.isArray(snapshot.nearbyBlocks) ||
+      snapshot.nearbyBlocks.some(
+        (entry) =>
+          !isRecord(entry) || typeof entry.name !== "string" || !isTrustedPosition(entry.position),
+      ))
+  ) {
+    return false;
+  }
+  if (
+    snapshot.nearbyEntities !== undefined &&
+    (!Array.isArray(snapshot.nearbyEntities) ||
+      snapshot.nearbyEntities.some(
+        (entry) =>
+          !isRecord(entry) ||
+          !Number.isFinite(entry.id) ||
+          typeof entry.kind !== "string" ||
+          !isTrustedPosition(entry.position),
+      ))
+  ) {
+    return false;
+  }
+  return true;
+}
+
+function snapshotPosition(snapshot: unknown, key: "botPosition" | "ownerPosition"): unknown {
+  return isRecord(snapshot) ? snapshot[key] : undefined;
 }
 
 export function createToolRegistry(dependencies: ToolRegistryDependencies) {
@@ -146,8 +211,11 @@ export function createToolRegistry(dependencies: ToolRegistryDependencies) {
     dependencies.observeSnapshot?.(structuredClone(trusted));
     return trusted;
   };
-  const takeSnapshot = async (): Promise<WorldSnapshot> =>
-    observeSnapshot(await dependencies.minecraft.snapshot(dependencies.ownerUsername));
+  const takeSnapshot = async (): Promise<WorldSnapshot> => {
+    const snapshot: unknown = await dependencies.minecraft.snapshot(dependencies.ownerUsername);
+    if (!isTrustedWorldSnapshot(snapshot)) throw new Error("trusted snapshot is unavailable");
+    return observeSnapshot(snapshot);
+  };
   const currentSnapshot = (): WorldSnapshot | undefined => {
     const snapshot = dependencies.latestSnapshot?.() ?? observedSnapshot;
     return snapshot === undefined ? undefined : structuredClone(snapshot);
@@ -161,12 +229,20 @@ export function createToolRegistry(dependencies: ToolRegistryDependencies) {
     const result = dependencies.budget.consume(kind, lease, trustedConsumption);
     return result.ok ? undefined : errorResult(result.reason);
   };
+  const checkLease = (lease: string): ToolResult | undefined => {
+    const result = dependencies.budget.checkLease(lease);
+    return result.ok ? undefined : errorResult(result.reason);
+  };
   const runAction = async (action: GameAction, lease: string): Promise<ToolResult> => {
+    const invalidLease = checkLease(lease);
+    if (invalidLease) return invalidLease;
+    const failAttempt = (message: string): ToolResult =>
+      consume(action.kind, lease) ?? errorResult(message);
     let baseContext: SafetyContext;
     try {
       baseContext = await dependencies.safetyContextProvider();
     } catch (error) {
-      return errorResult(safeMessage(error));
+      return failAttempt(safeMessage(error));
     }
     const initialContext = actionContext(baseContext, action, dependencies.budget);
     let horizontalTravel: number | undefined;
@@ -175,15 +251,17 @@ export function createToolRegistry(dependencies: ToolRegistryDependencies) {
       try {
         snapshot = await takeSnapshot();
       } catch (error) {
-        return errorResult(safeMessage(error));
+        return failAttempt(safeMessage(error));
       }
-      const destination = action.kind === "move_to" ? action.position : snapshot.ownerPosition;
-      if (!isTrustedPosition(snapshot.botPosition) || !isTrustedPosition(destination)) {
-        return errorResult("trusted movement distance is unavailable");
+      const botPosition = snapshotPosition(snapshot, "botPosition");
+      const destination =
+        action.kind === "move_to" ? action.position : snapshotPosition(snapshot, "ownerPosition");
+      if (!isTrustedPosition(botPosition) || !isTrustedPosition(destination)) {
+        return failAttempt("trusted movement distance is unavailable");
       }
-      horizontalTravel = trustedTravel(snapshot.botPosition, destination);
+      horizontalTravel = trustedTravel(botPosition, destination);
       if (!Number.isFinite(horizontalTravel)) {
-        return errorResult("trusted movement distance is unavailable");
+        return failAttempt("trusted movement distance is unavailable");
       }
     }
     const exhausted = consume(action.kind, lease, {
@@ -391,6 +469,10 @@ export function createToolRegistry(dependencies: ToolRegistryDependencies) {
         turnLease: string;
       }): Promise<ToolResult> => {
         const action: GameAction = { kind: "collect_dropped", entityId: droppedId };
+        const invalidLease = checkLease(lease);
+        if (invalidLease) return invalidLease;
+        const failAttempt = (message: string): ToolResult =>
+          consume(action.kind, lease) ?? errorResult(message);
         let context: SafetyContext;
         try {
           context = actionContext(
@@ -399,14 +481,18 @@ export function createToolRegistry(dependencies: ToolRegistryDependencies) {
             dependencies.budget,
           );
         } catch (error) {
-          return errorResult(safeMessage(error));
+          return failAttempt(safeMessage(error));
         }
         const exhausted = consume(action.kind, lease, {
           dangerousOperations: classifyActionRisk(action, context).dangerousOperations,
         });
         if (exhausted) return exhausted;
-        if (!hasDroppedItem(currentSnapshot(), droppedId))
-          return errorResult("dropped entity ID is not present in the latest snapshot");
+        try {
+          if (!hasDroppedItem(currentSnapshot(), droppedId))
+            return errorResult("dropped entity ID is not present in the latest snapshot");
+        } catch (error) {
+          return errorResult(safeMessage(error));
+        }
         try {
           return toToolResult(await dependencies.executor.execute(action, context));
         } catch (error) {

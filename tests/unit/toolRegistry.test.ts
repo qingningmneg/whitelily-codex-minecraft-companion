@@ -199,20 +199,81 @@ describe("Minecraft MCP tools", () => {
 
   it("returns structured errors for a failed safety context without touching Minecraft", async () => {
     const harness = createToolRegistryHarness();
+    const taskBudget = new TaskControllerBudget();
+    const budget = new TurnToolBudget(taskBudget);
+    const turnLease = budget.begin(taskBudget.begin({ maxToolCalls: 2 }));
     const dependencies = {
       ...harness.dependencies,
+      budget,
       safetyContextProvider: async () => {
         throw new Error("context unavailable");
       },
     };
+    const tools = createToolRegistry(dependencies);
 
+    await expect(tools.minecraft_say.execute({ message: "safe", turnLease })).resolves.toEqual({
+      text: '{"error":"context unavailable"}',
+      isError: true,
+    });
     await expect(
-      createToolRegistry(dependencies).minecraft_say.execute(leased(harness, { message: "safe" })),
+      tools.minecraft_collect_dropped.execute({ entityId: 1, turnLease }),
     ).resolves.toEqual({
       text: '{"error":"context unavailable"}',
       isError: true,
     });
+    await expect(tools.minecraft_say.execute({ message: "overflow", turnLease })).resolves.toEqual({
+      text: '{"error":"tool call budget exhausted"}',
+      isError: true,
+    });
+    expect(taskBudget.snapshot()).toMatchObject({
+      active: false,
+      stopReason: "budget_exhausted",
+      toolCalls: 2,
+    });
     expect(harness.minecraft.chatLog).toEqual([]);
+  });
+
+  it("rejects invalid turn leases before context, snapshot, or Minecraft side effects", async () => {
+    const harness = createToolRegistryHarness();
+    let contextReads = 0;
+    let sharedSnapshotReads = 0;
+    const tools = createToolRegistry({
+      ...harness.dependencies,
+      safetyContextProvider: async () => {
+        contextReads += 1;
+        return {
+          spawn: { x: 0, y: 64, z: 0 },
+          owner: { x: 0, y: 64, z: 0 },
+        };
+      },
+      latestSnapshot: () => {
+        sharedSnapshotReads += 1;
+        return harness.minecraft.world;
+      },
+    });
+    const invalidLease = harness.turnLease === "b".repeat(43) ? "c".repeat(43) : "b".repeat(43);
+
+    await expect(
+      tools.minecraft_get_state.execute({ turnLease: invalidLease }),
+    ).resolves.toMatchObject({ isError: true });
+    await expect(
+      tools.minecraft_find_block.execute({
+        blockName: "stone",
+        maxDistance: 8,
+        turnLease: invalidLease,
+      }),
+    ).resolves.toMatchObject({ isError: true });
+    await expect(
+      tools.minecraft_move_to.execute({ x: 1, y: 64, z: 0, turnLease: invalidLease }),
+    ).resolves.toMatchObject({ isError: true });
+    await expect(
+      tools.minecraft_collect_dropped.execute({ entityId: 1, turnLease: invalidLease }),
+    ).resolves.toMatchObject({ isError: true });
+
+    expect(contextReads).toBe(0);
+    expect(sharedSnapshotReads).toBe(0);
+    expect(harness.minecraft.calls).toEqual([]);
+    expect(harness.budget.snapshot().totalCalls).toBe(0);
   });
 
   it("consumes classifier-derived dangerous operations through the trusted task budget", async () => {
@@ -402,6 +463,77 @@ describe("Minecraft MCP tools", () => {
       await expect(tool.execute(leased(harness, input))).resolves.toMatchObject({ isError: true });
       expect(harness.minecraft.calls).not.toContainEqual(
         expect.objectContaining({ method: primitive }),
+      );
+    },
+  );
+
+  it.each([
+    {
+      label: "a thrown snapshot",
+      snapshot: async (): Promise<WorldSnapshot> => {
+        throw new Error("snapshot unavailable");
+      },
+    },
+    {
+      label: "a null snapshot",
+      snapshot: async (): Promise<WorldSnapshot> => null as unknown as WorldSnapshot,
+    },
+    {
+      label: "a primitive snapshot",
+      snapshot: async (): Promise<WorldSnapshot> => 7 as unknown as WorldSnapshot,
+    },
+    {
+      label: "a partial snapshot",
+      snapshot: async (): Promise<WorldSnapshot> =>
+        ({ botPosition: { x: 0, y: 64, z: 0 } }) as WorldSnapshot,
+    },
+    {
+      label: "a non-finite snapshot",
+      snapshot: async (): Promise<WorldSnapshot> =>
+        ({
+          botPosition: { x: Number.NaN, y: 64, z: 0 },
+          ownerPosition: { x: 0, y: 64, z: 0 },
+        }) as WorldSnapshot,
+    },
+    {
+      label: "a failed safety context",
+      snapshot: undefined,
+      safetyContextProvider: async (): Promise<never> => {
+        throw new Error("context unavailable");
+      },
+    },
+  ])(
+    "charges each failed movement attempt exactly once for $label and exhausts the 65th",
+    async ({ snapshot, safetyContextProvider }) => {
+      const harness = createToolRegistryHarness();
+      if (snapshot) harness.minecraft.snapshot = snapshot;
+      const taskBudget = new TaskControllerBudget();
+      const taskLease = taskBudget.begin();
+      const budget = new TurnToolBudget(taskBudget);
+      const turnLease = budget.begin(taskLease);
+      const tools = createToolRegistry({
+        ...harness.dependencies,
+        budget,
+        ...(safetyContextProvider ? { safetyContextProvider } : {}),
+      });
+
+      for (let attempt = 0; attempt < 64; attempt += 1) {
+        await expect(
+          tools.minecraft_move_to.execute({ x: 1, y: 64, z: 0, turnLease }),
+        ).resolves.toMatchObject({ isError: true });
+      }
+
+      await expect(
+        tools.minecraft_move_to.execute({ x: 1, y: 64, z: 0, turnLease }),
+      ).resolves.toEqual({ text: '{"error":"tool call budget exhausted"}', isError: true });
+      expect(taskBudget.snapshot()).toMatchObject({
+        active: false,
+        stopReason: "budget_exhausted",
+        toolCalls: 64,
+        horizontalTravel: 0,
+      });
+      expect(harness.minecraft.calls).not.toContainEqual(
+        expect.objectContaining({ method: "moveTo" }),
       );
     },
   );

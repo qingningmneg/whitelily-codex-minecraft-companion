@@ -271,6 +271,32 @@ describe("TaskController", () => {
     expect(controller.current()).toBeNull();
   });
 
+  it("invalidates state and completes synchronous cleanup before the stopped audit", () => {
+    const order: string[] = [];
+    let cleanupComplete = false;
+    const budget = new TaskControllerBudget({
+      now: () => Date.parse("2026-07-27T08:00:00.000Z"),
+      randomId: () => "task-lease-1",
+    });
+    let controller!: TaskController;
+    controller = new TaskController(budget, (event, data) => {
+      if (event !== "task_stopped" || !("reason" in data)) return;
+      order.push(
+        `audit:${data.reason}:${cleanupComplete}:${budget.snapshot().active}:${controller.current() === null}`,
+      );
+    });
+    controller.onTerminal((reason) => {
+      order.push(`cleanup:${reason}`);
+      cleanupComplete = true;
+      controller.stop("owner_stop");
+    });
+    controller.start(disclosure);
+
+    controller.stop("timeout");
+
+    expect(order).toEqual(["cleanup:timeout", "audit:timeout:true:false:true"]);
+  });
+
   it("fires the deadline terminal hook without another consume call", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-07-27T08:00:00.000Z"));

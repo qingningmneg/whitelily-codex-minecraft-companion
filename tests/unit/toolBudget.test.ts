@@ -65,6 +65,20 @@ describe("TurnToolBudget", () => {
     expect(budget.consume("say", newLease).ok).toBe(true);
   });
 
+  it("checks turn authority without consuming either the turn or task budget", () => {
+    const taskBudget = new TaskControllerBudget();
+    const budget = new TurnToolBudget(taskBudget);
+    const turnLease = budget.begin(taskBudget.begin());
+
+    expect(budget.checkLease(turnLease).ok).toBe(true);
+    expect(budget.checkLease("x".repeat(43))).toEqual({
+      ok: false,
+      reason: "tool turn lease is invalid",
+    });
+    expect(budget.snapshot().totalCalls).toBe(0);
+    expect(taskBudget.snapshot().toolCalls).toBe(0);
+  });
+
   it("delegates accepted calls to its supplied task lease", () => {
     const taskBudget = new TaskControllerBudget();
     const taskLease = taskBudget.begin();
