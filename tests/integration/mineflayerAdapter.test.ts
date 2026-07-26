@@ -35,6 +35,10 @@ vi.mock("mineflayer-pathfinder", () => {
 });
 
 import { MineflayerAdapter } from "../../src/minecraft/mineflayerAdapter.js";
+import {
+  createWorldSnapshot,
+  type EntityTracking,
+} from "../../src/minecraft/mineflayerObservation.js";
 
 interface FakeEntity {
   id: number;
@@ -139,6 +143,69 @@ function config() {
 function flush(): Promise<void> {
   return Promise.resolve();
 }
+
+describe("createWorldSnapshot", () => {
+  it("bounds projection output, returns fresh values, and leaves tracking input unchanged", () => {
+    const bot = new FakeBot();
+    bot.inventoryItems = Array.from({ length: 40 }, (_, index) => ({
+      name: `item_${index}`,
+      count: index + 1,
+      type: index,
+    }));
+    for (let index = 0; index < 70; index += 1) {
+      bot.entities[String(index)] = {
+        id: index,
+        name: `hostile_${index}`,
+        type: "hostile",
+        position: { x: index + 1, y: 64, z: 0 },
+      };
+    }
+    const hostileEntityIds = new Set(Array.from({ length: 70 }, (_, index) => index));
+    const droppedItemEntityIds = new Set([100, 101]);
+    const worldSpawn = { x: 10, y: 70, z: -20 };
+    bot.players.TestOwner = {
+      entity: {
+        id: 500,
+        name: "player",
+        type: "player",
+        position: { x: 5, y: 64, z: 5 },
+      },
+    };
+    const tracking: EntityTracking = {
+      worldSpawn,
+      hostileEntityIds,
+      droppedItemEntityIds,
+    };
+
+    const first = createWorldSnapshot(bot as never, "TestOwner", tracking);
+    const second = createWorldSnapshot(bot as never, "TestOwner", tracking);
+
+    expect(first.inventorySummary).toHaveLength(36);
+    expect(first.nearbyEntities).toHaveLength(64);
+    expect(first.nearbyHostiles).toHaveLength(64);
+    expect(hostileEntityIds).toHaveLength(70);
+    expect(droppedItemEntityIds).toEqual(new Set([100, 101]));
+    expect(first).not.toBe(second);
+    expect(first.botPosition).not.toBe(bot.entity.position);
+    expect(first.botPosition).not.toBe(second.botPosition);
+    expect(first.worldSpawn).not.toBe(worldSpawn);
+    expect(first.ownerPosition).not.toBe(bot.players.TestOwner?.entity?.position);
+    expect(first.ownerPosition).not.toBe(second.ownerPosition);
+    expect(first.inventorySummary[0]).not.toBe(second.inventorySummary[0]);
+    expect(first.nearbyEntities?.[0]?.position).not.toBe(second.nearbyEntities?.[0]?.position);
+    expect(first.nearbyHostiles[0]?.position).not.toBe(second.nearbyHostiles[0]?.position);
+
+    first.worldSpawn!.x = 999;
+    first.inventorySummary[0]!.count = 999;
+    first.nearbyEntities![0]!.position.x = 999;
+    expect(second.worldSpawn).toEqual({ x: 10, y: 70, z: -20 });
+    expect(second.inventorySummary[0]).toEqual({ name: "item_0", count: 1 });
+    expect(second.nearbyEntities?.[0]).toMatchObject({
+      id: 0,
+      position: { x: 1, y: 64, z: 0 },
+    });
+  });
+});
 
 describe("MineflayerAdapter", () => {
   beforeEach(() => {
