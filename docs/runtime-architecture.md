@@ -14,6 +14,7 @@ RuntimeFacade depends inward on `WhiteLilyAppLifecycle` for component lifecycle 
 stateDiagram-v2
   [*] --> idle
   idle --> starting: start()
+  idle --> stopping: stop(reason)
   starting --> running: lifecycle start succeeds
   starting --> stopping: stop(reason)
   starting --> failed: start failure
@@ -36,7 +37,7 @@ Its dependencies point inward to the managed MCP, Codex, Minecraft, CompanionSer
 
 `TaskController` owns one bounded task lease, validates the public task disclosure, starts and stops the task, records audit transitions, and invalidates its lease before downstream work can continue. It depends on `TaskControllerBudget`; callers receive cloned task state rather than its mutable active state.
 
-`TaskControllerBudget` enforces the task-wide accounting and invalidation. `TurnToolBudget` is per-Codex-turn accounting layered on that task budget: it authorizes individual tool calls only while the task lease remains valid and forwards task-wide consumption. These requested task limits can only lower the immutable program caps; they cannot raise them:
+`TaskControllerBudget` owns task-wide accounting and invalidation. `TurnToolBudget` is per-Codex-turn accounting layered on that task budget: it authorizes individual tool calls only while the task lease remains valid. TurnToolBudget forwards task-wide tool-call and classifier-derived dangerous-operation counts; it keeps dig/place/travel turn-local for safety context. `TaskControllerBudget` can enforce block-change and horizontal-travel caps only when trusted consumption values are supplied; the current MCP registry does not forward those values to it. These requested task limits can only lower the immutable program caps; they cannot raise them:
 
 | Hard limit           | Immutable cap |
 | -------------------- | ------------: |
@@ -46,7 +47,7 @@ Its dependencies point inward to the managed MCP, Codex, Minecraft, CompanionSer
 | Duration             |    10 minutes |
 | Dangerous operations |    8 per task |
 
-Budget exhaustion invalidates the task and causes later tool work to fail closed. `TaskController`, `TaskControllerBudget`, and `TurnToolBudget` are internal safety controls, not desktop-sidecar APIs.
+The currently forwarded task-wide counts, duration, and any other trusted values supplied to `TaskControllerBudget` fail closed on exhaustion; later tool work is then rejected. `TaskController`, `TaskControllerBudget`, and `TurnToolBudget` are internal safety controls, not desktop-sidecar APIs.
 
 ## ChatRouter
 
@@ -60,9 +61,9 @@ Budget exhaustion invalidates the task and causes later tool work to fail closed
 
 ## Codex and MCP
 
-`CompanionService` coordinates owner/autonomous work. It uses `ChatRouter`, task and turn budgets, `MinecraftPort`, `ActionExecutor`, memory/state, and the Codex port. Codex proposes tool work; MCP exposes the constrained tool registry; the registry checks `TurnToolBudget`, safety policy, and trusted snapshots before dispatching through `ActionExecutor` and `MinecraftPort`. Codex and MCP do not bypass these boundaries.
+`CompanionService` coordinates owner/autonomous work. It uses `ChatRouter`, `TaskController`, `TurnToolBudget`, `MinecraftPort`, `ActionExecutor`, memory/state, and the Codex port. Codex proposes tool work; MCP exposes the constrained tool registry. The registry validates tool schemas, obtains trusted context and risk classification, consumes `TurnToolBudget`, then dispatches to `ActionExecutor`. ActionExecutor performs SafetyEngine policy evaluation and invokes MinecraftPort. The MCP registry does not depend directly on TaskController. Codex and MCP do not bypass these boundaries.
 
-Dependency direction is therefore: RuntimeFacade -> WhiteLilyAppLifecycle -> CompanionService/Codex/MCP/Minecraft composition; CompanionService and MCP tools -> TaskController/TurnToolBudget, ActionExecutor, MinecraftPort; MineflayerAdapter -> MineflayerConnection and `createWorldSnapshot`. The arrows always point toward lower-level implementation or policy boundaries, never back toward the facade.
+Dependency direction is therefore: RuntimeFacade -> WhiteLilyAppLifecycle -> CompanionService/Codex/MCP/Minecraft composition; CompanionService -> TaskController and TurnToolBudget; MCP registry -> TurnToolBudget, trusted context/classification, and ActionExecutor (not TaskController); ActionExecutor -> SafetyEngine and MinecraftPort; MineflayerAdapter -> MineflayerConnection and `createWorldSnapshot`. The arrows always point toward lower-level implementation or policy boundaries, never back toward the facade.
 
 ## Emergency stop order
 

@@ -37,6 +37,11 @@ describe("public release readiness", () => {
       "ChatRouter",
       "MineflayerConnection",
       "Emergency stop order",
+      "idle --> stopping: stop(reason)",
+      "TurnToolBudget forwards task-wide tool-call and classifier-derived dangerous-operation counts",
+      "dig/place/travel turn-local for safety context",
+      "ActionExecutor performs SafetyEngine policy evaluation",
+      "MCP registry does not depend directly on TaskController",
     ]) {
       expect(architecture).toContain(heading);
     }
