@@ -191,6 +191,7 @@ export class CompanionService {
     this.logger = dependencies.logger ?? noOpLogger;
     this.setTimer = dependencies.setTimer ?? setTimeout;
     this.clearTimer = dependencies.clearTimer ?? clearTimeout;
+    dependencies.taskController.onTerminal((reason) => this.handleTaskTerminal(reason));
   }
 
   async start(preselectedModel?: string): Promise<void> {
@@ -901,6 +902,30 @@ export class CompanionService {
       .catch((error: unknown) =>
         this.logger.error("codex_interrupt_failed", { code: String(error) }),
       );
+  }
+
+  private handleTaskTerminal(reason: TaskStopReason): void {
+    if (reason !== "timeout" && reason !== "budget_exhausted") return;
+    this.invalidateCurrentTurn();
+    try {
+      this.dependencies.executor.stopAll();
+    } catch (error) {
+      void this.logger.error("task_terminal_executor_stop_failed", { code: String(error) });
+    }
+    try {
+      this.dependencies.confirmations.clear();
+    } catch (error) {
+      void this.logger.error("task_terminal_confirmation_clear_failed", { code: String(error) });
+    }
+    try {
+      this.dependencies.mode.stop();
+    } catch (error) {
+      void this.logger.error("task_terminal_mode_stop_failed", { code: String(error) });
+    }
+    this.unfinishedTaskSummary = null;
+    void this.persist().catch((error: unknown) =>
+      this.logger.error("task_terminal_state_save_failed", { code: String(error) }),
+    );
   }
 
   private invalidateCurrentTurn(): void {

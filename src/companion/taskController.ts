@@ -27,6 +27,12 @@ export type TaskAuditData = { task: ActiveTask } | { task: ActiveTask; reason: T
 
 export type TaskAuditCallback = (event: TaskAuditEvent, data: TaskAuditData) => void;
 
+export interface TaskControllerDependencies {
+  onTerminal?: (reason: TaskStopReason) => void;
+  setTimer?: (callback: () => void, milliseconds: number) => ReturnType<typeof setTimeout>;
+  clearTimer?: (timer: ReturnType<typeof setTimeout>) => void;
+}
+
 type TaskControllerConsumption = Omit<TaskConsumption, "lease"> & { leaseId: string };
 
 const taskLimitKeys = [
@@ -52,11 +58,23 @@ const taskStopReasons = new Set<TaskStopReason>([
 
 export class TaskController {
   private activeTask: ActiveTask | undefined;
+  private deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+  private readonly terminalListeners = new Set<(reason: TaskStopReason) => void>();
+  private readonly setTimer: (
+    callback: () => void,
+    milliseconds: number,
+  ) => ReturnType<typeof setTimeout>;
+  private readonly clearTimer: (timer: ReturnType<typeof setTimeout>) => void;
 
   constructor(
     private readonly budget = new TaskControllerBudget(),
     private readonly audit: TaskAuditCallback = () => undefined,
-  ) {}
+    private readonly dependencies: TaskControllerDependencies = {},
+  ) {
+    this.setTimer = dependencies.setTimer ?? setTimeout;
+    this.clearTimer = dependencies.clearTimer ?? clearTimeout;
+    this.budget.onInvalidated((reason) => this.finish(reason, true));
+  }
 
   start(disclosure: TaskDisclosure, requested?: Partial<TaskLimits>): ActiveTask {
     this.reconcileBudget();
@@ -79,6 +97,7 @@ export class TaskController {
       };
       this.activeTask = active;
       this.emitAudit("task_started", { task: cloneActiveTask(active) });
+      this.scheduleDeadline(active);
       return cloneActiveTask(active);
     } catch (error) {
       this.budget.invalidate("failed");
@@ -121,6 +140,11 @@ export class TaskController {
     return this.activeTask ? cloneActiveTask(this.activeTask) : null;
   }
 
+  onTerminal(listener: (reason: TaskStopReason) => void): () => void {
+    this.terminalListeners.add(listener);
+    return () => this.terminalListeners.delete(listener);
+  }
+
   private reconcileBudget(): void {
     if (!this.activeTask) return;
     const snapshot = this.budget.snapshot();
@@ -130,12 +154,43 @@ export class TaskController {
   private finish(reason: TaskStopReason, budgetAlreadyStopped = false): void {
     const active = this.activeTask;
     if (!active) return;
-    if (!budgetAlreadyStopped) this.budget.invalidate(reason);
     this.activeTask = undefined;
+    this.clearDeadline();
+    if (!budgetAlreadyStopped) this.budget.invalidate(reason);
     this.emitAudit("task_stopped", {
       task: cloneActiveTask(active),
       reason,
     });
+    try {
+      this.dependencies.onTerminal?.(reason);
+    } catch {
+      // Terminal observers cannot affect task lifecycle or lease invalidation.
+    }
+    for (const listener of this.terminalListeners) {
+      try {
+        listener(reason);
+      } catch {
+        // Terminal observers cannot affect task lifecycle or lease invalidation.
+      }
+    }
+  }
+
+  private scheduleDeadline(active: ActiveTask): void {
+    const leaseId = active.lease.id;
+    const timer = this.setTimer(() => {
+      if (this.deadlineTimer !== timer) return;
+      this.deadlineTimer = undefined;
+      if (this.activeTask?.lease.id !== leaseId) return;
+      this.finish("timeout");
+    }, active.disclosure.limits.maxDurationMs);
+    this.deadlineTimer = timer;
+    (timer as ReturnType<typeof setTimeout> & { unref?: () => void }).unref?.();
+  }
+
+  private clearDeadline(): void {
+    const timer = this.deadlineTimer;
+    this.deadlineTimer = undefined;
+    if (timer !== undefined) this.clearTimer(timer);
   }
 
   private emitAudit(event: TaskAuditEvent, data: TaskAuditData): void {

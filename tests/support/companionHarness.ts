@@ -381,10 +381,26 @@ export async function createCompanionHarness(options: CompanionHarnessOptions = 
   if (options.persistedState) await StateStore.prototype.save.call(state, options.persistedState);
   const confirmations = new ConfirmationStore();
   const taskAuditEvents: string[] = [];
+  const taskTerminalReasons: string[] = [];
   const taskBudget = new TaskControllerBudget();
-  const taskController = new TaskController(taskBudget, (event, data) => {
-    taskAuditEvents.push("reason" in data ? `${event}:${data.reason}` : event);
-  });
+  let taskDeadlineCallback: (() => void) | undefined;
+  const taskDeadlineTimer = 1 as unknown as ReturnType<typeof setTimeout>;
+  const taskController = new TaskController(
+    taskBudget,
+    (event, data) => {
+      taskAuditEvents.push("reason" in data ? `${event}:${data.reason}` : event);
+    },
+    {
+      onTerminal: (reason) => taskTerminalReasons.push(reason),
+      setTimer: (callback) => {
+        taskDeadlineCallback = callback;
+        return taskDeadlineTimer;
+      },
+      clearTimer: (timer) => {
+        if (timer === taskDeadlineTimer) taskDeadlineCallback = undefined;
+      },
+    },
+  );
   const budget = new TurnToolBudget(taskBudget);
   const executor = new ActionExecutor(
     minecraft,
@@ -487,6 +503,7 @@ export async function createCompanionHarness(options: CompanionHarnessOptions = 
     budget,
     taskController,
     taskAuditEvents,
+    taskTerminalReasons,
     budgetEvents,
     budgetLeases,
     budgetTaskLeaseIds,
@@ -558,6 +575,12 @@ export async function createCompanionHarness(options: CompanionHarnessOptions = 
       const callbacks = [...mergeTimers.values()];
       mergeTimers.clear();
       for (const callback of callbacks) callback();
+    },
+    fireTaskDeadline: () => {
+      const callback = taskDeadlineCallback;
+      if (!callback) throw new Error("no task deadline is pending");
+      taskDeadlineCallback = undefined;
+      callback();
     },
     untilTurnSettled: async () => {
       await waitForCondition(() => !service.isBusyForAutonomy(), "companion turn work to settle");

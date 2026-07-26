@@ -38,8 +38,10 @@ describe("public release readiness", () => {
       "MineflayerConnection",
       "Emergency stop order",
       "idle --> stopping: stop(reason)",
-      "TurnToolBudget forwards task-wide tool-call and classifier-derived dangerous-operation counts",
-      "dig/place/travel turn-local for safety context",
+      "TurnToolBudget forwards task-wide tool-call, block-change, horizontal-travel, and classifier-derived dangerous-operation counts",
+      "move and follow distance comes from trusted Minecraft snapshots",
+      "deadlines fire independently of later tool calls",
+      "cancels queued and in-flight actions",
       "ActionExecutor performs SafetyEngine policy evaluation",
       "MCP registry does not depend directly on TaskController",
     ]) {

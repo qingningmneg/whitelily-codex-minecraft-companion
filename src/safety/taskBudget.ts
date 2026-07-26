@@ -60,6 +60,8 @@ export interface TaskBudgetSnapshot {
   startedAt: number | null;
 }
 
+export type TaskBudgetInvalidationListener = (reason: TaskStopReason) => void;
+
 export class TaskControllerBudget {
   private active = false;
   private stopReason: TaskStopReason | null = null;
@@ -69,6 +71,7 @@ export class TaskControllerBudget {
   private horizontalTravel = 0;
   private dangerousOperations = 0;
   private activeLease: TaskLease | undefined;
+  private readonly invalidationListeners = new Set<TaskBudgetInvalidationListener>();
 
   constructor(
     private readonly dependencies: {
@@ -153,6 +156,18 @@ export class TaskControllerBudget {
     this.active = false;
     this.stopReason = reason;
     this.activeLease = undefined;
+    for (const listener of this.invalidationListeners) {
+      try {
+        listener(reason);
+      } catch {
+        // Invalidating a task lease must not depend on lifecycle observers.
+      }
+    }
+  }
+
+  onInvalidated(listener: TaskBudgetInvalidationListener): () => void {
+    this.invalidationListeners.add(listener);
+    return () => this.invalidationListeners.delete(listener);
   }
 
   snapshot(): TaskBudgetSnapshot {

@@ -5,6 +5,8 @@ import { TaskControllerBudget, type TaskLease } from "../safety/taskBudget.js";
 export type ToolActionKind = GameAction["kind"] | "get_state" | "find_block";
 
 export interface TrustedToolConsumption {
+  blockChanges?: 0 | 1;
+  horizontalTravel?: number;
   dangerousOperations?: 0 | 1;
 }
 
@@ -82,6 +84,12 @@ export class TurnToolBudget {
       lease: taskLease,
       kind,
       now: this.taskBudget.currentTime(),
+      ...(trustedConsumption.blockChanges === undefined
+        ? {}
+        : { blockChanges: trustedConsumption.blockChanges }),
+      ...(trustedConsumption.horizontalTravel === undefined
+        ? {}
+        : { horizontalTravel: trustedConsumption.horizontalTravel }),
       ...(trustedConsumption.dangerousOperations === undefined
         ? {}
         : { dangerousOperations: trustedConsumption.dangerousOperations }),

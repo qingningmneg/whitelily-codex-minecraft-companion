@@ -4,7 +4,7 @@ import type { GameAction, Vec3, WorldSnapshot } from "../domain/types.js";
 import type { MinecraftPort } from "../minecraft/minecraftPort.js";
 import { classifyActionRisk } from "../safety/actionRisk.js";
 import type { SafetyContext } from "../safety/safetyEngine.js";
-import { TurnToolBudget, type ToolActionKind } from "./toolBudget.js";
+import { TurnToolBudget, type ToolActionKind, type TrustedToolConsumption } from "./toolBudget.js";
 
 export interface ToolResult {
   text: string;
@@ -129,6 +129,15 @@ function trustedTravel(start: Vec3, destination: Vec3): number {
   return Math.hypot(destination.x - start.x, destination.z - start.z);
 }
 
+function isTrustedPosition(position: Vec3 | undefined): position is Vec3 {
+  return (
+    position !== undefined &&
+    Number.isFinite(position.x) &&
+    Number.isFinite(position.y) &&
+    Number.isFinite(position.z)
+  );
+}
+
 export function createToolRegistry(dependencies: ToolRegistryDependencies) {
   let observedSnapshot: WorldSnapshot | undefined;
   const observeSnapshot = (snapshot: WorldSnapshot): WorldSnapshot => {
@@ -147,9 +156,9 @@ export function createToolRegistry(dependencies: ToolRegistryDependencies) {
   const consume = (
     kind: ToolActionKind,
     lease: string,
-    dangerousOperations: 0 | 1 = 0,
+    trustedConsumption: TrustedToolConsumption = {},
   ): ToolResult | undefined => {
-    const result = dependencies.budget.consume(kind, lease, { dangerousOperations });
+    const result = dependencies.budget.consume(kind, lease, trustedConsumption);
     return result.ok ? undefined : errorResult(result.reason);
   };
   const runAction = async (action: GameAction, lease: string): Promise<ToolResult> => {
@@ -160,23 +169,33 @@ export function createToolRegistry(dependencies: ToolRegistryDependencies) {
       return errorResult(safeMessage(error));
     }
     const initialContext = actionContext(baseContext, action, dependencies.budget);
-    const exhausted = consume(
-      action.kind,
-      lease,
-      classifyActionRisk(action, initialContext).dangerousOperations,
-    );
-    if (exhausted) return exhausted;
-    if (action.kind === "move_to") {
+    let horizontalTravel: number | undefined;
+    if (action.kind === "move_to" || action.kind === "follow_owner") {
+      let snapshot: WorldSnapshot;
       try {
-        observedSnapshot = await takeSnapshot();
-        dependencies.budget.recordHorizontalTravel(
-          trustedTravel(observedSnapshot.botPosition, action.position),
-        );
+        snapshot = await takeSnapshot();
       } catch (error) {
-        dependencies.budget.recordHorizontalTravel(Infinity);
         return errorResult(safeMessage(error));
       }
+      const destination = action.kind === "move_to" ? action.position : snapshot.ownerPosition;
+      if (!isTrustedPosition(snapshot.botPosition) || !isTrustedPosition(destination)) {
+        return errorResult("trusted movement distance is unavailable");
+      }
+      horizontalTravel = trustedTravel(snapshot.botPosition, destination);
+      if (!Number.isFinite(horizontalTravel)) {
+        return errorResult("trusted movement distance is unavailable");
+      }
     }
+    const exhausted = consume(action.kind, lease, {
+      ...(action.kind === "dig_block" || action.kind === "place_block"
+        ? { blockChanges: 1 as const }
+        : {}),
+      ...(horizontalTravel === undefined ? {} : { horizontalTravel }),
+      dangerousOperations: classifyActionRisk(action, initialContext).dangerousOperations,
+    });
+    if (exhausted) return exhausted;
+    if (horizontalTravel !== undefined)
+      dependencies.budget.recordHorizontalTravel(horizontalTravel);
     try {
       const context = actionContext(baseContext, action, dependencies.budget);
       return toToolResult(await dependencies.executor.execute(action, context));
@@ -382,11 +401,9 @@ export function createToolRegistry(dependencies: ToolRegistryDependencies) {
         } catch (error) {
           return errorResult(safeMessage(error));
         }
-        const exhausted = consume(
-          action.kind,
-          lease,
-          classifyActionRisk(action, context).dangerousOperations,
-        );
+        const exhausted = consume(action.kind, lease, {
+          dangerousOperations: classifyActionRisk(action, context).dangerousOperations,
+        });
         if (exhausted) return exhausted;
         if (!hasDroppedItem(currentSnapshot(), droppedId))
           return errorResult("dropped entity ID is not present in the latest snapshot");

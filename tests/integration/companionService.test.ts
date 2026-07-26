@@ -127,6 +127,66 @@ describe("CompanionService lifecycle", () => {
     ).toEqual({ ok: false, reason: "task lease is invalid" });
   });
 
+  it.each(["deadline", "budget overflow"] as const)(
+    "%s actively cancels in-flight and queued work with one terminal transition",
+    async (trigger) => {
+      const value = await harness({
+        deferredTurns: [0],
+        activeMinecraftWait: true,
+      });
+      await value.start();
+      await startPlayerTurn(value, `trigger ${trigger}`);
+      const activeTurnLease = value.budgetLeases[0];
+      if (!activeTurnLease) throw new Error("expected an active turn lease");
+      let inFlightResult: unknown;
+      let queuedResult: unknown;
+      void value.executor
+        .execute(
+          { kind: "wait", milliseconds: 5_000 },
+          { spawn: { x: 0, y: 64, z: 0 }, owner: { x: 0, y: 64, z: 0 } },
+        )
+        .then((result) => {
+          inFlightResult = result;
+        });
+      void value.executor
+        .execute({ kind: "jump" }, { spawn: { x: 0, y: 64, z: 0 }, owner: { x: 0, y: 64, z: 0 } })
+        .then((result) => {
+          queuedResult = result;
+        });
+      const pending = value.confirmations.create("pending", { kind: "memory_clear" });
+      await value.untilActiveWaitStarted();
+
+      if (trigger === "deadline") {
+        value.fireTaskDeadline();
+      } else {
+        let overflowResult: unknown;
+        for (let call = 0; call < 65; call += 1) {
+          overflowResult = await value.executeRawTool("minecraft_get_state", {
+            turnLease: activeTurnLease,
+          });
+        }
+        expect(overflowResult).toEqual({
+          text: '{"error":"tool call budget exhausted"}',
+          isError: true,
+        });
+      }
+      for (let turn = 0; turn < 8; turn += 1) await Promise.resolve();
+
+      const reason = trigger === "deadline" ? "timeout" : "budget_exhausted";
+      expect(inFlightResult).toEqual({ status: "cancelled" });
+      expect(queuedResult).toEqual({ status: "cancelled" });
+      expect(value.activeWaitWasAborted()).toBe(true);
+      expect(value.minecraft.calls).not.toContainEqual(expect.objectContaining({ method: "jump" }));
+      expect(value.codex.interruptions).toEqual([{ threadId: "thread-1", turnId: "turn-1" }]);
+      expect(value.confirmations.get(pending.id)).toBeUndefined();
+      expect(value.budget.snapshot().active).toBe(false);
+      expect(value.taskController.current()).toBeNull();
+      expect(value.taskAuditEvents).toEqual(["task_started", `task_stopped:${reason}`]);
+      expect(value.taskTerminalReasons).toEqual([reason]);
+      expect(() => value.fireTaskDeadline()).toThrow("no task deadline is pending");
+    },
+  );
+
   it.each([
     ["completed", { text: outcome(), status: "completed" }],
     ["failed", { text: "", status: "failed" }],

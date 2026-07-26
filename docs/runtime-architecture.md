@@ -35,9 +35,9 @@ Its dependencies point inward to the managed MCP, Codex, Minecraft, CompanionSer
 
 ## TaskController
 
-`TaskController` owns one bounded task lease, validates the public task disclosure, starts and stops the task, records audit transitions, and invalidates its lease before downstream work can continue. It depends on `TaskControllerBudget`; callers receive cloned task state rather than its mutable active state.
+`TaskController` owns one bounded task lease, validates the public task disclosure, starts and stops the task, records audit transitions, and invalidates its lease before downstream work can continue. It also owns the task deadline: deadlines fire independently of later tool calls, and production timer handles are unreferenced and cleared on every earlier terminal path. It depends on `TaskControllerBudget`; callers receive cloned task state rather than its mutable active state.
 
-`TaskControllerBudget` owns task-wide accounting and invalidation. `TurnToolBudget` is per-Codex-turn accounting layered on that task budget: it authorizes individual tool calls only while the task lease remains valid. TurnToolBudget forwards task-wide tool-call and classifier-derived dangerous-operation counts; it keeps dig/place/travel turn-local for safety context. `TaskControllerBudget` can enforce block-change and horizontal-travel caps only when trusted consumption values are supplied; the current MCP registry does not forward those values to it. These requested task limits can only lower the immutable program caps; they cannot raise them:
+`TaskControllerBudget` owns task-wide accounting and invalidation. `TurnToolBudget` is per-Codex-turn accounting layered on that task budget: it authorizes individual tool calls only while the task lease remains valid. TurnToolBudget forwards task-wide tool-call, block-change, horizontal-travel, and classifier-derived dangerous-operation counts. Dig/place/travel counters also remain per-turn for safety context, but those counters do not substitute for task-wide enforcement. The registry charges one trusted block change for each dig or place before executor dispatch; move and follow distance comes from trusted Minecraft snapshots, never from model-supplied accounting values. Missing, malformed, or non-finite trusted positions fail closed without dispatch. These requested task limits can only lower the immutable program caps; they cannot raise them:
 
 | Hard limit           | Immutable cap |
 | -------------------- | ------------: |
@@ -47,7 +47,7 @@ Its dependencies point inward to the managed MCP, Codex, Minecraft, CompanionSer
 | Duration             |    10 minutes |
 | Dangerous operations |    8 per task |
 
-The currently forwarded task-wide counts, duration, and any other trusted values supplied to `TaskControllerBudget` fail closed on exhaustion; later tool work is then rejected. `TaskController`, `TaskControllerBudget`, and `TurnToolBudget` are internal safety controls, not desktop-sidecar APIs.
+All five task-wide dimensions fail closed on exhaustion. A deadline or overflow revokes the task lease, records one terminal transition, fences and interrupts the Codex turn, cancels queued and in-flight actions, and clears pending confirmations. `TaskController`, `TaskControllerBudget`, and `TurnToolBudget` are internal safety controls, not desktop-sidecar APIs.
 
 ## ChatRouter
 

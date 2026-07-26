@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   TaskController,
   type TaskAuditCallback,
@@ -40,6 +40,10 @@ function fixedController(audit?: TaskAuditCallback): TaskController {
 }
 
 describe("TaskController", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   it("allows only one active task", () => {
     const controller = fixedController();
     controller.start(disclosure);
@@ -267,6 +271,94 @@ describe("TaskController", () => {
     expect(controller.current()).toBeNull();
   });
 
+  it("fires the deadline terminal hook without another consume call", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-27T08:00:00.000Z"));
+    const events: string[] = [];
+    const terminalReasons: string[] = [];
+    const budget = new TaskControllerBudget({
+      now: () => Date.now(),
+      randomId: () => "task-lease-1",
+    });
+    const controller = new TaskController(
+      budget,
+      (event, data) => {
+        events.push("reason" in data ? `${event}:${data.reason}` : event);
+      },
+      {
+        onTerminal: (reason: string) => terminalReasons.push(reason),
+      },
+    );
+    controller.start(disclosure, { maxDurationMs: 1_000 });
+
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(controller.current()).toBeNull();
+    expect(budget.snapshot()).toMatchObject({ active: false, stopReason: "timeout" });
+    expect(events).toEqual(["task_started", "task_stopped:timeout"]);
+    expect(terminalReasons).toEqual(["timeout"]);
+  });
+
+  it.each(["completed", "owner_stop"] as const)(
+    "clears the deadline after %s and ignores its stale callback during a later task",
+    (reason) => {
+      const callbacks = new Map<number, () => void>();
+      const clearedTimers: number[] = [];
+      let nextTimer = 1;
+      let nextLease = 1;
+      const budget = new TaskControllerBudget({
+        now: () => Date.parse("2026-07-27T08:00:00.000Z"),
+        randomId: () => `task-lease-${nextLease++}`,
+      });
+      const controller = new TaskController(budget, () => undefined, {
+        setTimer: (callback) => {
+          const timer = nextTimer++;
+          callbacks.set(timer, callback);
+          return timer as unknown as ReturnType<typeof setTimeout>;
+        },
+        clearTimer: (timer) => {
+          const id = timer as unknown as number;
+          clearedTimers.push(id);
+          callbacks.delete(id);
+        },
+      });
+      const first = controller.start(disclosure, { maxDurationMs: 1_000 });
+      const staleDeadline = callbacks.get(1);
+      if (!staleDeadline) throw new Error("expected the first deadline callback");
+
+      controller.stop(reason);
+      const second = controller.start(disclosure, { maxDurationMs: 1_000 });
+      staleDeadline();
+
+      expect(clearedTimers).toContain(1);
+      expect(controller.current()?.id).toBe(second.id);
+      expect(controller.current()?.id).not.toBe(first.id);
+      controller.stop("completed");
+      expect(clearedTimers).toEqual([1, 2]);
+    },
+  );
+
+  it("unrefs the production deadline handle", () => {
+    const unref = vi.fn();
+    const timer = { unref } as unknown as ReturnType<typeof setTimeout>;
+    const controller = new TaskController(
+      new TaskControllerBudget({
+        now: () => Date.parse("2026-07-27T08:00:00.000Z"),
+        randomId: () => "task-lease-1",
+      }),
+      () => undefined,
+      {
+        setTimer: () => timer,
+        clearTimer: () => undefined,
+      },
+    );
+
+    controller.start(disclosure);
+
+    expect(unref).toHaveBeenCalledTimes(1);
+    controller.stop("completed");
+  });
+
   it("reconciles exhaustion consumed directly by the shared turn budget", () => {
     const events: Array<{ event: string; reason?: string }> = [];
     const taskBudget = new TaskControllerBudget({
@@ -284,13 +376,13 @@ describe("TaskController", () => {
       ok: false,
       reason: "tool call budget exhausted",
     });
-    expect(controller.current()).toBeNull();
-    controller.stop("completed");
-
     expect(events).toEqual([
       { event: "task_started" },
       { event: "task_stopped", reason: "budget_exhausted" },
     ]);
+    expect(controller.current()).toBeNull();
+    controller.stop("completed");
+    expect(events).toHaveLength(2);
   });
 
   it("rejects malformed consumption without spending the active budget", () => {
