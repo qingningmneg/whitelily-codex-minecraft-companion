@@ -333,8 +333,10 @@ git commit -m "refactor: centralize Minecraft action risk"
 
 - Create: `src/companion/chatRouter.ts`
 - Create: `tests/unit/chatRouter.test.ts`
+- Modify: `src/app.ts`
 - Modify: `src/companion/companionService.ts`
 - Modify: `tests/integration/companionService.test.ts`
+- Modify: `tests/support/companionHarness.ts`
 
 **Interfaces:**
 
@@ -386,7 +388,9 @@ The router must ignore non-chat events, require an exact case-sensitive owner us
 
 - [ ] **Step 4: Replace `CompanionService.handleEvent` chat branching**
 
-Inject `ChatRouter` through `CompanionServiceDependencies`. Preserve death, outage, reconnect, and action-result handling in `CompanionService`; only owner chat classification moves.
+Inject `ChatRouter` through `CompanionServiceDependencies`. Construct it in the production
+composition root and companion test harness. Preserve death, outage, reconnect, and action-result
+handling in `CompanionService`; only owner chat classification moves.
 
 ```ts
 const route = this.dependencies.chatRouter.route(event);
@@ -411,7 +415,7 @@ Expected: PASS.
 - [ ] **Step 6: Commit**
 
 ```powershell
-git add src/companion/chatRouter.ts src/companion/companionService.ts tests/unit/chatRouter.test.ts tests/integration/companionService.test.ts
+git add src/app.ts src/companion/chatRouter.ts src/companion/companionService.ts tests/unit/chatRouter.test.ts tests/integration/companionService.test.ts tests/support/companionHarness.ts
 git commit -m "refactor: isolate owner chat routing"
 ```
 
