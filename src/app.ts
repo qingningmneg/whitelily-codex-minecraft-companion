@@ -96,6 +96,7 @@ export interface CreateAppOptions {
 interface RuntimeCompositionObservers {
   taskChanged?(): void;
   modelSelected?(model: string): void;
+  invalidateTaskBeforeStartupCleanup?: boolean;
 }
 
 interface ComposedApp {
@@ -116,6 +117,10 @@ interface StartupAttempt {
   phases: AttemptedComponents;
   cancelled: boolean;
   cleanupPromise?: Promise<void>;
+}
+
+interface WhiteLilyLifecycleHooks {
+  beforeStartupCleanup?(): void | Promise<void>;
 }
 
 function emptyAttempts(): AttemptedComponents {
@@ -294,9 +299,11 @@ class WhiteLilyAppLifecycle implements WhiteLilyApp {
   #stopPromise: Promise<void> | undefined;
   #stopCompleted = false;
   readonly #runtime: AppRuntime;
+  readonly #hooks: WhiteLilyLifecycleHooks;
 
-  constructor(runtime: AppRuntime) {
+  constructor(runtime: AppRuntime, hooks: WhiteLilyLifecycleHooks = {}) {
     this.#runtime = runtime;
+    this.#hooks = hooks;
   }
 
   start(): Promise<void> {
@@ -370,6 +377,9 @@ class WhiteLilyAppLifecycle implements WhiteLilyApp {
       this.#state = "running";
     } catch (error) {
       attempt.cancelled = true;
+      await Promise.resolve()
+        .then(() => this.#hooks.beforeStartupCleanup?.())
+        .catch(() => undefined);
       await this.#queueCleanup(attempt).catch(() => undefined);
       this.#state = "terminal";
       if (this.#attempt === attempt) this.#attempt = undefined;
@@ -472,6 +482,7 @@ export async function createRuntimeFacade(
     modelSelected: (model) => {
       selectedModel = model;
     },
+    invalidateTaskBeforeStartupCleanup: true,
   });
   const minecraft = composition.runtime.minecraft.onEvent
     ? {
@@ -536,7 +547,13 @@ async function composeApp(
       }
     : runtime;
   return {
-    lifecycle: new WhiteLilyAppLifecycle(lifecycleRuntime),
+    lifecycle: new WhiteLilyAppLifecycle(lifecycleRuntime, {
+      ...(observers.invalidateTaskBeforeStartupCleanup
+        ? {
+            beforeStartupCleanup: () => taskController.stop("failed"),
+          }
+        : {}),
+    }),
     runtime,
     taskBudget,
     taskController,

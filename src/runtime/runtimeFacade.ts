@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
-import type { ActiveTask } from "../companion/taskController.js";
+import type { ActiveTask, TaskDisclosure } from "../companion/taskController.js";
 import type { MinecraftEvent } from "../minecraft/minecraftPort.js";
-import type { TaskBudgetSnapshot, TaskStopReason } from "../safety/taskBudget.js";
+import type { TaskBudgetSnapshot, TaskLimits, TaskStopReason } from "../safety/taskBudget.js";
 import type { PublicTaskSnapshot, RuntimeEvent, RuntimeSnapshot } from "./runtimeEvents.js";
 
 interface RuntimeLifecycle {
@@ -28,12 +28,60 @@ export interface RuntimeFacadeDependencies {
   createPublicTaskId?: () => string;
 }
 
+type InspectedTaskState =
+  | { kind: "none" }
+  | { kind: "unknown" }
+  | {
+      kind: "active";
+      identity: string;
+      leaseId: string;
+      disclosure: TaskDisclosure;
+      startedAt: string;
+      budget: TaskBudgetSnapshot;
+    };
+
+const taskStopReasons = new Set<TaskStopReason>([
+  "completed",
+  "failed",
+  "timeout",
+  "budget_exhausted",
+  "owner_stop",
+  "emergency_stop",
+  "disconnect",
+  "world_changed",
+  "model_unavailable",
+  "process_exit",
+]);
+
+const taskKeys = ["id", "lease", "disclosure", "startedAt"] as const;
+const leaseKeys = ["id", "startedAt"] as const;
+const disclosureKeys = ["goal", "expectedActions", "limits", "stopCondition"] as const;
+const limitKeys = [
+  "maxToolCalls",
+  "maxBlockChanges",
+  "maxHorizontalTravel",
+  "maxDurationMs",
+  "maxDangerousOperations",
+] as const;
+const budgetKeys = [
+  "active",
+  "stopReason",
+  "limits",
+  "toolCalls",
+  "blockChanges",
+  "horizontalTravel",
+  "dangerousOperations",
+  "startedAt",
+] as const;
+
 export class RuntimeFacade {
   readonly #dependencies: RuntimeFacadeDependencies;
   readonly #listeners = new Set<(event: RuntimeEvent) => void>();
+  readonly #eventQueue: RuntimeEvent[] = [];
+  #publishing = false;
   #unsubscribeTask: (() => void) | undefined;
   #unsubscribeMinecraft: (() => void) | undefined;
-  #taskPushSubscribed = false;
+  #taskEventsFenced = false;
   #snapshot: RuntimeSnapshot = {
     lifecycle: "idle",
     minecraft: { state: "disconnected", sessionId: null },
@@ -52,9 +100,9 @@ export class RuntimeFacade {
     this.#refreshTask(false);
     try {
       this.#unsubscribeTask = dependencies.task?.subscribe?.(() => {
+        if (this.#taskEventsFenced) return;
         this.#refreshTask(true);
       });
-      this.#taskPushSubscribed = this.#unsubscribeTask !== undefined;
     } catch {
       this.#recordError("TASK_STATE_UNKNOWN", "Task state is unavailable", false);
     }
@@ -76,10 +124,10 @@ export class RuntimeFacade {
     const operation = Promise.resolve().then(() => this.#startInternal());
     this.#startPromise = operation;
     this.#setLifecycle("starting");
-    if (!this.#terminal) {
-      this.#setMinecraft("connecting");
-      this.#setCodex("starting", null);
-    }
+    if (this.#terminal) return operation;
+    this.#setMinecraft("connecting");
+    if (this.#terminal) return operation;
+    this.#setCodex("starting", null);
     void operation.then(
       () => {
         if (this.#startPromise === operation) this.#startPromise = undefined;
@@ -97,6 +145,8 @@ export class RuntimeFacade {
       return Promise.resolve();
     }
     this.#terminal = true;
+    this.#taskEventsFenced = true;
+    this.#clearTask(false);
     const operation = Promise.resolve().then(() => this.#stopInternal(reason));
     this.#stopPromise = operation;
     this.#setLifecycle("stopping");
@@ -111,10 +161,14 @@ export class RuntimeFacade {
   }
 
   snapshot(): RuntimeSnapshot {
-    if (this.#snapshot.lifecycle !== "stopped" && this.#snapshot.lifecycle !== "failed") {
+    if (
+      !this.#taskEventsFenced &&
+      this.#snapshot.lifecycle !== "stopped" &&
+      this.#snapshot.lifecycle !== "failed"
+    ) {
       this.#refreshTask(false);
     }
-    return cloneFrozen(this.#snapshot);
+    return cloneRuntimeSnapshot(this.#snapshot);
   }
 
   async #startInternal(): Promise<void> {
@@ -123,19 +177,20 @@ export class RuntimeFacade {
       await this.#dependencies.lifecycle.start();
       if (this.#terminal || this.#snapshot.lifecycle !== "starting") return;
       const model = this.#readCodexModel();
+      if (this.#terminal || this.#snapshot.lifecycle !== "starting") return;
       this.#setCodex("ready", model);
+      if (this.#terminal || this.#snapshot.lifecycle !== "starting") return;
       this.#setLifecycle("running");
     } catch {
-      if (this.#terminal) {
-        throw new Error("Runtime startup was stopped");
-      }
+      if (this.#terminal) throw new Error("Runtime startup was stopped");
       this.#terminal = true;
       try {
         this.#dependencies.task?.stop("failed");
-        if (!this.#taskPushSubscribed) this.#refreshTask(false);
       } catch {
-        this.#clearTask(false);
+        // The public failure state below fails closed even when invalidation fails.
       }
+      this.#taskEventsFenced = true;
+      this.#clearTask(false);
       await this.#dependencies.lifecycle.stop().catch(() => undefined);
       this.#setMinecraft("disconnected");
       this.#setCodex("failed", null);
@@ -150,26 +205,33 @@ export class RuntimeFacade {
     let failed = false;
     try {
       this.#dependencies.task?.stop(reason);
-      this.#refreshTask(!this.#taskPushSubscribed);
-      if (this.#snapshot.task !== null) {
-        failed = true;
-        this.#clearTask(true);
-        this.#recordError("RUNTIME_STOP_FAILED", "Runtime failed to stop");
-      }
     } catch {
       failed = true;
-      this.#clearTask(true);
-      this.#recordError("RUNTIME_STOP_FAILED", "Runtime failed to stop");
     }
+
+    const afterInvalidation = this.#inspectTask();
+    if (afterInvalidation.kind !== "none") failed = true;
+    this.#clearTask(true);
+
     try {
       await this.#dependencies.lifecycle.stop();
     } catch {
       failed = true;
-      this.#recordError("RUNTIME_STOP_FAILED", "Runtime failed to stop");
     }
+
+    const afterCleanup = this.#inspectTask();
+    if (afterCleanup.kind !== "none") failed = true;
+    this.#clearTask(false);
+
+    if (failed) {
+      this.#recordError("RUNTIME_STOP_FAILED", "Runtime failed to stop");
+      this.#setLifecycle("failed");
+      this.#teardownObservers();
+      throw new Error("Runtime failed to stop");
+    }
+
     this.#setLifecycle("stopped");
     this.#teardownObservers();
-    if (failed) throw new Error("Runtime failed to stop");
   }
 
   #setLifecycle(lifecycle: RuntimeSnapshot["lifecycle"]): void {
@@ -243,48 +305,50 @@ export class RuntimeFacade {
     this.#recordError("MINECRAFT_STATE_UNKNOWN", "Minecraft state is unavailable");
   }
 
-  #refreshTask(publish: boolean): void {
+  #inspectTask(): InspectedTaskState {
     const taskAccess = this.#dependencies.task;
-    if (!taskAccess) return;
+    if (!taskAccess) return { kind: "none" };
     try {
-      const active = taskAccess.current();
-      const budget = taskAccess.budget();
-      if (active === null && budget.active === false) {
-        if (!validInactiveBudget(budget)) {
-          this.#failTaskState(publish);
-          return;
-        }
-        this.#privateTaskIdentity = undefined;
-        this.#publicTaskId = undefined;
-        this.#setTask(null, publish);
+      const active = taskAccess.current() as unknown;
+      const budget = parseBudget(taskAccess.budget() as unknown);
+      if (!budget) return { kind: "unknown" };
+      if (active === null && budget.active === false) return { kind: "none" };
+      if (active === null || budget.active !== true) return { kind: "unknown" };
+      return parseActiveTask(active, budget);
+    } catch {
+      return { kind: "unknown" };
+    }
+  }
+
+  #refreshTask(publish: boolean): void {
+    try {
+      const inspected = this.#inspectTask();
+      if (inspected.kind === "none") {
+        this.#clearTask(publish);
         return;
       }
-      if (active === null || budget.active !== true || !validActiveTask(active, budget)) {
+      if (inspected.kind === "unknown") {
         this.#failTaskState(publish);
         return;
       }
-      const identity = `${active.lease.id}\u0000${active.lease.startedAt}`;
-      if (this.#privateTaskIdentity !== identity) {
+      if (this.#privateTaskIdentity !== inspected.identity) {
         const publicId = (this.#dependencies.createPublicTaskId ?? randomUUID)();
-        if (!/^[A-Za-z0-9_-]{1,128}$/.test(publicId) || publicId === active.lease.id) {
+        if (!/^[A-Za-z0-9_-]{1,128}$/.test(publicId) || publicId === inspected.leaseId) {
           this.#failTaskState(publish);
           return;
         }
-        this.#privateTaskIdentity = identity;
+        this.#privateTaskIdentity = inspected.identity;
         this.#publicTaskId = publicId;
       }
-      const task: PublicTaskSnapshot = {
-        id: this.#publicTaskId!,
-        disclosure: {
-          goal: active.disclosure.goal,
-          expectedActions: [...active.disclosure.expectedActions],
-          limits: { ...active.disclosure.limits },
-          stopCondition: active.disclosure.stopCondition,
+      this.#setTask(
+        {
+          id: this.#publicTaskId!,
+          disclosure: cloneDisclosure(inspected.disclosure),
+          startedAt: inspected.startedAt,
+          budget: cloneBudget(inspected.budget),
         },
-        startedAt: active.startedAt,
-        budget: structuredClone(budget),
-      };
-      this.#setTask(task, publish);
+        publish,
+      );
     } catch {
       this.#failTaskState(publish);
     }
@@ -302,17 +366,31 @@ export class RuntimeFacade {
   }
 
   #setTask(task: PublicTaskSnapshot | null, publish: boolean): void {
-    this.#snapshot = {
-      ...this.#snapshot,
-      task: task === null ? null : structuredClone(task),
-    };
-    if (publish) this.#publish({ kind: "task", task });
+    const safeTask = task === null ? null : clonePublicTask(task);
+    this.#snapshot = { ...this.#snapshot, task: safeTask };
+    if (publish) {
+      this.#publish({
+        kind: "task",
+        task: safeTask === null ? null : clonePublicTask(safeTask),
+      });
+    }
   }
 
   #recordError(code: string, message: string, publish = true): void {
-    const error = { code: code.slice(0, 64), message: message.slice(0, 160) };
-    this.#snapshot = { ...this.#snapshot, lastError: error };
-    if (publish) this.#publish({ kind: "error", error });
+    const error = {
+      code: code.slice(0, 64),
+      message: message.slice(0, 160),
+    };
+    this.#snapshot = {
+      ...this.#snapshot,
+      lastError: { code: error.code, message: error.message },
+    };
+    if (publish) {
+      this.#publish({
+        kind: "error",
+        error: { code: error.code, message: error.message },
+      });
+    }
   }
 
   #teardownObservers(): void {
@@ -331,120 +409,312 @@ export class RuntimeFacade {
   }
 
   #publish(event: RuntimeEvent): void {
-    for (const listener of this.#listeners) {
-      try {
-        listener(cloneFrozen(event));
-      } catch {
-        // Desktop listeners cannot affect runtime lifecycle.
+    this.#eventQueue.push(cloneRuntimeEvent(event));
+    if (this.#publishing) return;
+    this.#publishing = true;
+    try {
+      while (this.#eventQueue.length > 0) {
+        const next = this.#eventQueue.shift()!;
+        for (const listener of [...this.#listeners]) {
+          try {
+            listener(deepFreeze(cloneRuntimeEvent(next)));
+          } catch {
+            // Desktop listeners cannot affect runtime lifecycle.
+          }
+        }
       }
+    } finally {
+      this.#publishing = false;
     }
   }
 }
 
-function validActiveTask(active: ActiveTask, budget: TaskBudgetSnapshot): boolean {
-  const startedAt = Date.parse(active.startedAt);
-  return (
-    typeof active.id === "string" &&
-    active.id.length > 0 &&
-    active.id.length <= 512 &&
-    typeof active.lease?.id === "string" &&
-    active.lease.id.length > 0 &&
-    active.lease.id.length <= 512 &&
-    active.id === active.lease.id &&
-    Number.isFinite(active.lease.startedAt) &&
-    startedAt === active.lease.startedAt &&
-    budget.startedAt === active.lease.startedAt &&
-    validDisclosure(active.disclosure) &&
-    validBudget(budget)
-  );
+function parseActiveTask(value: unknown, budget: TaskBudgetSnapshot): InspectedTaskState {
+  if (!isExactRecord(value, taskKeys)) return { kind: "unknown" };
+  const lease = value.lease;
+  if (!isExactRecord(lease, leaseKeys)) return { kind: "unknown" };
+  const disclosure = value.disclosure;
+  if (!isExactRecord(disclosure, disclosureKeys)) return { kind: "unknown" };
+
+  const id = value.id;
+  const leaseId = lease.id;
+  const leaseStartedAt = lease.startedAt;
+  const startedAt = value.startedAt;
+  if (
+    typeof id !== "string" ||
+    id.length === 0 ||
+    id.length > 512 ||
+    typeof leaseId !== "string" ||
+    leaseId.length === 0 ||
+    leaseId.length > 512 ||
+    id !== leaseId ||
+    !finiteNonnegativeInteger(leaseStartedAt) ||
+    typeof startedAt !== "string" ||
+    startedAt.length === 0 ||
+    startedAt.length > 64 ||
+    Date.parse(startedAt) !== leaseStartedAt ||
+    budget.startedAt !== leaseStartedAt
+  ) {
+    return { kind: "unknown" };
+  }
+
+  const goal = disclosure.goal;
+  const stopCondition = disclosure.stopCondition;
+  const expectedActions = parseExpectedActions(disclosure.expectedActions);
+  const limits = parseLimits(disclosure.limits);
+  if (
+    typeof goal !== "string" ||
+    goal.length === 0 ||
+    goal.length > 4_000 ||
+    typeof stopCondition !== "string" ||
+    stopCondition.length === 0 ||
+    stopCondition.length > 4_000 ||
+    !expectedActions ||
+    !limits ||
+    !limitsEqual(limits, budget.limits)
+  ) {
+    return { kind: "unknown" };
+  }
+
+  return {
+    kind: "active",
+    identity: `${leaseId}\u0000${leaseStartedAt}`,
+    leaseId,
+    disclosure: {
+      goal,
+      expectedActions,
+      limits,
+      stopCondition,
+    },
+    startedAt,
+    budget: cloneBudget(budget),
+  };
 }
 
-function validDisclosure(disclosure: ActiveTask["disclosure"]): boolean {
-  return (
-    typeof disclosure === "object" &&
-    disclosure !== null &&
-    typeof disclosure.goal === "string" &&
-    disclosure.goal.length > 0 &&
-    disclosure.goal.length <= 4_000 &&
-    Array.isArray(disclosure.expectedActions) &&
-    disclosure.expectedActions.length <= 16 &&
-    disclosure.expectedActions.every(
-      (value) => typeof value === "string" && value.length > 0 && value.length <= 256,
-    ) &&
-    validLimits(disclosure.limits) &&
-    typeof disclosure.stopCondition === "string" &&
-    disclosure.stopCondition.length > 0 &&
-    disclosure.stopCondition.length <= 4_000
-  );
+function parseBudget(value: unknown): TaskBudgetSnapshot | null {
+  if (!isExactRecord(value, budgetKeys)) return null;
+  const active = value.active;
+  const stopReason = value.stopReason;
+  const limits = parseLimits(value.limits);
+  const toolCalls = value.toolCalls;
+  const blockChanges = value.blockChanges;
+  const horizontalTravel = value.horizontalTravel;
+  const dangerousOperations = value.dangerousOperations;
+  const startedAt = value.startedAt;
+  if (
+    typeof active !== "boolean" ||
+    (stopReason !== null &&
+      (typeof stopReason !== "string" || !taskStopReasons.has(stopReason as TaskStopReason))) ||
+    !limits ||
+    !finiteNonnegativeInteger(toolCalls) ||
+    !finiteNonnegativeInteger(blockChanges) ||
+    !finiteNonnegative(horizontalTravel) ||
+    !finiteNonnegativeInteger(dangerousOperations) ||
+    toolCalls > limits.maxToolCalls ||
+    blockChanges > limits.maxBlockChanges ||
+    horizontalTravel > limits.maxHorizontalTravel ||
+    dangerousOperations > limits.maxDangerousOperations
+  ) {
+    return null;
+  }
+  let safeStartedAt: number | null;
+  if (active) {
+    if (stopReason !== null || !finiteNonnegativeInteger(startedAt)) return null;
+    safeStartedAt = startedAt;
+  } else {
+    if (startedAt !== null) return null;
+    safeStartedAt = null;
+  }
+  return {
+    active,
+    stopReason: stopReason as TaskStopReason | null,
+    limits,
+    toolCalls,
+    blockChanges,
+    horizontalTravel,
+    dangerousOperations,
+    startedAt: safeStartedAt,
+  };
 }
 
-function validBudget(budget: TaskBudgetSnapshot): boolean {
-  return (
-    typeof budget === "object" &&
-    budget !== null &&
-    budget.active === true &&
-    budget.stopReason === null &&
-    validBudgetNumbers(budget) &&
-    validLimits(budget.limits)
-  );
+function parseLimits(value: unknown): TaskLimits | null {
+  if (!isExactRecord(value, limitKeys)) return null;
+  const maxToolCalls = value.maxToolCalls;
+  const maxBlockChanges = value.maxBlockChanges;
+  const maxHorizontalTravel = value.maxHorizontalTravel;
+  const maxDurationMs = value.maxDurationMs;
+  const maxDangerousOperations = value.maxDangerousOperations;
+  if (
+    !finiteNonnegative(maxToolCalls) ||
+    !finiteNonnegative(maxBlockChanges) ||
+    !finiteNonnegative(maxHorizontalTravel) ||
+    !finiteNonnegative(maxDurationMs) ||
+    !finiteNonnegative(maxDangerousOperations)
+  ) {
+    return null;
+  }
+  return {
+    maxToolCalls,
+    maxBlockChanges,
+    maxHorizontalTravel,
+    maxDurationMs,
+    maxDangerousOperations,
+  };
 }
 
-function validInactiveBudget(budget: TaskBudgetSnapshot): boolean {
-  return (
-    typeof budget === "object" &&
-    budget !== null &&
-    budget.active === false &&
-    budget.startedAt === null &&
-    (budget.stopReason === null || taskStopReasons.has(budget.stopReason)) &&
-    validBudgetNumbers(budget) &&
-    validLimits(budget.limits)
-  );
+function parseExpectedActions(value: unknown): string[] | null {
+  if (!Array.isArray(value) || value.length > 16 || !hasExactArrayKeys(value)) {
+    return null;
+  }
+  if (value.some((item) => typeof item !== "string" || item.length === 0 || item.length > 256)) {
+    return null;
+  }
+  return value.map((item) => item as string);
 }
 
-function validBudgetNumbers(budget: TaskBudgetSnapshot): boolean {
-  return (
-    finiteNonnegative(budget.toolCalls) &&
-    finiteNonnegative(budget.blockChanges) &&
-    finiteNonnegative(budget.horizontalTravel) &&
-    finiteNonnegative(budget.dangerousOperations)
-  );
+function isExactRecord<const K extends readonly string[]>(
+  value: unknown,
+  keys: K,
+): value is Record<K[number], unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) return false;
+  const actual = Reflect.ownKeys(value);
+  return actual.length === keys.length && keys.every((key) => actual.includes(key));
 }
 
-function validLimits(limits: TaskBudgetSnapshot["limits"]): boolean {
-  return (
-    typeof limits === "object" &&
-    limits !== null &&
-    finiteNonnegative(limits.maxToolCalls) &&
-    finiteNonnegative(limits.maxBlockChanges) &&
-    finiteNonnegative(limits.maxHorizontalTravel) &&
-    finiteNonnegative(limits.maxDurationMs) &&
-    finiteNonnegative(limits.maxDangerousOperations)
-  );
+function hasExactArrayKeys(value: unknown[]): boolean {
+  const actual = Reflect.ownKeys(value);
+  if (actual.length !== value.length + 1 || !actual.includes("length")) return false;
+  for (let index = 0; index < value.length; index += 1) {
+    if (!actual.includes(String(index))) return false;
+  }
+  return true;
 }
 
-const taskStopReasons = new Set<TaskStopReason>([
-  "completed",
-  "failed",
-  "timeout",
-  "budget_exhausted",
-  "owner_stop",
-  "emergency_stop",
-  "disconnect",
-  "world_changed",
-  "model_unavailable",
-  "process_exit",
-]);
+function limitsEqual(left: TaskLimits, right: TaskLimits): boolean {
+  return limitKeys.every((key) => left[key] === right[key]);
+}
 
 function finiteNonnegative(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value) && value >= 0;
 }
 
-function cloneFrozen<T>(value: T): T {
-  return deepFreeze(structuredClone(value));
+function finiteNonnegativeInteger(value: unknown): value is number {
+  return finiteNonnegative(value) && Number.isSafeInteger(value);
+}
+
+function cloneLimits(limits: TaskLimits): TaskLimits {
+  return {
+    maxToolCalls: limits.maxToolCalls,
+    maxBlockChanges: limits.maxBlockChanges,
+    maxHorizontalTravel: limits.maxHorizontalTravel,
+    maxDurationMs: limits.maxDurationMs,
+    maxDangerousOperations: limits.maxDangerousOperations,
+  };
+}
+
+function cloneDisclosure(disclosure: TaskDisclosure): TaskDisclosure {
+  return {
+    goal: disclosure.goal,
+    expectedActions: disclosure.expectedActions.map((action) => action),
+    limits: cloneLimits(disclosure.limits),
+    stopCondition: disclosure.stopCondition,
+  };
+}
+
+function cloneBudget(budget: TaskBudgetSnapshot): TaskBudgetSnapshot {
+  return {
+    active: budget.active,
+    stopReason: budget.stopReason,
+    limits: cloneLimits(budget.limits),
+    toolCalls: budget.toolCalls,
+    blockChanges: budget.blockChanges,
+    horizontalTravel: budget.horizontalTravel,
+    dangerousOperations: budget.dangerousOperations,
+    startedAt: budget.startedAt,
+  };
+}
+
+function clonePublicTask(task: PublicTaskSnapshot): PublicTaskSnapshot {
+  return {
+    id: task.id,
+    disclosure: cloneDisclosure(task.disclosure),
+    startedAt: task.startedAt,
+    budget: cloneBudget(task.budget),
+  };
+}
+
+function cloneRuntimeEvent(event: RuntimeEvent): RuntimeEvent {
+  switch (event.kind) {
+    case "lifecycle":
+      return { kind: "lifecycle", state: event.state };
+    case "minecraft":
+      return {
+        kind: "minecraft",
+        state: {
+          state: event.state.state,
+          sessionId: event.state.sessionId,
+        },
+      };
+    case "codex":
+      return {
+        kind: "codex",
+        state: {
+          state: event.state.state,
+          model: event.state.model,
+        },
+      };
+    case "task":
+      return {
+        kind: "task",
+        task: event.task === null ? null : clonePublicTask(event.task),
+      };
+    case "error":
+      return {
+        kind: "error",
+        error: {
+          code: event.error.code,
+          message: event.error.message,
+        },
+      };
+    default:
+      return assertNever(event);
+  }
+}
+
+function cloneRuntimeSnapshot(snapshot: RuntimeSnapshot): RuntimeSnapshot {
+  return deepFreeze({
+    lifecycle: snapshot.lifecycle,
+    minecraft: {
+      state: snapshot.minecraft.state,
+      sessionId: snapshot.minecraft.sessionId,
+    },
+    codex: {
+      state: snapshot.codex.state,
+      model: snapshot.codex.model,
+    },
+    task: snapshot.task === null ? null : clonePublicTask(snapshot.task),
+    lastError:
+      snapshot.lastError === null
+        ? null
+        : {
+            code: snapshot.lastError.code,
+            message: snapshot.lastError.message,
+          },
+  });
+}
+
+function assertNever(value: never): never {
+  throw new Error(`Unexpected runtime event: ${String(value)}`);
 }
 
 function deepFreeze<T>(value: T): T {
-  if (typeof value !== "object" || value === null || Object.isFrozen(value)) return value;
+  if (typeof value !== "object" || value === null || Object.isFrozen(value)) {
+    return value;
+  }
   for (const nested of Object.values(value)) deepFreeze(nested);
   return Object.freeze(value);
 }

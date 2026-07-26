@@ -33,6 +33,28 @@ function inactiveBudget(): TaskBudgetSnapshot {
   };
 }
 
+function activeTaskFixture(): ActiveTask {
+  return {
+    id: "lease-active-fixture",
+    lease: { id: "lease-active-fixture", startedAt: 1_700_000_000_000 },
+    disclosure: {
+      goal: "Build safely",
+      expectedActions: ["place"],
+      limits: { ...inactiveBudget().limits },
+      stopCondition: "Build complete",
+    },
+    startedAt: "2023-11-14T22:13:20.000Z",
+  };
+}
+
+function activeBudgetFixture(): TaskBudgetSnapshot {
+  return {
+    ...inactiveBudget(),
+    active: true,
+    startedAt: 1_700_000_000_000,
+  };
+}
+
 function createRuntimeFacadeHarness() {
   const cleanup: string[] = [];
   const stopReasons: TaskStopReason[] = [];
@@ -131,6 +153,75 @@ describe("RuntimeFacade", () => {
     await first;
 
     expect(starts).toBe(1);
+  });
+
+  it("queues a reentrant stop until every listener receives starting", async () => {
+    const deliveries: string[] = [];
+    let stopping: Promise<void> | undefined;
+    const runtime = new RuntimeFacade({
+      lifecycle: {
+        start: async () => undefined,
+        stop: async () => undefined,
+      },
+    });
+    runtime.subscribe((event) => {
+      if (event.kind !== "lifecycle") return;
+      deliveries.push(`first:${event.state}`);
+      if (event.state === "starting") stopping = runtime.stop("process_exit");
+    });
+    runtime.subscribe((event) => {
+      if (event.kind === "lifecycle") deliveries.push(`second:${event.state}`);
+    });
+
+    await runtime.start();
+    await stopping;
+
+    expect(deliveries).toEqual([
+      "first:starting",
+      "second:starting",
+      "first:stopping",
+      "second:stopping",
+      "first:stopped",
+      "second:stopped",
+    ]);
+    expect(runtime.snapshot().lifecycle).toBe("stopped");
+  });
+
+  it("does not publish running when a Codex-ready listener stops startup", async () => {
+    const deliveries: string[] = [];
+    let stopping: Promise<void> | undefined;
+    const runtime = new RuntimeFacade({
+      lifecycle: {
+        start: async () => undefined,
+        stop: async () => undefined,
+      },
+      codex: {
+        model: () => "gpt-5.6-terra",
+      },
+    });
+    runtime.subscribe((event) => {
+      if (event.kind === "codex") {
+        deliveries.push(`first:codex:${event.state.state}`);
+        if (event.state.state === "ready") stopping = runtime.stop("process_exit");
+      }
+      if (event.kind === "lifecycle") deliveries.push(`first:lifecycle:${event.state}`);
+    });
+    runtime.subscribe((event) => {
+      if (event.kind === "codex") deliveries.push(`second:codex:${event.state.state}`);
+      if (event.kind === "lifecycle") deliveries.push(`second:lifecycle:${event.state}`);
+    });
+
+    await runtime.start();
+    await stopping;
+
+    expect(deliveries).toContain("first:codex:ready");
+    expect(deliveries).toContain("second:codex:ready");
+    expect(deliveries).not.toContain("first:lifecycle:running");
+    expect(deliveries).not.toContain("second:lifecycle:running");
+    expect(deliveries.indexOf("second:codex:ready")).toBeLessThan(
+      deliveries.indexOf("first:lifecycle:stopping"),
+    );
+    expect(runtime.snapshot().lifecycle).toBe("stopped");
   });
 
   it("fences a stop during startup from later publishing running", async () => {
@@ -269,7 +360,7 @@ describe("RuntimeFacade", () => {
     expect(lifecycleStops).toBe(1);
     const snapshot = runtime.snapshot();
     expect(snapshot).toMatchObject({
-      lifecycle: "stopped",
+      lifecycle: "failed",
       task: null,
       lastError: {
         code: "RUNTIME_STOP_FAILED",
@@ -321,7 +412,7 @@ describe("RuntimeFacade", () => {
     expect(reasons).toEqual(["world_changed"]);
     expect(lifecycleStops).toBe(1);
     expect(runtime.snapshot()).toMatchObject({
-      lifecycle: "stopped",
+      lifecycle: "failed",
       task: null,
       lastError: {
         code: "RUNTIME_STOP_FAILED",
@@ -329,6 +420,128 @@ describe("RuntimeFacade", () => {
       },
     });
     expect(JSON.stringify(runtime.snapshot())).not.toContain(leaseId);
+  });
+
+  it("treats an accessor throw after invalidation as unknown and still cleans up", async () => {
+    const leaseId = "lease-accessor-throw-secret";
+    let invalidated = false;
+    let lifecycleStops = 0;
+    const runtime = new RuntimeFacade({
+      lifecycle: {
+        start: async () => undefined,
+        stop: async () => {
+          lifecycleStops += 1;
+        },
+      },
+      task: {
+        current: () => {
+          if (invalidated) throw new Error(`cannot read ${leaseId} at C:\\private`);
+          return {
+            id: leaseId,
+            lease: { id: leaseId, startedAt: 1_700_000_000_000 },
+            disclosure: {
+              goal: "Build safely",
+              expectedActions: ["place"],
+              limits: { ...inactiveBudget().limits },
+              stopCondition: "Build complete",
+            },
+            startedAt: "2023-11-14T22:13:20.000Z",
+          };
+        },
+        budget: () => ({
+          ...inactiveBudget(),
+          active: !invalidated,
+          stopReason: invalidated ? "emergency_stop" : null,
+          startedAt: invalidated ? null : 1_700_000_000_000,
+        }),
+        stop: () => {
+          invalidated = true;
+        },
+      },
+      createPublicTaskId: () => "public-accessor-throw-task",
+    });
+    await runtime.start();
+
+    await expect(runtime.stop("emergency_stop")).rejects.toThrow("Runtime failed to stop");
+
+    expect(lifecycleStops).toBe(1);
+    expect(runtime.snapshot()).toMatchObject({
+      lifecycle: "failed",
+      task: null,
+      lastError: {
+        code: "RUNTIME_STOP_FAILED",
+        message: "Runtime failed to stop",
+      },
+    });
+    const serialized = JSON.stringify(runtime.snapshot());
+    expect(serialized).not.toContain(leaseId);
+    expect(serialized).not.toContain("C:\\private");
+  });
+
+  it("fences task events during cleanup and rejects a task created late", async () => {
+    const lateLeaseId = "lease-created-during-cleanup";
+    let active: ActiveTask | null = null;
+    let budget = inactiveBudget();
+    let taskListener: (() => void) | undefined;
+    const publishedTasks: RuntimeEvent[] = [];
+    const runtime = new RuntimeFacade({
+      lifecycle: {
+        start: async () => undefined,
+        stop: async () => {
+          active = {
+            id: lateLeaseId,
+            lease: { id: lateLeaseId, startedAt: 1_700_000_000_000 },
+            disclosure: {
+              goal: "Late unsafe task",
+              expectedActions: ["place"],
+              limits: { ...inactiveBudget().limits },
+              stopCondition: "Never",
+            },
+            startedAt: "2023-11-14T22:13:20.000Z",
+          };
+          budget = {
+            ...inactiveBudget(),
+            active: true,
+            startedAt: 1_700_000_000_000,
+          };
+          taskListener?.();
+        },
+      },
+      task: {
+        current: () => active,
+        budget: () => budget,
+        stop: () => undefined,
+        subscribe: (listener) => {
+          taskListener = listener;
+          return () => {
+            taskListener = undefined;
+          };
+        },
+      },
+      createPublicTaskId: () => "public-late-cleanup-task",
+    });
+    runtime.subscribe((event) => {
+      if (event.kind === "task") publishedTasks.push(event);
+    });
+    await runtime.start();
+
+    await expect(runtime.stop("process_exit")).rejects.toThrow("Runtime failed to stop");
+
+    expect(publishedTasks).not.toContainEqual(
+      expect.objectContaining({
+        kind: "task",
+        task: expect.objectContaining({ id: "public-late-cleanup-task" }),
+      }),
+    );
+    expect(runtime.snapshot()).toMatchObject({
+      lifecycle: "failed",
+      task: null,
+      lastError: {
+        code: "RUNTIME_STOP_FAILED",
+        message: "Runtime failed to stop",
+      },
+    });
+    expect(JSON.stringify(runtime.snapshot())).not.toContain(lateLeaseId);
   });
 
   it("maps Minecraft and Codex startup, connection, outage, and terminal states", async () => {
@@ -501,6 +714,165 @@ describe("RuntimeFacade", () => {
     budget = { ...budget, active: false, stopReason: "completed", startedAt: null };
     taskListener?.();
     expect(observed.at(-1)).toEqual({ kind: "task", task: null });
+  });
+
+  it.each([
+    {
+      boundary: "active task",
+      task: () =>
+        ({
+          ...activeTaskFixture(),
+          leaseId: "EXTRA_LEASE_ID_SECRET",
+        }) as ActiveTask,
+      budget: activeBudgetFixture,
+    },
+    {
+      boundary: "task lease",
+      task: () => {
+        const task = activeTaskFixture();
+        return {
+          ...task,
+          lease: { ...task.lease, credential: "EXTRA_CREDENTIAL_SECRET" },
+        } as ActiveTask;
+      },
+      budget: activeBudgetFixture,
+    },
+    {
+      boundary: "task disclosure",
+      task: () => {
+        const task = activeTaskFixture();
+        return {
+          ...task,
+          disclosure: { ...task.disclosure, path: "C:\\EXTRA_PRIVATE_PATH" },
+        } as ActiveTask;
+      },
+      budget: activeBudgetFixture,
+    },
+    {
+      boundary: "expected actions",
+      task: () => {
+        const task = activeTaskFixture();
+        const actions = [...task.disclosure.expectedActions] as string[] & {
+          credential?: string;
+        };
+        actions.credential = "EXTRA_ACTION_SECRET";
+        return {
+          ...task,
+          disclosure: { ...task.disclosure, expectedActions: actions },
+        };
+      },
+      budget: activeBudgetFixture,
+    },
+    {
+      boundary: "disclosure limits",
+      task: () => {
+        const task = activeTaskFixture();
+        return {
+          ...task,
+          disclosure: {
+            ...task.disclosure,
+            limits: {
+              ...task.disclosure.limits,
+              privateText: "X".repeat(10_000),
+            },
+          },
+        } as ActiveTask;
+      },
+      budget: activeBudgetFixture,
+    },
+    {
+      boundary: "task budget",
+      task: activeTaskFixture,
+      budget: () =>
+        ({
+          ...activeBudgetFixture(),
+          leaseId: "EXTRA_BUDGET_LEASE_SECRET",
+        }) as TaskBudgetSnapshot,
+    },
+  ])("rejects non-allowlisted properties at the $boundary boundary", ({ task, budget }) => {
+    const runtime = new RuntimeFacade({
+      lifecycle: {
+        start: async () => undefined,
+        stop: async () => undefined,
+      },
+      task: {
+        current: task,
+        budget,
+        stop: () => undefined,
+      },
+      createPublicTaskId: () => "public-exact-shape-task",
+    });
+
+    const snapshot = runtime.snapshot();
+    expect(snapshot).toMatchObject({
+      task: null,
+      lastError: {
+        code: "TASK_STATE_UNKNOWN",
+        message: "Task state is unavailable",
+      },
+    });
+    const serialized = JSON.stringify(snapshot);
+    expect(serialized).not.toContain("EXTRA_");
+    expect(serialized.length).toBeLessThan(2_048);
+  });
+
+  it.each([
+    "maxToolCalls",
+    "maxBlockChanges",
+    "maxHorizontalTravel",
+    "maxDurationMs",
+    "maxDangerousOperations",
+  ] as const)("rejects a %s mismatch between disclosure and budget limits", (key) => {
+    const task = activeTaskFixture();
+    task.disclosure.limits[key] = task.disclosure.limits[key] - 1;
+    const runtime = new RuntimeFacade({
+      lifecycle: {
+        start: async () => undefined,
+        stop: async () => undefined,
+      },
+      task: {
+        current: () => task,
+        budget: activeBudgetFixture,
+        stop: () => undefined,
+      },
+    });
+
+    expect(runtime.snapshot()).toMatchObject({
+      task: null,
+      lastError: {
+        code: "TASK_STATE_UNKNOWN",
+        message: "Task state is unavailable",
+      },
+    });
+  });
+
+  it.each([
+    { counter: "toolCalls", limit: "maxToolCalls" },
+    { counter: "blockChanges", limit: "maxBlockChanges" },
+    { counter: "horizontalTravel", limit: "maxHorizontalTravel" },
+    { counter: "dangerousOperations", limit: "maxDangerousOperations" },
+  ] as const)("rejects $counter above $limit", ({ counter, limit }) => {
+    const budget = activeBudgetFixture();
+    budget[counter] = budget.limits[limit] + 1;
+    const runtime = new RuntimeFacade({
+      lifecycle: {
+        start: async () => undefined,
+        stop: async () => undefined,
+      },
+      task: {
+        current: activeTaskFixture,
+        budget: () => budget,
+        stop: () => undefined,
+      },
+    });
+
+    expect(runtime.snapshot()).toMatchObject({
+      task: null,
+      lastError: {
+        code: "TASK_STATE_UNKNOWN",
+        message: "Task state is unavailable",
+      },
+    });
   });
 
   it("returns deeply frozen independent snapshots and event payloads", async () => {

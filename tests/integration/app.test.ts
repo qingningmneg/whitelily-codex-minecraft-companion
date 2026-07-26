@@ -615,6 +615,93 @@ describe("WhiteLilyApp composition", () => {
       task: null,
     });
   });
+
+  it("invalidates a startup-created task before component failure cleanup", async () => {
+    const files = await createCliHarness();
+    cleanups.push(files.cleanup);
+    const events: string[] = [];
+    const runtime = await createRuntimeFacade(files.configPath, {
+      cwd: files.directory,
+      runtimeFactory: (context) => ({
+        preferredModel: context.config.codex.preferredModel,
+        mcp: {
+          start: async () => {
+            events.push("mcp:start");
+          },
+          stop: async () => {
+            events.push("mcp:stop");
+          },
+        },
+        codex: {
+          assertChatGptLogin: async () => {
+            events.push("codex:auth-check");
+          },
+          start: async () => {
+            events.push("codex:start");
+          },
+          listModels: async () => ["gpt-5.6-terra"],
+          stop: async () => {
+            events.push("codex:stop");
+          },
+        },
+        selectModel: (_models, preferred) => preferred,
+        minecraft: {
+          connect: async () => {
+            events.push("minecraft:connect");
+          },
+          disconnect: async () => {
+            events.push("minecraft:disconnect");
+          },
+        },
+        companion: {
+          start: async () => {
+            events.push("companion:start");
+            context.taskController.start({
+              goal: "Task created during startup",
+              expectedActions: ["place"],
+              limits: {
+                maxToolCalls: 8,
+                maxBlockChanges: 16,
+                maxHorizontalTravel: 64,
+                maxDurationMs: 60_000,
+                maxDangerousOperations: 0,
+              },
+              stopCondition: "Startup completes",
+            });
+            throw new Error("startup:companion");
+          },
+          stop: async () => {
+            events.push("companion:stop");
+          },
+        },
+        executor: {
+          stopAll: async () => {
+            events.push("actions:stop");
+          },
+        },
+      }),
+    });
+    runtime.subscribe((event) => {
+      if (event.kind === "task") events.push(event.task ? "task:started" : "task:stopped");
+    });
+
+    await expect(runtime.start()).rejects.toThrow("Runtime failed to start");
+
+    const stoppedIndex = events.indexOf("task:stopped");
+    expect(stoppedIndex).toBeGreaterThan(events.indexOf("task:started"));
+    expect(events.slice(stoppedIndex)).toEqual([
+      "task:stopped",
+      "companion:stop",
+      "actions:stop",
+      "minecraft:disconnect",
+      "codex:stop",
+      "mcp:stop",
+    ]);
+    expect(runtime.snapshot()).toMatchObject({
+      lifecycle: "failed",
+      task: null,
+    });
+  });
 });
 
 describe("externally composed CompanionService startup", () => {
