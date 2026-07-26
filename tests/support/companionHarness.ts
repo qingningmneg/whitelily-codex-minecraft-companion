@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { setTimeout as nativeDelay } from "node:timers/promises";
 import { ActionExecutor } from "../../src/actions/actionExecutor.js";
 import { parseLocalCommand } from "../../src/commands/commandParser.js";
+import { ChatRouter } from "../../src/companion/chatRouter.js";
 import { CompanionService } from "../../src/companion/companionService.js";
 import type { CodexPort, CodexTurnResult } from "../../src/codex/codexPort.js";
 import type { PersistentState } from "../../src/memory/stateStore.js";
@@ -439,6 +440,7 @@ export async function createCompanionHarness(options: CompanionHarnessOptions = 
       owner: { x: 0, y: 64, z: 0 },
     }),
     ownerUsername: "TestOwner",
+    chatRouter: new ChatRouter({ ownerUsername: "TestOwner", maxMessageLength: 4_000 }),
     cwd: directory,
     preferredModel: "gpt-5.6-terra",
     reasoningEffort: "low",

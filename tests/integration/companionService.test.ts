@@ -72,6 +72,18 @@ describe("CompanionService lifecycle", () => {
     expect(value.autonomy.actionsFailed).toBe(1);
   });
 
+  it("ignores visitor commands and normalizes owner chat before the model turn", async () => {
+    const value = await harness();
+    await value.start();
+
+    value.minecraft.emit({ kind: "chat", username: "Visitor", message: "!stop" });
+    expect(value.mode.snapshot().paused).toBe(false);
+
+    await startPlayerTurn(value, "first\r\nsecond");
+
+    expect(value.codex.turns[0]?.text).toContain('"ownerMessage":"first  second"');
+  });
+
   it("owner-offline immediately interrupts active work, clears confirmation, pauses, and persists", async () => {
     vi.useFakeTimers();
     const value = await harness({

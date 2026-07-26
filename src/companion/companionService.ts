@@ -1,6 +1,6 @@
 import { ActionExecutor } from "../actions/actionExecutor.js";
 import type { AutonomyReason } from "../autonomy/autonomyScheduler.js";
-import { parseLocalCommand, type LocalCommand } from "../commands/commandParser.js";
+import type { LocalCommand } from "../commands/commandParser.js";
 import type { CodexPort, CodexTurnResult } from "../codex/codexPort.js";
 import { selectModel } from "../codex/modelSelector.js";
 import type { CompanionMode } from "../domain/types.js";
@@ -19,6 +19,7 @@ import {
   companionTurnOutcomeSchema,
   type CompanionTurnOutcome,
 } from "./promptBuilder.js";
+import { ChatRouter } from "./chatRouter.js";
 
 const repairPrompt = "只返回符合既定结构的 JSON，不要使用 Markdown。";
 const unavailableMessage =
@@ -65,6 +66,7 @@ export interface CompanionServiceDependencies {
   autonomy: CompanionAutonomyScheduler;
   safetyContextProvider: () => Promise<SafetyContext>;
   ownerUsername: string;
+  chatRouter: ChatRouter;
   cwd: string;
   preferredModel: string;
   reasoningEffort: "low" | "medium";
@@ -254,13 +256,13 @@ export class CompanionService {
   private async handleEvent(event: MinecraftEvent): Promise<void> {
     if (!this.running) return;
     if (event.kind === "chat") {
-      if (event.username !== this.dependencies.ownerUsername) return;
-      const command = parseLocalCommand(event.message);
-      if (command) {
-        await this.handleCommand(command);
+      const route = this.dependencies.chatRouter.route(event);
+      if (route.kind === "ignore") return;
+      if (route.kind === "command") {
+        await this.handleCommand(route.command);
         return;
       }
-      this.onOwnerMessage(event.message);
+      this.onOwnerMessage(route.text);
       return;
     }
     if (event.kind === "owner_offline") {

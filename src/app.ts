@@ -4,6 +4,7 @@ import { ActionExecutor } from "./actions/actionExecutor.js";
 import { AutonomyScheduler } from "./autonomy/autonomyScheduler.js";
 import { CodexAppServerClient } from "./codex/appServerClient.js";
 import { selectModel } from "./codex/modelSelector.js";
+import { ChatRouter } from "./companion/chatRouter.js";
 import { CompanionService } from "./companion/companionService.js";
 import { loadConfig } from "./config/loadConfig.js";
 import type { AppConfig } from "./config/schema.js";
@@ -237,6 +238,10 @@ function createProductionRuntime(context: AppCompositionContext): AppRuntime {
     autonomy,
     safetyContextProvider,
     ownerUsername: config.minecraft.ownerUsername,
+    chatRouter: new ChatRouter({
+      ownerUsername: config.minecraft.ownerUsername,
+      maxMessageLength: 4_000,
+    }),
     cwd: paths.cwd,
     preferredModel: config.codex.preferredModel,
     reasoningEffort: config.codex.reasoningEffort,
