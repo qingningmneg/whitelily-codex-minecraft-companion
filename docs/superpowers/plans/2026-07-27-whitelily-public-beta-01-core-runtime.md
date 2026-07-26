@@ -235,9 +235,11 @@ Expected: typecheck passes and the commit contains only the four listed files.
 - Create: `tests/unit/actionRisk.test.ts`
 - Modify: `src/safety/safetyEngine.ts`
 - Modify: `src/minecraft/mineflayerAdapter.ts`
+- Modify: `src/mcp/toolBudget.ts`
 - Modify: `src/mcp/toolRegistry.ts`
 - Test: `tests/unit/safetyEngine.test.ts`
 - Test: `tests/integration/mineflayerAdapter.test.ts`
+- Test: `tests/unit/toolBudget.test.ts`
 
 **Interfaces:**
 
@@ -303,7 +305,10 @@ export function classifyActionRisk(action: GameAction, context: SafetyContext): 
 
 - [ ] **Step 4: Route registry budget consumption through the classifier**
 
-In `createToolRegistry`, build the trusted action context first, classify it, and include `dangerousOperations` in task consumption before dispatch. Never accept a model-provided risk flag.
+Extend `TurnToolBudget.consume()` with a narrow optional trusted-consumption input and forward
+`dangerousOperations` to `TaskControllerBudget.consume()`. In `createToolRegistry`, build the
+trusted action context first, classify it, and include `dangerousOperations` in task consumption
+before dispatch. Never accept a model-provided risk flag.
 
 - [ ] **Step 5: Run safety and adapter tests**
 
@@ -318,7 +323,7 @@ Expected: PASS with existing permanent denials unchanged.
 - [ ] **Step 6: Commit**
 
 ```powershell
-git add src/safety/actionRisk.ts src/safety/safetyEngine.ts src/minecraft/mineflayerAdapter.ts src/mcp/toolRegistry.ts tests/unit/actionRisk.test.ts tests/unit/safetyEngine.test.ts tests/integration/mineflayerAdapter.test.ts tests/unit/toolRegistry.test.ts
+git add src/safety/actionRisk.ts src/safety/safetyEngine.ts src/minecraft/mineflayerAdapter.ts src/mcp/toolBudget.ts src/mcp/toolRegistry.ts tests/unit/actionRisk.test.ts tests/unit/safetyEngine.test.ts tests/integration/mineflayerAdapter.test.ts tests/unit/toolBudget.test.ts tests/unit/toolRegistry.test.ts
 git commit -m "refactor: centralize Minecraft action risk"
 ```
 
