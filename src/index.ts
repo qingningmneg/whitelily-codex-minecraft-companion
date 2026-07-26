@@ -2,6 +2,9 @@ import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { WhiteLilyApp } from "./app.js";
 import { loadConfig } from "./config/loadConfig.js";
+import { RuntimeFacade } from "./runtime/runtimeFacade.js";
+import type { RuntimeEvent } from "./runtime/runtimeEvents.js";
+import type { TaskStopReason } from "./safety/taskBudget.js";
 
 export const APP_NAME = "whitelily-codex-minecraft-companion";
 export const APP_VERSION = "0.1.0";
@@ -9,8 +12,15 @@ export const APP_VERSION = "0.1.0";
 type SignalName = "SIGINT" | "SIGTERM";
 type PollHandle = ReturnType<typeof setInterval> | number;
 
+export interface CliRuntime {
+  start(): Promise<void>;
+  stop(reason: TaskStopReason): Promise<void>;
+  subscribe(listener: (event: RuntimeEvent) => void): () => void;
+}
+
 export interface CliDependencies {
   cwd?: string;
+  createRuntime?: (configPath: string) => Promise<CliRuntime>;
   createApp?: (configPath: string) => Promise<WhiteLilyApp>;
   writeStdout?: (message: string) => void;
   writeStderr?: (message: string) => void;
@@ -76,15 +86,41 @@ export async function runCli(
   }
 
   const create =
-    dependencies.createApp ??
-    (async (path: string) => {
-      const { createApp } = await import("./app.js");
-      return createApp(path);
-    });
+    dependencies.createRuntime ??
+    (dependencies.createApp
+      ? async (path: string): Promise<CliRuntime> =>
+          new RuntimeFacade({ lifecycle: await dependencies.createApp!(path) })
+      : async (path: string): Promise<CliRuntime> => {
+          const { createRuntimeFacade } = await import("./app.js");
+          return createRuntimeFacade(path);
+        });
   const configPath = resolve(cwd, args[0] ?? "config.toml");
-  let app: WhiteLilyApp;
+  let runtime: CliRuntime;
+  let startFailureReported = false;
+  let stopFailureReported = false;
+  const reportRuntimeEvent = (event: RuntimeEvent): void => {
+    if (event.kind !== "error") return;
+    if (event.error.code === "RUNTIME_START_FAILED") {
+      if (startFailureReported) return;
+      startFailureReported = true;
+      writeStderr("WhiteLily failed to start");
+      setExitCode(1);
+      return;
+    }
+    if (event.error.code === "RUNTIME_STOP_FAILED") {
+      if (stopFailureReported) return;
+      stopFailureReported = true;
+      writeStderr("WhiteLily failed to stop");
+      setExitCode(1);
+      return;
+    }
+    writeStderr("WhiteLily runtime error");
+    setExitCode(1);
+  };
+  let unsubscribeRuntime: () => void = () => undefined;
   try {
-    app = await create(configPath);
+    runtime = await create(configPath);
+    unsubscribeRuntime = runtime.subscribe(reportRuntimeEvent);
   } catch {
     writeStderr("WhiteLily failed to start");
     setExitCode(1);
@@ -120,11 +156,17 @@ export async function runCli(
   const shutdown = (): Promise<void> => {
     shutdownPromise ??= (async () => {
       detachControls();
-      await app.stop();
+      try {
+        await runtime.stop("process_exit");
+      } finally {
+        unsubscribeRuntime();
+      }
     })();
     return shutdownPromise;
   };
   const reportShutdownFailure = (): void => {
+    if (stopFailureReported) return;
+    stopFailureReported = true;
     writeStderr("WhiteLily failed to stop");
     setExitCode(1);
   };
@@ -176,11 +218,14 @@ export async function runCli(
   poll = setPoll(pollMarker, 500);
 
   try {
-    await app.start();
+    await runtime.start();
   } catch {
     await shutdown().catch(() => undefined);
-    writeStderr("WhiteLily failed to start");
-    setExitCode(1);
+    if (!startFailureReported) {
+      startFailureReported = true;
+      writeStderr("WhiteLily failed to start");
+      setExitCode(1);
+    }
   }
 }
 

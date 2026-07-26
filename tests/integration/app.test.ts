@@ -3,11 +3,11 @@ import { join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
-import { createApp } from "../../src/app.js";
+import { createApp, createRuntimeFacade } from "../../src/app.js";
 import { ActionExecutor } from "../../src/actions/actionExecutor.js";
 import { CodexAppServerClient } from "../../src/codex/appServerClient.js";
 import type { AppConfig } from "../../src/config/schema.js";
-import { isMainModule } from "../../src/index.js";
+import { isMainModule, runCli, type CliDependencies } from "../../src/index.js";
 import { TurnToolBudget } from "../../src/mcp/toolBudget.js";
 import { createToolRegistry, createTrustedSnapshotStore } from "../../src/mcp/toolRegistry.js";
 import { FakeMinecraftPort } from "../../src/minecraft/fakeMinecraftPort.js";
@@ -490,6 +490,131 @@ describe("WhiteLilyApp composition", () => {
         .sort(),
     ).toEqual(["start", "stop"]);
   });
+
+  it("composes a reusable runtime facade without changing createApp", async () => {
+    const files = await createCliHarness();
+    cleanups.push(files.cleanup);
+    const events: string[] = [];
+    let context: import("../../src/app.js").AppCompositionContext | undefined;
+    let minecraftListener:
+      ((event: import("../../src/minecraft/minecraftPort.js").MinecraftEvent) => void) | undefined;
+    const runtime = await createRuntimeFacade(files.configPath, {
+      cwd: files.directory,
+      runtimeFactory: (createdContext) => {
+        context = createdContext;
+        return {
+          preferredModel: createdContext.config.codex.preferredModel,
+          mcp: {
+            start: async () => {
+              events.push("mcp:start");
+            },
+            stop: async () => {
+              events.push("mcp:stop");
+            },
+          },
+          codex: {
+            assertChatGptLogin: async () => {
+              events.push("codex:auth-check");
+            },
+            start: async () => {
+              events.push("codex:start");
+            },
+            listModels: async () => ["gpt-5.6-terra"],
+            stop: async () => {
+              events.push("codex:stop");
+            },
+          },
+          selectModel: (models, preferred) => {
+            if (!models.includes(preferred)) throw new Error("model unavailable");
+            events.push(`codex:model-select:${preferred}`);
+            return preferred;
+          },
+          minecraft: {
+            connect: async () => {
+              events.push("minecraft:connect");
+              minecraftListener?.({ kind: "connected" });
+            },
+            disconnect: async () => {
+              events.push("minecraft:disconnect");
+            },
+            onEvent: (listener) => {
+              minecraftListener = listener;
+              return () => {
+                minecraftListener = undefined;
+              };
+            },
+          },
+          companion: {
+            start: async (model) => {
+              events.push(`companion:start:${model}`);
+            },
+            stop: async () => {
+              events.push("companion:stop");
+            },
+          },
+          executor: {
+            stopAll: async () => {
+              events.push("actions:stop");
+            },
+          },
+        };
+      },
+    });
+    if (!context) throw new Error("runtime context was not composed");
+    const taskEvents: Array<
+      Extract<
+        import("../../src/runtime/runtimeEvents.js").RuntimeEvent,
+        {
+          kind: "task";
+        }
+      >
+    > = [];
+    runtime.subscribe((event) => {
+      if (event.kind === "task") taskEvents.push(event);
+    });
+
+    await runtime.start();
+    const active = context.taskController.start({
+      goal: "Build a safe house",
+      expectedActions: ["move", "place"],
+      limits: {
+        maxToolCalls: 8,
+        maxBlockChanges: 16,
+        maxHorizontalTravel: 64,
+        maxDurationMs: 60_000,
+        maxDangerousOperations: 0,
+      },
+      stopCondition: "House complete",
+    });
+
+    expect(runtime.snapshot()).toMatchObject({
+      lifecycle: "running",
+      minecraft: { state: "connected", sessionId: null },
+      codex: { state: "ready", model: "gpt-5.6-terra" },
+      task: {
+        disclosure: { goal: "Build a safe house" },
+      },
+    });
+    expect(runtime.snapshot().task?.id).not.toBe(active.lease.id);
+    expect(JSON.stringify({ snapshot: runtime.snapshot(), taskEvents })).not.toContain(
+      active.lease.id,
+    );
+
+    await runtime.stop("emergency_stop");
+    expect(events.slice(-5)).toEqual([
+      "companion:stop",
+      "actions:stop",
+      "minecraft:disconnect",
+      "codex:stop",
+      "mcp:stop",
+    ]);
+    expect(runtime.snapshot()).toMatchObject({
+      lifecycle: "stopped",
+      minecraft: { state: "disconnected", sessionId: null },
+      codex: { state: "stopped", model: null },
+      task: null,
+    });
+  });
 });
 
 describe("externally composed CompanionService startup", () => {
@@ -655,5 +780,66 @@ describe("Windows CLI", () => {
     expect(harness.pollCount()).toBe(0);
     expect(harness.signalListenerCount("SIGINT")).toBe(0);
     expect(harness.signalListenerCount("SIGTERM")).toBe(0);
+  });
+
+  it("translates a signal to the exact process_exit runtime stop reason", async () => {
+    let signalListener: (() => void) | undefined;
+    const reasons: string[] = [];
+    await runCli(["config.toml"], {
+      cwd: "C:\\WhiteLily",
+      createRuntime: async () => ({
+        start: async () => undefined,
+        stop: async (reason) => {
+          reasons.push(reason);
+        },
+        subscribe: () => () => undefined,
+      }),
+      onSignal: (_signal, listener) => {
+        signalListener = listener;
+      },
+      offSignal: () => undefined,
+      setPoll: () => 1,
+      clearPoll: () => undefined,
+      markerExists: async () => false,
+    } satisfies CliDependencies);
+
+    signalListener?.();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(reasons).toEqual(["process_exit"]);
+  });
+
+  it("translates the stop marker to the exact process_exit runtime stop reason", async () => {
+    let poll: (() => void) | undefined;
+    const reasons: string[] = [];
+    const deleted: string[] = [];
+    await runCli(["config.toml"], {
+      cwd: "C:\\WhiteLily",
+      createRuntime: async () => ({
+        start: async () => undefined,
+        stop: async (reason) => {
+          reasons.push(reason);
+        },
+        subscribe: () => () => undefined,
+      }),
+      onSignal: () => undefined,
+      offSignal: () => undefined,
+      setPoll: (listener) => {
+        poll = listener;
+        return 1;
+      },
+      clearPoll: () => undefined,
+      markerExists: async () => true,
+      deleteMarker: async (path) => {
+        deleted.push(path);
+      },
+    } satisfies CliDependencies);
+
+    poll?.();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(reasons).toEqual(["process_exit"]);
+    expect(deleted).toEqual(["C:\\WhiteLily\\data\\stop.request"]);
   });
 });

@@ -19,9 +19,10 @@ import {
 } from "./mcp/toolRegistry.js";
 import { MemoryStore } from "./memory/memoryStore.js";
 import { StateStore } from "./memory/stateStore.js";
-import type { MinecraftPort } from "./minecraft/minecraftPort.js";
+import type { MinecraftEvent, MinecraftPort } from "./minecraft/minecraftPort.js";
 import { MineflayerAdapter } from "./minecraft/mineflayerAdapter.js";
 import { ModeManager } from "./mode/modeManager.js";
+import { RuntimeFacade } from "./runtime/runtimeFacade.js";
 import { ConfirmationStore } from "./safety/confirmationStore.js";
 import { SafetyEngine, type SafetyContext } from "./safety/safetyEngine.js";
 import { TaskControllerBudget } from "./safety/taskBudget.js";
@@ -49,6 +50,7 @@ interface ManagedCodex {
 interface ManagedMinecraft {
   connect(): Promise<void>;
   disconnect(): Promise<void>;
+  onEvent?(listener: (event: MinecraftEvent) => void): () => void;
 }
 
 interface ManagedCompanion {
@@ -89,6 +91,18 @@ export interface AppCompositionContext {
 export interface CreateAppOptions {
   cwd?: string;
   runtimeFactory?: (context: AppCompositionContext) => AppRuntime | Promise<AppRuntime>;
+}
+
+interface RuntimeCompositionObservers {
+  taskChanged?(): void;
+  modelSelected?(model: string): void;
+}
+
+interface ComposedApp {
+  lifecycle: WhiteLilyAppLifecycle;
+  runtime: AppRuntime;
+  taskBudget: TaskControllerBudget;
+  taskController: TaskController;
 }
 
 interface AttemptedComponents {
@@ -435,6 +449,57 @@ export async function createApp(
   configPath: string,
   options: CreateAppOptions = {},
 ): Promise<WhiteLilyApp> {
+  const composition = await composeApp(configPath, options);
+  return composition.lifecycle;
+}
+
+export async function createRuntimeFacade(
+  configPath: string,
+  options: CreateAppOptions = {},
+): Promise<RuntimeFacade> {
+  const taskListeners = new Set<() => void>();
+  let selectedModel: string | null = null;
+  const composition = await composeApp(configPath, options, {
+    taskChanged: () => {
+      for (const listener of taskListeners) {
+        try {
+          listener();
+        } catch {
+          // Runtime task observers cannot affect task lifecycle.
+        }
+      }
+    },
+    modelSelected: (model) => {
+      selectedModel = model;
+    },
+  });
+  const minecraft = composition.runtime.minecraft.onEvent
+    ? {
+        subscribe: (listener: (event: MinecraftEvent) => void) =>
+          composition.runtime.minecraft.onEvent!(listener),
+      }
+    : undefined;
+  return new RuntimeFacade({
+    lifecycle: composition.lifecycle,
+    task: {
+      current: () => composition.taskController.current(),
+      budget: () => composition.taskBudget.snapshot(),
+      stop: (reason) => composition.taskController.stop(reason),
+      subscribe: (listener) => {
+        taskListeners.add(listener);
+        return () => taskListeners.delete(listener);
+      },
+    },
+    ...(minecraft ? { minecraft } : {}),
+    codex: { model: () => selectedModel },
+  });
+}
+
+async function composeApp(
+  configPath: string,
+  options: CreateAppOptions,
+  observers: RuntimeCompositionObservers = {},
+): Promise<ComposedApp> {
   const config = await loadConfig(configPath);
   const cwd = resolve(options.cwd ?? process.cwd());
   const paths: AppPaths = {
@@ -446,7 +511,7 @@ export async function createApp(
   };
   await initializeStorage(paths);
   const taskBudget = new TaskControllerBudget();
-  const taskController = new TaskController(taskBudget);
+  const taskController = new TaskController(taskBudget, () => observers.taskChanged?.());
   const context: AppCompositionContext = {
     config,
     paths,
@@ -455,5 +520,25 @@ export async function createApp(
     taskController,
   };
   const runtime = await (options.runtimeFactory ?? createProductionRuntime)(context);
-  return new WhiteLilyAppLifecycle(runtime);
+  const lifecycleRuntime: AppRuntime = observers.modelSelected
+    ? {
+        preferredModel: runtime.preferredModel,
+        mcp: runtime.mcp,
+        codex: runtime.codex,
+        selectModel: async (available, preferred) => {
+          const model = await runtime.selectModel(available, preferred);
+          observers.modelSelected?.(model);
+          return model;
+        },
+        minecraft: runtime.minecraft,
+        companion: runtime.companion,
+        executor: runtime.executor,
+      }
+    : runtime;
+  return {
+    lifecycle: new WhiteLilyAppLifecycle(lifecycleRuntime),
+    runtime,
+    taskBudget,
+    taskController,
+  };
 }
