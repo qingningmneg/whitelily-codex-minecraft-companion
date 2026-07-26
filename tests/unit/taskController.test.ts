@@ -1,0 +1,280 @@
+import { describe, expect, it } from "vitest";
+import {
+  TaskController,
+  type TaskAuditCallback,
+  type TaskDisclosure,
+} from "../../src/companion/taskController.js";
+import { TurnToolBudget } from "../../src/mcp/toolBudget.js";
+import { HARD_TASK_LIMITS, TaskControllerBudget } from "../../src/safety/taskBudget.js";
+
+const disclosure: TaskDisclosure = {
+  goal: "collect four oak logs",
+  expectedActions: ["get_state", "find_block", "move_to", "dig_block"],
+  limits: { ...HARD_TASK_LIMITS },
+  stopCondition: "four logs are collected or the owner stops the task",
+};
+
+function fixedController(audit?: TaskAuditCallback): TaskController {
+  return new TaskController(
+    new TaskControllerBudget({
+      now: () => Date.parse("2026-07-27T08:00:00.000Z"),
+      randomId: () => "task-lease-1",
+    }),
+    audit,
+  );
+}
+
+describe("TaskController", () => {
+  it("allows only one active task", () => {
+    const controller = fixedController();
+    controller.start(disclosure);
+
+    expect(() => controller.start(disclosure)).toThrow("a task is already active");
+  });
+
+  it.each(["emergency_stop", "disconnect", "world_changed", "model_unavailable"] as const)(
+    "invalidates tool work on %s",
+    (reason) => {
+      const controller = fixedController();
+      const task = controller.start(disclosure);
+
+      controller.stop(reason);
+
+      expect(
+        controller.consume({
+          leaseId: task.lease.id,
+          kind: "say",
+          now: Date.parse("2026-07-27T08:00:01.000Z"),
+        }),
+      ).toEqual({ ok: false, reason: "task lease is invalid" });
+      expect(controller.current()).toBeNull();
+    },
+  );
+
+  it.each([
+    [{ ...disclosure, goal: "" }, "task goal cannot be empty"],
+    [{ ...disclosure, goal: " \t\n " }, "task goal cannot be empty"],
+    [{ ...disclosure, stopCondition: "" }, "task stop condition cannot be empty"],
+    [{ ...disclosure, stopCondition: " \t\n " }, "task stop condition cannot be empty"],
+    [
+      {
+        ...disclosure,
+        expectedActions: Array.from({ length: 17 }, (_, index) => `action-${index}`),
+      },
+      "task expected actions cannot exceed 16 labels",
+    ],
+    [
+      { ...disclosure, expectedActions: ["get_state", " "] },
+      "task expected action labels must be non-empty strings",
+    ],
+  ] as const)("rejects an ambiguous disclosure: %s", (invalid, message) => {
+    const controller = fixedController();
+
+    expect(() => controller.start(invalid as TaskDisclosure)).toThrow(message);
+    expect(controller.current()).toBeNull();
+  });
+
+  it.each([
+    [{ ...disclosure, expectedActions: "say" }, "task expected actions must be an array"],
+    [
+      { ...disclosure, limits: { ...disclosure.limits, maxToolCalls: Number.NaN } },
+      "task limits are invalid",
+    ],
+    [{ ...disclosure, limits: null }, "task limits are invalid"],
+  ])("rejects malformed disclosure structure before opening a lease", (invalid, message) => {
+    const controller = fixedController();
+
+    expect(() => controller.start(invalid as TaskDisclosure)).toThrow(message);
+    expect(controller.current()).toBeNull();
+  });
+
+  it("rejects malformed requested limits before opening a lease", () => {
+    const controller = fixedController();
+
+    expect(() =>
+      controller.start(disclosure, { maxToolCalls: "3" } as unknown as { maxToolCalls: number }),
+    ).toThrow("requested task limits are invalid");
+    expect(() =>
+      controller.start(disclosure, { unknownLimit: 1 } as unknown as { maxToolCalls: number }),
+    ).toThrow("requested task limits are invalid");
+    expect(controller.current()).toBeNull();
+  });
+
+  it("clones disclosure input and every active-task output", () => {
+    const controller = fixedController();
+    const input = structuredClone(disclosure);
+    const started = controller.start(input, { maxToolCalls: 3 });
+
+    input.goal = "mutated input";
+    input.expectedActions.push("attack_hostile");
+    input.limits.maxToolCalls = 999;
+    started.disclosure.goal = "mutated started output";
+    started.disclosure.expectedActions.push("place_block");
+    started.disclosure.limits.maxToolCalls = 999;
+    started.lease.id = "mutated lease";
+
+    const firstCurrent = controller.current();
+    expect(firstCurrent).toEqual({
+      id: "task-lease-1",
+      lease: {
+        id: "task-lease-1",
+        startedAt: Date.parse("2026-07-27T08:00:00.000Z"),
+      },
+      disclosure: {
+        ...disclosure,
+        expectedActions: [...disclosure.expectedActions],
+        limits: { ...disclosure.limits, maxToolCalls: 3 },
+      },
+      startedAt: "2026-07-27T08:00:00.000Z",
+    });
+
+    if (!firstCurrent) throw new Error("expected an active task");
+    firstCurrent.disclosure.goal = "mutated current output";
+    firstCurrent.disclosure.expectedActions.splice(0);
+    firstCurrent.disclosure.limits.maxDurationMs = 0;
+    firstCurrent.lease.id = "mutated current lease";
+
+    expect(controller.current()).toEqual({
+      id: "task-lease-1",
+      lease: {
+        id: "task-lease-1",
+        startedAt: Date.parse("2026-07-27T08:00:00.000Z"),
+      },
+      disclosure: {
+        ...disclosure,
+        expectedActions: [...disclosure.expectedActions],
+        limits: { ...disclosure.limits, maxToolCalls: 3 },
+      },
+      startedAt: "2026-07-27T08:00:00.000Z",
+    });
+  });
+
+  it("audits actual transitions once with stable identity, reason, and defensive data", () => {
+    const events: Array<{ event: string; data: unknown }> = [];
+    const observedGoals: string[] = [];
+    const controller = fixedController((event, data) => {
+      events.push({ event, data });
+      if ("task" in data) {
+        observedGoals.push(data.task.disclosure.goal);
+        data.task.disclosure.goal = "mutated audit";
+        data.task.lease.id = "mutated audit lease";
+      }
+    });
+
+    const started = controller.start(disclosure);
+    controller.stop("owner_stop");
+    controller.stop("disconnect");
+
+    expect(started.id).toBe("task-lease-1");
+    expect(events).toHaveLength(2);
+    expect(events[0]).toMatchObject({
+      event: "task_started",
+      data: {
+        task: {
+          id: "task-lease-1",
+          disclosure: { goal: "mutated audit" },
+        },
+      },
+    });
+    expect(events[1]).toMatchObject({
+      event: "task_stopped",
+      data: {
+        task: {
+          id: "task-lease-1",
+          disclosure: { goal: "mutated audit" },
+        },
+        reason: "owner_stop",
+      },
+    });
+    expect(started).toMatchObject({
+      id: "task-lease-1",
+      lease: { id: "task-lease-1" },
+      disclosure: { goal: disclosure.goal },
+    });
+    expect(observedGoals).toEqual([disclosure.goal, disclosure.goal]);
+  });
+
+  it("fails closed on an invalid stop reason without letting audit errors escape", () => {
+    const events: string[] = [];
+    const controller = fixedController((event) => {
+      events.push(event);
+      throw new Error("audit sink failed");
+    });
+    const task = controller.start(disclosure);
+
+    expect(() => controller.stop("ambiguous" as never)).toThrow("task stop reason is invalid");
+    expect(controller.current()).toBeNull();
+    expect(
+      controller.consume({
+        leaseId: task.lease.id,
+        kind: "say",
+        now: Date.parse("2026-07-27T08:00:01.000Z"),
+      }),
+    ).toEqual({ ok: false, reason: "task lease is invalid" });
+    expect(events).toEqual(["task_started", "task_stopped"]);
+  });
+
+  it("audits budget exhaustion as the single stopping transition", () => {
+    const events: string[] = [];
+    const controller = fixedController((event) => events.push(event));
+    const task = controller.start(disclosure, { maxToolCalls: 0 });
+
+    expect(
+      controller.consume({
+        leaseId: task.lease.id,
+        kind: "get_state",
+        now: Date.parse("2026-07-27T08:00:01.000Z"),
+      }),
+    ).toEqual({ ok: false, reason: "task budget exhausted" });
+    controller.stop("failed");
+
+    expect(events).toEqual(["task_started", "task_stopped"]);
+    expect(controller.current()).toBeNull();
+  });
+
+  it("reconciles exhaustion consumed directly by the shared turn budget", () => {
+    const events: Array<{ event: string; reason?: string }> = [];
+    const taskBudget = new TaskControllerBudget({
+      now: () => Date.parse("2026-07-27T08:00:00.000Z"),
+      randomId: () => "task-lease-1",
+    });
+    const controller = new TaskController(taskBudget, (event, data) => {
+      events.push({ event, ...("reason" in data ? { reason: data.reason } : {}) });
+    });
+    const turnBudget = new TurnToolBudget(taskBudget);
+    const task = controller.start(disclosure, { maxToolCalls: 0 });
+    const turnLease = turnBudget.begin(task.lease);
+
+    expect(turnBudget.consume("get_state", turnLease)).toEqual({
+      ok: false,
+      reason: "tool call budget exhausted",
+    });
+    expect(controller.current()).toBeNull();
+    controller.stop("completed");
+
+    expect(events).toEqual([
+      { event: "task_started" },
+      { event: "task_stopped", reason: "budget_exhausted" },
+    ]);
+  });
+
+  it("rejects malformed consumption without spending the active budget", () => {
+    const controller = fixedController();
+    const task = controller.start(disclosure, { maxToolCalls: 1 });
+
+    expect(
+      controller.consume({
+        leaseId: "",
+        kind: "say",
+        now: Date.parse("2026-07-27T08:00:01.000Z"),
+      }),
+    ).toEqual({ ok: false, reason: "task lease is invalid" });
+    expect(
+      controller.consume({
+        leaseId: task.lease.id,
+        kind: "say",
+        now: Date.parse("2026-07-27T08:00:01.000Z"),
+      }).ok,
+    ).toBe(true);
+  });
+});

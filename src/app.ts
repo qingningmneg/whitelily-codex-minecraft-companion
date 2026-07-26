@@ -6,6 +6,7 @@ import { CodexAppServerClient } from "./codex/appServerClient.js";
 import { selectModel } from "./codex/modelSelector.js";
 import { ChatRouter } from "./companion/chatRouter.js";
 import { CompanionService } from "./companion/companionService.js";
+import { TaskController } from "./companion/taskController.js";
 import { loadConfig } from "./config/loadConfig.js";
 import type { AppConfig } from "./config/schema.js";
 import { SafeLogger } from "./logging/safeLogger.js";
@@ -23,6 +24,7 @@ import { MineflayerAdapter } from "./minecraft/mineflayerAdapter.js";
 import { ModeManager } from "./mode/modeManager.js";
 import { ConfirmationStore } from "./safety/confirmationStore.js";
 import { SafetyEngine, type SafetyContext } from "./safety/safetyEngine.js";
+import { TaskControllerBudget } from "./safety/taskBudget.js";
 
 const MCP_HOST = "127.0.0.1" as const;
 const MCP_PORT = 32123;
@@ -81,6 +83,7 @@ export interface AppCompositionContext {
   paths: AppPaths;
   mode: ModeManager;
   budget: TurnToolBudget;
+  taskController: TaskController;
 }
 
 export interface CreateAppOptions {
@@ -192,7 +195,7 @@ class McpLifecycle implements ManagedMcp {
 }
 
 function createProductionRuntime(context: AppCompositionContext): AppRuntime {
-  const { config, paths, mode, budget } = context;
+  const { config, paths, mode, budget, taskController } = context;
   const confirmations = new ConfirmationStore();
   const safety = new SafetyEngine(confirmations, config.safety);
   const minecraft = new MineflayerAdapter(config.minecraft);
@@ -201,6 +204,7 @@ function createProductionRuntime(context: AppCompositionContext): AppRuntime {
     safety,
     confirmations,
     config.minecraft.ownerUsername,
+    () => taskController.stop("owner_stop"),
   );
   const memories = new MemoryStore(paths.memories);
   const state = new StateStore(paths.state);
@@ -235,6 +239,7 @@ function createProductionRuntime(context: AppCompositionContext): AppRuntime {
     confirmations,
     executor,
     budget,
+    taskController,
     autonomy,
     safetyContextProvider,
     ownerUsername: config.minecraft.ownerUsername,
@@ -440,11 +445,14 @@ export async function createApp(
     codexWorkspace: join(cwd, "codex-workspace"),
   };
   await initializeStorage(paths);
+  const taskBudget = new TaskControllerBudget();
+  const taskController = new TaskController(taskBudget);
   const context: AppCompositionContext = {
     config,
     paths,
     mode: new ModeManager(),
-    budget: new TurnToolBudget(),
+    budget: new TurnToolBudget(taskBudget),
+    taskController,
   };
   const runtime = await (options.runtimeFactory ?? createProductionRuntime)(context);
   return new WhiteLilyAppLifecycle(runtime);

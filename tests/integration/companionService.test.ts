@@ -9,6 +9,10 @@ import {
 const unavailable = "Codex 暂时不可用，我已安全暂停。你仍可以使用 !status、!stop 和记忆命令。";
 const harnesses: Array<Awaited<ReturnType<typeof createCompanionHarness>>> = [];
 
+function withoutTaskDisclosures(messages: readonly string[]): string[] {
+  return messages.filter((message) => !message.startsWith("任务披露："));
+}
+
 async function harness(options: CompanionHarnessOptions = {}) {
   const created = await createCompanionHarness(options);
   harnesses.push(created);
@@ -44,6 +48,101 @@ afterEach(async () => {
 });
 
 describe("CompanionService lifecycle", () => {
+  it("discloses an owner task before Codex receives the same task lease as the tool budget", async () => {
+    const value = await harness({ deferredTurns: [0] });
+    await value.start();
+
+    await startPlayerTurn(value, "collect four oak logs");
+
+    const task = value.taskController.current();
+    expect(task).not.toBeNull();
+    expect(value.minecraft.chatLog[0]).toContain("任务披露");
+    expect(value.minecraft.chatLog[0]).toContain("collect four oak logs");
+    expect(value.codex.turns[0]?.text).toContain(task?.lease.id);
+    expect(value.budgetTaskLeaseIds).toEqual([task?.lease.id]);
+    expect(value.taskAuditEvents).toEqual(["task_started"]);
+
+    value.codex.releaseTurnResult(0, outcome());
+    await value.untilTurnSettled();
+    expect(value.taskController.current()).toBeNull();
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:completed"]);
+  });
+
+  it("discloses an autonomous microtask before opening its leased Codex turn", async () => {
+    const value = await harness({ deferredTurns: [0] });
+    await value.start();
+    await emitCommand(value, "!mode balanced");
+    value.minecraft.chatLog.splice(0);
+
+    const turn = value.service.requestAutonomousTurn("nearby_threat");
+    await value.untilCodexTurns(1);
+
+    const task = value.taskController.current();
+    expect(task?.disclosure.goal).toContain("nearby_threat");
+    expect(value.minecraft.chatLog[0]).toContain("任务披露");
+    expect(value.codex.turns[0]?.text).toContain(task?.lease.id);
+    expect(value.budgetTaskLeaseIds).toEqual([task?.lease.id]);
+
+    value.codex.releaseTurnResult(0, outcome());
+    await turn;
+    expect(value.taskController.current()).toBeNull();
+  });
+
+  it("invalidates an owner task before !stop cancels its deferred Codex turn", async () => {
+    const value = await harness({ deferredTurns: [0] });
+    await value.start();
+    await startPlayerTurn(value, "keep collecting");
+    const leaseId = value.taskController.current()?.lease.id;
+
+    await emitCommand(value, "!stop");
+
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:owner_stop"]);
+    expect(value.taskController.current()).toBeNull();
+    expect(
+      value.taskController.consume({
+        leaseId: leaseId ?? "",
+        kind: "say",
+        now: Date.now(),
+      }),
+    ).toEqual({ ok: false, reason: "task lease is invalid" });
+  });
+
+  it("invalidates active task work as disconnect before outage cancellation", async () => {
+    const value = await harness({ deferredTurns: [0] });
+    await value.start();
+    await startPlayerTurn(value, "keep collecting");
+    const leaseId = value.taskController.current()?.lease.id;
+
+    value.minecraft.emit({ kind: "disconnected" });
+    await value.untilState((state) => state.paused);
+    await value.untilTurnSettled();
+
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:disconnect"]);
+    expect(
+      value.taskController.consume({
+        leaseId: leaseId ?? "",
+        kind: "say",
+        now: Date.now(),
+      }),
+    ).toEqual({ ok: false, reason: "task lease is invalid" });
+  });
+
+  it.each([
+    ["completed", { text: outcome(), status: "completed" }],
+    ["failed", { text: "", status: "failed" }],
+    ["interrupted", { text: "", status: "interrupted" }],
+  ] as const)("stops the task after a %s Codex terminal result", async (label, response) => {
+    const value = await harness({ codexResponses: [response] });
+    await value.start();
+    await value.ownerSays(`terminal ${label}`);
+
+    expect(value.taskController.current()).toBeNull();
+    expect(value.taskAuditEvents).toEqual([
+      "task_started",
+      `task_stopped:${label === "completed" ? "completed" : "failed"}`,
+    ]);
+  });
+
   it("starts and stops its autonomy scheduler without duplicate lifecycle subscriptions", async () => {
     const value = await harness();
 
@@ -310,7 +409,7 @@ describe("CompanionService lifecycle", () => {
       paused: true,
       unfinishedTaskSummary: null,
     });
-    expect(value.minecraft.chatLog).toEqual(["已停止当前任务和所有动作。"]);
+    expect(withoutTaskDisclosures(value.minecraft.chatLog)).toEqual(["已停止当前任务和所有动作。"]);
   });
 
   it("owner input interrupts an autonomous action and turn before the new player turn starts", async () => {
@@ -441,7 +540,7 @@ describe("CompanionService recovery", () => {
     await value.start();
     await startPlayerTurn(value, "trigger quota");
     await value.untilChat(unavailable);
-    expect(value.minecraft.chatLog).toEqual([unavailable]);
+    expect(withoutTaskDisclosures(value.minecraft.chatLog)).toEqual([unavailable]);
     value.minecraft.chatLog.splice(0);
     value.budgetEvents.splice(0);
 
@@ -553,7 +652,7 @@ describe("CompanionService recovery", () => {
       await value.start();
       await startPlayerTurn(value, "hello");
       await value.untilChat(unavailable);
-      expect(value.minecraft.chatLog).toEqual([unavailable]);
+      expect(withoutTaskDisclosures(value.minecraft.chatLog)).toEqual([unavailable]);
       expect(value.mode.snapshot().paused).toBe(true);
 
       await emitCommand(value, "!resume");
@@ -589,7 +688,7 @@ describe("CompanionService recovery", () => {
       await value.untilChat(unavailable);
 
       expect(value.mode.snapshot().paused).toBe(true);
-      expect(value.minecraft.chatLog).toEqual([unavailable, unavailable]);
+      expect(withoutTaskDisclosures(value.minecraft.chatLog)).toEqual([unavailable, unavailable]);
       await emitCommand(value, "!status");
       expect(value.minecraft.chatLog.at(-1)).toContain("Codex：不可用");
       expect(value.minecraft.chatLog).not.toContain("已恢复。");
@@ -763,22 +862,22 @@ describe("CompanionService output and commands", () => {
     await value.start();
 
     await value.service.requestAutonomousTurn("nearby_threat");
-    expect(value.minecraft.chatLog).toEqual([]);
+    expect(withoutTaskDisclosures(value.minecraft.chatLog)).toEqual([]);
     expect(value.codex.turns).toHaveLength(0);
 
     await emitCommand(value, "!mode balanced");
     value.minecraft.chatLog.splice(0);
     value.autonomy.canChat = false;
     await value.service.requestAutonomousTurn("balanced_idle");
-    expect(value.minecraft.chatLog).toEqual([]);
+    expect(withoutTaskDisclosures(value.minecraft.chatLog)).toEqual([]);
     expect(value.autonomy.proactiveMarks).toBe(0);
     await expect(value.memories.search("suppressed")).resolves.toHaveLength(1);
 
     value.autonomy.canChat = true;
     await value.service.requestAutonomousTurn("goal_completed");
-    expect(value.minecraft.chatLog.join("")).toBe(longReply);
+    expect(withoutTaskDisclosures(value.minecraft.chatLog).join("")).toBe(longReply);
     expect(
-      value.minecraft.chatLog.every(
+      withoutTaskDisclosures(value.minecraft.chatLog).every(
         (chunk) =>
           chunk.length <= 240 && !/[\uD800-\uDBFF]$/.test(chunk) && !/^[\uDC00-\uDFFF]/.test(chunk),
       ),
@@ -797,7 +896,7 @@ describe("CompanionService output and commands", () => {
 
     await value.service.requestAutonomousTurn("nearby_threat");
 
-    expect(value.minecraft.chatLog).toEqual(["自主模式主动消息"]);
+    expect(withoutTaskDisclosures(value.minecraft.chatLog)).toEqual(["自主模式主动消息"]);
     expect(value.autonomy.proactiveMarks).toBe(1);
   });
 
@@ -834,6 +933,16 @@ describe("CompanionService output and commands", () => {
     await value.service.requestAutonomousTurn("autonomous_idle");
 
     expect(value.budgetEvents).toEqual(["begin", "end", "begin", "end"]);
+    expect(new Set(value.budgetTaskLeaseIds).size).toBe(1);
+    const sharedTaskLeaseId = value.budgetTaskLeaseIds[0];
+    if (!sharedTaskLeaseId) throw new Error("expected a shared task lease");
+    for (const turn of value.codex.turns) {
+      expect(turn.text).toContain(sharedTaskLeaseId);
+    }
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:completed"]);
+    expect(
+      value.minecraft.chatLog.filter((message) => message.startsWith("任务披露：")),
+    ).toHaveLength(1);
     expect(value.budget.snapshot().active).toBe(false);
     expect(value.autonomy.proactiveMarks).toBe(0);
   });
@@ -872,12 +981,11 @@ describe("CompanionService output and commands", () => {
     await startPlayerTurn(value, "chunk");
     await value.untilTurnSettled();
 
-    expect(value.minecraft.chatLog.join("")).toBe(reply);
-    expect(value.minecraft.chatLog.every((chunk) => chunk.length > 0 && chunk.length <= 240)).toBe(
-      true,
-    );
+    const replyChunks = withoutTaskDisclosures(value.minecraft.chatLog);
+    expect(replyChunks.join("")).toBe(reply);
+    expect(replyChunks.every((chunk) => chunk.length > 0 && chunk.length <= 240)).toBe(true);
     expect(
-      value.minecraft.chatLog.every(
+      replyChunks.every(
         (chunk) => !/[\uD800-\uDBFF]$/.test(chunk) && !/^[\uDC00-\uDFFF]/.test(chunk),
       ),
     ).toBe(true);
@@ -983,7 +1091,7 @@ describe("CompanionService output and commands", () => {
     await value.untilChat(unavailable);
 
     await expect(value.memories.list()).resolves.toEqual([]);
-    expect(value.minecraft.chatLog).toEqual([unavailable]);
+    expect(withoutTaskDisclosures(value.minecraft.chatLog)).toEqual([unavailable]);
   });
 
   it("repairs an unlabeled verbatim owner-memory proposal before any persistence", async () => {
@@ -1099,7 +1207,7 @@ describe("CompanionService failures", () => {
     await value.untilChat(unavailable);
 
     expect(value.budgetEvents).toEqual(["begin", "end", "begin", "end"]);
-    expect(value.minecraft.chatLog).toEqual([unavailable]);
+    expect(withoutTaskDisclosures(value.minecraft.chatLog)).toEqual([unavailable]);
     expect(value.mode.snapshot().paused).toBe(true);
   });
 
@@ -1117,7 +1225,7 @@ describe("CompanionService failures", () => {
       await value.untilChat(unavailable);
 
       expect(value.budgetEvents).toEqual(["begin", "end"]);
-      expect(value.minecraft.chatLog).toEqual([unavailable]);
+      expect(withoutTaskDisclosures(value.minecraft.chatLog)).toEqual([unavailable]);
       expect(value.mode.snapshot().paused).toBe(true);
     },
   );

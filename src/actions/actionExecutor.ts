@@ -69,6 +69,7 @@ export class ActionExecutor {
     private readonly safety: ActionSafety,
     private readonly confirmations: ConfirmationStore,
     private readonly ownerUsername: string,
+    private readonly beforeStopAll: () => void = () => undefined,
   ) {}
 
   execute(action: GameAction, context: SafetyContext): Promise<ActionResult> {
@@ -95,6 +96,7 @@ export class ActionExecutor {
   }
 
   stopAll(): void {
+    this.beforeStopAll();
     const stoppedGeneration = this.generation;
     this.generation += 1;
     for (const job of this.jobs) {

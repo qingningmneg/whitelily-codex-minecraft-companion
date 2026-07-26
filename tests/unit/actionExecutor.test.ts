@@ -24,6 +24,32 @@ function waitsForAbort(signal: AbortSignal): Promise<void> {
 afterEach(() => vi.useRealTimers());
 
 describe("ActionExecutor", () => {
+  it("invalidates task work synchronously before cancellation aborts the action", async () => {
+    const minecraft = new FakeMinecraftPort();
+    const order: string[] = [];
+    let waitStarted = false;
+    minecraft.wait = (_milliseconds, signal) => {
+      waitStarted = true;
+      signal.addEventListener("abort", () => order.push("action_aborted"), { once: true });
+      return waitsForAbort(signal);
+    };
+    const confirmations = new ConfirmationStore();
+    const executor = new ActionExecutor(
+      minecraft,
+      new SafetyEngine(confirmations),
+      confirmations,
+      "TestOwner",
+      () => order.push("task_invalidated"),
+    );
+    const running = executor.execute({ kind: "wait", milliseconds: 60_000 }, context);
+    await vi.waitFor(() => expect(waitStarted).toBe(true));
+
+    executor.stopAll();
+
+    expect(order).toEqual(["task_invalidated", "action_aborted"]);
+    await expect(running).resolves.toEqual({ status: "cancelled" });
+  });
+
   it("stops a running action locally", async () => {
     const minecraft = new FakeMinecraftPort();
     minecraft.wait = (_milliseconds, signal) => waitsForAbort(signal);

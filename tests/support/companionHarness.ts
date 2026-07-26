@@ -6,6 +6,7 @@ import { ActionExecutor } from "../../src/actions/actionExecutor.js";
 import { parseLocalCommand } from "../../src/commands/commandParser.js";
 import { ChatRouter } from "../../src/companion/chatRouter.js";
 import { CompanionService } from "../../src/companion/companionService.js";
+import { TaskController } from "../../src/companion/taskController.js";
 import type { CodexPort, CodexTurnResult } from "../../src/codex/codexPort.js";
 import type { PersistentState } from "../../src/memory/stateStore.js";
 import { MemoryStore } from "../../src/memory/memoryStore.js";
@@ -16,6 +17,7 @@ import { createToolRegistry, type ToolResult } from "../../src/mcp/toolRegistry.
 import { FakeMinecraftPort } from "../../src/minecraft/fakeMinecraftPort.js";
 import { ConfirmationStore } from "../../src/safety/confirmationStore.js";
 import { SafetyEngine } from "../../src/safety/safetyEngine.js";
+import { TaskControllerBudget, type TaskLease } from "../../src/safety/taskBudget.js";
 
 interface Deferred<T> {
   promise: Promise<T>;
@@ -378,22 +380,30 @@ export async function createCompanionHarness(options: CompanionHarnessOptions = 
   const state = new GateStateStore(join(directory, "state.json"), options.gatedStateSaves ?? []);
   if (options.persistedState) await StateStore.prototype.save.call(state, options.persistedState);
   const confirmations = new ConfirmationStore();
+  const taskAuditEvents: string[] = [];
+  const taskBudget = new TaskControllerBudget();
+  const taskController = new TaskController(taskBudget, (event, data) => {
+    taskAuditEvents.push("reason" in data ? `${event}:${data.reason}` : event);
+  });
+  const budget = new TurnToolBudget(taskBudget);
   const executor = new ActionExecutor(
     minecraft,
     new SafetyEngine(confirmations),
     confirmations,
     "TestOwner",
+    () => taskController.stop("owner_stop"),
   );
-  const budget = new TurnToolBudget();
   const autonomy = new FakeAutonomyScheduler(options.autonomyCanChat ?? true);
   const budgetEvents: string[] = [];
   const budgetLeases: Array<string | undefined> = [];
+  const budgetTaskLeaseIds: Array<string | undefined> = [];
   const errors: string[] = [];
   const begin = budget.begin.bind(budget);
   const end = budget.end.bind(budget);
-  budget.begin = () => {
+  budget.begin = (taskLease?: TaskLease) => {
     budgetEvents.push("begin");
-    const lease = begin();
+    budgetTaskLeaseIds.push(taskLease?.id);
+    const lease = begin(taskLease);
     budgetLeases.push(lease);
     return lease;
   };
@@ -429,6 +439,7 @@ export async function createCompanionHarness(options: CompanionHarnessOptions = 
     confirmations,
     executor,
     budget,
+    taskController,
     autonomy,
     logger: {
       error: async (_event: string, fields: Record<string, unknown>) => {
@@ -474,8 +485,11 @@ export async function createCompanionHarness(options: CompanionHarnessOptions = 
     confirmations,
     executor,
     budget,
+    taskController,
+    taskAuditEvents,
     budgetEvents,
     budgetLeases,
+    budgetTaskLeaseIds,
     autonomy,
     errors,
     service,
