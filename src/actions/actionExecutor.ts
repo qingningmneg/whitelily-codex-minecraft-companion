@@ -56,6 +56,10 @@ function isAbortError(error: unknown): boolean {
   return error instanceof Error && error.name === "AbortError";
 }
 
+function isTransportFenceError(error: unknown): boolean {
+  return error instanceof Error && error.name === "MineflayerTransportFenceError";
+}
+
 export class ActionExecutor {
   private current: ActionJob | null = null;
   private gate = Promise.resolve();
@@ -182,8 +186,11 @@ export class ActionExecutor {
               : { status: "completed" },
         );
       } catch (error) {
-        if (job.timedOut) this.finishUser(job, { status: "failed", reason: "action timed out" });
-        else if (job.controller.signal.aborted || isAbortError(error)) {
+        if (isTransportFenceError(error)) {
+          this.finishUser(job, { status: "failed", reason: String(error) });
+        } else if (job.timedOut) {
+          this.finishUser(job, { status: "failed", reason: "action timed out" });
+        } else if (job.controller.signal.aborted || isAbortError(error)) {
           this.finishUser(job, { status: "cancelled" });
         } else {
           this.finishUser(job, { status: "failed", reason: String(error) });

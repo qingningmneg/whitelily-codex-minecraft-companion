@@ -35,10 +35,12 @@ vi.mock("mineflayer-pathfinder", () => {
 });
 
 import { MineflayerAdapter } from "../../src/minecraft/mineflayerAdapter.js";
+import { ActionExecutor } from "../../src/actions/actionExecutor.js";
 import {
   createWorldSnapshot,
   type EntityTracking,
 } from "../../src/minecraft/mineflayerObservation.js";
+import { ConfirmationStore } from "../../src/safety/confirmationStore.js";
 
 interface FakeEntity {
   id: number;
@@ -73,7 +75,10 @@ class FakeFurnace {
 class FakeBot extends EventEmitter {
   throwOnEvent: string | undefined;
   readonly game: { dimension: unknown } = { dimension: "overworld" };
-  readonly _client = new EventEmitter();
+  readonly _client = Object.assign(new EventEmitter(), {
+    end: vi.fn(),
+    socket: { end: vi.fn(), destroy: vi.fn() },
+  });
   readonly supportFeature = vi.fn(() => false);
   readonly chat = vi.fn();
   readonly loadPlugin = vi.fn();
@@ -87,7 +92,7 @@ class FakeBot extends EventEmitter {
   readonly activateItem = vi.fn();
   readonly attack = vi.fn();
   readonly dig = vi.fn<(...args: unknown[]) => Promise<void>>(async (): Promise<void> => undefined);
-  readonly stopDigging = vi.fn();
+  readonly stopDigging = vi.fn<() => unknown>();
   readonly placeBlock = vi.fn(async () => undefined);
   readonly craft = vi.fn<(...args: unknown[]) => Promise<void>>(
     async (): Promise<void> => undefined,
@@ -858,6 +863,80 @@ describe("MineflayerAdapter", () => {
     expect(outcome).toBe("aborted");
   });
 
+  it("accepts a resolved stopDigging thenable as the physical cancellation acknowledgement", async () => {
+    const bot = new FakeBot();
+    bot.blockAt.mockReturnValue({ name: "stone" });
+    let resolveDig: (() => void) | undefined;
+    bot.dig.mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveDig = resolve;
+        }),
+    );
+    bot.stopDigging.mockReturnValue(Promise.resolve());
+    createBot.mockReturnValue(bot);
+    const adapter = new MineflayerAdapter(config());
+    const connecting = adapter.connect();
+    bot.emit("spawn");
+    await connecting;
+    const controller = new AbortController();
+    const digging = adapter.digBlock({ x: 1, y: 64, z: 1 }, "stone", controller.signal);
+    await flush();
+
+    controller.abort();
+
+    await expect(digging).rejects.toMatchObject({ name: "AbortError" });
+    expect(bot.end).not.toHaveBeenCalled();
+    resolveDig?.();
+    await flush();
+    expect(bot.end).not.toHaveBeenCalled();
+  });
+
+  it("handles a rejected stopDigging thenable and fences the stale dig without an unhandled rejection", async () => {
+    const bot = new FakeBot();
+    bot.blockAt.mockReturnValue({ name: "stone" });
+    bot.dig.mockImplementation(() => new Promise<void>(() => undefined));
+    bot.stopDigging.mockReturnValue(Promise.reject(new Error("stop acknowledgement failed")));
+    createBot.mockReturnValue(bot);
+    const adapter = new MineflayerAdapter(config());
+    const connecting = adapter.connect();
+    bot.emit("spawn");
+    await connecting;
+    const controller = new AbortController();
+    const digging = adapter.digBlock({ x: 1, y: 64, z: 1 }, "stone", controller.signal);
+    await flush();
+
+    controller.abort();
+
+    await expect(digging).rejects.toMatchObject({ name: "AbortError" });
+    expect(bot.end).toHaveBeenCalledOnce();
+  });
+
+  it("times out a never-settling stopDigging thenable and fences the stale dig", async () => {
+    vi.useFakeTimers();
+    const bot = new FakeBot();
+    bot.blockAt.mockReturnValue({ name: "stone" });
+    bot.dig.mockImplementation(() => new Promise<void>(() => undefined));
+    bot.stopDigging.mockReturnValue(new Promise<void>(() => undefined));
+    createBot.mockReturnValue(bot);
+    const adapter = new MineflayerAdapter(config());
+    const connecting = adapter.connect();
+    bot.emit("spawn");
+    await connecting;
+    const controller = new AbortController();
+    const digging = adapter.digBlock({ x: 1, y: 64, z: 1 }, "stone", controller.signal);
+    await flush();
+
+    controller.abort();
+    const rejected = expect(digging).rejects.toMatchObject({ name: "AbortError" });
+    await vi.advanceTimersByTimeAsync(999);
+    expect(bot.end).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+
+    await rejected;
+    expect(bot.end).toHaveBeenCalledOnce();
+  });
+
   it("fences a dig if physical cancellation does not settle within one second", async () => {
     vi.useFakeTimers();
     const bot = new FakeBot();
@@ -1027,6 +1106,197 @@ describe("MineflayerAdapter", () => {
     expect(bot.pathfinder.goto).not.toHaveBeenCalled();
   });
 
+  it.each(["move", "follow", "collect"] as const)(
+    "fences a never-settling %s path within one second of cancellation",
+    async (kind) => {
+      vi.useFakeTimers();
+      const bot = new FakeBot();
+      bot.pathfinder.goto.mockImplementation(() => new Promise<void>(() => undefined));
+      bot.players.TestOwner = {
+        entity: {
+          id: 1,
+          name: "player",
+          type: "player",
+          position: { x: 2, y: 64, z: 2 },
+        },
+      };
+      bot.entities["8"] = {
+        id: 8,
+        name: "item",
+        type: "other",
+        position: { x: 3, y: 64, z: 3 },
+      };
+      createBot.mockReturnValue(bot);
+      const adapter = new MineflayerAdapter(config());
+      const connecting = adapter.connect();
+      bot.emit("spawn");
+      await connecting;
+      if (kind === "collect") await adapter.snapshot("TestOwner");
+      const controller = new AbortController();
+      const operation =
+        kind === "move"
+          ? adapter.moveTo({ x: 10, y: 64, z: 10 }, controller.signal)
+          : kind === "follow"
+            ? adapter.followOwner("TestOwner", 2, controller.signal)
+            : adapter.collectDropped(8, controller.signal);
+      let outcome = "pending";
+      void operation.then(
+        () => {
+          outcome = "resolved";
+        },
+        () => {
+          outcome = "aborted";
+        },
+      );
+      await flush();
+
+      controller.abort();
+      await vi.advanceTimersByTimeAsync(999);
+      expect(outcome).toBe("pending");
+      expect(bot.end).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+
+      expect(outcome).toBe("aborted");
+      expect(bot.end).toHaveBeenCalledOnce();
+      await expect(operation).rejects.toMatchObject({ name: "AbortError" });
+    },
+  );
+
+  it("reopens the ActionExecutor gate only after a timed-out path is fenced and uses the replacement session", async () => {
+    vi.useFakeTimers();
+    const first = new FakeBot();
+    const replacement = new FakeBot();
+    first.pathfinder.goto.mockImplementation(() => new Promise<void>(() => undefined));
+    createBot.mockReturnValueOnce(first).mockReturnValueOnce(replacement);
+    const adapter = new MineflayerAdapter(config());
+    const lifecycle: string[] = [];
+    let executor: ActionExecutor | undefined;
+    adapter.onEvent((event) => {
+      lifecycle.push(event.kind);
+      if (event.kind === "world_changed") executor?.stopAll();
+    });
+    const connecting = adapter.connect();
+    first._client.emit("login", { worldState: { name: "minecraft:overworld" } });
+    first.emit("spawn");
+    await connecting;
+    const confirmations = new ConfirmationStore();
+    executor = new ActionExecutor(
+      adapter,
+      {
+        evaluate: () => ({ kind: "allow" }),
+        evaluatePermanent: () => ({ kind: "allow" }),
+      },
+      confirmations,
+      "TestOwner",
+    );
+    const context = {
+      spawn: { x: 0, y: 64, z: 0 },
+      owner: { x: 0, y: 64, z: 0 },
+    };
+    const active = executor.execute(
+      { kind: "move_to", position: { x: 10, y: 64, z: 10 } },
+      context,
+    );
+    const queued = executor.execute({ kind: "jump" }, context);
+    await flush();
+    await flush();
+    await flush();
+    expect(first.pathfinder.goto).toHaveBeenCalledOnce();
+
+    first._client.emit("respawn", { worldState: { name: "custom:mirror_world" } });
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    await expect(Promise.all([active, queued])).resolves.toEqual([
+      { status: "cancelled" },
+      { status: "cancelled" },
+    ]);
+    expect(first.waitForTicks).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1_000);
+    replacement._client.emit("login", { worldState: { name: "custom:mirror_world" } });
+    replacement.emit("spawn");
+    const subsequent = executor.execute(
+      { kind: "move_to", position: { x: 20, y: 64, z: 20 } },
+      context,
+    );
+
+    await expect(subsequent).resolves.toEqual({ status: "completed" });
+    expect(lifecycle).toEqual(["connected", "world_changed", "disconnected", "connected"]);
+    expect(first.pathfinder.goto).toHaveBeenCalledOnce();
+    expect(replacement.pathfinder.goto).toHaveBeenCalledOnce();
+  });
+
+  it("fails the active action and blocks all primitives after every transport fence fallback throws", async () => {
+    vi.useFakeTimers();
+    const bot = new FakeBot();
+    bot.pathfinder.goto.mockImplementation(() => new Promise<void>(() => undefined));
+    bot.end.mockImplementation(() => {
+      throw new Error("bot end failed");
+    });
+    bot._client.end.mockImplementation(() => {
+      throw new Error("client end failed");
+    });
+    Object.assign(bot._client, {
+      socket: {
+        end: vi.fn(() => {
+          throw new Error("socket end failed");
+        }),
+        destroy: vi.fn(() => {
+          throw new Error("socket destroy failed");
+        }),
+      },
+    });
+    createBot.mockReturnValue(bot);
+    const adapter = new MineflayerAdapter(config());
+    const connecting = adapter.connect();
+    bot.emit("spawn");
+    await connecting;
+    const confirmations = new ConfirmationStore();
+    const executor = new ActionExecutor(
+      adapter,
+      {
+        evaluate: () => ({ kind: "allow" }),
+        evaluatePermanent: () => ({ kind: "allow" }),
+      },
+      confirmations,
+      "TestOwner",
+    );
+    const context = {
+      spawn: { x: 0, y: 64, z: 0 },
+      owner: { x: 0, y: 64, z: 0 },
+    };
+    const active = executor.execute(
+      { kind: "move_to", position: { x: 10, y: 64, z: 10 } },
+      context,
+    );
+    const queued = executor.execute({ kind: "jump" }, context);
+    await flush();
+    await flush();
+    await flush();
+    expect(bot.pathfinder.goto).toHaveBeenCalledOnce();
+
+    executor.stopAll();
+    const activeResult = expect(active).resolves.toMatchObject({
+      status: "failed",
+      reason: expect.stringContaining("physical transport fence failed"),
+    });
+    const queuedResult = expect(queued).resolves.toEqual({ status: "cancelled" });
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    await activeResult;
+    await queuedResult;
+    await expect(adapter.connect()).rejects.toThrow("adapter is stopped");
+    const subsequent = executor.execute(
+      { kind: "move_to", position: { x: 20, y: 64, z: 20 } },
+      context,
+    );
+    await expect(subsequent).resolves.toMatchObject({
+      status: "failed",
+      reason: expect.stringContaining("not connected"),
+    });
+    expect(bot.pathfinder.goto).toHaveBeenCalledOnce();
+    expect(bot.waitForTicks).not.toHaveBeenCalled();
+  });
+
   it.each(["disconnect", "outage"] as const)(
     "does not start a queued action after connection-driven %s cancellation",
     async (cancellationKind) => {
@@ -1058,6 +1328,9 @@ describe("MineflayerAdapter", () => {
 
   it("fences a deferred placement before stale equip completion can place", async () => {
     const bot = new FakeBot();
+    bot.end.mockImplementation(() => {
+      throw new Error("Mineflayer end failed");
+    });
     bot.inventoryItems = [{ name: "stone", type: 1, count: 1 }];
     bot.blockAt.mockReturnValue({ name: "dirt" });
     let resolveEquip: (() => void) | undefined;
@@ -1088,6 +1361,9 @@ describe("MineflayerAdapter", () => {
     );
     await vi.waitFor(() => expect(outcome).toBe("aborted"), { timeout: 100 });
     expect(bot.end).toHaveBeenCalledOnce();
+    expect(bot._client.end).not.toHaveBeenCalled();
+    expect(bot._client.socket.end).toHaveBeenCalledOnce();
+    expect(bot._client.socket.destroy).not.toHaveBeenCalled();
     await adapter.disconnect();
     resolveEquip?.();
     await expect(placing).rejects.toMatchObject({ name: "AbortError" });

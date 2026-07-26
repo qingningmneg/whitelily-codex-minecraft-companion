@@ -160,19 +160,27 @@ describe("CompanionService lifecycle", () => {
     expect(value.confirmations.get(confirmation.id)).toBeUndefined();
     expect(value.mode.snapshot()).toMatchObject({ paused: true, taskId: null });
 
+    const savesBeforeReconnectSequence = value.savedStates.length;
     value.minecraft.emit({ kind: "world_changed" });
+    value.minecraft.emit({ kind: "disconnected", reason: "world fence" });
+    value.minecraft.emit({ kind: "connected" });
     await expect(Promise.all([running, queued])).resolves.toEqual([
       { status: "cancelled" },
       { status: "cancelled" },
     ]);
     await value.untilTurnSettled();
-    await value.untilState((state) => state.paused);
+    await vi.waitFor(
+      () =>
+        expect(value.savedStates.length).toBeGreaterThanOrEqual(savesBeforeReconnectSequence + 3),
+      { timeout: 1_000 },
+    );
 
     expect(value.minecraft.calls).not.toContainEqual(expect.objectContaining({ method: "jump" }));
     expect(value.codex.interruptions).toEqual([{ threadId: "thread-1", turnId: "turn-1" }]);
     expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:world_changed"]);
     expect(value.taskTerminalReasons).toEqual(["world_changed"]);
-    await expect(value.state.load()).resolves.toMatchObject({
+    expect(value.mode.snapshot()).toMatchObject({ paused: true, taskId: null });
+    expect(value.savedStates.at(-1)).toMatchObject({
       paused: true,
       unfinishedTaskSummary: null,
     });

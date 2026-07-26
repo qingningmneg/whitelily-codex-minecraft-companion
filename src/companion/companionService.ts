@@ -191,6 +191,7 @@ export class CompanionService {
   private turnWorkCount = 0;
   private autonomousRequestCount = 0;
   private externallyManagedCodex = false;
+  private worldInvalidated = false;
 
   constructor(private readonly dependencies: CompanionServiceDependencies) {
     this.logger = dependencies.logger ?? noOpLogger;
@@ -221,7 +222,7 @@ export class CompanionService {
       this.dependencies.mode.setMode("friend");
       this.dependencies.mode.completeTask();
       this.unfinishedTaskSummary = persisted.unfinishedTaskSummary;
-      if (this.unfinishedTaskSummary) this.dependencies.mode.pause();
+      if (this.worldInvalidated || this.unfinishedTaskSummary) this.dependencies.mode.pause();
       else this.dependencies.mode.resume();
 
       if (preselectedModel === undefined) {
@@ -330,6 +331,7 @@ export class CompanionService {
       return;
     }
     if (event.kind === "world_changed") {
+      this.worldInvalidated = true;
       this.dependencies.taskController.stop("world_changed");
       this.invalidateCurrentTurn();
       this.dependencies.confirmations.clear();
@@ -355,7 +357,7 @@ export class CompanionService {
       this.dependencies.mode.setMode("friend");
       this.dependencies.autonomy.notifyModeChanged();
       this.dependencies.mode.completeTask();
-      if (this.unfinishedTaskSummary) this.dependencies.mode.pause();
+      if (this.worldInvalidated || this.unfinishedTaskSummary) this.dependencies.mode.pause();
       else this.dependencies.mode.resume();
       await this.persist();
     }
@@ -805,6 +807,7 @@ export class CompanionService {
           await this.say("已暂停，当前任务已保留。");
           return;
         case "resume":
+          this.worldInvalidated = false;
           if (!this.codexHealthy || this.unfinishedTaskSummary) {
             await this.recoverSingleFlight();
             return;
@@ -814,6 +817,7 @@ export class CompanionService {
           await this.say("已恢复。");
           return;
         case "stop":
+          this.worldInvalidated = false;
           this.dependencies.taskController.stop("owner_stop");
           this.invalidateCurrentTurn();
           this.dependencies.executor.stopAll();

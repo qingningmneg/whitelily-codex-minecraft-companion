@@ -43,7 +43,11 @@ describe("public release readiness", () => {
       "deadlines fire independently of later tool calls",
       "cancels queued and in-flight actions",
       "publishes one fail-closed `world_changed` event",
+      "normalizes modern `worldState.name` and legacy flat `worldName`",
+      "world invalidation latch",
       "Dig cancellation calls Mineflayer's `stopDigging`",
+      "Movement and dig cancellation are bounded by a one-second physical acknowledgement window",
+      "physical transport close",
       "ActionExecutor performs SafetyEngine policy evaluation",
       "MCP registry does not depend directly on TaskController",
     ]) {

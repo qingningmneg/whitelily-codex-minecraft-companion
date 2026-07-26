@@ -38,6 +38,13 @@ export interface MineflayerSession {
   generation: number;
 }
 
+export class MineflayerTransportFenceError extends Error {
+  constructor(reason: string, cause: AggregateError) {
+    super(`Minecraft physical transport fence failed: ${reason}`, { cause });
+    this.name = "MineflayerTransportFenceError";
+  }
+}
+
 interface BotHandlers {
   chat: (username: string, message: string) => void;
   playerJoined: (player: { username: string }) => void;
@@ -84,12 +91,24 @@ function trustedWorldIdentity(bot: Bot, packet?: unknown): string | undefined {
   if (packet === undefined) return normalizedDimension;
   if (typeof packet !== "object" || packet === null) return undefined;
   const outer = packet as Record<string, unknown>;
-  const state =
-    typeof outer.worldState === "object" && outer.worldState !== null
-      ? (outer.worldState as Record<string, unknown>)
-      : outer;
-  if (!Object.hasOwn(state, "worldName")) return normalizedDimension;
-  const worldName = trustedResourceIdentity(state.worldName);
+  let worldNameValue: unknown;
+  if (Object.hasOwn(outer, "worldState")) {
+    if (
+      typeof outer.worldState !== "object" ||
+      outer.worldState === null ||
+      Array.isArray(outer.worldState)
+    ) {
+      return undefined;
+    }
+    const worldState = outer.worldState as Record<string, unknown>;
+    if (!Object.hasOwn(worldState, "name")) return undefined;
+    worldNameValue = worldState.name;
+  } else if (Object.hasOwn(outer, "worldName")) {
+    worldNameValue = outer.worldName;
+  } else {
+    return normalizedDimension;
+  }
+  const worldName = trustedResourceIdentity(worldNameValue);
   return worldName ? `${normalizedDimension}\u0000${worldName}` : undefined;
 }
 
@@ -163,18 +182,32 @@ export class MineflayerConnection {
 
   currentSession(): MineflayerSession | undefined {
     const bot = this.bot;
-    return bot ? { bot, generation: this.sessionGeneration } : undefined;
+    return bot && this.lifecycleState === "connected"
+      ? { bot, generation: this.sessionGeneration }
+      : undefined;
   }
 
   isCurrentSession(session: MineflayerSession): boolean {
-    return this.bot === session.bot && this.sessionGeneration === session.generation;
+    return (
+      this.lifecycleState === "connected" &&
+      this.bot === session.bot &&
+      this.sessionGeneration === session.generation
+    );
   }
 
   fenceActiveSession(session: MineflayerSession, reason: string): void {
     if (!this.isCurrentSession(session)) return;
-    this.handleEnd(session.bot, reason);
     this.safelyStopBot(session.bot);
-    this.safelyEndBot(session.bot, reason);
+    const fenceErrors = this.establishTransportFence(session.bot, reason);
+    if (fenceErrors.length > 0) {
+      const error = new MineflayerTransportFenceError(
+        reason,
+        new AggregateError(fenceErrors, "Every available Minecraft transport close failed"),
+      );
+      this.handleFenceFailure(session.bot, error);
+      throw error;
+    }
+    this.handleEnd(session.bot, reason);
   }
 
   onEvent(listener: (event: MineflayerConnectionEvent) => void): () => void {
@@ -402,6 +435,87 @@ export class MineflayerConnection {
 
   private safelyEndBot(bot: Bot, reason: string): void {
     this.tryCleanup(() => bot.end(reason));
+  }
+
+  private establishTransportFence(bot: Bot, reason: string): Error[] {
+    const candidate = bot as unknown as {
+      end?: (reason?: string) => void;
+      _client?: {
+        end?: (reason?: string) => void;
+        socket?: {
+          end?: () => void;
+          destroy?: () => void;
+        };
+      };
+    };
+    const botEnd =
+      typeof candidate.end === "function" ? () => candidate.end?.call(bot, reason) : undefined;
+    const clientEnd =
+      typeof candidate._client?.end === "function"
+        ? () => candidate._client?.end?.call(candidate._client, reason)
+        : undefined;
+    const attempts: Array<{
+      operation: (() => void) | undefined;
+      label: string;
+    }> = [
+      {
+        label: "bot.end",
+        operation: botEnd,
+      },
+      {
+        label: "bot._client.end",
+        // Installed Mineflayer's bot.end delegates to this exact method. Calling it
+        // again after bot.end throws would repeat the same failing close attempt.
+        operation: botEnd ? undefined : clientEnd,
+      },
+      {
+        label: "bot._client.socket.end",
+        operation:
+          typeof candidate._client?.socket?.end === "function"
+            ? () => candidate._client?.socket?.end?.call(candidate._client.socket)
+            : undefined,
+      },
+      {
+        label: "bot._client.socket.destroy",
+        operation:
+          typeof candidate._client?.socket?.destroy === "function"
+            ? () => candidate._client?.socket?.destroy?.call(candidate._client.socket)
+            : undefined,
+      },
+    ];
+    const errors: Error[] = [];
+    for (const attempt of attempts) {
+      if (!attempt.operation) continue;
+      try {
+        attempt.operation();
+        return [];
+      } catch (error) {
+        errors.push(
+          new Error(`${attempt.label} failed`, {
+            cause: error instanceof Error ? error : new Error(String(error)),
+          }),
+        );
+      }
+    }
+    if (errors.length === 0)
+      errors.push(new Error("no Minecraft transport close API is available"));
+    return errors;
+  }
+
+  private handleFenceFailure(bot: Bot, error: MineflayerTransportFenceError): void {
+    if (this.bot !== bot) return;
+    this.detach(bot);
+    this.bot = undefined;
+    this.worldIdentity = undefined;
+    this.clearRetryTimer();
+    this.lifecycleState = "exhausted";
+    this.rejectConnection?.(error);
+    this.clearConnectionPromise();
+    if (!this.outageNotified) {
+      this.outageNotified = true;
+      this.emit({ kind: "outage", reason: error.message });
+    }
+    queueMicrotask(() => this.cancelActiveOperations());
   }
 
   private tryCleanup(operation: () => void): void {

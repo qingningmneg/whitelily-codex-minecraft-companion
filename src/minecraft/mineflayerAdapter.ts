@@ -36,6 +36,17 @@ function abortError(): Error {
   return error;
 }
 
+function asError(error: unknown): Error {
+  return error instanceof Error ? error : new Error(String(error));
+}
+
+function isThenable(value: unknown): value is PromiseLike<unknown> {
+  return (
+    ((typeof value === "object" && value !== null) || typeof value === "function") &&
+    typeof (value as { then?: unknown }).then === "function"
+  );
+}
+
 function toVec3(position: { x: number; y: number; z: number }): Vec3 {
   return { x: position.x, y: position.y, z: position.z };
 }
@@ -546,6 +557,21 @@ export class MineflayerAdapter implements MinecraftPort {
       let aborted = false;
       let cancelTimer: ReturnType<typeof setTimeout> | undefined;
       let unregister: () => void = () => undefined;
+      const finishAfterFence = (reason: string) => {
+        try {
+          this.connection.fenceActiveSession(session, reason);
+          finish(abortError());
+        } catch (error) {
+          finish(asError(error));
+        }
+      };
+      const startFenceTimer = (reason: string) => {
+        cancelTimer = setTimeout(() => {
+          cancelTimer = undefined;
+          finishAfterFence(reason);
+        }, OPERATION_CANCEL_TIMEOUT_MS);
+        cancelTimer.unref?.();
+      };
       const onAbort = () => {
         if (aborted) {
           if (!this.connection.isCurrentSession(session)) finish(abortError());
@@ -556,8 +582,7 @@ export class MineflayerAdapter implements MinecraftPort {
         try {
           abortCleanup?.();
         } catch {
-          this.connection.fenceActiveSession(session, "operation cleanup failed");
-          finish(abortError());
+          finishAfterFence("operation cleanup failed");
           return;
         }
         if (!started || !this.connection.isCurrentSession(session)) {
@@ -565,25 +590,27 @@ export class MineflayerAdapter implements MinecraftPort {
           return;
         }
         if (cancellation === "dig") {
+          let cancellationResult: unknown;
           try {
-            session.bot.stopDigging();
+            cancellationResult = session.bot.stopDigging();
           } catch {
-            this.connection.fenceActiveSession(session, "dig cancellation failed");
-            finish(abortError());
+            finishAfterFence("dig cancellation failed");
             return;
           }
-          cancelTimer = setTimeout(() => {
-            cancelTimer = undefined;
-            this.connection.fenceActiveSession(session, "dig cancellation timed out");
-            finish(abortError());
-          }, OPERATION_CANCEL_TIMEOUT_MS);
-          cancelTimer.unref?.();
+          startFenceTimer("dig cancellation timed out");
+          if (isThenable(cancellationResult)) {
+            Promise.resolve(cancellationResult).then(
+              () => finish(abortError()),
+              () => finishAfterFence("dig cancellation acknowledgement failed"),
+            );
+          }
           return;
         }
         if (cancellation === "fence") {
-          this.connection.fenceActiveSession(session, "operation cancelled");
-          finish(abortError());
+          finishAfterFence("operation cancelled");
+          return;
         }
+        startFenceTimer("motion cancellation timed out");
       };
       const cancel = () => onAbort();
       const finish = (error?: Error) => {
@@ -607,11 +634,7 @@ export class MineflayerAdapter implements MinecraftPort {
           return operation();
         })
         .then(() => finish(aborted ? abortError() : undefined))
-        .catch((error: unknown) =>
-          finish(
-            aborted ? abortError() : error instanceof Error ? error : new Error(String(error)),
-          ),
-        );
+        .catch((error: unknown) => finish(aborted ? abortError() : asError(error)));
     });
   }
 

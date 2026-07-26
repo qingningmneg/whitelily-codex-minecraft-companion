@@ -9,7 +9,7 @@ class FakeBot extends EventEmitter {
   throwOnEvent: string | undefined;
   throwOnRemove = false;
   readonly game: { dimension: unknown } = { dimension: "overworld" };
-  readonly _client = new EventEmitter();
+  readonly _client = Object.assign(new EventEmitter(), { end: vi.fn() });
   readonly loadPlugin = vi.fn();
   readonly end = vi.fn();
   readonly clearControlStates = vi.fn();
@@ -128,6 +128,47 @@ describe("MineflayerConnection", () => {
     harness.bots[0]?._client.emit("respawn", { worldName: "custom:mirror_world" });
 
     expect(events).toEqual(["connected", "world_changed"]);
+  });
+
+  it("normalizes modern nested worldState.name and ignores stale nested respawns", async () => {
+    const harness = createMineflayerConnectionHarness();
+    const connection = new MineflayerConnection(harness.dependencies);
+    const events: string[] = [];
+    connection.onEvent((event) => events.push(event.kind));
+    const initial = connection.connect();
+    harness.bots[0]?._client.emit("login", {
+      worldState: { name: "minecraft:overworld" },
+    });
+    harness.spawn();
+    await initial;
+
+    harness.bots[0]?._client.emit("respawn", {
+      worldState: { name: "minecraft:overworld" },
+    });
+    harness.bots[0]?._client.emit("respawn", {
+      worldState: { name: "custom:mirror_world" },
+    });
+    harness.bots[0]?._client.emit("respawn", {
+      worldState: { name: "custom:mirror_world" },
+    });
+    harness.end("socket closed");
+    harness.runNextTimer();
+    harness.bots[1]?._client.emit("login", {
+      worldState: { name: "minecraft:overworld" },
+    });
+    harness.spawn();
+
+    harness.bots[0]?._client.emit("respawn", {
+      worldState: { name: "minecraft:the_end" },
+    });
+    harness.bots[1]?._client.emit("respawn", {
+      worldState: { name: { malformed: true } },
+    });
+    harness.bots[1]?._client.emit("respawn", {
+      worldState: { name: { malformed: true } },
+    });
+
+    expect(events).toEqual(["connected", "world_changed", "outage", "connected", "world_changed"]);
   });
 
   it("fails closed once for malformed identity while ignoring stale and replacement initial spawns", async () => {
@@ -378,6 +419,88 @@ describe("MineflayerConnection", () => {
 
     expect(secondCancel).toHaveBeenCalledOnce();
     expect(connection.state()).toBe("stopped");
+  });
+
+  it.each(["client_end", "socket_end", "socket_destroy"] as const)(
+    "establishes a physical session fence through the %s fallback before retrying",
+    async (successfulFallback) => {
+      const harness = createMineflayerConnectionHarness();
+      const connection = new MineflayerConnection(harness.dependencies);
+      const connecting = connection.connect();
+      harness.spawn();
+      await connecting;
+      const bot = harness.bots[0]!;
+      const botEnd = bot.end;
+      if (successfulFallback === "client_end") {
+        delete (bot as unknown as { end?: (reason?: string) => void }).end;
+      } else {
+        bot.end.mockImplementation(() => {
+          throw new Error("bot end failed");
+        });
+      }
+      const clientEnd = vi.fn(() => {
+        if (successfulFallback !== "client_end") throw new Error("client end failed");
+      });
+      const socketEnd = vi.fn(() => {
+        if (successfulFallback !== "socket_end") throw new Error("socket end failed");
+      });
+      const socketDestroy = vi.fn(() => {
+        if (successfulFallback !== "socket_destroy") throw new Error("socket destroy failed");
+      });
+      Object.assign(bot._client, {
+        end: clientEnd,
+        socket: { end: socketEnd, destroy: socketDestroy },
+      });
+      const session = connection.currentSession();
+      if (!session) throw new Error("expected an active session");
+
+      expect(() => connection.fenceActiveSession(session, "cancel timed out")).not.toThrow();
+
+      expect(botEnd).toHaveBeenCalledTimes(successfulFallback === "client_end" ? 0 : 1);
+      expect(clientEnd).toHaveBeenCalledTimes(successfulFallback === "client_end" ? 1 : 0);
+      expect(socketEnd).toHaveBeenCalledTimes(successfulFallback === "client_end" ? 0 : 1);
+      expect(socketDestroy).toHaveBeenCalledTimes(successfulFallback === "socket_destroy" ? 1 : 0);
+      expect(connection.currentBot()).toBeUndefined();
+      expect(connection.state()).toBe("retrying");
+      expect(harness.pendingTimers()).toBe(1);
+    },
+  );
+
+  it("enters terminal exhaustion and reports a fatal error when every physical fence fails", async () => {
+    const harness = createMineflayerConnectionHarness();
+    const connection = new MineflayerConnection(harness.dependencies);
+    const connecting = connection.connect();
+    harness.spawn();
+    await connecting;
+    const bot = harness.bots[0]!;
+    bot.end.mockImplementation(() => {
+      throw new Error("bot end failed");
+    });
+    Object.assign(bot._client, {
+      end: vi.fn(() => {
+        throw new Error("client end failed");
+      }),
+      socket: {
+        end: vi.fn(() => {
+          throw new Error("socket end failed");
+        }),
+        destroy: vi.fn(() => {
+          throw new Error("socket destroy failed");
+        }),
+      },
+    });
+    const session = connection.currentSession();
+    if (!session) throw new Error("expected an active session");
+
+    expect(() => connection.fenceActiveSession(session, "cancel timed out")).toThrow(
+      "physical transport fence failed",
+    );
+
+    expect(bot._client.end).not.toHaveBeenCalled();
+    expect(connection.currentBot()).toBeUndefined();
+    expect(connection.state()).toBe("exhausted");
+    expect(harness.pendingTimers()).toBe(0);
+    await expect(connection.connect()).rejects.toThrow("adapter is stopped");
   });
 
   it("fails closed if lifecycle state is corrupted", async () => {
