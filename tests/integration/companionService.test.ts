@@ -143,6 +143,28 @@ describe("CompanionService lifecycle", () => {
     ]);
   });
 
+  it("stops rejected model transport once as model_unavailable and cancels active action work", async () => {
+    const value = await harness({
+      activeMinecraftWait: true,
+      codexResponses: [new Error("model transport rejected")],
+    });
+    await value.start();
+    const action = value.executor.execute(
+      { kind: "wait", milliseconds: 5_000 },
+      { spawn: { x: 0, y: 64, z: 0 }, owner: { x: 0, y: 64, z: 0 } },
+    );
+    await value.untilActiveWaitStarted();
+
+    await value.ownerSays("trigger rejected model transport");
+
+    await expect(action).resolves.toEqual({ status: "cancelled" });
+    expect(value.activeWaitWasAborted()).toBe(true);
+    expect(value.taskController.current()).toBeNull();
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:model_unavailable"]);
+    expect(value.mode.snapshot().paused).toBe(true);
+    expect(withoutTaskDisclosures(value.minecraft.chatLog)).toEqual([unavailable]);
+  });
+
   it("starts and stops its autonomy scheduler without duplicate lifecycle subscriptions", async () => {
     const value = await harness();
 

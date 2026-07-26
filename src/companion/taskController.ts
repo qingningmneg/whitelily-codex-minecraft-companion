@@ -204,7 +204,8 @@ function cloneAndValidateRequestedLimits(
     if (!taskLimitKeys.includes(key as (typeof taskLimitKeys)[number]))
       throw new Error("requested task limits are invalid");
     const value = values[key];
-    if (typeof value !== "number") throw new Error("requested task limits are invalid");
+    if (typeof value !== "number" || !Number.isFinite(value) || value < 0)
+      throw new Error("requested task limits are invalid");
     requested[key as (typeof taskLimitKeys)[number]] = value;
   }
   return requested;

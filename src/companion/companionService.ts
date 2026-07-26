@@ -591,8 +591,8 @@ export class CompanionService {
       }
       return result;
     } catch (error) {
-      if (task) this.dependencies.taskController.stop("failed");
       if (failClosedOnError) await this.failClosed(generation, error);
+      else if (task) this.dependencies.taskController.stop("failed");
       return undefined;
     } finally {
       try {

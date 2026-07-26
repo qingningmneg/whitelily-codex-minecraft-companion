@@ -14,6 +14,21 @@ const disclosure: TaskDisclosure = {
   stopCondition: "four logs are collected or the owner stops the task",
 };
 
+const requestedLimitFields = [
+  "maxToolCalls",
+  "maxBlockChanges",
+  "maxHorizontalTravel",
+  "maxDurationMs",
+  "maxDangerousOperations",
+] as const;
+
+const invalidRequestedLimitCases = requestedLimitFields.flatMap((field) => [
+  { field, label: "NaN", value: Number.NaN },
+  { field, label: "positive Infinity", value: Number.POSITIVE_INFINITY },
+  { field, label: "negative Infinity", value: Number.NEGATIVE_INFINITY },
+  { field, label: "negative value", value: -1 },
+]);
+
 function fixedController(audit?: TaskAuditCallback): TaskController {
   return new TaskController(
     new TaskControllerBudget({
@@ -99,6 +114,26 @@ describe("TaskController", () => {
     ).toThrow("requested task limits are invalid");
     expect(controller.current()).toBeNull();
   });
+
+  it.each(invalidRequestedLimitCases)(
+    "rejects $label for requested $field without opening or auditing a task",
+    ({ field, value }) => {
+      const events: string[] = [];
+      const controller = new TaskController(
+        new TaskControllerBudget({
+          now: () => Date.parse("2026-07-27T08:00:00.000Z"),
+          randomId: () => "task-lease-1",
+        }),
+        (event) => events.push(event),
+      );
+
+      expect(() => controller.start(disclosure, { [field]: value })).toThrow(
+        "requested task limits are invalid",
+      );
+      expect(controller.current()).toBeNull();
+      expect(events).toEqual([]);
+    },
+  );
 
   it("clones disclosure input and every active-task output", () => {
     const controller = fixedController();
