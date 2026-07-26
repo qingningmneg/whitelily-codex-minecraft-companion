@@ -1,5 +1,6 @@
 import { randomBytes } from "node:crypto";
 import type { GameAction } from "../domain/types.js";
+import { TaskControllerBudget, type TaskLease } from "../safety/taskBudget.js";
 
 export type ToolActionKind = GameAction["kind"] | "get_state" | "find_block";
 
@@ -23,8 +24,6 @@ export type BudgetConsumeResult =
         | "tool call budget exhausted";
     };
 
-const MAX_TOOL_CALLS = 64;
-
 export class TurnToolBudget {
   private active = false;
   private ended = false;
@@ -33,8 +32,12 @@ export class TurnToolBudget {
   private attemptedPlaceCount = 0;
   private cumulativeHorizontalTravel = 0;
   private activeLease: string | undefined;
+  private taskLease: TaskLease | undefined;
+  private ownsTaskLease = false;
 
-  begin(): string {
+  constructor(private readonly taskBudget = new TaskControllerBudget()) {}
+
+  begin(taskLease?: TaskLease): string {
     if (this.active) throw new Error("tool turn is already active");
     this.active = true;
     this.ended = false;
@@ -42,6 +45,8 @@ export class TurnToolBudget {
     this.attemptedDigCount = 0;
     this.attemptedPlaceCount = 0;
     this.cumulativeHorizontalTravel = 0;
+    this.taskLease = taskLease ?? this.taskBudget.begin();
+    this.ownsTaskLease = taskLease === undefined;
     this.activeLease = randomBytes(32).toString("base64url");
     return this.activeLease;
   }
@@ -51,6 +56,9 @@ export class TurnToolBudget {
     this.active = false;
     this.ended = true;
     this.activeLease = undefined;
+    if (this.ownsTaskLease) this.taskBudget.invalidate("completed");
+    this.taskLease = undefined;
+    this.ownsTaskLease = false;
   }
 
   consume(kind: ToolActionKind, lease?: string): BudgetConsumeResult {
@@ -60,8 +68,18 @@ export class TurnToolBudget {
     if (lease === undefined || lease !== this.activeLease) {
       return { ok: false, reason: "tool turn lease is invalid" };
     }
-    if (this.totalCalls >= MAX_TOOL_CALLS)
-      return { ok: false, reason: "tool call budget exhausted" };
+    const taskLease = this.taskLease;
+    if (!taskLease) return { ok: false, reason: "tool turn lease is invalid" };
+    const taskResult = this.taskBudget.consume({ lease: taskLease, kind, now: Date.now() });
+    if (!taskResult.ok) {
+      return {
+        ok: false,
+        reason:
+          taskResult.reason === "task lease is invalid"
+            ? "tool turn lease is invalid"
+            : "tool call budget exhausted",
+      };
+    }
 
     this.totalCalls += 1;
     if (kind === "dig_block") this.attemptedDigCount += 1;

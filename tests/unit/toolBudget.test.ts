@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { TurnToolBudget } from "../../src/mcp/toolBudget.js";
+import { TaskControllerBudget } from "../../src/safety/taskBudget.js";
 
 describe("TurnToolBudget", () => {
   it("rejects the sixty-fifth attempted call", () => {
@@ -60,5 +61,15 @@ describe("TurnToolBudget", () => {
     });
     expect(budget.snapshot().totalCalls).toBe(0);
     expect(budget.consume("say", newLease).ok).toBe(true);
+  });
+
+  it("delegates accepted calls to its supplied task lease", () => {
+    const taskBudget = new TaskControllerBudget();
+    const taskLease = taskBudget.begin();
+    const budget = new TurnToolBudget(taskBudget);
+    const turnLease = budget.begin(taskLease);
+
+    expect(budget.consume("say", turnLease).ok).toBe(true);
+    expect(taskBudget.snapshot().toolCalls).toBe(1);
   });
 });
