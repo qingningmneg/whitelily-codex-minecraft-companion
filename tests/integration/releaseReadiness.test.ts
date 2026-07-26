@@ -21,11 +21,25 @@ const required = [
   "scripts/package-release.ps1",
   "scripts/release-path-safety.ps1",
   "scripts/release-check.ps1",
+  "docs/runtime-architecture.md",
 ];
 
 describe("public release readiness", () => {
   it("contains every public distribution file", async () => {
     await Promise.all(required.map((path) => access(path)));
+  });
+
+  it("documents the reusable runtime boundary", async () => {
+    const architecture = await readFile("docs/runtime-architecture.md", "utf8");
+    for (const heading of [
+      "RuntimeFacade",
+      "TaskController",
+      "ChatRouter",
+      "MineflayerConnection",
+      "Emergency stop order",
+    ]) {
+      expect(architecture).toContain(heading);
+    }
   });
 
   it("does not publish personal example values", async () => {

@@ -29,6 +29,8 @@
 
 真实游玩前请完成 [Windows 烟雾测试清单](docs/windows-smoke-test.md)。
 
+架构：[运行时边界](docs/runtime-architecture.md)。
+
 ## 聊天命令与三种模式
 
 在 Minecraft 聊天框正常说话即可。主人命令包括：`!mode friend`、`!mode balanced`、`!mode autonomous`、`!pause`、`!resume`、`!stop`、`!status`、`!allow <确认编号>`、`!deny <确认编号>`、`!memory show`、`!memory clear`、`!memory search <关键词>` 和 `!memory forget <编号>`。
