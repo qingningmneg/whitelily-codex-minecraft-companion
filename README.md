@@ -17,6 +17,8 @@ Run `codex login` on this PC and sign in with ChatGPT. WhiteLily deliberately us
 
 ## Install and operate
 
+For a complete Chinese walkthrough, see the [Windows 11 + PCL2 installation guide](docs/installation-windows.zh-CN.md).
+
 1. Install Node.js 24 and the Codex CLI, then run `codex login`.
 2. Clone or unpack WhiteLily, open PowerShell in its folder, and run `./scripts/setup.ps1`.
 3. Copy `config.example.toml` to `config.toml`; set `minecraft.host`, `minecraft.port`, and `owner_username`. Keep `allow_api_key_fallback = false`.

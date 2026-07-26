@@ -1,3 +1,5 @@
+* text=auto eol=lf
+
 docs/superpowers export-ignore
 docs/superpowers/** export-ignore
 .superpowers export-ignore

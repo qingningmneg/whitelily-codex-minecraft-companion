@@ -17,6 +17,8 @@
 
 ## 安装、配置与运行
 
+请优先阅读可直接照着操作的 [Windows 11 + PCL2 完整安装指南](docs/installation-windows.zh-CN.md)。
+
 1. 安装 Node.js 24 和 Codex CLI，然后运行 `codex login`。
 2. 克隆或解压本项目，在 PowerShell 中执行 `./scripts/setup.ps1`。
 3. 将 `config.example.toml` 复制为 `config.toml`，填写 `minecraft.host`、`minecraft.port` 与 `owner_username`；保持 `allow_api_key_fallback = false`。
