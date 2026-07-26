@@ -6,6 +6,7 @@ export type MineflayerConnectionState =
 export type MineflayerConnectionEvent =
   | { kind: "connected" }
   | { kind: "outage"; reason: string }
+  | { kind: "world_changed" }
   | { kind: "chat"; username: string; message: string }
   | { kind: "owner_online" | "owner_offline"; username: string }
   | { kind: "death" }
@@ -32,11 +33,18 @@ export interface MineflayerConnectionDependencies {
   clearTimer(handle: unknown): void;
 }
 
+export interface MineflayerSession {
+  bot: Bot;
+  generation: number;
+}
+
 interface BotHandlers {
   chat: (username: string, message: string) => void;
   playerJoined: (player: { username: string }) => void;
   playerLeft: (player: { username: string }) => void;
   spawn: () => void;
+  login: (packet: unknown) => void;
+  respawn: (packet: unknown) => void;
   death: () => void;
   end: (reason: string) => void;
   entitySpawn: (entity: Bot["entity"]) => void;
@@ -47,10 +55,42 @@ interface BotHandlers {
   spawnPosition: (packet: unknown) => void;
 }
 
+type WorldIdentity =
+  { kind: "known"; value: string } | { kind: "unknown"; changeNotified: boolean };
+
 function abortError(): Error {
   const error = new Error("operation aborted");
   error.name = "AbortError";
   return error;
+}
+
+function trustedResourceIdentity(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim().toLowerCase();
+  if (
+    normalized.length === 0 ||
+    normalized.length > 256 ||
+    !/^[a-z0-9_.-]+(?::[a-z0-9_./-]+)?$/.test(normalized)
+  ) {
+    return undefined;
+  }
+  return normalized.startsWith("minecraft:") ? normalized.slice("minecraft:".length) : normalized;
+}
+
+function trustedWorldIdentity(bot: Bot, packet?: unknown): string | undefined {
+  const dimension = (bot.game as unknown as { dimension?: unknown } | undefined)?.dimension;
+  const normalizedDimension = trustedResourceIdentity(dimension);
+  if (!normalizedDimension) return undefined;
+  if (packet === undefined) return normalizedDimension;
+  if (typeof packet !== "object" || packet === null) return undefined;
+  const outer = packet as Record<string, unknown>;
+  const state =
+    typeof outer.worldState === "object" && outer.worldState !== null
+      ? (outer.worldState as Record<string, unknown>)
+      : outer;
+  if (!Object.hasOwn(state, "worldName")) return normalizedDimension;
+  const worldName = trustedResourceIdentity(state.worldName);
+  return worldName ? `${normalizedDimension}\u0000${worldName}` : undefined;
 }
 
 export class MineflayerConnection {
@@ -65,6 +105,8 @@ export class MineflayerConnection {
   private connectionPromise: Promise<void> | undefined;
   private resolveConnection: (() => void) | undefined;
   private rejectConnection: ((error: Error) => void) | undefined;
+  private worldIdentity: WorldIdentity | undefined;
+  private sessionGeneration = 0;
 
   constructor(private readonly dependencies: MineflayerConnectionDependencies) {}
 
@@ -94,7 +136,6 @@ export class MineflayerConnection {
     const wasConnected = this.lifecycleState === "connected";
     this.lifecycleState = "stopped";
     this.clearRetryTimer();
-    this.cancelActiveOperations();
     this.rejectConnection?.(abortError());
     this.clearConnectionPromise();
 
@@ -102,8 +143,11 @@ export class MineflayerConnection {
     if (bot) {
       this.detach(bot);
       this.bot = undefined;
+      this.worldIdentity = undefined;
+      this.safelyStopBot(bot);
       this.safelyEndBot(bot, "adapter disconnect");
     }
+    this.cancelActiveOperations();
     if (wasConnected && !this.outageNotified) {
       this.emit({ kind: "outage", reason: "adapter disconnect" });
     }
@@ -115,6 +159,22 @@ export class MineflayerConnection {
 
   currentBot(): Bot | undefined {
     return this.bot;
+  }
+
+  currentSession(): MineflayerSession | undefined {
+    const bot = this.bot;
+    return bot ? { bot, generation: this.sessionGeneration } : undefined;
+  }
+
+  isCurrentSession(session: MineflayerSession): boolean {
+    return this.bot === session.bot && this.sessionGeneration === session.generation;
+  }
+
+  fenceActiveSession(session: MineflayerSession, reason: string): void {
+    if (!this.isCurrentSession(session)) return;
+    this.handleEnd(session.bot, reason);
+    this.safelyStopBot(session.bot);
+    this.safelyEndBot(session.bot, reason);
   }
 
   onEvent(listener: (event: MineflayerConnectionEvent) => void): () => void {
@@ -139,6 +199,8 @@ export class MineflayerConnection {
         hideErrors: false,
       });
       this.bot = bot;
+      this.sessionGeneration += 1;
+      this.worldIdentity = undefined;
       bot.loadPlugin(this.dependencies.plugin);
       this.attach(bot);
     } catch (error) {
@@ -155,6 +217,8 @@ export class MineflayerConnection {
       playerLeft: (player) =>
         this.emitForBot(bot, { kind: "owner_offline", username: player.username }),
       spawn: () => this.handleSpawn(bot),
+      login: (packet) => this.handleLogin(bot, packet),
+      respawn: (packet) => this.handleRespawn(bot, packet),
       death: () => this.emitForBot(bot, { kind: "death" }),
       end: (reason) => this.handleEnd(bot, reason),
       entitySpawn: (entity) => this.emitForBot(bot, { kind: "entity_spawn", bot, entity }),
@@ -176,6 +240,8 @@ export class MineflayerConnection {
     bot.on("entityGone", handlers.entityGone);
     bot.on("move", handlers.move);
     bot.on("forcedMove", handlers.forcedMove);
+    bot._client.on("login", handlers.login);
+    bot._client.on("respawn", handlers.respawn);
     bot._client.on("spawn_position", handlers.spawnPosition);
   }
 
@@ -193,6 +259,8 @@ export class MineflayerConnection {
     this.tryCleanup(() => bot.removeListener("entityGone", handlers.entityGone));
     this.tryCleanup(() => bot.removeListener("move", handlers.move));
     this.tryCleanup(() => bot.removeListener("forcedMove", handlers.forcedMove));
+    this.tryCleanup(() => bot._client.removeListener("login", handlers.login));
+    this.tryCleanup(() => bot._client.removeListener("respawn", handlers.respawn));
     this.tryCleanup(() => bot._client.removeListener("spawn_position", handlers.spawnPosition));
     this.botHandlers = undefined;
   }
@@ -215,15 +283,58 @@ export class MineflayerConnection {
     this.lifecycleState = "connected";
     this.outageNotified = false;
     this.retryIndex = 0;
+    if (this.worldIdentity === undefined) {
+      const identity = trustedWorldIdentity(bot);
+      this.worldIdentity =
+        identity === undefined
+          ? { kind: "unknown", changeNotified: false }
+          : { kind: "known", value: identity };
+    }
     this.emit({ kind: "connected" });
     this.resolveConnection?.();
     this.clearConnectionPromise();
+  }
+
+  private handleLogin(bot: Bot, packet: unknown): void {
+    if (
+      this.bot !== bot ||
+      (this.lifecycleState !== "connecting" && this.lifecycleState !== "retrying")
+    ) {
+      return;
+    }
+    const identity = trustedWorldIdentity(bot, packet);
+    this.worldIdentity =
+      identity === undefined
+        ? { kind: "unknown", changeNotified: false }
+        : { kind: "known", value: identity };
+  }
+
+  private handleRespawn(bot: Bot, packet: unknown): void {
+    if (this.bot !== bot || this.lifecycleState !== "connected") return;
+    const identity = trustedWorldIdentity(bot, packet);
+    const previous = this.worldIdentity;
+    if (identity === undefined) {
+      if (previous?.kind === "unknown" && previous.changeNotified) return;
+      this.worldIdentity = { kind: "unknown", changeNotified: true };
+      this.emit({ kind: "world_changed" });
+      return;
+    }
+    if (previous?.kind === "known") {
+      if (previous.value === identity) return;
+      this.worldIdentity = { kind: "known", value: identity };
+      this.emit({ kind: "world_changed" });
+      return;
+    }
+    const shouldNotify = previous === undefined || !previous.changeNotified;
+    this.worldIdentity = { kind: "known", value: identity };
+    if (shouldNotify) this.emit({ kind: "world_changed" });
   }
 
   private handleEnd(bot: Bot | undefined, reason: string): void {
     if (bot && this.bot !== bot) return;
     if (bot) this.detach(bot);
     if (this.bot === bot) this.bot = undefined;
+    this.worldIdentity = undefined;
     this.cancelActiveOperations();
     if (this.lifecycleState === "stopped" || this.lifecycleState === "exhausted") return;
     this.lifecycleState = "retrying";

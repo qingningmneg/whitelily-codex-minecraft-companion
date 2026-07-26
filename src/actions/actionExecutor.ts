@@ -100,7 +100,9 @@ export class ActionExecutor {
     const stoppedGeneration = this.generation;
     this.generation += 1;
     for (const job of this.jobs) {
-      if (job.generation === stoppedGeneration) this.finishUser(job, { status: "cancelled" });
+      if (job.generation === stoppedGeneration && job !== this.current) {
+        this.finishUser(job, { status: "cancelled" });
+      }
     }
     if (this.current?.generation === stoppedGeneration) {
       this.clearTimeout(this.current);
@@ -167,14 +169,17 @@ export class ActionExecutor {
       job.timeout = setTimeout(() => {
         job.timedOut = true;
         this.clearTimeout(job);
-        this.finishUser(job, { status: "failed", reason: "action timed out" });
         job.controller?.abort();
       }, this.timeoutFor(job.action));
       try {
         await this.dispatchWithRetries(job.action, job.controller.signal);
         this.finishUser(
           job,
-          job.controller.signal.aborted ? { status: "cancelled" } : { status: "completed" },
+          job.timedOut
+            ? { status: "failed", reason: "action timed out" }
+            : job.controller.signal.aborted
+              ? { status: "cancelled" }
+              : { status: "completed" },
         );
       } catch (error) {
         if (job.timedOut) this.finishUser(job, { status: "failed", reason: "action timed out" });

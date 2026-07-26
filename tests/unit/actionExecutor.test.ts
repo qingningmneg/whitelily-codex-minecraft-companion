@@ -63,6 +63,36 @@ describe("ActionExecutor", () => {
     expect(executor.pendingCount()).toBe(0);
   });
 
+  it("waits for active port cancellation before publishing one cancelled result", async () => {
+    const minecraft = new FakeMinecraftPort();
+    let settleDig: (() => void) | undefined;
+    minecraft.digBlock = async () =>
+      new Promise<void>((resolve) => {
+        settleDig = resolve;
+      });
+    const executor = createActionExecutorHarness(minecraft, { kind: "allow" });
+    const published: string[] = [];
+    executor.onResult((result) => published.push(result.status));
+    const running = executor.execute(
+      { kind: "dig_block", blockName: "stone", position: { x: 1, y: 64, z: 1 } },
+      context,
+    );
+    await vi.waitFor(() => expect(settleDig).toBeTypeOf("function"));
+    let outcome = "pending";
+    void running.then((result) => {
+      outcome = result.status;
+    });
+
+    executor.stopAll();
+    await Promise.resolve();
+
+    expect(outcome).toBe("pending");
+    expect(published).toEqual([]);
+    settleDig?.();
+    await expect(running).resolves.toEqual({ status: "cancelled" });
+    expect(published).toEqual(["cancelled"]);
+  });
+
   it("cancels all queued actions from the old generation and accepts a new action", async () => {
     const minecraft = new FakeMinecraftPort();
     minecraft.wait = (_milliseconds, signal) => waitsForAbort(signal);
@@ -83,7 +113,7 @@ describe("ActionExecutor", () => {
     expect(minecraft.chatLog).toEqual(["new"]);
   });
 
-  it("returns cancellation immediately but holds the port queue until an abort-ignoring action settles", async () => {
+  it("holds cancellation and the port queue until an abort-ignoring action settles", async () => {
     vi.useFakeTimers();
     const minecraft = new FakeMinecraftPort();
     let settlePlace: (() => void) | undefined;
@@ -102,16 +132,21 @@ describe("ActionExecutor", () => {
     executor.stopAll();
     await vi.advanceTimersByTimeAsync(0);
 
-    await expect(running).resolves.toEqual({ status: "cancelled" });
     await expect(oldQueued).resolves.toEqual({ status: "cancelled" });
-    expect(executor.pendingCount()).toBe(0);
+    let runningOutcome = "pending";
+    void running.then((result) => {
+      runningOutcome = result.status;
+    });
+    expect(runningOutcome).toBe("pending");
+    expect(executor.pendingCount()).toBe(1);
     expect(vi.getTimerCount()).toBe(0);
     const afterStop = executor.execute({ kind: "say", message: "after stop" }, context);
     await vi.advanceTimersByTimeAsync(0);
-    expect(executor.pendingCount()).toBe(1);
+    expect(executor.pendingCount()).toBe(2);
     expect(minecraft.chatLog).toEqual([]);
 
     settlePlace?.();
+    await expect(running).resolves.toEqual({ status: "cancelled" });
     await expect(afterStop).resolves.toEqual({ status: "completed" });
     expect(minecraft.chatLog).toEqual(["after stop"]);
   });
@@ -131,11 +166,12 @@ describe("ActionExecutor", () => {
     await vi.waitFor(() => expect(executor.pendingCount()).toBe(1));
 
     executor.stopAll();
-    await expect(running).resolves.toEqual({ status: "cancelled" });
-    expect(executor.pendingCount()).toBe(0);
+    expect(executor.pendingCount()).toBe(1);
     expect(executor.isBusy()).toBe(true);
 
     settlePlace?.();
+    await expect(running).resolves.toEqual({ status: "cancelled" });
+    expect(executor.pendingCount()).toBe(0);
     await expect(executor.execute({ kind: "say", message: "settled" }, context)).resolves.toEqual({
       status: "completed",
     });
@@ -156,13 +192,13 @@ describe("ActionExecutor", () => {
     );
     await vi.waitFor(() => expect(executor.pendingCount()).toBe(1));
     executor.stopAll();
-    await expect(running).resolves.toEqual({ status: "cancelled" });
 
     const afterStop = executor.execute({ kind: "say", message: "after rejection" }, context);
     await Promise.resolve();
     expect(minecraft.chatLog).toEqual([]);
     rejectPlace?.(new Error("late failure"));
 
+    await expect(running).resolves.toEqual({ status: "cancelled" });
     await expect(afterStop).resolves.toEqual({ status: "completed" });
     expect(minecraft.chatLog).toEqual(["after rejection"]);
   });
@@ -266,7 +302,7 @@ describe("ActionExecutor", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it("keeps smelting alive past 20 seconds, then times out at its 70-second budget without opening the gate", async () => {
+  it("does not publish a smelt timeout until physical cancellation settles", async () => {
     vi.useFakeTimers();
     const minecraft = new FakeMinecraftPort();
     let settleSmelt: (() => void) | undefined;
@@ -282,13 +318,19 @@ describe("ActionExecutor", () => {
 
     await vi.advanceTimersByTimeAsync(20_000);
     expect(executor.pendingCount()).toBe(1);
+    let smeltOutcome = "pending";
+    void smelting.then((result) => {
+      smeltOutcome = result.status;
+    });
     await vi.advanceTimersByTimeAsync(50_000);
 
-    await expect(smelting).resolves.toEqual({ status: "failed", reason: "action timed out" });
+    expect(smeltOutcome).toBe("pending");
+    expect(executor.pendingCount()).toBe(1);
     const afterSmelt = executor.execute({ kind: "say", message: "after smelt" }, context);
     await vi.advanceTimersByTimeAsync(0);
     expect(minecraft.chatLog).toEqual([]);
     settleSmelt?.();
+    await expect(smelting).resolves.toEqual({ status: "failed", reason: "action timed out" });
     await expect(afterSmelt).resolves.toEqual({ status: "completed" });
   });
 

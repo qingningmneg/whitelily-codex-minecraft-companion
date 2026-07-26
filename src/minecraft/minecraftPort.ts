@@ -2,6 +2,7 @@ import type { Vec3, WorldSnapshot } from "../domain/types.js";
 
 export type MinecraftEvent =
   | { kind: "connected" | "disconnected"; reason?: string }
+  | { kind: "world_changed" }
   | { kind: "chat"; username: string; message: string }
   | { kind: "owner_online" | "owner_offline"; username: string }
   | { kind: "death" }

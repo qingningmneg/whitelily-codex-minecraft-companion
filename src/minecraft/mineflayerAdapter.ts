@@ -3,7 +3,11 @@ import pathfinderPackage from "mineflayer-pathfinder";
 import { Vec3 as PrismarineVec3 } from "vec3";
 import type { GameAction, Vec3, WorldSnapshot } from "../domain/types.js";
 import { classifyActionRisk } from "../safety/actionRisk.js";
-import { MineflayerConnection, type MineflayerConnectionEvent } from "./mineflayerConnection.js";
+import {
+  MineflayerConnection,
+  type MineflayerConnectionEvent,
+  type MineflayerSession,
+} from "./mineflayerConnection.js";
 import { createWorldSnapshot, selectSnapshotEntities } from "./mineflayerObservation.js";
 import type { MinecraftEvent, MinecraftPort } from "./minecraftPort.js";
 
@@ -11,6 +15,7 @@ const { goals, pathfinder } = pathfinderPackage;
 
 const RETRY_DELAYS_MS = [1_000, 2_000, 4_000, 8_000, 15_000] as const;
 const MAX_SMELT_WAIT_TICKS = 20 * 60;
+const OPERATION_CANCEL_TIMEOUT_MS = 1_000;
 const MAX_KNOWN_HOSTILES = 64;
 const HOSTILE_PROXIMITY_RADIUS_SQUARED = 16 ** 2;
 const FUEL_OUTPUT_CAPACITY: Readonly<Record<string, number>> = {
@@ -144,30 +149,36 @@ export class MineflayerAdapter implements MinecraftPort {
 
   async moveTo(position: Vec3, signal: AbortSignal): Promise<void> {
     this.assertNotAborted(signal);
-    const bot = this.requireBot();
-    await this.abortable(signal, () =>
-      bot.pathfinder.goto(new goals.GoalNear(position.x, position.y, position.z, 1)),
+    const session = this.requireSession();
+    await this.abortable(signal, session, "motion", () =>
+      session.bot.pathfinder.goto(new goals.GoalNear(position.x, position.y, position.z, 1)),
     );
   }
 
   async followOwner(username: string, distance: number, signal: AbortSignal): Promise<void> {
     this.assertNotAborted(signal);
-    const bot = this.requireBot();
+    const session = this.requireSession();
+    const bot = session.bot;
     const entity = bot.players[username]?.entity;
     if (!entity) throw new Error(`owner ${username} is not online`);
-    await this.abortable(signal, () => bot.pathfinder.goto(new goals.GoalFollow(entity, distance)));
+    await this.abortable(signal, session, "motion", () =>
+      bot.pathfinder.goto(new goals.GoalFollow(entity, distance)),
+    );
   }
 
   async lookAt(position: Vec3, signal: AbortSignal): Promise<void> {
     this.assertNotAborted(signal);
-    const bot = this.requireBot();
-    await this.abortable(signal, () => bot.lookAt(minecraftVec3(position)));
+    const session = this.requireSession();
+    await this.abortable(signal, session, "fence", () =>
+      session.bot.lookAt(minecraftVec3(position)),
+    );
   }
 
   async jump(signal: AbortSignal): Promise<void> {
     this.assertNotAborted(signal);
-    const bot = this.requireBot();
-    await this.abortable(signal, async () => {
+    const session = this.requireSession();
+    const bot = session.bot;
+    await this.abortable(signal, session, "motion", async () => {
       bot.setControlState("jump", true);
       try {
         await bot.waitForTicks(1);
@@ -179,19 +190,21 @@ export class MineflayerAdapter implements MinecraftPort {
 
   async digBlock(position: Vec3, expectedBlockName: string, signal: AbortSignal): Promise<void> {
     this.assertNotAborted(signal);
-    const bot = this.requireBot();
+    const session = this.requireSession();
+    const bot = session.bot;
     this.requireBlock(bot, expectedBlockName);
     const block = bot.blockAt(minecraftVec3(position));
     if (!block || block.name !== expectedBlockName) {
       throw new Error("block at position does not match expected block name");
     }
-    await this.abortable(signal, () => bot.dig(block));
+    await this.abortable(signal, session, "dig", () => bot.dig(block));
   }
 
   async placeBlock(position: Vec3, blockName: string, signal: AbortSignal): Promise<void> {
     this.assertNotAborted(signal);
     this.assertSafeAction({ kind: "place_block", position, blockName });
-    const bot = this.requireBot();
+    const session = this.requireSession();
+    const bot = session.bot;
     this.requireBlock(bot, blockName);
     const item = this.requireItem(bot, blockName);
     const held = bot.inventory.items().find((candidate) => candidate.name === item.name);
@@ -200,26 +213,28 @@ export class MineflayerAdapter implements MinecraftPort {
       minecraftVec3({ x: position.x, y: position.y - 1, z: position.z }),
     );
     if (!reference) throw new Error("no supporting block at placement position");
-    await this.abortable(signal, async () => {
+    await this.abortable(signal, session, "fence", async () => {
       await bot.equip(held, "hand");
-      this.assertNotAborted(signal);
+      this.assertActive(session, signal);
       await bot.placeBlock(reference, new PrismarineVec3(0, 1, 0));
     });
   }
 
   async craftItem(itemName: string, count: number, signal: AbortSignal): Promise<void> {
     this.assertNotAborted(signal);
-    const bot = this.requireBot();
+    const session = this.requireSession();
+    const bot = session.bot;
     const item = this.requireItem(bot, itemName);
     const recipe = bot.recipesFor(item.id, null, 1, null)[0];
     if (!recipe) throw new Error(`no craftable recipe for ${itemName}`);
-    await this.abortable(signal, () => bot.craft(recipe, count));
+    await this.abortable(signal, session, "fence", () => bot.craft(recipe, count));
   }
 
   async smeltItem(itemName: string, count: number, signal: AbortSignal): Promise<void> {
     this.assertNotAborted(signal);
     if (!Number.isSafeInteger(count) || count <= 0) throw new Error("smelt count must be positive");
-    const bot = this.requireBot();
+    const session = this.requireSession();
+    const bot = session.bot;
     const item = this.requireItem(bot, itemName);
     const input = bot.inventory
       .items()
@@ -240,17 +255,19 @@ export class MineflayerAdapter implements MinecraftPort {
     };
     await this.abortable(
       signal,
+      session,
+      "fence",
       async () => {
         window = await bot.openFurnace(furnace);
         try {
-          this.assertNotAborted(signal);
+          this.assertActive(session, signal);
           if (window.inputItem() || window.outputItem() || window.fuelItem()) {
             throw new Error("furnace must be empty before smelting");
           }
           await window.putInput(input.type, null, count);
-          this.assertNotAborted(signal);
+          this.assertActive(session, signal);
           await window.putFuel(fuel.type, null, fuel.count);
-          this.assertNotAborted(signal);
+          this.assertActive(session, signal);
           for (let tick = 0; tick < MAX_SMELT_WAIT_TICKS; tick += 1) {
             const output = window.outputItem();
             if (output && output.count >= count) {
@@ -258,7 +275,7 @@ export class MineflayerAdapter implements MinecraftPort {
               return;
             }
             await bot.waitForTicks(1);
-            this.assertNotAborted(signal);
+            this.assertActive(session, signal);
           }
           throw new Error("smelting timed out");
         } finally {
@@ -271,13 +288,14 @@ export class MineflayerAdapter implements MinecraftPort {
 
   async collectDropped(entityId: number, signal: AbortSignal): Promise<void> {
     this.assertNotAborted(signal);
-    const bot = this.requireBot();
+    const session = this.requireSession();
+    const bot = session.bot;
     if (!this.droppedItemEntityIds.has(entityId)) {
       throw new Error("dropped entity ID was not authorized by the latest snapshot");
     }
     const entity = bot.entities[String(entityId)];
     if (!entity || !isDroppedItem(entity)) throw new Error("dropped item is no longer available");
-    await this.abortable(signal, () =>
+    await this.abortable(signal, session, "motion", () =>
       bot.pathfinder.goto(
         new goals.GoalNear(entity.position.x, entity.position.y, entity.position.z, 1),
       ),
@@ -291,22 +309,24 @@ export class MineflayerAdapter implements MinecraftPort {
   ): Promise<void> {
     this.assertNotAborted(signal);
     this.assertSafeAction({ kind: "equip_item", itemName, destination });
-    const bot = this.requireBot();
+    const session = this.requireSession();
+    const bot = session.bot;
     const item = this.requireItem(bot, itemName);
     const held = bot.inventory.items().find((candidate) => candidate.name === item.name);
     if (!held) throw new Error(`missing ${itemName} in inventory`);
-    await this.abortable(signal, () => bot.equip(held, destination));
+    await this.abortable(signal, session, "fence", () => bot.equip(held, destination));
   }
 
   async attackHostile(entityId: number, signal: AbortSignal): Promise<void> {
     this.assertNotAborted(signal);
-    const bot = this.requireBot();
+    const session = this.requireSession();
+    const bot = session.bot;
     if (!this.hostileEntityIds.has(entityId)) {
       throw new Error("hostile entity ID was not authorized by the latest snapshot");
     }
     const entity = bot.entities[String(entityId)];
     if (!entity || !isHostile(entity)) throw new Error("hostile is no longer available");
-    await this.abortable(signal, () => {
+    await this.abortable(signal, session, "fence", () => {
       bot.attack(entity);
     });
   }
@@ -345,6 +365,11 @@ export class MineflayerAdapter implements MinecraftPort {
         this.clearHostileProximity();
         this.emit({ kind: "disconnected", reason: event.reason });
         return;
+      case "world_changed":
+        this.clearSnapshotAuthorizations();
+        this.clearHostileProximity();
+        this.emit({ kind: "world_changed" });
+        return;
       case "chat":
       case "owner_online":
       case "owner_offline":
@@ -379,6 +404,12 @@ export class MineflayerAdapter implements MinecraftPort {
     const bot = this.connection.currentBot();
     if (!bot) throw new Error("Minecraft bot is not connected");
     return bot;
+  }
+
+  private requireSession(): MineflayerSession {
+    const session = this.connection.currentSession();
+    if (!session) throw new Error("Minecraft bot is not connected");
+    return session;
   }
 
   private requireBlock(bot: Bot, name: string) {
@@ -486,6 +517,11 @@ export class MineflayerAdapter implements MinecraftPort {
     if (signal.aborted) throw abortError();
   }
 
+  private assertActive(session: MineflayerSession, signal: AbortSignal): void {
+    this.assertNotAborted(signal);
+    if (!this.connection.isCurrentSession(session)) throw abortError();
+  }
+
   private assertSafeAction(action: GameAction): void {
     if (
       classifyActionRisk(action, {
@@ -498,6 +534,8 @@ export class MineflayerAdapter implements MinecraftPort {
 
   private async abortable(
     signal: AbortSignal,
+    session: MineflayerSession,
+    cancellation: "motion" | "dig" | "fence",
     operation: () => Promise<void> | void,
     abortCleanup?: () => void,
   ): Promise<void> {
@@ -506,17 +544,53 @@ export class MineflayerAdapter implements MinecraftPort {
       let settled = false;
       let started = false;
       let aborted = false;
+      let cancelTimer: ReturnType<typeof setTimeout> | undefined;
       let unregister: () => void = () => undefined;
       const onAbort = () => {
+        if (aborted) {
+          if (!this.connection.isCurrentSession(session)) finish(abortError());
+          return;
+        }
         aborted = true;
-        this.stopMotion();
-        abortCleanup?.();
-        if (!started) finish(abortError());
+        this.safelyStopBot(session.bot);
+        try {
+          abortCleanup?.();
+        } catch {
+          this.connection.fenceActiveSession(session, "operation cleanup failed");
+          finish(abortError());
+          return;
+        }
+        if (!started || !this.connection.isCurrentSession(session)) {
+          finish(abortError());
+          return;
+        }
+        if (cancellation === "dig") {
+          try {
+            session.bot.stopDigging();
+          } catch {
+            this.connection.fenceActiveSession(session, "dig cancellation failed");
+            finish(abortError());
+            return;
+          }
+          cancelTimer = setTimeout(() => {
+            cancelTimer = undefined;
+            this.connection.fenceActiveSession(session, "dig cancellation timed out");
+            finish(abortError());
+          }, OPERATION_CANCEL_TIMEOUT_MS);
+          cancelTimer.unref?.();
+          return;
+        }
+        if (cancellation === "fence") {
+          this.connection.fenceActiveSession(session, "operation cancelled");
+          finish(abortError());
+        }
       };
       const cancel = () => onAbort();
       const finish = (error?: Error) => {
         if (settled) return;
         settled = true;
+        if (cancelTimer !== undefined) clearTimeout(cancelTimer);
+        cancelTimer = undefined;
         signal.removeEventListener("abort", onAbort);
         unregister();
         if (error) reject(error);
@@ -528,7 +602,7 @@ export class MineflayerAdapter implements MinecraftPort {
       Promise.resolve()
         .then(() => {
           if (aborted || settled) return;
-          this.assertNotAborted(signal);
+          this.assertActive(session, signal);
           started = true;
           return operation();
         })
@@ -539,10 +613,6 @@ export class MineflayerAdapter implements MinecraftPort {
           ),
         );
     });
-  }
-
-  private stopMotion(): void {
-    this.safelyStopBot(this.connection.currentBot());
   }
 
   private safelyStopBot(bot: Bot | undefined): void {

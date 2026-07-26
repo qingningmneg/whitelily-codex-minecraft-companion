@@ -586,6 +586,11 @@ describe("RuntimeFacade", () => {
       state: "connected",
       sessionId: null,
     });
+    minecraftListener?.({ kind: "world_changed" });
+    expect(runtime.snapshot()).toMatchObject({
+      minecraft: { state: "connected", sessionId: null },
+      lastError: null,
+    });
     minecraftListener?.({
       kind: "disconnected",
       sessionId: "C:\\unsafe\\session",

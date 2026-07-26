@@ -291,6 +291,7 @@ export class RuntimeFacade {
         case "owner_offline":
         case "death":
         case "hostile_nearby":
+        case "world_changed":
           return;
         default:
           this.#failMinecraftState();

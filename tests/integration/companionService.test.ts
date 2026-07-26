@@ -127,6 +127,57 @@ describe("CompanionService lifecycle", () => {
     ).toEqual({ ok: false, reason: "task lease is invalid" });
   });
 
+  it("synchronously invalidates world-bound work once and persists the paused stop", async () => {
+    const value = await harness({
+      deferredTurns: [0],
+      activeMinecraftWait: true,
+    });
+    await value.start();
+    await startPlayerTurn(value, "keep building in this world");
+    const leaseId = value.taskController.current()?.lease.id;
+    const running = value.executor.execute(
+      { kind: "wait", milliseconds: 5_000 },
+      { spawn: { x: 0, y: 64, z: 0 }, owner: { x: 0, y: 64, z: 0 } },
+    );
+    const queued = value.executor.execute(
+      { kind: "jump" },
+      { spawn: { x: 0, y: 64, z: 0 }, owner: { x: 0, y: 64, z: 0 } },
+    );
+    const confirmation = value.confirmations.create("pending", { kind: "memory_clear" });
+    await value.untilActiveWaitStarted();
+
+    value.minecraft.emit({ kind: "world_changed" });
+
+    expect(value.taskController.current()).toBeNull();
+    expect(
+      value.taskController.consume({
+        leaseId: leaseId ?? "",
+        kind: "say",
+        now: Date.now(),
+      }),
+    ).toEqual({ ok: false, reason: "task lease is invalid" });
+    expect(value.activeWaitWasAborted()).toBe(true);
+    expect(value.confirmations.get(confirmation.id)).toBeUndefined();
+    expect(value.mode.snapshot()).toMatchObject({ paused: true, taskId: null });
+
+    value.minecraft.emit({ kind: "world_changed" });
+    await expect(Promise.all([running, queued])).resolves.toEqual([
+      { status: "cancelled" },
+      { status: "cancelled" },
+    ]);
+    await value.untilTurnSettled();
+    await value.untilState((state) => state.paused);
+
+    expect(value.minecraft.calls).not.toContainEqual(expect.objectContaining({ method: "jump" }));
+    expect(value.codex.interruptions).toEqual([{ threadId: "thread-1", turnId: "turn-1" }]);
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:world_changed"]);
+    expect(value.taskTerminalReasons).toEqual(["world_changed"]);
+    await expect(value.state.load()).resolves.toMatchObject({
+      paused: true,
+      unfinishedTaskSummary: null,
+    });
+  });
+
   it.each(["deadline", "budget overflow"] as const)(
     "%s actively cancels in-flight and queued work with one terminal transition",
     async (trigger) => {

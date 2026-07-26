@@ -329,6 +329,17 @@ export class CompanionService {
       this.dependencies.autonomy.notifyThreat();
       return;
     }
+    if (event.kind === "world_changed") {
+      this.dependencies.taskController.stop("world_changed");
+      this.invalidateCurrentTurn();
+      this.dependencies.confirmations.clear();
+      this.dependencies.executor.stopAll();
+      this.dependencies.mode.stop();
+      this.unfinishedTaskSummary = null;
+      this.dependencies.autonomy.notifyModeChanged();
+      await this.persist();
+      return;
+    }
     if (event.kind === "death" || event.kind === "disconnected") {
       this.dependencies.taskController.stop("disconnect");
       this.invalidateCurrentTurn();

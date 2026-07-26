@@ -42,6 +42,8 @@ describe("public release readiness", () => {
       "move and follow distance comes from trusted Minecraft snapshots",
       "deadlines fire independently of later tool calls",
       "cancels queued and in-flight actions",
+      "publishes one fail-closed `world_changed` event",
+      "Dig cancellation calls Mineflayer's `stopDigging`",
       "ActionExecutor performs SafetyEngine policy evaluation",
       "MCP registry does not depend directly on TaskController",
     ]) {

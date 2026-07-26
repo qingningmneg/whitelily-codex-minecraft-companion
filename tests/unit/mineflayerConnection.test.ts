@@ -8,6 +8,7 @@ import {
 class FakeBot extends EventEmitter {
   throwOnEvent: string | undefined;
   throwOnRemove = false;
+  readonly game: { dimension: unknown } = { dimension: "overworld" };
   readonly _client = new EventEmitter();
   readonly loadPlugin = vi.fn();
   readonly end = vi.fn();
@@ -95,6 +96,64 @@ function createMineflayerConnectionHarness(options?: {
 }
 
 describe("MineflayerConnection", () => {
+  it("suppresses initial and same-dimension spawns but emits one trusted world change", async () => {
+    const harness = createMineflayerConnectionHarness();
+    const connection = new MineflayerConnection(harness.dependencies);
+    const events: string[] = [];
+    connection.onEvent((event) => events.push(event.kind));
+    const connecting = connection.connect();
+    harness.bots[0]?._client.emit("login", { worldName: "minecraft:overworld" });
+    harness.spawn();
+    await connecting;
+
+    harness.bots[0]?._client.emit("respawn", { worldName: "minecraft:overworld" });
+    harness.bots[0]!.game.dimension = "the_nether";
+    harness.bots[0]?._client.emit("respawn", { worldName: "minecraft:the_nether" });
+    harness.bots[0]?._client.emit("respawn", { worldName: "minecraft:the_nether" });
+
+    expect(events).toEqual(["connected", "world_changed"]);
+  });
+
+  it("detects a trusted world-name transition with the same dimension type", async () => {
+    const harness = createMineflayerConnectionHarness();
+    const connection = new MineflayerConnection(harness.dependencies);
+    const events: string[] = [];
+    connection.onEvent((event) => events.push(event.kind));
+    const connecting = connection.connect();
+    harness.bots[0]?._client.emit("login", { worldName: "minecraft:overworld" });
+    harness.spawn();
+    await connecting;
+
+    harness.bots[0]?._client.emit("respawn", { worldName: "custom:mirror_world" });
+    harness.bots[0]?._client.emit("respawn", { worldName: "custom:mirror_world" });
+
+    expect(events).toEqual(["connected", "world_changed"]);
+  });
+
+  it("fails closed once for malformed identity while ignoring stale and replacement initial spawns", async () => {
+    const harness = createMineflayerConnectionHarness();
+    const connection = new MineflayerConnection(harness.dependencies);
+    const events: string[] = [];
+    connection.onEvent((event) => events.push(event.kind));
+    const initial = connection.connect();
+    harness.bots[0]?._client.emit("login", { worldName: "minecraft:overworld" });
+    harness.spawn();
+    await initial;
+    harness.end("socket closed");
+    harness.runNextTimer();
+    harness.bots[1]!.game.dimension = "the_nether";
+    harness.bots[1]?._client.emit("login", { worldName: "minecraft:the_nether" });
+    harness.spawn();
+
+    harness.bots[0]!.game.dimension = "the_end";
+    harness.bots[0]?._client.emit("respawn", { worldName: "minecraft:the_end" });
+    harness.bots[1]!.game.dimension = { malformed: true };
+    harness.bots[1]?._client.emit("respawn", { worldName: { malformed: true } });
+    harness.bots[1]?._client.emit("respawn", { worldName: { malformed: true } });
+
+    expect(events).toEqual(["connected", "outage", "connected", "world_changed"]);
+  });
+
   it("emits one outage and retries with the bounded delay sequence", async () => {
     const harness = createMineflayerConnectionHarness();
     const connection = new MineflayerConnection(harness.dependencies);
