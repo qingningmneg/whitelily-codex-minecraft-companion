@@ -70,12 +70,17 @@ export class TurnToolBudget {
     }
     const taskLease = this.taskLease;
     if (!taskLease) return { ok: false, reason: "tool turn lease is invalid" };
-    const taskResult = this.taskBudget.consume({ lease: taskLease, kind, now: Date.now() });
+    const taskResult = this.taskBudget.consume({
+      lease: taskLease,
+      kind,
+      now: this.taskBudget.currentTime(),
+    });
     if (!taskResult.ok) {
       return {
         ok: false,
         reason:
-          taskResult.reason === "task lease is invalid"
+          taskResult.reason === "task lease is invalid" &&
+          this.taskBudget.snapshot().stopReason !== "budget_exhausted"
             ? "tool turn lease is invalid"
             : "tool call budget exhausted",
       };

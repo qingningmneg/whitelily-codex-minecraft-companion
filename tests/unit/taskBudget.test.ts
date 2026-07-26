@@ -2,7 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   HARD_TASK_LIMITS,
   TaskControllerBudget,
-  type TaskLimits,
+  type TaskConsumption,
+  type TaskStopReason,
 } from "../../src/safety/taskBudget.js";
 
 describe("TaskControllerBudget", () => {
@@ -61,5 +62,92 @@ describe("TaskControllerBudget", () => {
       ok: false,
       reason: "task budget exhausted",
     });
+  });
+
+  it("rejects malformed consumption input as an invalid lease without throwing", () => {
+    const budget = new TaskControllerBudget({ now: () => 0 });
+    budget.begin();
+
+    for (const input of [undefined, null, {}, { lease: null }, { lease: {} }]) {
+      expect(budget.consume(input as TaskConsumption)).toEqual({
+        ok: false,
+        reason: "task lease is invalid",
+      });
+    }
+  });
+
+  it("enforces the ten-minute duration boundary before accepting a call", () => {
+    const budget = new TaskControllerBudget({ now: () => 0 });
+    const lease = budget.begin();
+
+    expect(budget.consume({ lease, kind: "say", now: HARD_TASK_LIMITS.maxDurationMs - 1 }).ok).toBe(
+      true,
+    );
+    expect(budget.consume({ lease, kind: "say", now: HARD_TASK_LIMITS.maxDurationMs })).toEqual({
+      ok: false,
+      reason: "task duration exhausted",
+    });
+    expect(budget.snapshot()).toMatchObject({ active: false, stopReason: "timeout" });
+  });
+
+  it("allows only one active task", () => {
+    const budget = new TaskControllerBudget({ now: () => 0 });
+    budget.begin();
+
+    expect(() => budget.begin()).toThrow("task is already active");
+  });
+
+  it.each([Number.NaN, Infinity, -1])(
+    "rejects non-finite or negative consumption without changing counters: %s",
+    (blockChanges) => {
+      const budget = new TaskControllerBudget({ now: () => 0 });
+      const lease = budget.begin();
+      const before = budget.snapshot();
+
+      expect(budget.consume({ lease, kind: "dig_block", now: 1, blockChanges })).toEqual({
+        ok: false,
+        reason: "task budget exhausted",
+      });
+      expect(budget.snapshot()).toMatchObject({
+        toolCalls: before.toolCalls,
+        blockChanges: before.blockChanges,
+        horizontalTravel: before.horizontalTravel,
+        dangerousOperations: before.dangerousOperations,
+      });
+    },
+  );
+
+  it("returns immutable snapshot copies", () => {
+    const budget = new TaskControllerBudget({ now: () => 0 });
+    budget.begin();
+    const snapshot = budget.snapshot();
+
+    expect(() => {
+      snapshot.toolCalls = 99;
+    }).toThrow(TypeError);
+    expect(() => {
+      snapshot.limits.maxToolCalls = 99;
+    }).toThrow(TypeError);
+    expect(budget.snapshot().limits.maxToolCalls).toBe(HARD_TASK_LIMITS.maxToolCalls);
+  });
+
+  it.each([
+    "completed",
+    "failed",
+    "timeout",
+    "budget_exhausted",
+    "owner_stop",
+    "emergency_stop",
+    "disconnect",
+    "world_changed",
+    "model_unavailable",
+    "process_exit",
+  ] as const)("records the %s stop reason", (reason: TaskStopReason) => {
+    const budget = new TaskControllerBudget({ now: () => 0 });
+    budget.begin();
+
+    budget.invalidate(reason);
+
+    expect(budget.snapshot()).toMatchObject({ active: false, stopReason: reason });
   });
 });

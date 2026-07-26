@@ -79,7 +79,7 @@ export class TaskControllerBudget {
 
   begin(requested: Partial<TaskLimits> = {}): TaskLease {
     if (this.active) throw new Error("task is already active");
-    const startedAt = this.now();
+    const startedAt = this.currentTime();
     if (!Number.isFinite(startedAt)) throw new Error("task start time is invalid");
 
     this.active = true;
@@ -106,6 +106,7 @@ export class TaskControllerBudget {
   }
 
   consume(input: TaskConsumption): TaskBudgetDecision {
+    if (!isTaskConsumptionShape(input)) return { ok: false, reason: "task lease is invalid" };
     const activeLease = this.activeLease;
     if (
       !this.active ||
@@ -167,7 +168,7 @@ export class TaskControllerBudget {
     });
   }
 
-  private now(): number {
+  currentTime(): number {
     return (this.dependencies.now ?? Date.now)();
   }
 
@@ -187,4 +188,13 @@ function clampLimit(requested: number | undefined, hardLimit: number): number {
 function consumptionValue(value: number | undefined): number | undefined {
   if (value === undefined) return 0;
   return Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+function isTaskConsumptionShape(input: unknown): input is TaskConsumption {
+  if (typeof input !== "object" || input === null) return false;
+  const candidate = input as Record<string, unknown>;
+  if (typeof candidate.kind !== "string" || typeof candidate.now !== "number") return false;
+  if (typeof candidate.lease !== "object" || candidate.lease === null) return false;
+  const lease = candidate.lease as Record<string, unknown>;
+  return typeof lease.id === "string" && Number.isFinite(lease.startedAt);
 }
