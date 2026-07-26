@@ -1,7 +1,7 @@
 import type { ChildProcess } from "node:child_process";
-import { access, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { access, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   clearFixtureCleanupIdentityForTest,
@@ -46,7 +46,10 @@ async function waitForText(
     try {
       if ((await readFile(path, "utf8")).includes(expected)) return;
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT" && code !== "EBUSY" && code !== "EACCES" && code !== "EPERM") {
+        throw error;
+      }
     }
     await new Promise<void>((resolveDelay) => setTimeout(resolveDelay, 20));
   }
@@ -64,7 +67,8 @@ async function observe<T>(
 }
 
 async function fixtureRoot(): Promise<string> {
-  const root = await mkdtemp(join(tmpdir(), "whitelily-windows-script-"));
+  const created = await mkdtemp(join(tmpdir(), "whitelily-windows-script-"));
+  const root = await realpath(created);
   roots.push(root);
   return root;
 }
@@ -78,6 +82,31 @@ afterEach(async () => {
 }, 15_000);
 
 describe("Windows scripts", { timeout: 30_000 }, () => {
+  it("cleans a canonical fixture created through a temporary-directory alias", async () => {
+    const canonicalTemporaryRoot = await realpath(tmpdir());
+    const alias = await mkdtemp(join(dirname(canonicalTemporaryRoot), "whitelily-temp-alias-"));
+    await rm(alias, { recursive: true });
+    await symlink(canonicalTemporaryRoot, alias, "junction");
+    const originalTemp = process.env.TEMP;
+    const originalTmp = process.env.TMP;
+    try {
+      process.env.TEMP = alias;
+      process.env.TMP = alias;
+      expect(resolve(tmpdir())).toBe(resolve(alias));
+      const root = await fixtureRoot();
+
+      await cleanupWindowsFixture(root);
+
+      await expect(access(root)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      if (originalTemp === undefined) delete process.env.TEMP;
+      else process.env.TEMP = originalTemp;
+      if (originalTmp === undefined) delete process.env.TMP;
+      else process.env.TMP = originalTmp;
+      await rm(alias, { force: true });
+    }
+  });
+
   it("keeps setup check-only mode non-mutating", async () => {
     const root = await fixtureRoot();
     const result = await runWindowsScriptFixture(root, "setup.ps1", ["-CheckOnly"]);
@@ -409,6 +438,24 @@ describe("Windows scripts", { timeout: 30_000 }, () => {
       identities.filter((identity) => identity !== undefined),
       JSON.stringify({ result, identities }),
     ).toEqual([]);
+  }, 15_000);
+
+  it("cleans up the exact child when fixture identity cannot be established", async () => {
+    const root = await fixtureRoot();
+    let spawnedPid: number | undefined;
+
+    const result = await observe(
+      startOwnedFixtureProcess(root, "stubborn", undefined, {
+        expectedIdentityPathForTest: join(root, "dist", "src", "missing.js"),
+        onSpawnedPidForTest: (pid) => {
+          spawnedPid = pid;
+        },
+      }),
+    );
+
+    expect(result.status).toBe("rejected");
+    expect(spawnedPid).toBeDefined();
+    expect(processIsAlive(spawnedPid!)).toBe(false);
   }, 15_000);
 
   it("refuses fixture cleanup when the registered process identity does not match", async () => {
