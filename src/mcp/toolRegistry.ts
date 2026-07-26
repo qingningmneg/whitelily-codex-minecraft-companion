@@ -2,6 +2,7 @@ import * as z from "zod/v4";
 import type { ActionExecutor, ActionResult } from "../actions/actionExecutor.js";
 import type { GameAction, Vec3, WorldSnapshot } from "../domain/types.js";
 import type { MinecraftPort } from "../minecraft/minecraftPort.js";
+import { classifyActionRisk } from "../safety/actionRisk.js";
 import type { SafetyContext } from "../safety/safetyEngine.js";
 import { TurnToolBudget, type ToolActionKind } from "./toolBudget.js";
 
@@ -143,12 +144,27 @@ export function createToolRegistry(dependencies: ToolRegistryDependencies) {
     return snapshot === undefined ? undefined : structuredClone(snapshot);
   };
 
-  const consume = (kind: ToolActionKind, lease: string): ToolResult | undefined => {
-    const result = dependencies.budget.consume(kind, lease);
+  const consume = (
+    kind: ToolActionKind,
+    lease: string,
+    dangerousOperations: 0 | 1 = 0,
+  ): ToolResult | undefined => {
+    const result = dependencies.budget.consume(kind, lease, { dangerousOperations });
     return result.ok ? undefined : errorResult(result.reason);
   };
   const runAction = async (action: GameAction, lease: string): Promise<ToolResult> => {
-    const exhausted = consume(action.kind, lease);
+    let baseContext: SafetyContext;
+    try {
+      baseContext = await dependencies.safetyContextProvider();
+    } catch (error) {
+      return errorResult(safeMessage(error));
+    }
+    const initialContext = actionContext(baseContext, action, dependencies.budget);
+    const exhausted = consume(
+      action.kind,
+      lease,
+      classifyActionRisk(action, initialContext).dangerousOperations,
+    );
     if (exhausted) return exhausted;
     if (action.kind === "move_to") {
       try {
@@ -162,11 +178,7 @@ export function createToolRegistry(dependencies: ToolRegistryDependencies) {
       }
     }
     try {
-      const context = actionContext(
-        await dependencies.safetyContextProvider(),
-        action,
-        dependencies.budget,
-      );
+      const context = actionContext(baseContext, action, dependencies.budget);
       return toToolResult(await dependencies.executor.execute(action, context));
     } catch (error) {
       return errorResult(safeMessage(error));
@@ -359,22 +371,27 @@ export function createToolRegistry(dependencies: ToolRegistryDependencies) {
         entityId: number;
         turnLease: string;
       }): Promise<ToolResult> => {
-        const exhausted = consume("collect_dropped", lease);
+        const action: GameAction = { kind: "collect_dropped", entityId: droppedId };
+        let context: SafetyContext;
+        try {
+          context = actionContext(
+            await dependencies.safetyContextProvider(),
+            action,
+            dependencies.budget,
+          );
+        } catch (error) {
+          return errorResult(safeMessage(error));
+        }
+        const exhausted = consume(
+          action.kind,
+          lease,
+          classifyActionRisk(action, context).dangerousOperations,
+        );
         if (exhausted) return exhausted;
         if (!hasDroppedItem(currentSnapshot(), droppedId))
           return errorResult("dropped entity ID is not present in the latest snapshot");
         try {
-          const context = actionContext(
-            await dependencies.safetyContextProvider(),
-            { kind: "collect_dropped", entityId: droppedId },
-            dependencies.budget,
-          );
-          return toToolResult(
-            await dependencies.executor.execute(
-              { kind: "collect_dropped", entityId: droppedId },
-              context,
-            ),
-          );
+          return toToolResult(await dependencies.executor.execute(action, context));
         } catch (error) {
           return errorResult(safeMessage(error));
         }

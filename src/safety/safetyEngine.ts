@@ -1,5 +1,6 @@
 import type { GameAction, SafetyDecision, Vec3 } from "../domain/types.js";
 import { ConfirmationStore } from "./confirmationStore.js";
+import { canonicalMinecraftName, classifyActionRisk } from "./actionRisk.js";
 
 export interface SafetyContext {
   spawn?: Vec3;
@@ -28,21 +29,6 @@ const defaultLimits: SafetyLimits = {
 
 function horizontalDistance(a: Vec3, b: Vec3): number {
   return Math.hypot(a.x - b.x, a.z - b.z);
-}
-
-const permanentlyDangerousItems = new Set([
-  "tnt",
-  "lava",
-  "lava_bucket",
-  "flowing_lava",
-  "fire",
-  "soul_fire",
-  "flint_and_steel",
-  "fire_charge",
-]);
-
-function canonicalMinecraftName(name: string): string {
-  return name.toLowerCase().replace(/^minecraft:/, "");
 }
 
 export class SafetyEngine {
@@ -95,21 +81,19 @@ export class SafetyEngine {
   }
 
   private permanentDecision(action: GameAction, context: SafetyContext): SafetyDecision | null {
+    const risk = classifyActionRisk(action, context);
     if (action.kind === "place_block" && canonicalMinecraftName(action.blockName) === "tnt") {
       return { kind: "deny", reason: "TNT is permanently forbidden" };
     }
 
     if (
       (action.kind === "place_block" || action.kind === "dig_block") &&
-      permanentlyDangerousItems.has(canonicalMinecraftName(action.blockName))
+      risk.level === "dangerous"
     ) {
       return { kind: "deny", reason: "Lava and destructive fire are permanently forbidden" };
     }
 
-    if (
-      action.kind === "equip_item" &&
-      permanentlyDangerousItems.has(canonicalMinecraftName(action.itemName))
-    ) {
+    if (action.kind === "equip_item" && risk.level === "dangerous") {
       return {
         kind: "deny",
         reason: "TNT, lava, and destructive fire items are permanently forbidden",
@@ -134,7 +118,7 @@ export class SafetyEngine {
       };
     }
 
-    if (action.kind === "attack_hostile" && context.protectedTarget) {
+    if (action.kind === "attack_hostile" && risk.level === "dangerous") {
       return {
         kind: "deny",
         reason: `Attacking a ${context.protectedTarget} is permanently forbidden`,

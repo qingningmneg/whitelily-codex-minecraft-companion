@@ -4,6 +4,10 @@ import { TaskControllerBudget, type TaskLease } from "../safety/taskBudget.js";
 
 export type ToolActionKind = GameAction["kind"] | "get_state" | "find_block";
 
+export interface TrustedToolConsumption {
+  dangerousOperations?: 0 | 1;
+}
+
 export interface TurnToolBudgetSnapshot {
   active: boolean;
   ended: boolean;
@@ -61,7 +65,11 @@ export class TurnToolBudget {
     this.ownsTaskLease = false;
   }
 
-  consume(kind: ToolActionKind, lease?: string): BudgetConsumeResult {
+  consume(
+    kind: ToolActionKind,
+    lease?: string,
+    trustedConsumption: TrustedToolConsumption = {},
+  ): BudgetConsumeResult {
     if (!this.active) {
       return { ok: false, reason: this.ended ? "tool turn has ended" : "tool turn has not begun" };
     }
@@ -74,6 +82,9 @@ export class TurnToolBudget {
       lease: taskLease,
       kind,
       now: this.taskBudget.currentTime(),
+      ...(trustedConsumption.dangerousOperations === undefined
+        ? {}
+        : { dangerousOperations: trustedConsumption.dangerousOperations }),
     });
     if (!taskResult.ok) {
       return {

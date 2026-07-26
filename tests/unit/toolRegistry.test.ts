@@ -2,6 +2,10 @@ import { describe, expect, it } from "vitest";
 import { createToolRegistry } from "../../src/mcp/toolRegistry.js";
 import type { ActionSafety } from "../../src/actions/actionExecutor.js";
 import type { WorldSnapshot } from "../../src/domain/types.js";
+import { TurnToolBudget } from "../../src/mcp/toolBudget.js";
+import { ConfirmationStore } from "../../src/safety/confirmationStore.js";
+import { SafetyEngine } from "../../src/safety/safetyEngine.js";
+import { TaskControllerBudget } from "../../src/safety/taskBudget.js";
 import { createToolRegistryHarness } from "../support/toolRegistryHarness.js";
 
 function leased<T extends Record<string, unknown> = Record<never, never>>(
@@ -209,6 +213,30 @@ describe("Minecraft MCP tools", () => {
       isError: true,
     });
     expect(harness.minecraft.chatLog).toEqual([]);
+  });
+
+  it("consumes classifier-derived dangerous operations through the trusted task budget", async () => {
+    const harness = createToolRegistryHarness({
+      safety: new SafetyEngine(new ConfirmationStore()),
+    });
+    const taskBudget = new TaskControllerBudget();
+    const budget = new TurnToolBudget(taskBudget);
+    const turnLease = budget.begin(taskBudget.begin());
+    const tools = createToolRegistry({ ...harness.dependencies, budget });
+
+    await expect(
+      tools.minecraft_place_block.execute({
+        x: 20,
+        y: 64,
+        z: 0,
+        blockName: "minecraft:tnt",
+        turnLease,
+      }),
+    ).resolves.toEqual({
+      text: '{"status":"denied","reason":"TNT is permanently forbidden"}',
+      isError: true,
+    });
+    expect(taskBudget.snapshot().dangerousOperations).toBe(1);
   });
 
   it("does not touch Minecraft before begin or after end", async () => {

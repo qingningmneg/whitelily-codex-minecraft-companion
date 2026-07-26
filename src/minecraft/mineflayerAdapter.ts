@@ -1,7 +1,8 @@
 import { createBot, type Bot, type Furnace } from "mineflayer";
 import pathfinderPackage from "mineflayer-pathfinder";
 import { Vec3 as PrismarineVec3 } from "vec3";
-import type { Vec3, WorldSnapshot } from "../domain/types.js";
+import type { GameAction, Vec3, WorldSnapshot } from "../domain/types.js";
+import { classifyActionRisk } from "../safety/actionRisk.js";
 import type { MinecraftEvent, MinecraftPort } from "./minecraftPort.js";
 
 const { goals, pathfinder } = pathfinderPackage;
@@ -66,21 +67,6 @@ function distanceSquared(
   right: { x: number; y: number; z: number },
 ): number {
   return (left.x - right.x) ** 2 + (left.y - right.y) ** 2 + (left.z - right.z) ** 2;
-}
-
-const permanentlyDangerousItems = new Set([
-  "tnt",
-  "lava",
-  "lava_bucket",
-  "flowing_lava",
-  "fire",
-  "soul_fire",
-  "flint_and_steel",
-  "fire_charge",
-]);
-
-function canonicalMinecraftName(name: string): string {
-  return name.toLowerCase().replace(/^minecraft:/, "");
 }
 
 function packetSpawnPosition(bot: Bot, packet: unknown): Vec3 | undefined {
@@ -275,7 +261,7 @@ export class MineflayerAdapter implements MinecraftPort {
 
   async placeBlock(position: Vec3, blockName: string, signal: AbortSignal): Promise<void> {
     this.assertNotAborted(signal);
-    this.assertSafeItem(blockName);
+    this.assertSafeAction({ kind: "place_block", position, blockName });
     const bot = this.requireBot();
     this.requireBlock(bot, blockName);
     const item = this.requireItem(bot, blockName);
@@ -375,7 +361,7 @@ export class MineflayerAdapter implements MinecraftPort {
     signal: AbortSignal,
   ): Promise<void> {
     this.assertNotAborted(signal);
-    this.assertSafeItem(itemName);
+    this.assertSafeAction({ kind: "equip_item", itemName, destination });
     const bot = this.requireBot();
     const item = this.requireItem(bot, itemName);
     const held = bot.inventory.items().find((candidate) => candidate.name === item.name);
@@ -686,8 +672,12 @@ export class MineflayerAdapter implements MinecraftPort {
     if (signal.aborted) throw abortError();
   }
 
-  private assertSafeItem(name: string): void {
-    if (permanentlyDangerousItems.has(canonicalMinecraftName(name))) {
+  private assertSafeAction(action: GameAction): void {
+    if (
+      classifyActionRisk(action, {
+        owner: { x: 0, y: 0, z: 0 },
+      }).level === "dangerous"
+    ) {
       throw new Error("dangerous item is permanently forbidden");
     }
   }

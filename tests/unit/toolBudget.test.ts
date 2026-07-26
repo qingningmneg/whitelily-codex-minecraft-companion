@@ -75,6 +75,16 @@ describe("TurnToolBudget", () => {
     expect(taskBudget.snapshot().toolCalls).toBe(1);
   });
 
+  it("forwards trusted dangerous-operation consumption to its task lease", () => {
+    const taskBudget = new TaskControllerBudget();
+    const taskLease = taskBudget.begin();
+    const budget = new TurnToolBudget(taskBudget);
+    const turnLease = budget.begin(taskLease);
+
+    expect(budget.consume("place_block", turnLease, { dangerousOperations: 1 }).ok).toBe(true);
+    expect(taskBudget.snapshot().dangerousOperations).toBe(1);
+  });
+
   it("uses the task budget clock for supplied task leases", () => {
     let now = 0;
     const taskBudget = new TaskControllerBudget({ now: () => now });
