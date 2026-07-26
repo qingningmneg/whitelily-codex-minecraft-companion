@@ -425,6 +425,7 @@ git commit -m "refactor: isolate owner chat routing"
 
 - Create: `src/companion/taskController.ts`
 - Create: `tests/unit/taskController.test.ts`
+- Modify: `src/app.ts`
 - Modify: `src/companion/companionService.ts`
 - Modify: `src/actions/actionExecutor.ts`
 - Modify: `tests/support/companionHarness.ts`
@@ -484,6 +485,9 @@ Use `TaskControllerBudget` as the only mutable budget source. Clone disclosures 
 
 For owner text and autonomous microtasks:
 
+- Construct one shared `TaskControllerBudget`, `TaskController`, and `TurnToolBudget` in the
+  production composition root and test harness; inject the controller into `CompanionService` and
+  its stop callback into `ActionExecutor`.
 - Create one disclosure before the Codex turn.
 - Send a concise disclosure to Minecraft chat before actions can run.
 - Attach the task lease ID to the prompt.
@@ -522,7 +526,7 @@ Expected: PASS and existing `!stop` tests still observe action cancellation.
 - [ ] **Step 7: Commit**
 
 ```powershell
-git add src/companion/taskController.ts src/companion/companionService.ts src/actions/actionExecutor.ts tests/unit/taskController.test.ts tests/unit/actionExecutor.test.ts tests/integration/companionService.test.ts tests/support/companionHarness.ts
+git add src/app.ts src/companion/taskController.ts src/companion/companionService.ts src/actions/actionExecutor.ts tests/unit/taskController.test.ts tests/unit/actionExecutor.test.ts tests/integration/companionService.test.ts tests/support/companionHarness.ts
 git commit -m "feat: control one bounded companion task"
 ```
 
