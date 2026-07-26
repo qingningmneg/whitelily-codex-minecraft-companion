@@ -1,0 +1,147 @@
+import { describe, expect, it } from "vitest";
+import { containsSensitiveData, redactSecrets } from "../../src/memory/redaction.js";
+
+const openAiApiKey = ["OPENAI", "_API", "_KEY"].join("");
+const codexAccessToken = ["codex", "_access", "_token"].join("");
+
+describe("redactSecrets", () => {
+  it.each([
+    ["sk-test-abcdefghijklmnopqrstuvwxyz123456", "[REDACTED_OPENAI_KEY]"],
+    ["SK-TEST-ABCDEFGHIJKLMNOPQRSTUVWXYZ123456", "[REDACTED_OPENAI_KEY]"],
+    ["Bearer abcdefghijklmnopqrstuvwxyz.123456", "Bearer [REDACTED_TOKEN]"],
+    [
+      "authorization: bearer abcdefghijklmnopqrstuvwxyz.123456",
+      "authorization: Bearer [REDACTED_TOKEN]",
+    ],
+    ["password=hunter2", "password=[REDACTED_PASSWORD]"],
+    ["PASSWORD: hunter2", "PASSWORD=[REDACTED_PASSWORD]"],
+    [`${openAiApiKey}=sk-test-abcdefghijklmnopqrstuvwxyz123456`, `${openAiApiKey}=[REDACTED]`],
+    [`${codexAccessToken}: abcdefghijklmnopqrstuvwxyz`, `${codexAccessToken}=[REDACTED]`],
+    ["SERVICE_TOKEN=abcdefghijklmnop", "SERVICE_TOKEN=[REDACTED]"],
+    ["DATABASE_URL=postgres://player:secret@localhost/world", "DATABASE_URL=[REDACTED_ENV]"],
+    ["mail=player@example.invalid", "mail=[REDACTED_EMAIL]"],
+    ["联系我：player@example.invalid", "联系我：[REDACTED_EMAIL]"],
+    ["phone=13800138000", "phone=[REDACTED_PHONE]"],
+    ["PHONE: +86 138 0013 8000", "PHONE=[REDACTED_PHONE]"],
+  ])("redacts %s", (input, expected) => {
+    expect(redactSecrets(input)).toBe(expected);
+    expect(containsSensitiveData(input)).toBe(true);
+  });
+
+  it("leaves ordinary game summaries unchanged", () => {
+    const summary = "玩家喜欢在山顶建家，正在收集橡木。";
+
+    expect(redactSecrets(summary)).toBe(summary);
+    expect(containsSensitiveData(summary)).toBe(false);
+  });
+
+  it.each([
+    JSON.stringify({ password: "hunter2" }),
+    JSON.stringify({ token: "abcdefghijklmnopqrstuvwxyz.123456" }),
+    JSON.stringify({ OPENAI_API_KEY: "sk-test-abcdefghijklmnopqrstuvwxyz123456" }),
+    JSON.stringify({ email: "player@example.invalid", phone: "13800138000" }),
+    JSON.stringify({ note: "password=hunter2" }),
+  ])("redacts sensitive JSON without making it invalid: %s", (input) => {
+    const output = redactSecrets(input);
+
+    expect(() => JSON.parse(output)).not.toThrow();
+    expect(output).not.toContain("hunter2");
+    expect(output).not.toContain("player@example.invalid");
+    expect(output).not.toContain("13800138000");
+    expect(containsSensitiveData(input)).toBe(true);
+  });
+
+  it("redacts text with an escaped assignment separator", () => {
+    const input = String.raw`password\u003dhunter2`;
+
+    expect(redactSecrets(input)).not.toContain("hunter2");
+    expect(containsSensitiveData(input)).toBe(true);
+  });
+
+  it.each([
+    JSON.stringify({ DATABASE_URL: "postgres://player:db-password@localhost/world" }),
+    JSON.stringify({ config: { REDIS_URL: "redis://cache-user:redis-password@localhost:6379/0" } }),
+  ])("redacts credential-bearing JSON environment URLs: %s", (input) => {
+    const output = redactSecrets(input);
+
+    expect(() => JSON.parse(output)).not.toThrow();
+    expect(output).not.toContain("db-password");
+    expect(output).not.toContain("redis-password");
+    expect(containsSensitiveData(input)).toBe(true);
+  });
+
+  it("leaves an ordinary JSON URL unchanged", () => {
+    const input = JSON.stringify({ website: "https://example.invalid/docs" });
+
+    expect(redactSecrets(input)).toBe(input);
+    expect(containsSensitiveData(input)).toBe(false);
+  });
+
+  it.each([
+    JSON.stringify({ TOKEN: "actual-secret [REDACTED] suffix" }),
+    JSON.stringify({ nested: { TOKEN: "actual-secret [REDACTED] suffix" } }),
+  ])("does not trust a marker embedded in a sensitive JSON value: %s", (input) => {
+    const output = redactSecrets(input);
+
+    expect(output).not.toContain("actual-secret");
+    expect(containsSensitiveData(input)).toBe(true);
+  });
+
+  it.each([
+    "redis://:redis-password@localhost:6379/0",
+    "redis://user:redis-password@localhost:6379/0",
+  ])("redacts URI userinfo with empty or populated usernames: %s", (url) => {
+    const textOutput = redactSecrets(`endpoint=${url}`);
+    const jsonOutput = redactSecrets(JSON.stringify({ endpoint: url, website: url }));
+
+    expect(textOutput).not.toContain("redis-password");
+    expect(jsonOutput).not.toContain("redis-password");
+    expect(containsSensitiveData(JSON.stringify({ endpoint: url }))).toBe(true);
+  });
+
+  it.each(["public_url", "PUBLIC_URL"])("preserves credential-free URLs under %s", (key) => {
+    const input = JSON.stringify({ [key]: "https://example.invalid/docs" });
+
+    expect(redactSecrets(input)).toBe(input);
+    expect(containsSensitiveData(input)).toBe(false);
+  });
+
+  it("is idempotent after fully redacting JSON", () => {
+    const input = JSON.stringify({
+      TOKEN: "actual-secret",
+      endpoint: "redis://:redis-password@localhost:6379/0",
+    });
+    const once = redactSecrets(input);
+
+    expect(redactSecrets(once)).toBe(once);
+  });
+
+  it.each([
+    "TOKEN=[REDACTED]suffix actual-secret",
+    "password=[REDACTED_PASSWORD]suffix actual-secret",
+    `${openAiApiKey}=[REDACTED]suffix actual-secret`,
+  ])("does not trust marker prefixes in sensitive text: %s", (input) => {
+    const output = redactSecrets(input);
+
+    expect(output).not.toContain("actual-secret");
+    expect(containsSensitiveData(input)).toBe(true);
+  });
+
+  it.each(["TOKEN=[REDACTED]", "password=[REDACTED_PASSWORD]", `${openAiApiKey}=[REDACTED]`])(
+    "keeps a fully redacted sensitive text value unchanged: %s",
+    (input) => {
+      expect(redactSecrets(input)).toBe(input);
+      expect(containsSensitiveData(input)).toBe(false);
+    },
+  );
+
+  it.each([
+    JSON.stringify({ TOKEN: { value: "actual-secret" } }),
+    JSON.stringify({ nested: { password: ["actual-secret"] } }),
+  ])("replaces non-string JSON values under sensitive keys: %s", (input) => {
+    const output = redactSecrets(input);
+
+    expect(output).not.toContain("actual-secret");
+    expect(containsSensitiveData(input)).toBe(true);
+  });
+});
