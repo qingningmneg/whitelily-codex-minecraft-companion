@@ -181,7 +181,15 @@ export async function runReleasePackage(version: string): Promise<ReleasePackage
       join(repositoryRoot, "docs", "runtime-architecture.md"),
       join(fixture, "docs", "runtime-architecture.md"),
     );
-    for (const file of ["README.md", "README.zh-CN.md", "SECURITY.md", "CONTRIBUTING.md"]) {
+    for (const file of [
+      "README.md",
+      "README.zh-CN.md",
+      "SECURITY.md",
+      "CONTRIBUTING.md",
+      "LICENSE",
+      "NOTICE",
+      "CHANGELOG.md",
+    ]) {
       await cp(join(repositoryRoot, file), join(fixture, file));
     }
     await cp(join(repositoryRoot, "config.example.toml"), join(fixture, "config.example.toml"));

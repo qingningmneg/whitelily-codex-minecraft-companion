@@ -139,13 +139,13 @@ npm run build
 
 下面的计划文档描述尚未完成的 Public Beta 工作；它们不是 v0.1.1 已交付能力，也不构成固定发布日期承诺。
 
-| 阶段                                                                                                        | 状态          | 范围                                                          |
-| ----------------------------------------------------------------------------------------------------------- | ------------- | ------------------------------------------------------------- |
-| [01 核心运行时](docs/superpowers/plans/2026-07-27-whitelily-public-beta-01-core-runtime.md)                 | v0.1.1 已实现 | 可复用运行时、单任务控制、租约、预算、连接生命周期和安全栅栏  |
-| [02 桌面壳](docs/superpowers/plans/2026-07-27-whitelily-public-beta-02-desktop-shell.md)                    | 计划中        | Tauri 桌面控制中心、Sidecar 协议、托盘、原生紧急停止          |
-| [03 引导与连接](docs/superpowers/plans/2026-07-27-whitelily-public-beta-03-onboarding-connection.md)        | 计划中        | ChatGPT 登录流程、实时模型 UI、只读 PCL2 发现、LAN 检测与确认 |
-| [04 配置、记忆与安全](docs/superpowers/plans/2026-07-27-whitelily-public-beta-04-profiles-memory-safety.md) | 计划中        | 可编辑伙伴配置、分层记忆、世界绑定和安全预设                  |
-| [05 打包与发布](docs/superpowers/plans/2026-07-27-whitelily-public-beta-05-packaging-release.md)            | 计划中        | 双语桌面产品、诊断导出、更新提醒、兼容性矩阵和原生安装器      |
+| 阶段                                                                                                                                                                                      | 状态          | 范围                                                          |
+| ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------- | ------------------------------------------------------------- |
+| [01 核心运行时](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/blob/main/docs/superpowers/plans/2026-07-27-whitelily-public-beta-01-core-runtime.md)                 | v0.1.1 已实现 | 可复用运行时、单任务控制、租约、预算、连接生命周期和安全栅栏  |
+| [02 桌面壳](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/blob/main/docs/superpowers/plans/2026-07-27-whitelily-public-beta-02-desktop-shell.md)                    | 计划中        | Tauri 桌面控制中心、Sidecar 协议、托盘、原生紧急停止          |
+| [03 引导与连接](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/blob/main/docs/superpowers/plans/2026-07-27-whitelily-public-beta-03-onboarding-connection.md)        | 计划中        | ChatGPT 登录流程、实时模型 UI、只读 PCL2 发现、LAN 检测与确认 |
+| [04 配置、记忆与安全](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/blob/main/docs/superpowers/plans/2026-07-27-whitelily-public-beta-04-profiles-memory-safety.md) | 计划中        | 可编辑伙伴配置、分层记忆、世界绑定和安全预设                  |
+| [05 打包与发布](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/blob/main/docs/superpowers/plans/2026-07-27-whitelily-public-beta-05-packaging-release.md)            | 计划中        | 双语桌面产品、诊断导出、更新提醒、兼容性矩阵和原生安装器      |
 
 因此，当前版本没有桌面端、不会自动发现 PCL2 或 LAN 端口、没有模型选择 UI，也没有一键安装器。
 
@@ -205,16 +205,16 @@ PCL2 always remains under user control. WhiteLily does not launch, control, clic
 
 ### Current support matrix
 
-| Item                   | v0.1.1 support                                                  |
-| ---------------------- | --------------------------------------------------------------- |
-| Operating system       | Windows 11 x64                                                  |
-| Launcher               | PCL2, started and operated by the user                          |
-| Minecraft              | Java Edition 1.21.5                                             |
-| Deployment             | WhiteLily, Codex, PCL2, and Minecraft on the same computer      |
-| Game address           | `127.0.0.1` only; no cross-device or remote-LAN-host deployment |
-| Runtime                | Node.js 24+, npm 11+                                            |
-| Model entry point      | Local Codex CLI authenticated with ChatGPT                      |
-| Recommended test world | A disposable single-player world manually opened to LAN         |
+| Item                   | v0.1.1 support                                             |
+| ---------------------- | ---------------------------------------------------------- |
+| Operating system       | Windows 11 x64                                             |
+| Launcher               | PCL2, started and operated by the user                     |
+| Minecraft              | Java Edition 1.21.5                                        |
+| Deployment             | WhiteLily, Codex, PCL2, and Minecraft on the same computer |
+| Game address           | `127.0.0.1` only; cross-device deployment is not supported |
+| Runtime                | Node.js 24+, npm 11+                                       |
+| Model entry point      | Local Codex CLI authenticated with ChatGPT                 |
+| Recommended test world | A disposable single-player world manually opened to LAN    |
 
 Availability and limits depend on the user's ChatGPT/Codex account and current product rules. WhiteLily uses the applicable shared usage or credits of the local signed-in session, does not promise unlimited or fixed usage, and does not fall back to separately billed Platform API keys. See the official [Codex pricing](https://learn.chatgpt.com/docs/pricing.md) and [authentication documentation](https://learn.chatgpt.com/docs/auth).
 
@@ -301,13 +301,13 @@ Validate behavior changes in a disposable Minecraft world. The release check sca
 
 The plans below describe unfinished Public Beta work. They are not v0.1.1 capabilities and do not promise fixed delivery dates.
 
-| Stage                                                                                                                   | Status                | Scope                                                                                                     |
-| ----------------------------------------------------------------------------------------------------------------------- | --------------------- | --------------------------------------------------------------------------------------------------------- |
-| [01 Core runtime](docs/superpowers/plans/2026-07-27-whitelily-public-beta-01-core-runtime.md)                           | Implemented in v0.1.1 | Reusable runtime, single-task control, leases, budgets, connection lifecycle, and safety fences           |
-| [02 Desktop shell](docs/superpowers/plans/2026-07-27-whitelily-public-beta-02-desktop-shell.md)                         | Planned               | Tauri control center, Sidecar protocol, tray, and native emergency stop                                   |
-| [03 Onboarding and connection](docs/superpowers/plans/2026-07-27-whitelily-public-beta-03-onboarding-connection.md)     | Planned               | ChatGPT login flow, live model UI, read-only PCL2 discovery, LAN detection, and confirmation              |
-| [04 Profiles, memory, and safety](docs/superpowers/plans/2026-07-27-whitelily-public-beta-04-profiles-memory-safety.md) | Planned               | Editable companion profiles, scoped memory, world binding, and safety presets                             |
-| [05 Packaging and release](docs/superpowers/plans/2026-07-27-whitelily-public-beta-05-packaging-release.md)             | Planned               | Bilingual desktop product, diagnostics export, update notices, compatibility matrix, and native installer |
+| Stage                                                                                                                                                                                                 | Status                | Scope                                                                                                     |
+| ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------- | --------------------------------------------------------------------------------------------------------- |
+| [01 Core runtime](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/blob/main/docs/superpowers/plans/2026-07-27-whitelily-public-beta-01-core-runtime.md)                           | Implemented in v0.1.1 | Reusable runtime, single-task control, leases, budgets, connection lifecycle, and safety fences           |
+| [02 Desktop shell](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/blob/main/docs/superpowers/plans/2026-07-27-whitelily-public-beta-02-desktop-shell.md)                         | Planned               | Tauri control center, Sidecar protocol, tray, and native emergency stop                                   |
+| [03 Onboarding and connection](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/blob/main/docs/superpowers/plans/2026-07-27-whitelily-public-beta-03-onboarding-connection.md)     | Planned               | ChatGPT login flow, live model UI, read-only PCL2 discovery, LAN detection, and confirmation              |
+| [04 Profiles, memory, and safety](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/blob/main/docs/superpowers/plans/2026-07-27-whitelily-public-beta-04-profiles-memory-safety.md) | Planned               | Editable companion profiles, scoped memory, world binding, and safety presets                             |
+| [05 Packaging and release](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/blob/main/docs/superpowers/plans/2026-07-27-whitelily-public-beta-05-packaging-release.md)             | Planned               | Bilingual desktop product, diagnostics export, update notices, compatibility matrix, and native installer |
 
 The current release therefore has no desktop app, does not automatically discover PCL2 or LAN ports, has no model-selection UI, and has no one-click installer.
 
