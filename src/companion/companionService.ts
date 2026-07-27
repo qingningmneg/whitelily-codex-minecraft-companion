@@ -12,7 +12,7 @@ import { TurnToolBudget } from "../mcp/toolBudget.js";
 import type { MinecraftEvent, MinecraftPort } from "../minecraft/minecraftPort.js";
 import { ConfirmationStore } from "../safety/confirmationStore.js";
 import type { SafetyContext } from "../safety/safetyEngine.js";
-import { HARD_TASK_LIMITS, type TaskStopReason } from "../safety/taskBudget.js";
+import { HARD_TASK_LIMITS, type TaskLimits, type TaskStopReason } from "../safety/taskBudget.js";
 import {
   buildCompanionAutonomousTurn,
   buildCompanionRecoveryTurn,
@@ -78,7 +78,25 @@ function conciseGoal(goal: string): string {
 }
 
 function disclosureMessage(disclosure: TaskDisclosure): string {
-  return `任务披露：目标“${conciseGoal(disclosure.goal)}”；预计仅使用受限 Minecraft 操作；上限 ${disclosure.limits.maxToolCalls} 次工具调用、${Math.floor(disclosure.limits.maxDurationMs / 60_000)} 分钟；${disclosure.stopCondition}。`;
+  return [
+    `任务披露：目标“${conciseGoal(disclosure.goal)}”`,
+    `预计动作类别：${disclosure.expectedActions.join("、")}`,
+    `有效上限：工具调用 ${disclosure.limits.maxToolCalls} 次`,
+    `方块修改 ${disclosure.limits.maxBlockChanges} 次`,
+    `水平移动 ${disclosure.limits.maxHorizontalTravel} 格`,
+    `持续时间 ${disclosure.limits.maxDurationMs} 毫秒`,
+    `危险操作 ${disclosure.limits.maxDangerousOperations} 次`,
+    `停止条件：${disclosure.stopCondition}`,
+  ].join("；");
+}
+
+export function formatTaskDisclosureForMinecraft(disclosure: TaskDisclosure): string[] {
+  const firstPrefix = "任务披露：";
+  const continuationPrefix = "任务披露（续）：";
+  const body = disclosureMessage(disclosure).slice(firstPrefix.length);
+  return splitForMinecraft(body, 240 - continuationPrefix.length).map(
+    (chunk, index) => `${index === 0 ? firstPrefix : continuationPrefix}${chunk}`,
+  );
 }
 
 function memoryValidationSource(
@@ -118,6 +136,7 @@ export interface CompanionServiceDependencies {
   cwd: string;
   preferredModel: string;
   reasoningEffort: "low" | "medium";
+  requestedTaskLimits?: Partial<TaskLimits>;
   logger?: Pick<SafeLogger, "error">;
   setTimer?: (callback: () => void, milliseconds: number) => ReturnType<typeof setTimeout>;
   clearTimer?: (timer: ReturnType<typeof setTimeout>) => void;
@@ -143,11 +162,11 @@ interface ActiveTurn {
 
 const noOpLogger: Pick<SafeLogger, "error"> = { error: async () => undefined };
 
-function splitForMinecraft(reply: string): string[] {
+function splitForMinecraft(reply: string, maxLength = 240): string[] {
   const chunks: string[] = [];
   let chunk = "";
   for (const character of reply) {
-    if (chunk.length > 0 && chunk.length + character.length > 240) {
+    if (chunk.length > 0 && chunk.length + character.length > maxLength) {
       chunks.push(chunk);
       chunk = "";
     }
@@ -499,9 +518,16 @@ export class CompanionService {
     let taskStopReason: TaskStopReason = "failed";
     try {
       if (disclosure) {
-        task = this.dependencies.taskController.start(disclosure);
-        await this.say(disclosureMessage(task.disclosure));
+        const prepared = this.dependencies.taskController.prepare(
+          disclosure,
+          this.dependencies.requestedTaskLimits,
+        );
+        for (const chunk of formatTaskDisclosureForMinecraft(prepared)) {
+          if (!this.isCurrent(generation)) return undefined;
+          await this.dependencies.minecraft.say(chunk);
+        }
         if (!this.isCurrent(generation)) return undefined;
+        task = this.dependencies.taskController.start(prepared, prepared.limits);
       }
       for (let attempt = 0; attempt < 2; attempt += 1) {
         const result = await this.sendAttempt(

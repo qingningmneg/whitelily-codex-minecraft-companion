@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { MinecraftEvent } from "../../src/minecraft/minecraftPort.js";
+import type { TaskDisclosure } from "../../src/companion/taskController.js";
 import {
   createCompanionHarness,
   outcome,
@@ -10,7 +11,11 @@ const unavailable = "Codex 暂时不可用，我已安全暂停。你仍可以�
 const harnesses: Array<Awaited<ReturnType<typeof createCompanionHarness>>> = [];
 
 function withoutTaskDisclosures(messages: readonly string[]): string[] {
-  return messages.filter((message) => !message.startsWith("任务披露："));
+  return messages.filter((message) => !message.startsWith("任务披露"));
+}
+
+function reconstructTaskDisclosure(messages: readonly string[]): string {
+  return messages.map((message) => message.replace(/^任务披露(?:（续）)?：/u, "")).join("");
 }
 
 async function harness(options: CompanionHarnessOptions = {}) {
@@ -48,6 +53,127 @@ afterEach(async () => {
 });
 
 describe("CompanionService lifecycle", () => {
+  it("splits long Unicode disclosure labels into bounded command-safe chunks", async () => {
+    const companionModule =
+      (await import("../../src/companion/companionService.js")) as typeof import("../../src/companion/companionService.js") & {
+        formatTaskDisclosureForMinecraft?: (disclosure: TaskDisclosure) => string[];
+      };
+    expect(companionModule.formatTaskDisclosureForMinecraft).toBeTypeOf("function");
+    const firstAction = `观察${"😀".repeat(300)}`;
+    const secondAction = `/${"移动🌍".repeat(200)}`;
+    const chunks = companionModule.formatTaskDisclosureForMinecraft!({
+      goal: `整理${"🌸".repeat(300)}`,
+      expectedActions: [firstAction, secondAction],
+      limits: {
+        maxToolCalls: 5,
+        maxBlockChanges: 6,
+        maxHorizontalTravel: 7,
+        maxDurationMs: 8_000,
+        maxDangerousOperations: 1,
+      },
+      stopCondition: `主人停止或${"完成✅".repeat(100)}`,
+    });
+
+    const reconstructed = reconstructTaskDisclosure(chunks);
+    expect(reconstructed).toContain(firstAction);
+    expect(reconstructed).toContain(secondAction);
+    expect(chunks.every((chunk) => chunk.startsWith("任务披露"))).toBe(true);
+    expect(
+      chunks.every(
+        (chunk) =>
+          chunk.length <= 240 &&
+          Array.from(chunk).length <= 240 &&
+          !/[\uD800-\uDBFF]$/u.test(chunk) &&
+          !/^[\uDC00-\uDFFF]/u.test(chunk) &&
+          !chunk.startsWith("/"),
+      ),
+    ).toBe(true);
+  });
+
+  it("sends the complete goal, action categories, five effective limits, and stop condition before task authority or Codex", async () => {
+    const value = await harness({ deferredTurns: [0] });
+    await value.start();
+
+    await startPlayerTurn(value, "collect four oak logs");
+
+    const disclosure = reconstructTaskDisclosure(value.disclosureChatAtTaskStart[0] ?? []);
+    expect(disclosure).toContain("collect four oak logs");
+    for (const category of [
+      "get_state",
+      "find_block",
+      "say",
+      "move_to",
+      "follow_owner",
+      "look_at",
+      "jump",
+      "dig_block",
+      "place_block",
+      "craft_item",
+      "smelt_item",
+      "collect_dropped",
+      "equip_item",
+      "attack_hostile",
+      "wait",
+    ]) {
+      expect(disclosure).toContain(category);
+    }
+    expect(disclosure).toContain("工具调用 64");
+    expect(disclosure).toContain("方块修改 256");
+    expect(disclosure).toContain("水平移动 1024");
+    expect(disclosure).toContain("持续时间 600000");
+    expect(disclosure).toContain("危险操作 8");
+    expect(disclosure).toContain("完成、失败、中断、达到安全边界或预算耗尽时立即停止");
+    expect(value.codex.turns).toHaveLength(1);
+  });
+
+  it("discloses and acquires every requested lower limit", async () => {
+    const limits = {
+      maxToolCalls: 5,
+      maxBlockChanges: 6,
+      maxHorizontalTravel: 7,
+      maxDurationMs: 8_000,
+      maxDangerousOperations: 1,
+    };
+    const value = await harness({ deferredTurns: [0], requestedTaskLimits: limits });
+    await value.start();
+
+    await startPlayerTurn(value, "bounded task");
+
+    const disclosure = reconstructTaskDisclosure(value.disclosureChatAtTaskStart[0] ?? []);
+    expect(disclosure).toContain("工具调用 5");
+    expect(disclosure).toContain("方块修改 6");
+    expect(disclosure).toContain("水平移动 7");
+    expect(disclosure).toContain("持续时间 8000");
+    expect(disclosure).toContain("危险操作 1");
+    expect(value.taskController.current()?.disclosure.limits).toEqual(limits);
+  });
+
+  it("opens no task, Codex turn, or Minecraft action when disclosure delivery fails", async () => {
+    const value = await harness();
+    await value.start();
+    let disclosureAttempts = 0;
+    value.minecraft.say = async () => {
+      disclosureAttempts += 1;
+      throw new Error("disclosure transport failed");
+    };
+
+    value.minecraft.emit({
+      kind: "chat",
+      username: "TestOwner",
+      message: "must not gain authority",
+    });
+    await value.untilMergeTimer();
+    value.fireMergeTimers();
+    await vi.waitFor(() => expect(disclosureAttempts).toBeGreaterThan(0));
+    await value.untilTurnSettled();
+
+    expect(value.taskController.current()).toBeNull();
+    expect(value.taskAuditEvents).toEqual([]);
+    expect(value.codex.turns).toEqual([]);
+    expect(value.budgetEvents).toEqual([]);
+    expect(value.minecraft.calls).toEqual([]);
+  });
+
   it("discloses an owner task before Codex receives the same task lease as the tool budget", async () => {
     const value = await harness({ deferredTurns: [0] });
     await value.start();

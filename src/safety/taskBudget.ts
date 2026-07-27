@@ -62,6 +62,22 @@ export interface TaskBudgetSnapshot {
 
 export type TaskBudgetInvalidationListener = (reason: TaskStopReason) => void;
 
+export function effectiveTaskLimits(requested: Partial<TaskLimits> = {}): TaskLimits {
+  return {
+    maxToolCalls: clampLimit(requested.maxToolCalls, HARD_TASK_LIMITS.maxToolCalls),
+    maxBlockChanges: clampLimit(requested.maxBlockChanges, HARD_TASK_LIMITS.maxBlockChanges),
+    maxHorizontalTravel: clampLimit(
+      requested.maxHorizontalTravel,
+      HARD_TASK_LIMITS.maxHorizontalTravel,
+    ),
+    maxDurationMs: clampLimit(requested.maxDurationMs, HARD_TASK_LIMITS.maxDurationMs),
+    maxDangerousOperations: clampLimit(
+      requested.maxDangerousOperations,
+      HARD_TASK_LIMITS.maxDangerousOperations,
+    ),
+  };
+}
+
 export class TaskControllerBudget {
   private active = false;
   private stopReason: TaskStopReason | null = null;
@@ -87,19 +103,7 @@ export class TaskControllerBudget {
 
     this.active = true;
     this.stopReason = null;
-    this.limits = {
-      maxToolCalls: clampLimit(requested.maxToolCalls, HARD_TASK_LIMITS.maxToolCalls),
-      maxBlockChanges: clampLimit(requested.maxBlockChanges, HARD_TASK_LIMITS.maxBlockChanges),
-      maxHorizontalTravel: clampLimit(
-        requested.maxHorizontalTravel,
-        HARD_TASK_LIMITS.maxHorizontalTravel,
-      ),
-      maxDurationMs: clampLimit(requested.maxDurationMs, HARD_TASK_LIMITS.maxDurationMs),
-      maxDangerousOperations: clampLimit(
-        requested.maxDangerousOperations,
-        HARD_TASK_LIMITS.maxDangerousOperations,
-      ),
-    };
+    this.limits = effectiveTaskLimits(requested);
     this.toolCalls = 0;
     this.blockChanges = 0;
     this.horizontalTravel = 0;

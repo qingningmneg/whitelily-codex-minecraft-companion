@@ -6,7 +6,12 @@ import { CodexAppServerClient } from "./codex/appServerClient.js";
 import { selectModel } from "./codex/modelSelector.js";
 import { ChatRouter } from "./companion/chatRouter.js";
 import { CompanionService } from "./companion/companionService.js";
-import { TaskController } from "./companion/taskController.js";
+import {
+  TaskController,
+  type TaskAuditCallback,
+  type TaskAuditData,
+  type TaskAuditEvent,
+} from "./companion/taskController.js";
 import { loadConfig } from "./config/loadConfig.js";
 import type { AppConfig } from "./config/schema.js";
 import { SafeLogger } from "./logging/safeLogger.js";
@@ -86,6 +91,7 @@ export interface AppCompositionContext {
   mode: ModeManager;
   budget: TurnToolBudget;
   taskController: TaskController;
+  logger: Pick<SafeLogger, "info" | "error">;
 }
 
 export interface CreateAppOptions {
@@ -121,6 +127,67 @@ interface StartupAttempt {
 
 interface WhiteLilyLifecycleHooks {
   beforeStartupCleanup?(): void | Promise<void>;
+  beforeStopCleanup?(): void;
+  afterCleanup?(): void | Promise<void>;
+}
+
+class PersistentTaskAudit {
+  private tail: Promise<void> = Promise.resolve();
+
+  constructor(
+    private readonly logger: Pick<SafeLogger, "info" | "error">,
+    private readonly budget: TaskControllerBudget,
+  ) {}
+
+  readonly record: TaskAuditCallback = (event, data) => {
+    const fields = taskAuditFields(event, data, this.budget);
+    this.tail = this.tail
+      .catch(() => undefined)
+      .then(() => this.logger.info(event, fields))
+      .catch(() =>
+        Promise.resolve()
+          .then(() =>
+            this.logger.error("task_audit_write_failed", {
+              code: "audit_write_failed",
+            }),
+          )
+          .catch(() => undefined),
+      );
+  };
+
+  async flush(): Promise<void> {
+    let pending: Promise<void>;
+    do {
+      pending = this.tail;
+      await pending;
+    } while (pending !== this.tail);
+  }
+}
+
+function taskAuditFields(
+  event: TaskAuditEvent,
+  data: TaskAuditData,
+  budget: TaskControllerBudget,
+): Record<string, unknown> {
+  const snapshot = budget.snapshot();
+  return {
+    startedAt: data.task.startedAt,
+    expectedActionCategoryCount: data.task.disclosure.expectedActions.length,
+    limits: {
+      maxToolCalls: snapshot.limits.maxToolCalls,
+      maxBlockChanges: snapshot.limits.maxBlockChanges,
+      maxHorizontalTravel: snapshot.limits.maxHorizontalTravel,
+      maxDurationMs: snapshot.limits.maxDurationMs,
+      maxDangerousOperations: snapshot.limits.maxDangerousOperations,
+    },
+    counters: {
+      toolCalls: snapshot.toolCalls,
+      blockChanges: snapshot.blockChanges,
+      horizontalTravel: snapshot.horizontalTravel,
+      dangerousOperations: snapshot.dangerousOperations,
+    },
+    ...(event === "task_stopped" && "reason" in data ? { reason: data.reason } : {}),
+  };
 }
 
 function emptyAttempts(): AttemptedComponents {
@@ -215,7 +282,7 @@ class McpLifecycle implements ManagedMcp {
 }
 
 function createProductionRuntime(context: AppCompositionContext): AppRuntime {
-  const { config, paths, mode, budget, taskController } = context;
+  const { config, paths, mode, budget, taskController, logger } = context;
   const confirmations = new ConfirmationStore();
   const safety = new SafetyEngine(confirmations, config.safety);
   const minecraft = new MineflayerAdapter(config.minecraft);
@@ -228,7 +295,6 @@ function createProductionRuntime(context: AppCompositionContext): AppRuntime {
   );
   const memories = new MemoryStore(paths.memories);
   const state = new StateStore(paths.state);
-  const logger = new SafeLogger(paths.log);
   const codex = new CodexAppServerClient(config, {
     workspacePath: paths.codexWorkspace,
   });
@@ -382,6 +448,9 @@ class WhiteLilyAppLifecycle implements WhiteLilyApp {
         .then(() => this.#hooks.beforeStartupCleanup?.())
         .catch(() => undefined);
       await this.#queueCleanup(attempt).catch(() => undefined);
+      await Promise.resolve()
+        .then(() => this.#hooks.afterCleanup?.())
+        .catch(() => undefined);
       this.#state = "terminal";
       if (this.#attempt === attempt) this.#attempt = undefined;
       throw error;
@@ -390,6 +459,11 @@ class WhiteLilyAppLifecycle implements WhiteLilyApp {
 
   async #stopInternal(attempt: StartupAttempt | undefined): Promise<void> {
     let cleanupError: unknown;
+    try {
+      this.#hooks.beforeStopCleanup?.();
+    } catch {
+      // Task invalidation failures cannot block the remaining safety cleanup.
+    }
     if (attempt) {
       try {
         await this.#queueCleanup(attempt);
@@ -397,6 +471,9 @@ class WhiteLilyAppLifecycle implements WhiteLilyApp {
         cleanupError = error;
       }
     }
+    await Promise.resolve()
+      .then(() => this.#hooks.afterCleanup?.())
+      .catch(() => undefined);
     this.#stopCompleted = true;
     if (!this.#startPromise && this.#attempt === attempt) this.#attempt = undefined;
     if (cleanupError !== undefined) throw cleanupError;
@@ -433,6 +510,9 @@ class WhiteLilyAppLifecycle implements WhiteLilyApp {
     if (component === "mcp") {
       await this.#runtime.mcp.stop().catch(() => undefined);
     }
+    await Promise.resolve()
+      .then(() => this.#hooks.afterCleanup?.())
+      .catch(() => undefined);
   }
 
   async #cleanup(attempted: AttemptedComponents): Promise<void> {
@@ -524,13 +604,22 @@ async function composeApp(
   };
   await initializeStorage(paths);
   const taskBudget = new TaskControllerBudget();
-  const taskController = new TaskController(taskBudget, () => observers.taskChanged?.());
+  const logger = new SafeLogger(paths.log);
+  const taskAudit = new PersistentTaskAudit(logger, taskBudget);
+  const taskController = new TaskController(taskBudget, (event, data) => {
+    try {
+      observers.taskChanged?.();
+    } finally {
+      taskAudit.record(event, data);
+    }
+  });
   const context: AppCompositionContext = {
     config,
     paths,
     mode: new ModeManager(),
     budget: new TurnToolBudget(taskBudget),
     taskController,
+    logger,
   };
   const runtime = await (options.runtimeFactory ?? createProductionRuntime)(context);
   const lifecycleRuntime: AppRuntime = observers.modelSelected
@@ -555,6 +644,8 @@ async function composeApp(
             beforeStartupCleanup: () => taskController.stop("failed"),
           }
         : {}),
+      beforeStopCleanup: () => taskController.stop("process_exit"),
+      afterCleanup: () => taskAudit.flush(),
     }),
     runtime,
     taskBudget,

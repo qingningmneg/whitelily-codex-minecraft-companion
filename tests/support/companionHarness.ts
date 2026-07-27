@@ -17,7 +17,11 @@ import { createToolRegistry, type ToolResult } from "../../src/mcp/toolRegistry.
 import { FakeMinecraftPort } from "../../src/minecraft/fakeMinecraftPort.js";
 import { ConfirmationStore } from "../../src/safety/confirmationStore.js";
 import { SafetyEngine } from "../../src/safety/safetyEngine.js";
-import { TaskControllerBudget, type TaskLease } from "../../src/safety/taskBudget.js";
+import {
+  TaskControllerBudget,
+  type TaskLease,
+  type TaskLimits,
+} from "../../src/safety/taskBudget.js";
 
 interface Deferred<T> {
   promise: Promise<T>;
@@ -286,6 +290,7 @@ export interface CompanionHarnessOptions {
   activeMinecraftWait?: boolean;
   autonomyCanChat?: boolean;
   storageDirectory?: string;
+  requestedTaskLimits?: Partial<TaskLimits>;
 }
 
 class FakeAutonomyScheduler {
@@ -383,6 +388,7 @@ export async function createCompanionHarness(options: CompanionHarnessOptions = 
   if (options.persistedState) await StateStore.prototype.save.call(state, options.persistedState);
   const confirmations = new ConfirmationStore();
   const taskAuditEvents: string[] = [];
+  const disclosureChatAtTaskStart: string[][] = [];
   const taskTerminalReasons: string[] = [];
   const taskBudget = new TaskControllerBudget();
   let taskDeadlineCallback: (() => void) | undefined;
@@ -391,6 +397,7 @@ export async function createCompanionHarness(options: CompanionHarnessOptions = 
     taskBudget,
     (event, data) => {
       taskAuditEvents.push("reason" in data ? `${event}:${data.reason}` : event);
+      if (event === "task_started") disclosureChatAtTaskStart.push([...minecraft.chatLog]);
     },
     {
       onTerminal: (reason) => taskTerminalReasons.push(reason),
@@ -473,6 +480,7 @@ export async function createCompanionHarness(options: CompanionHarnessOptions = 
     cwd: directory,
     preferredModel: "gpt-5.6-terra",
     reasoningEffort: "low",
+    requestedTaskLimits: options.requestedTaskLimits,
     setTimer: (callback) => {
       const id = nextTimerId++;
       mergeTimers.set(id, callback);
@@ -481,6 +489,8 @@ export async function createCompanionHarness(options: CompanionHarnessOptions = 
     clearTimer: (timer) => {
       mergeTimers.delete(timer as unknown as number);
     },
+  } as ConstructorParameters<typeof CompanionService>[0] & {
+    requestedTaskLimits?: Partial<TaskLimits>;
   });
   const tools = createToolRegistry({
     minecraft,
@@ -505,6 +515,7 @@ export async function createCompanionHarness(options: CompanionHarnessOptions = 
     budget,
     taskController,
     taskAuditEvents,
+    disclosureChatAtTaskStart,
     taskTerminalReasons,
     budgetEvents,
     budgetLeases,

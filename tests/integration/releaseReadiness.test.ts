@@ -1,8 +1,9 @@
 import { access, readFile } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
-import type { ActiveTask } from "../../src/companion/taskController.js";
+import { formatTaskDisclosureForMinecraft } from "../../src/companion/companionService.js";
+import { TaskController, type ActiveTask } from "../../src/companion/taskController.js";
 import { RuntimeFacade } from "../../src/runtime/runtimeFacade.js";
-import type { TaskBudgetSnapshot } from "../../src/safety/taskBudget.js";
+import { TaskControllerBudget, type TaskBudgetSnapshot } from "../../src/safety/taskBudget.js";
 import {
   runPublicRepoPreparation,
   runReleaseJunctionRegressions,
@@ -55,9 +56,67 @@ describe("public release readiness", () => {
       "Explicit disconnect and partial setup teardown use the same physical transport close",
       "ActionExecutor performs SafetyEngine policy evaluation",
       "MCP registry does not depend directly on TaskController",
+      "authority-free `prepare()`",
+      "awaits every disclosure chunk before calling `TaskController.start()`",
+      "exactly one `task_stopped` record",
+      "flushes that queue before `stop()` resolves",
     ]) {
       expect(architecture).toContain(heading);
     }
+  });
+
+  it("keeps release disclosure values equal to the later acquired lower limits", () => {
+    const controller = new TaskController(
+      new TaskControllerBudget({
+        now: () => 1_700_000_000_000,
+        randomId: () => "release-task-lease",
+      }),
+    );
+    const requested = {
+      maxToolCalls: 5,
+      maxBlockChanges: 6,
+      maxHorizontalTravel: 7,
+      maxDurationMs: 8_000,
+      maxDangerousOperations: 1,
+    };
+    const prepared = controller.prepare(
+      {
+        goal: "collect safely",
+        expectedActions: ["get_state", "move_to", "dig_block"],
+        limits: {
+          maxToolCalls: 64,
+          maxBlockChanges: 256,
+          maxHorizontalTravel: 1_024,
+          maxDurationMs: 600_000,
+          maxDangerousOperations: 8,
+        },
+        stopCondition: "owner stops or work completes",
+      },
+      requested,
+    );
+    const chunks = formatTaskDisclosureForMinecraft(prepared);
+    const sent = chunks.map((chunk) => chunk.replace(/^任务披露(?:（续）)?：/u, "")).join("");
+
+    expect(controller.current()).toBeNull();
+    expect(sent).toContain("预计动作类别：get_state、move_to、dig_block");
+    expect(sent).toContain("工具调用 5");
+    expect(sent).toContain("方块修改 6");
+    expect(sent).toContain("水平移动 7");
+    expect(sent).toContain("持续时间 8000");
+    expect(sent).toContain("危险操作 1");
+    expect(sent).toContain("停止条件：owner stops or work completes");
+    expect(
+      chunks.every(
+        (chunk) =>
+          chunk.length <= 240 &&
+          !/[\uD800-\uDBFF]$/u.test(chunk) &&
+          !/^[\uDC00-\uDFFF]/u.test(chunk) &&
+          !chunk.startsWith("/"),
+      ),
+    ).toBe(true);
+
+    expect(controller.start(prepared, prepared.limits).disclosure.limits).toEqual(requested);
+    controller.stop("completed");
   });
 
   it("enforces the public disclosure and operational fail-closed behavior", async () => {

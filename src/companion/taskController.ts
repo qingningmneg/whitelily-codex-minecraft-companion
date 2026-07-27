@@ -1,4 +1,5 @@
 import {
+  effectiveTaskLimits,
   TaskControllerBudget,
   type TaskBudgetDecision,
   type TaskConsumption,
@@ -78,12 +79,20 @@ export class TaskController {
     this.budget.onInvalidated((reason) => this.finish(reason, true));
   }
 
+  prepare(disclosure: TaskDisclosure, requested?: Partial<TaskLimits>): TaskDisclosure {
+    const safeDisclosure = cloneAndValidateDisclosure(disclosure);
+    const safeRequested = cloneAndValidateRequestedLimits(requested);
+    return {
+      ...safeDisclosure,
+      limits: effectiveTaskLimits(safeRequested ?? safeDisclosure.limits),
+    };
+  }
+
   start(disclosure: TaskDisclosure, requested?: Partial<TaskLimits>): ActiveTask {
     this.reconcileBudget();
     if (this.activeTask) throw new Error("a task is already active");
-    const safeDisclosure = cloneAndValidateDisclosure(disclosure);
-    const safeRequested = cloneAndValidateRequestedLimits(requested);
-    const lease = this.budget.begin(safeRequested ?? safeDisclosure.limits);
+    const safeDisclosure = this.prepare(disclosure, requested);
+    const lease = this.budget.begin(safeDisclosure.limits);
     try {
       if (lease.id.trim().length === 0) throw new Error("task lease id is invalid");
       const startedAt = new Date(lease.startedAt);

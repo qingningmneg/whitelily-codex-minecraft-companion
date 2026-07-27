@@ -1,4 +1,4 @@
-import { access, mkdir, readFile, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { pathToFileURL } from "node:url";
@@ -478,6 +478,211 @@ describe("WhiteLilyApp composition", () => {
     expect(harness.identities.companionMode).toBe(harness.composition.mode);
     expect(harness.identities.mcpBudget).toBe(harness.composition.budget);
     expect(harness.identities.companionBudget).toBe(harness.composition.budget);
+  });
+
+  it("persists sanitized task start and completed audit records through legacy createApp", async () => {
+    const harness = await createAppHarness();
+    cleanups.push(harness.cleanup);
+    await harness.app.start();
+    const rawGoal =
+      "Use password=hunter2 from D:\\PrivateRoot\\AuditOwner\\private\\task.txt for TestOwner";
+    const active = harness.composition.taskController.start(
+      {
+        goal: rawGoal,
+        expectedActions: ["get_state", "move_to", "dig_block"],
+        limits: {
+          maxToolCalls: 5,
+          maxBlockChanges: 6,
+          maxHorizontalTravel: 7,
+          maxDurationMs: 8_000,
+          maxDangerousOperations: 1,
+        },
+        stopCondition: "finish safely",
+      },
+      {
+        maxToolCalls: 5,
+        maxBlockChanges: 6,
+        maxHorizontalTravel: 7,
+        maxDurationMs: 8_000,
+        maxDangerousOperations: 1,
+      },
+    );
+    expect(
+      harness.composition.taskController.consume({
+        leaseId: active.lease.id,
+        kind: "get_state",
+        now: active.lease.startedAt + 1,
+      }).ok,
+    ).toBe(true);
+
+    harness.composition.taskController.stop("completed");
+    await harness.app.stop();
+
+    const output = (await harness.readData()).log;
+    const records = output
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    expect(records.map((record) => record.event)).toEqual(["task_started", "task_stopped"]);
+    expect(records[0]).toMatchObject({
+      limits: {
+        maxToolCalls: 5,
+        maxBlockChanges: 6,
+        maxHorizontalTravel: 7,
+        maxDurationMs: 8_000,
+        maxDangerousOperations: 1,
+      },
+      counters: {
+        toolCalls: 0,
+        blockChanges: 0,
+        horizontalTravel: 0,
+        dangerousOperations: 0,
+      },
+      expectedActionCategoryCount: 3,
+    });
+    expect(records[1]).toMatchObject({
+      reason: "completed",
+      counters: {
+        toolCalls: 1,
+        blockChanges: 0,
+        horizontalTravel: 0,
+        dangerousOperations: 0,
+      },
+    });
+    for (const sensitive of [
+      active.id,
+      active.lease.id,
+      rawGoal,
+      "hunter2",
+      "PrivateRoot",
+      "AuditOwner",
+      "private",
+      "task.txt",
+      "TestOwner",
+    ]) {
+      expect(output).not.toContain(sensitive);
+    }
+  });
+
+  it("flushes the process_exit task audit before legacy app.stop resolves", async () => {
+    const harness = await createAppHarness();
+    cleanups.push(harness.cleanup);
+    await harness.app.start();
+    harness.composition.taskController.start({
+      goal: "keep this raw goal private",
+      expectedActions: ["wait"],
+      limits: {
+        maxToolCalls: 1,
+        maxBlockChanges: 0,
+        maxHorizontalTravel: 0,
+        maxDurationMs: 1_000,
+        maxDangerousOperations: 0,
+      },
+      stopCondition: "process exits",
+    });
+
+    await harness.app.stop();
+
+    const records = (await harness.readData()).log
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    expect(records.map((record) => [record.event, record.reason ?? null])).toEqual([
+      ["task_started", null],
+      ["task_stopped", "process_exit"],
+    ]);
+  });
+
+  it.each([
+    "completed",
+    "failed",
+    "timeout",
+    "budget_exhausted",
+    "owner_stop",
+    "emergency_stop",
+    "disconnect",
+    "world_changed",
+    "model_unavailable",
+    "process_exit",
+  ] as const)("persists exactly one start and one %s terminal audit", async (reason) => {
+    const harness = await createAppHarness();
+    cleanups.push(harness.cleanup);
+    await harness.app.start();
+    harness.composition.taskController.start({
+      goal: "private lifecycle goal",
+      expectedActions: ["wait"],
+      limits: {
+        maxToolCalls: 1,
+        maxBlockChanges: 0,
+        maxHorizontalTravel: 0,
+        maxDurationMs: 1_000,
+        maxDangerousOperations: 0,
+      },
+      stopCondition: "terminal transition",
+    });
+    if (reason !== "process_exit") harness.composition.taskController.stop(reason);
+
+    await harness.app.stop();
+
+    const records = (await harness.readData()).log
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    expect(records.map((record) => [record.event, record.reason ?? null])).toEqual([
+      ["task_started", null],
+      ["task_stopped", reason],
+    ]);
+  });
+
+  it("keeps process-exit revocation and cleanup fail-closed when every audit write throws", async () => {
+    const harness = await createAppHarness();
+    cleanups.push(harness.cleanup);
+    await harness.app.start();
+    const logPath = join(harness.directory, "logs", "companion.log");
+    await rm(logPath);
+    await mkdir(logPath);
+    const unhandled: unknown[] = [];
+    const onUnhandled = (error: unknown) => unhandled.push(error);
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      const active = harness.composition.taskController.start({
+        goal: "password=hunter2 D:\\PrivateRoot\\PrivateOwner\\secret.txt",
+        expectedActions: ["wait"],
+        limits: {
+          maxToolCalls: 1,
+          maxBlockChanges: 0,
+          maxHorizontalTravel: 0,
+          maxDurationMs: 1_000,
+          maxDangerousOperations: 0,
+        },
+        stopCondition: "process exits",
+      });
+
+      await expect(harness.app.stop()).resolves.toBeUndefined();
+
+      expect(harness.composition.taskController.current()).toBeNull();
+      expect(
+        harness.composition.taskController.consume({
+          leaseId: active.lease.id,
+          kind: "wait",
+          now: active.lease.startedAt + 1,
+        }),
+      ).toEqual({ ok: false, reason: "task lease is invalid" });
+      expect(harness.events.slice(-5)).toEqual([
+        "companion:stop",
+        "actions:stop",
+        "minecraft:disconnect",
+        "codex:stop",
+        "mcp:stop",
+      ]);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
   });
 
   it("returns only the public start/stop surface without reflective runtime state", async () => {
