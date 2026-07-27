@@ -13,6 +13,11 @@ interface StoredConfirmation extends PendingConfirmation {
   reservedHorizontalTravel?: number;
 }
 
+export interface GameConfirmationExpiry {
+  taskLease: TaskLease;
+  expiresAt: Date;
+}
+
 function cloneOperation(operation: ConfirmableOperation): ConfirmableOperation {
   return structuredClone(operation);
 }
@@ -29,6 +34,8 @@ function cloneConfirmation(confirmation: StoredConfirmation): PendingConfirmatio
 export class ConfirmationStore {
   private nextId = 1;
   private readonly pending = new Map<number, StoredConfirmation>();
+  private readonly gameActionChangedListeners = new Set<() => void>();
+  private readonly gameActionExpiredListeners = new Set<(taskLease: TaskLease) => void>();
 
   constructor(private readonly now: () => Date = () => new Date()) {}
 
@@ -55,12 +62,14 @@ export class ConfirmationStore {
     if (!Number.isFinite(reservedHorizontalTravel) || reservedHorizontalTravel < 0) {
       throw new Error("reserved horizontal travel is invalid");
     }
-    return this.createStored(
+    const created = this.createStored(
       reason,
       { kind: "game_action", action },
       { ...taskLease },
       reservedHorizontalTravel,
     );
+    this.notifyGameActionsChanged();
+    return created;
   }
 
   private createStored(
@@ -70,7 +79,7 @@ export class ConfirmationStore {
     reservedHorizontalTravel?: number,
   ): PendingConfirmation {
     const now = this.now();
-    this.removeExpired(now);
+    this.removeExpiredLocalConfirmations(now);
     if (!Number.isSafeInteger(this.nextId) || this.nextId >= Number.MAX_SAFE_INTEGER) {
       throw new Error("Confirmation ID space exhausted");
     }
@@ -90,7 +99,7 @@ export class ConfirmationStore {
     const item = this.pending.get(id);
     if (!item) return undefined;
     if (item.expiresAt <= this.now()) {
-      this.pending.delete(id);
+      this.deleteExpired(id, item);
       return undefined;
     }
     return cloneConfirmation(item);
@@ -104,7 +113,7 @@ export class ConfirmationStore {
     const item = this.pending.get(id);
     if (!item) return { ok: false, reason: "missing" };
     if (item.expiresAt <= this.now()) {
-      this.pending.delete(id);
+      this.deleteExpired(id, item);
       return { ok: false, reason: "expired" };
     }
     if (item.operation.kind === "game_action") {
@@ -123,7 +132,7 @@ export class ConfirmationStore {
     const item = this.pending.get(id);
     if (!item) return { ok: false, reason: "missing" };
     if (item.expiresAt <= this.now()) {
-      this.pending.delete(id);
+      this.deleteExpired(id, item);
       return { ok: false, reason: "expired" };
     }
     if (item.operation.kind !== "game_action") return { ok: false, reason: "wrong_operation" };
@@ -131,6 +140,7 @@ export class ConfirmationStore {
       return { ok: false, reason: "wrong_task" };
     }
     this.pending.delete(id);
+    this.notifyGameActionsChanged();
     return {
       ok: true,
       action: structuredClone(item.operation.action),
@@ -147,7 +157,7 @@ export class ConfirmationStore {
     const item = this.pending.get(id);
     if (!item) return { ok: false, reason: "missing" };
     if (item.expiresAt <= this.now()) {
-      this.pending.delete(id);
+      this.deleteExpired(id, item);
       return { ok: false, reason: "expired" };
     }
     if (item.operation.kind !== "game_action") return { ok: false, reason: "wrong_operation" };
@@ -165,7 +175,7 @@ export class ConfirmationStore {
     const item = this.pending.get(id);
     if (!item) return false;
     if (item.expiresAt <= this.now()) {
-      this.pending.delete(id);
+      this.deleteExpired(id, item);
       return false;
     }
     if (item.operation.kind === "game_action") return false;
@@ -181,7 +191,7 @@ export class ConfirmationStore {
     const item = this.pending.get(id);
     if (!item) return { ok: false, reason: "missing" };
     if (item.expiresAt <= this.now()) {
-      this.pending.delete(id);
+      this.deleteExpired(id, item);
       return { ok: false, reason: "expired" };
     }
     if (item.operation.kind !== "game_action") return { ok: false, reason: "wrong_operation" };
@@ -189,21 +199,28 @@ export class ConfirmationStore {
       return { ok: false, reason: "wrong_task" };
     }
     this.pending.delete(id);
+    this.notifyGameActionsChanged();
     return { ok: true };
   }
 
   clear(): void {
+    const hadGameActions = this.hasStoredGameActions();
     this.pending.clear();
+    if (hadGameActions) this.notifyGameActionsChanged();
   }
 
   clearGameActions(): void {
+    let changed = false;
     for (const [id, item] of this.pending) {
-      if (item.operation.kind === "game_action") this.pending.delete(id);
+      if (item.operation.kind === "game_action") {
+        this.pending.delete(id);
+        changed = true;
+      }
     }
+    if (changed) this.notifyGameActionsChanged();
   }
 
   hasGameActions(taskLease: TaskLease): boolean {
-    this.removeExpired(this.now());
     for (const item of this.pending.values()) {
       if (
         item.operation.kind === "game_action" &&
@@ -216,9 +233,95 @@ export class ConfirmationStore {
     return false;
   }
 
-  private removeExpired(now: Date): void {
+  onGameActionsChanged(listener: () => void): () => void {
+    this.gameActionChangedListeners.add(listener);
+    return () => this.gameActionChangedListeners.delete(listener);
+  }
+
+  onGameActionsExpired(listener: (taskLease: TaskLease) => void): () => void {
+    this.gameActionExpiredListeners.add(listener);
+    return () => this.gameActionExpiredListeners.delete(listener);
+  }
+
+  nextGameActionExpiry(): GameConfirmationExpiry | undefined {
+    let next: StoredConfirmation | undefined;
+    for (const item of this.pending.values()) {
+      if (
+        item.operation.kind === "game_action" &&
+        item.taskLease &&
+        (next === undefined || item.expiresAt < next.expiresAt)
+      ) {
+        next = item;
+      }
+    }
+    if (!next?.taskLease) return undefined;
+    return {
+      taskLease: { ...next.taskLease },
+      expiresAt: new Date(next.expiresAt),
+    };
+  }
+
+  expireGameActions(taskLease: TaskLease): number {
+    const now = this.now();
+    let expired = 0;
     for (const [id, item] of this.pending) {
-      if (item.expiresAt <= now) this.pending.delete(id);
+      if (
+        item.operation.kind === "game_action" &&
+        item.taskLease &&
+        sameTaskLease(item.taskLease, taskLease) &&
+        item.expiresAt <= now
+      ) {
+        this.pending.delete(id);
+        expired += 1;
+      }
+    }
+    if (expired > 0) {
+      this.notifyGameActionsExpired(taskLease);
+      this.notifyGameActionsChanged();
+    }
+    return expired;
+  }
+
+  private deleteExpired(id: number, item: StoredConfirmation): void {
+    this.pending.delete(id);
+    if (item.operation.kind === "game_action" && item.taskLease) {
+      this.notifyGameActionsExpired(item.taskLease);
+      this.notifyGameActionsChanged();
+    }
+  }
+
+  private removeExpiredLocalConfirmations(now: Date): void {
+    for (const [id, item] of this.pending) {
+      if (item.operation.kind !== "game_action" && item.expiresAt <= now) {
+        this.pending.delete(id);
+      }
+    }
+  }
+
+  private hasStoredGameActions(): boolean {
+    for (const item of this.pending.values()) {
+      if (item.operation.kind === "game_action") return true;
+    }
+    return false;
+  }
+
+  private notifyGameActionsChanged(): void {
+    for (const listener of this.gameActionChangedListeners) {
+      try {
+        listener();
+      } catch {
+        // Confirmation lifecycle observers cannot veto a fail-closed store mutation.
+      }
+    }
+  }
+
+  private notifyGameActionsExpired(taskLease: TaskLease): void {
+    for (const listener of this.gameActionExpiredListeners) {
+      try {
+        listener({ ...taskLease });
+      } catch {
+        // Confirmation lifecycle observers cannot veto a fail-closed store mutation.
+      }
     }
   }
 }

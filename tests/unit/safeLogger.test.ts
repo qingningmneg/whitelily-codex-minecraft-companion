@@ -147,6 +147,7 @@ describe("SafeLogger", () => {
   it("fully redacts token68 and URI userinfo credential forms", async () => {
     const path = await logPath();
     await new SafeLogger(path).info("credentials_seen", {
+      bearerShort: "Authorization: Bearer abc+def==",
       bearerPlus: "Bearer abcdefghijklmnop+private==",
       bearerSlash: "authorization: bearer abcdefghijklmnop/private=",
       firstEndpoint: "https://opaque-access-token@example.invalid/world",
@@ -157,6 +158,7 @@ describe("SafeLogger", () => {
     const output = await readFile(path, "utf8");
     expect(() => JSON.parse(output)).not.toThrow();
     for (const sensitive of [
+      "abc+def==",
       "+private==",
       "/private=",
       "opaque-access-token",

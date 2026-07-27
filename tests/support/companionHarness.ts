@@ -291,6 +291,9 @@ export interface CompanionHarnessOptions {
   autonomyCanChat?: boolean;
   storageDirectory?: string;
   requestedTaskLimits?: Partial<TaskLimits>;
+  manualConfirmationTimers?: boolean;
+  confirmationTimerSetThrows?: boolean;
+  confirmationTimerClearThrows?: boolean;
 }
 
 class FakeAutonomyScheduler {
@@ -444,6 +447,11 @@ export async function createCompanionHarness(options: CompanionHarnessOptions = 
   let activeWaitAbort: AbortSignal | undefined;
   let nextTimerId = 1;
   const mergeTimers = new Map<number, () => void>();
+  let nextConfirmationTimerId = 10_000;
+  const confirmationTimers = new Map<
+    number,
+    { callback: () => void; milliseconds: number; cleared: boolean }
+  >();
   if (options.activeMinecraftWait) {
     minecraft.wait = async (_milliseconds, signal) => {
       activeWaitAbort = signal;
@@ -494,6 +502,26 @@ export async function createCompanionHarness(options: CompanionHarnessOptions = 
     clearTimer: (timer) => {
       mergeTimers.delete(timer as unknown as number);
     },
+    ...(options.manualConfirmationTimers
+      ? {
+          confirmationNow: () => new Date(),
+          setConfirmationTimer: (callback: () => void, milliseconds: number) => {
+            if (options.confirmationTimerSetThrows) {
+              throw new Error("confirmation timer set failed");
+            }
+            const id = nextConfirmationTimerId++;
+            confirmationTimers.set(id, { callback, milliseconds, cleared: false });
+            return id as unknown as ReturnType<typeof setTimeout>;
+          },
+          clearConfirmationTimer: (timer: ReturnType<typeof setTimeout>) => {
+            if (options.confirmationTimerClearThrows) {
+              throw new Error("confirmation timer clear failed");
+            }
+            const record = confirmationTimers.get(timer as unknown as number);
+            if (record) record.cleared = true;
+          },
+        }
+      : {}),
   } as ConstructorParameters<typeof CompanionService>[0] & {
     requestedTaskLimits?: Partial<TaskLimits>;
   });
@@ -599,6 +627,20 @@ export async function createCompanionHarness(options: CompanionHarnessOptions = 
       if (!callback) throw new Error("no task deadline is pending");
       taskDeadlineCallback = undefined;
       callback();
+    },
+    confirmationTimerRecords: () =>
+      [...confirmationTimers.entries()].map(([id, record]) => ({
+        id,
+        milliseconds: record.milliseconds,
+        cleared: record.cleared,
+      })),
+    fireConfirmationTimer: (id: number, includeCleared = false) => {
+      const record = confirmationTimers.get(id);
+      if (!record || (record.cleared && !includeCleared)) {
+        throw new Error("no matching confirmation timer is pending");
+      }
+      record.cleared = true;
+      record.callback();
     },
     untilTurnSettled: async () => {
       await waitForCondition(() => !service.isBusyForAutonomy(), "companion turn work to settle");

@@ -12,7 +12,12 @@ import { TurnToolBudget } from "../mcp/toolBudget.js";
 import type { MinecraftEvent, MinecraftPort } from "../minecraft/minecraftPort.js";
 import { ConfirmationStore } from "../safety/confirmationStore.js";
 import type { SafetyContext } from "../safety/safetyEngine.js";
-import { HARD_TASK_LIMITS, type TaskLimits, type TaskStopReason } from "../safety/taskBudget.js";
+import {
+  HARD_TASK_LIMITS,
+  type TaskLease,
+  type TaskLimits,
+  type TaskStopReason,
+} from "../safety/taskBudget.js";
 import {
   buildCompanionAutonomousTurn,
   buildCompanionRecoveryTurn,
@@ -140,6 +145,12 @@ export interface CompanionServiceDependencies {
   logger?: Pick<SafeLogger, "error">;
   setTimer?: (callback: () => void, milliseconds: number) => ReturnType<typeof setTimeout>;
   clearTimer?: (timer: ReturnType<typeof setTimeout>) => void;
+  confirmationNow?: () => Date;
+  setConfirmationTimer?: (
+    callback: () => void,
+    milliseconds: number,
+  ) => ReturnType<typeof setTimeout>;
+  clearConfirmationTimer?: (timer: ReturnType<typeof setTimeout>) => void;
 }
 
 export interface CompanionAutonomyScheduler {
@@ -185,6 +196,14 @@ function compactTask(outcome: CompanionTurnOutcome): string | null {
   });
 }
 
+function taskLeaseKey(taskLease: TaskLease): string {
+  return `${taskLease.id}\u0000${taskLease.startedAt}`;
+}
+
+function sameTaskLease(first: TaskLease, second: TaskLease): boolean {
+  return first.id === second.id && first.startedAt === second.startedAt;
+}
+
 export class CompanionService {
   private readonly logger: Pick<SafeLogger, "error">;
   private readonly setTimer: (
@@ -192,9 +211,16 @@ export class CompanionService {
     milliseconds: number,
   ) => ReturnType<typeof setTimeout>;
   private readonly clearTimer: (timer: ReturnType<typeof setTimeout>) => void;
+  private readonly confirmationNow: () => Date;
+  private readonly setConfirmationTimer: (
+    callback: () => void,
+    milliseconds: number,
+  ) => ReturnType<typeof setTimeout>;
+  private readonly clearConfirmationTimer: (timer: ReturnType<typeof setTimeout>) => void;
   private unsubscribe: (() => void) | undefined;
   private unsubscribeActionResult: (() => void) | undefined;
   private mergeTimer: ReturnType<typeof setTimeout> | undefined;
+  private confirmationExpiryTimer: ReturnType<typeof setTimeout> | undefined;
   private mergedMessages: string[] = [];
   private generation = 0;
   private running = false;
@@ -212,13 +238,21 @@ export class CompanionService {
   private autonomousRequestCount = 0;
   private externallyManagedCodex = false;
   private worldInvalidated = false;
+  private readonly pendingConfirmationTerminalReasons = new Map<string, "failed" | "owner_stop">();
 
   constructor(private readonly dependencies: CompanionServiceDependencies) {
     this.logger = dependencies.logger ?? noOpLogger;
     this.setTimer = dependencies.setTimer ?? setTimeout;
     this.clearTimer = dependencies.clearTimer ?? clearTimeout;
+    this.confirmationNow = dependencies.confirmationNow ?? (() => new Date());
+    this.setConfirmationTimer = dependencies.setConfirmationTimer ?? setTimeout;
+    this.clearConfirmationTimer = dependencies.clearConfirmationTimer ?? clearTimeout;
     dependencies.taskController.onTerminal((reason, forceCleanup) =>
       this.handleTaskTerminal(reason, forceCleanup),
+    );
+    dependencies.confirmations.onGameActionsChanged(() => this.scheduleConfirmationExpiry());
+    dependencies.confirmations.onGameActionsExpired((taskLease) =>
+      this.queueFailedConfirmation(taskLease),
     );
   }
 
@@ -263,6 +297,7 @@ export class CompanionService {
       if (generation !== this.generation) return;
       this.codexHealthy = this.unfinishedTaskSummary === null;
       this.running = true;
+      this.scheduleConfirmationExpiry();
       this.unsubscribeActionResult = this.dependencies.executor.onResult((result) => {
         if (!this.running || result.status !== "failed") return;
         try {
@@ -299,6 +334,7 @@ export class CompanionService {
     if (!this.running && !this.starting) return;
     this.running = false;
     this.generation += 1;
+    this.clearConfirmationExpiry();
     this.dependencies.autonomy.stop();
     this.unsubscribeActionResult?.();
     this.unsubscribeActionResult = undefined;
@@ -927,6 +963,73 @@ export class CompanionService {
     return queued;
   }
 
+  private scheduleConfirmationExpiry(): void {
+    this.clearConfirmationExpiry();
+    if (!this.running) return;
+    const next = this.dependencies.confirmations.nextGameActionExpiry();
+    if (!next) return;
+    const delay = Math.max(0, next.expiresAt.getTime() - this.confirmationNow().getTime());
+    const taskLease = { ...next.taskLease };
+    let timer!: ReturnType<typeof setTimeout>;
+    try {
+      timer = this.setConfirmationTimer(() => {
+        if (this.confirmationExpiryTimer !== timer) return;
+        this.confirmationExpiryTimer = undefined;
+        if (!this.running) return;
+        const current = this.dependencies.taskController.current();
+        if (!current || !sameTaskLease(current.lease, taskLease)) {
+          this.scheduleConfirmationExpiry();
+          return;
+        }
+        const expired = this.dependencies.confirmations.expireGameActions(taskLease);
+        if (expired === 0) this.scheduleConfirmationExpiry();
+      }, delay);
+    } catch (error) {
+      this.failConfirmationTimer(taskLease, error);
+      return;
+    }
+    this.confirmationExpiryTimer = timer;
+    (timer as ReturnType<typeof setTimeout> & { unref?: () => void }).unref?.();
+  }
+
+  private clearConfirmationExpiry(): void {
+    const timer = this.confirmationExpiryTimer;
+    this.confirmationExpiryTimer = undefined;
+    if (timer === undefined) return;
+    try {
+      this.clearConfirmationTimer(timer);
+    } catch (error) {
+      this.logConfirmationSafetyError("confirmation_expiry_timer_clear_failed", error);
+    }
+  }
+
+  private failConfirmationTimer(taskLease: TaskLease, error: unknown): void {
+    this.dependencies.confirmations.clearGameActions();
+    this.queueFailedConfirmation(taskLease);
+    this.logConfirmationSafetyError("confirmation_expiry_timer_set_failed", error);
+  }
+
+  private queueFailedConfirmation(taskLease: TaskLease): void {
+    if (!this.running) return;
+    const safeLease = { ...taskLease };
+    const key = taskLeaseKey(safeLease);
+    this.pendingConfirmationTerminalReasons.set(key, "failed");
+    void this.serializeConfirmation(async () => {
+      if (!this.pendingConfirmationTerminalReasons.has(key)) return;
+      await this.settleConfirmationTask(safeLease, "failed");
+    }).catch((error: unknown) => {
+      this.logConfirmationSafetyError("confirmation_expiry_settlement_failed", error);
+    });
+  }
+
+  private logConfirmationSafetyError(event: string, error: unknown): void {
+    try {
+      void this.logger.error(event, { code: String(error) }).catch(() => undefined);
+    } catch {
+      // Timer safety must not depend on diagnostic observers.
+    }
+  }
+
   private async allow(id: number): Promise<void> {
     const task = this.dependencies.taskController.current();
     const inspected = task
@@ -968,22 +1071,16 @@ export class CompanionService {
         task.lease,
         additionalHorizontalTravel,
       );
-      if (this.dependencies.taskController.isLeaseLive(task.lease)) {
-        if (result.status !== "completed") {
-          this.dependencies.taskController.stop("failed");
-        } else if (!this.dependencies.confirmations.hasGameActions(task.lease)) {
-          this.dependencies.taskController.stop("completed");
-        }
-      }
+      await this.settleConfirmationTask(
+        task.lease,
+        result.status === "completed" ? "completed" : "failed",
+      );
       await this.say(result.status === "completed" ? "已执行确认动作。" : "确认动作未能执行。");
       return;
     }
     if (task && inspected && !inspected.ok) {
-      if (
-        inspected.reason === "expired" &&
-        this.dependencies.taskController.isLeaseLive(task.lease)
-      ) {
-        this.dependencies.taskController.stop("failed");
+      if (inspected.reason === "expired") {
+        await this.settleConfirmationTask(task.lease, "failed");
       }
       if (inspected.reason === "expired" || inspected.reason === "wrong_task") {
         await this.say("确认不存在或已过期。");
@@ -1009,17 +1106,12 @@ export class CompanionService {
     if (task) {
       const denied = this.dependencies.confirmations.denyGameAction(id, task.lease);
       if (denied.ok) {
-        if (
-          this.dependencies.taskController.isLeaseLive(task.lease) &&
-          !this.dependencies.confirmations.hasGameActions(task.lease)
-        ) {
-          this.dependencies.taskController.stop("owner_stop");
-        }
+        await this.settleConfirmationTask(task.lease, "owner_stop");
         await this.say("已取消确认。");
         return;
       }
-      if (denied.reason === "expired" && this.dependencies.taskController.isLeaseLive(task.lease)) {
-        this.dependencies.taskController.stop("failed");
+      if (denied.reason === "expired") {
+        await this.settleConfirmationTask(task.lease, "failed");
       }
       if (denied.reason === "expired" || denied.reason === "wrong_task") {
         await this.say("已取消确认。");
@@ -1028,6 +1120,43 @@ export class CompanionService {
     }
     this.dependencies.confirmations.deny(id);
     await this.say("已取消确认。");
+  }
+
+  private async settleConfirmationTask(
+    taskLease: TaskLease,
+    reason: "completed" | "failed" | "owner_stop",
+  ): Promise<boolean> {
+    this.dependencies.confirmations.expireGameActions(taskLease);
+    const key = taskLeaseKey(taskLease);
+    const pendingReason = this.pendingConfirmationTerminalReasons.get(key);
+    if (reason === "failed" || (reason === "owner_stop" && pendingReason !== "failed")) {
+      this.pendingConfirmationTerminalReasons.set(key, reason);
+    }
+    if (this.dependencies.confirmations.hasGameActions(taskLease)) return false;
+    if (!this.dependencies.taskController.isLeaseLive(taskLease)) {
+      this.pendingConfirmationTerminalReasons.delete(key);
+      return false;
+    }
+    const terminalReason = this.pendingConfirmationTerminalReasons.get(key) ?? reason;
+    this.dependencies.taskController.stop(terminalReason);
+    this.invalidateCurrentTurn();
+    try {
+      this.dependencies.executor.stopAll();
+    } catch (error) {
+      this.logConfirmationSafetyError("confirmation_settlement_executor_stop_failed", error);
+    }
+    if (terminalReason === "completed") this.dependencies.mode.completeTask();
+    else this.dependencies.mode.stop();
+    this.unfinishedTaskSummary = null;
+    await this.persist();
+    if (terminalReason === "completed") {
+      try {
+        this.dependencies.autonomy.notifyGoalCompleted();
+      } catch (error) {
+        await this.logger.error("autonomy_goal_notification_failed", { code: String(error) });
+      }
+    }
+    return true;
   }
 
   private interruptActive(): void {
@@ -1043,6 +1172,7 @@ export class CompanionService {
   }
 
   private handleTaskTerminal(reason: TaskStopReason, forceCleanup = false): void {
+    this.pendingConfirmationTerminalReasons.clear();
     try {
       this.dependencies.confirmations.clearGameActions();
     } catch (error) {

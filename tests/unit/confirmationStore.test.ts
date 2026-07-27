@@ -80,6 +80,63 @@ describe("ConfirmationStore", () => {
     expect(store.allow(memory.id)).toEqual({ ok: true, operation: { kind: "memory_clear" } });
   });
 
+  it("isolates game confirmation lifecycle operations from failing observers", () => {
+    let now = new Date("2026-07-25T00:00:00Z");
+    const store = new ConfirmationStore(() => now);
+    const changedEvents: string[] = [];
+    const expiredEvents: TaskLease[] = [];
+    store.onGameActionsChanged(() => {
+      throw new Error("changed observer failed");
+    });
+    store.onGameActionsChanged(() => changedEvents.push("changed"));
+    store.onGameActionsExpired(() => {
+      throw new Error("expiry observer failed");
+    });
+    store.onGameActionsExpired((lease) => expiredEvents.push(lease));
+
+    const allowed = store.createGameAction("allow", { kind: "wait", milliseconds: 1 }, taskLease);
+    expect(store.allowGameAction(allowed.id, taskLease)).toEqual({
+      ok: true,
+      action: { kind: "wait", milliseconds: 1 },
+      reservedHorizontalTravel: 0,
+    });
+
+    store.createGameAction("clear", { kind: "wait", milliseconds: 1 }, taskLease);
+    expect(() => store.clearGameActions()).not.toThrow();
+
+    const expired = store.createGameAction("expire", { kind: "wait", milliseconds: 1 }, taskLease);
+    now = new Date("2026-07-25T00:02:00Z");
+    expect(() => store.get(expired.id)).not.toThrow();
+    expect(store.get(expired.id)).toBeUndefined();
+    expect(changedEvents).toHaveLength(6);
+    expect(expiredEvents).toEqual([taskLease]);
+  });
+
+  it("expires only confirmations owned by the exact task lease", () => {
+    let now = new Date("2026-07-25T00:00:00Z");
+    const store = new ConfirmationStore(() => now);
+    const replacementLease: TaskLease = { id: "task-lease-b", startedAt: 2_000 };
+    const oldConfirmation = store.createGameAction(
+      "old",
+      { kind: "wait", milliseconds: 1 },
+      taskLease,
+    );
+    const replacementConfirmation = store.createGameAction(
+      "replacement",
+      { kind: "wait", milliseconds: 1 },
+      replacementLease,
+    );
+    now = new Date("2026-07-25T00:02:00Z");
+
+    expect(store.expireGameActions(taskLease)).toBe(1);
+    expect(store.get(oldConfirmation.id)).toBeUndefined();
+    expect(store.hasGameActions(replacementLease)).toBe(true);
+    expect(store.allowGameAction(replacementConfirmation.id, replacementLease)).toEqual({
+      ok: false,
+      reason: "expired",
+    });
+  });
+
   it("creates a pending confirmation that can be retrieved without consuming it", () => {
     const store = new ConfirmationStore(() => new Date("2026-07-25T00:00:00Z"));
     const operation = { kind: "memory_clear" as const };

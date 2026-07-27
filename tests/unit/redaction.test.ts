@@ -34,6 +34,11 @@ describe("redactSecrets", () => {
 
   it.each([
     [
+      "short token68 with plus and padding",
+      "Authorization: Bearer abc+def==",
+      "Authorization: Bearer [REDACTED_TOKEN]",
+    ],
+    [
       "complete token68 with plus and padding",
       "Bearer abcdefghijklmnop+private==",
       "Bearer [REDACTED_TOKEN]",

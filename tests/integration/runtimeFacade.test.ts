@@ -788,7 +788,7 @@ describe("RuntimeFacade", () => {
     const task = activeTaskFixture();
     task.disclosure = {
       ...task.disclosure,
-      goal: `Collect spruce safely password=hunter2 Bearer abcdefghijklmnopqrstuvwxyz.123456 Bearer abcdefghijklmnop+private== authorization: bearer abcdefghijklmnop/private= at C:\\Users\\Owner\\private with ${task.lease.id}`,
+      goal: `Collect spruce safely password=hunter2 Authorization: Bearer abc+def== Bearer abcdefghijklmnopqrstuvwxyz.123456 Bearer abcdefghijklmnop+private== authorization: bearer abcdefghijklmnop/private= at C:\\Users\\Owner\\private with ${task.lease.id}`,
       expectedActions: [
         "move SERVICE_TOKEN=private-action-token",
         "place redis://player:private-uri-password@localhost/world",
@@ -837,6 +837,7 @@ describe("RuntimeFacade", () => {
     expect(cliJson).toContain("craft safely");
     for (const sensitive of [
       "hunter2",
+      "abc+def==",
       "abcdefghijklmnopqrstuvwxyz.123456",
       "+private==",
       "/private=",

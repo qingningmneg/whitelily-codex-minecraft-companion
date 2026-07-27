@@ -1,6 +1,6 @@
 const textPatterns: Array<[RegExp, string]> = [
   [
-    /\b(authorization\s*:\s*)?bearer\s+[A-Za-z0-9._~+/-]{16,}={0,}(?![A-Za-z0-9._~+/=-])/gi,
+    /\b(authorization\s*:\s*)?bearer\s+[A-Za-z0-9._~+/-]+={0,}(?![A-Za-z0-9._~+/=-])/gi,
     "$1Bearer [REDACTED_TOKEN]",
   ],
   [/\bsk-[A-Za-z0-9_-]{20,}\b/gi, "[REDACTED_OPENAI_KEY]"],
