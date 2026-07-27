@@ -223,7 +223,8 @@ export class CodexAppServerClient implements CodexPort {
       }
       throw loginError();
     }
-    if (status.exitCode !== 0 || !/^Logged in using ChatGPT\s*$/im.test(status.stdout)) {
+    const hasChatGptLoginLine = status.stdout.split(/\r?\n/u).includes("Logged in using ChatGPT");
+    if (status.exitCode !== 0 || !hasChatGptLoginLine) {
       throw loginError(status);
     }
   }

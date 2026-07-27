@@ -3,6 +3,8 @@ import {
   companionTurnOutcomeSchema,
   type CompanionTurnOutcome,
 } from "../../src/companion/promptBuilder.js";
+import { RuntimeFacade } from "../../src/runtime/runtimeFacade.js";
+import type { TaskBudgetSnapshot } from "../../src/safety/taskBudget.js";
 import {
   createCompanionHarness,
   teardownCompanionHarnesses,
@@ -105,6 +107,85 @@ describe("companion harness teardown", () => {
 });
 
 describe("simulated WhiteLily lifecycle", () => {
+  it("runs the companion through the reusable runtime boundary without exposing its lease", async () => {
+    const value = await harness();
+    let budget: TaskBudgetSnapshot = {
+      active: false,
+      stopReason: null,
+      limits: {
+        maxToolCalls: 8,
+        maxBlockChanges: 16,
+        maxHorizontalTravel: 64,
+        maxDurationMs: 60_000,
+        maxDangerousOperations: 0,
+      },
+      toolCalls: 0,
+      blockChanges: 0,
+      horizontalTravel: 0,
+      dangerousOperations: 0,
+      startedAt: null,
+    };
+    const runtime = new RuntimeFacade({
+      lifecycle: {
+        start: value.start,
+        stop: value.stop,
+      },
+      task: {
+        current: value.taskController.current.bind(value.taskController),
+        budget: () => budget,
+        stop: (reason) => {
+          value.taskController.stop(reason);
+          budget = {
+            ...budget,
+            active: false,
+            stopReason: reason,
+            startedAt: null,
+          };
+        },
+      },
+      minecraft: {
+        subscribe: (listener) => value.minecraft.onEvent(listener),
+      },
+      codex: {
+        model: () => "gpt-5.6-terra",
+      },
+      createPublicTaskId: () => "public-e2e-task",
+    });
+    const lifecycle: string[] = [];
+    runtime.subscribe((event) => {
+      if (event.kind === "lifecycle") lifecycle.push(event.state);
+    });
+
+    await runtime.start();
+    value.minecraft.emit({ kind: "connected" });
+    const active = value.taskController.start({
+      goal: "Build a safe shelter",
+      expectedActions: ["move", "place"],
+      limits: { ...budget.limits },
+      stopCondition: "Shelter complete",
+    });
+    budget = {
+      ...budget,
+      active: true,
+      startedAt: active.lease.startedAt,
+    };
+    expect(runtime.snapshot()).toMatchObject({
+      lifecycle: "running",
+      minecraft: { state: "connected", sessionId: null },
+      codex: { state: "ready", model: "gpt-5.6-terra" },
+      task: { id: "public-e2e-task" },
+    });
+    expect(JSON.stringify(runtime.snapshot())).not.toContain(active.lease.id);
+
+    await runtime.stop("emergency_stop");
+    expect(lifecycle).toEqual(["starting", "running", "stopping", "stopped"]);
+    expect(runtime.snapshot()).toMatchObject({
+      lifecycle: "stopped",
+      task: null,
+    });
+    expect(value.taskAuditEvents).toContain("task_stopped:emergency_stop");
+  });
+
   it("closes the dangerous equip-plus-generic-use tool chain without touching Minecraft", async () => {
     const value = await harness();
     await value.start();

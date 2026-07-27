@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { createToolRegistry } from "../../src/mcp/toolRegistry.js";
 import type { ActionSafety } from "../../src/actions/actionExecutor.js";
-import type { WorldSnapshot } from "../../src/domain/types.js";
+import type { GameAction, WorldSnapshot } from "../../src/domain/types.js";
+import { TurnToolBudget } from "../../src/mcp/toolBudget.js";
+import { ConfirmationStore } from "../../src/safety/confirmationStore.js";
+import { SafetyEngine } from "../../src/safety/safetyEngine.js";
+import { TaskControllerBudget } from "../../src/safety/taskBudget.js";
 import { createToolRegistryHarness } from "../support/toolRegistryHarness.js";
 
 function leased<T extends Record<string, unknown> = Record<never, never>>(
@@ -195,21 +199,344 @@ describe("Minecraft MCP tools", () => {
 
   it("returns structured errors for a failed safety context without touching Minecraft", async () => {
     const harness = createToolRegistryHarness();
+    const taskBudget = new TaskControllerBudget();
+    const budget = new TurnToolBudget(taskBudget);
+    const turnLease = budget.begin(taskBudget.begin({ maxToolCalls: 2 }));
     const dependencies = {
       ...harness.dependencies,
+      budget,
       safetyContextProvider: async () => {
         throw new Error("context unavailable");
       },
     };
+    const tools = createToolRegistry(dependencies);
 
+    await expect(tools.minecraft_say.execute({ message: "safe", turnLease })).resolves.toEqual({
+      text: '{"error":"context unavailable"}',
+      isError: true,
+    });
     await expect(
-      createToolRegistry(dependencies).minecraft_say.execute(leased(harness, { message: "safe" })),
+      tools.minecraft_collect_dropped.execute({ entityId: 1, turnLease }),
     ).resolves.toEqual({
       text: '{"error":"context unavailable"}',
       isError: true,
     });
+    await expect(tools.minecraft_say.execute({ message: "overflow", turnLease })).resolves.toEqual({
+      text: '{"error":"tool call budget exhausted"}',
+      isError: true,
+    });
+    expect(taskBudget.snapshot()).toMatchObject({
+      active: false,
+      stopReason: "budget_exhausted",
+      toolCalls: 2,
+    });
     expect(harness.minecraft.chatLog).toEqual([]);
   });
+
+  it("rejects invalid turn leases before context, snapshot, or Minecraft side effects", async () => {
+    const harness = createToolRegistryHarness();
+    let contextReads = 0;
+    let sharedSnapshotReads = 0;
+    const tools = createToolRegistry({
+      ...harness.dependencies,
+      safetyContextProvider: async () => {
+        contextReads += 1;
+        return {
+          spawn: { x: 0, y: 64, z: 0 },
+          owner: { x: 0, y: 64, z: 0 },
+        };
+      },
+      latestSnapshot: () => {
+        sharedSnapshotReads += 1;
+        return harness.minecraft.world;
+      },
+    });
+    const invalidLease = harness.turnLease === "b".repeat(43) ? "c".repeat(43) : "b".repeat(43);
+
+    await expect(
+      tools.minecraft_get_state.execute({ turnLease: invalidLease }),
+    ).resolves.toMatchObject({ isError: true });
+    await expect(
+      tools.minecraft_find_block.execute({
+        blockName: "stone",
+        maxDistance: 8,
+        turnLease: invalidLease,
+      }),
+    ).resolves.toMatchObject({ isError: true });
+    await expect(
+      tools.minecraft_move_to.execute({ x: 1, y: 64, z: 0, turnLease: invalidLease }),
+    ).resolves.toMatchObject({ isError: true });
+    await expect(
+      tools.minecraft_collect_dropped.execute({ entityId: 1, turnLease: invalidLease }),
+    ).resolves.toMatchObject({ isError: true });
+
+    expect(contextReads).toBe(0);
+    expect(sharedSnapshotReads).toBe(0);
+    expect(harness.minecraft.calls).toEqual([]);
+    expect(harness.budget.snapshot().totalCalls).toBe(0);
+  });
+
+  it("consumes classifier-derived dangerous operations through the trusted task budget", async () => {
+    const harness = createToolRegistryHarness({
+      safety: new SafetyEngine(new ConfirmationStore()),
+    });
+    const taskBudget = new TaskControllerBudget();
+    const budget = new TurnToolBudget(taskBudget);
+    const turnLease = budget.begin(taskBudget.begin());
+    const tools = createToolRegistry({ ...harness.dependencies, budget });
+
+    await expect(
+      tools.minecraft_place_block.execute({
+        x: 20,
+        y: 64,
+        z: 0,
+        blockName: "minecraft:tnt",
+        turnLease,
+      }),
+    ).resolves.toEqual({
+      text: '{"status":"denied","reason":"TNT is permanently forbidden"}',
+      isError: true,
+    });
+    expect(taskBudget.snapshot().dangerousOperations).toBe(1);
+  });
+
+  it("fails closed before executor or Minecraft dispatch when the dangerous budget is exhausted", async () => {
+    const evaluatedActions: GameAction[] = [];
+    const safety: ActionSafety = {
+      evaluate: (action) => {
+        evaluatedActions.push(action);
+        return { kind: "allow" };
+      },
+      evaluatePermanent: () => ({ kind: "allow" }),
+    };
+    const harness = createToolRegistryHarness({ safety });
+    const taskBudget = new TaskControllerBudget();
+    const budget = new TurnToolBudget(taskBudget);
+    const turnLease = budget.begin(taskBudget.begin({ maxDangerousOperations: 0 }));
+    const tools = createToolRegistry({ ...harness.dependencies, budget });
+
+    await expect(
+      tools.minecraft_place_block.execute({
+        x: 20,
+        y: 64,
+        z: 0,
+        blockName: "minecraft:tnt",
+        turnLease,
+      }),
+    ).resolves.toEqual({ text: '{"error":"tool call budget exhausted"}', isError: true });
+    expect(evaluatedActions).toEqual([]);
+    expect(harness.minecraft.calls).toEqual([]);
+  });
+
+  it("charges block changes cumulatively across repair turns before executor dispatch", async () => {
+    const harness = createToolRegistryHarness();
+    const taskBudget = new TaskControllerBudget();
+    const taskLease = taskBudget.begin({ maxBlockChanges: 1 });
+    const budget = new TurnToolBudget(taskBudget);
+    const tools = createToolRegistry({ ...harness.dependencies, budget });
+    const firstTurnLease = budget.begin(taskLease);
+
+    await expect(
+      tools.minecraft_dig_block.execute({
+        x: 20,
+        y: 64,
+        z: 0,
+        blockName: "stone",
+        turnLease: firstTurnLease,
+      }),
+    ).resolves.toEqual({ text: '{"status":"completed"}' });
+    budget.end();
+    const repairTurnLease = budget.begin(taskLease);
+
+    await expect(
+      tools.minecraft_place_block.execute({
+        x: 21,
+        y: 64,
+        z: 0,
+        blockName: "stone",
+        turnLease: repairTurnLease,
+      }),
+    ).resolves.toEqual({ text: '{"error":"tool call budget exhausted"}', isError: true });
+
+    expect(taskBudget.snapshot().blockChanges).toBe(1);
+    expect(harness.minecraft.calls).toContainEqual({
+      method: "digBlock",
+      args: [{ x: 20, y: 64, z: 0 }, "stone"],
+    });
+    expect(harness.minecraft.calls).not.toContainEqual(
+      expect.objectContaining({ method: "placeBlock" }),
+    );
+  });
+
+  it("charges trusted move distance at the exact task boundary and rejects overflow", async () => {
+    const harness = createToolRegistryHarness();
+    const taskBudget = new TaskControllerBudget();
+    const taskLease = taskBudget.begin({ maxHorizontalTravel: 5 });
+    const budget = new TurnToolBudget(taskBudget);
+    const tools = createToolRegistry({ ...harness.dependencies, budget });
+    const firstTurnLease = budget.begin(taskLease);
+
+    await expect(
+      tools.minecraft_move_to.execute({
+        x: 3,
+        y: 64,
+        z: 4,
+        turnLease: firstTurnLease,
+      }),
+    ).resolves.toEqual({ text: '{"status":"completed"}' });
+    budget.end();
+    harness.minecraft.world.botPosition = { x: 3, y: 64, z: 4 };
+    const repairTurnLease = budget.begin(taskLease);
+
+    await expect(
+      tools.minecraft_move_to.execute({
+        x: 4,
+        y: 64,
+        z: 4,
+        turnLease: repairTurnLease,
+      }),
+    ).resolves.toEqual({ text: '{"error":"tool call budget exhausted"}', isError: true });
+
+    expect(taskBudget.snapshot().horizontalTravel).toBe(5);
+    expect(
+      harness.minecraft.calls.filter((call) => call.method === "moveTo").map((call) => call.args),
+    ).toEqual([[{ x: 3, y: 64, z: 4 }]]);
+  });
+
+  it("charges trusted bot-to-owner distance for follow instead of model-supplied distance", async () => {
+    const harness = createToolRegistryHarness();
+    const taskBudget = new TaskControllerBudget();
+    const taskLease = taskBudget.begin({ maxHorizontalTravel: 5 });
+    const budget = new TurnToolBudget(taskBudget);
+    const tools = createToolRegistry({ ...harness.dependencies, budget });
+    harness.minecraft.world.ownerPosition = { x: 3, y: 64, z: 4 };
+    const firstTurnLease = budget.begin(taskLease);
+
+    await expect(
+      tools.minecraft_follow_owner.execute({ distance: 2, turnLease: firstTurnLease }),
+    ).resolves.toEqual({ text: '{"status":"completed"}' });
+    budget.end();
+    harness.minecraft.world.botPosition = { x: 3, y: 64, z: 4 };
+    harness.minecraft.world.ownerPosition = { x: 4, y: 64, z: 4 };
+    const repairTurnLease = budget.begin(taskLease);
+
+    await expect(
+      tools.minecraft_follow_owner.execute({ distance: 16, turnLease: repairTurnLease }),
+    ).resolves.toEqual({ text: '{"error":"tool call budget exhausted"}', isError: true });
+
+    expect(taskBudget.snapshot().horizontalTravel).toBe(5);
+    expect(
+      harness.minecraft.calls
+        .filter((call) => call.method === "followOwner")
+        .map((call) => call.args),
+    ).toEqual([["TestOwner", 2]]);
+  });
+
+  it.each([
+    [
+      "move_to with a malformed bot position",
+      "minecraft_move_to" as const,
+      { x: 1, y: 64, z: 0 },
+      (snapshot: WorldSnapshot) => {
+        snapshot.botPosition.x = Number.NaN;
+      },
+      "moveTo",
+    ],
+    [
+      "follow_owner without an owner position",
+      "minecraft_follow_owner" as const,
+      { distance: 2 },
+      (snapshot: WorldSnapshot) => {
+        delete snapshot.ownerPosition;
+      },
+      "followOwner",
+    ],
+  ])(
+    "fails closed for %s before executor dispatch",
+    async (_label, toolName, input, mutateSnapshot, primitive) => {
+      const harness = createToolRegistryHarness();
+      mutateSnapshot(harness.minecraft.world);
+      const tool = createToolRegistry(harness.dependencies)[toolName] as {
+        execute(input: Record<string, unknown>): Promise<{ text: string; isError?: boolean }>;
+      };
+
+      await expect(tool.execute(leased(harness, input))).resolves.toMatchObject({ isError: true });
+      expect(harness.minecraft.calls).not.toContainEqual(
+        expect.objectContaining({ method: primitive }),
+      );
+    },
+  );
+
+  it.each([
+    {
+      label: "a thrown snapshot",
+      snapshot: async (): Promise<WorldSnapshot> => {
+        throw new Error("snapshot unavailable");
+      },
+    },
+    {
+      label: "a null snapshot",
+      snapshot: async (): Promise<WorldSnapshot> => null as unknown as WorldSnapshot,
+    },
+    {
+      label: "a primitive snapshot",
+      snapshot: async (): Promise<WorldSnapshot> => 7 as unknown as WorldSnapshot,
+    },
+    {
+      label: "a partial snapshot",
+      snapshot: async (): Promise<WorldSnapshot> =>
+        ({ botPosition: { x: 0, y: 64, z: 0 } }) as WorldSnapshot,
+    },
+    {
+      label: "a non-finite snapshot",
+      snapshot: async (): Promise<WorldSnapshot> =>
+        ({
+          botPosition: { x: Number.NaN, y: 64, z: 0 },
+          ownerPosition: { x: 0, y: 64, z: 0 },
+        }) as WorldSnapshot,
+    },
+    {
+      label: "a failed safety context",
+      snapshot: undefined,
+      safetyContextProvider: async (): Promise<never> => {
+        throw new Error("context unavailable");
+      },
+    },
+  ])(
+    "charges each failed movement attempt exactly once for $label and exhausts the 65th",
+    async ({ snapshot, safetyContextProvider }) => {
+      const harness = createToolRegistryHarness();
+      if (snapshot) harness.minecraft.snapshot = snapshot;
+      const taskBudget = new TaskControllerBudget();
+      const taskLease = taskBudget.begin();
+      const budget = new TurnToolBudget(taskBudget);
+      const turnLease = budget.begin(taskLease);
+      const tools = createToolRegistry({
+        ...harness.dependencies,
+        budget,
+        ...(safetyContextProvider ? { safetyContextProvider } : {}),
+      });
+
+      for (let attempt = 0; attempt < 64; attempt += 1) {
+        await expect(
+          tools.minecraft_move_to.execute({ x: 1, y: 64, z: 0, turnLease }),
+        ).resolves.toMatchObject({ isError: true });
+      }
+
+      await expect(
+        tools.minecraft_move_to.execute({ x: 1, y: 64, z: 0, turnLease }),
+      ).resolves.toEqual({ text: '{"error":"tool call budget exhausted"}', isError: true });
+      expect(taskBudget.snapshot()).toMatchObject({
+        active: false,
+        stopReason: "budget_exhausted",
+        toolCalls: 64,
+        horizontalTravel: 0,
+      });
+      expect(harness.minecraft.calls).not.toContainEqual(
+        expect.objectContaining({ method: "moveTo" }),
+      );
+    },
+  );
 
   it("does not touch Minecraft before begin or after end", async () => {
     const harness = createToolRegistryHarness({ begun: false });
@@ -256,7 +583,14 @@ describe("Minecraft MCP tools", () => {
 
     expect(result).toEqual({ text: '{"status":"completed"}' });
     expect(harness.budget.snapshot().cumulativeHorizontalTravel).toBe(300);
-    expect(harness.contexts.at(-1)).toMatchObject({ estimatedTravelDistance: 300 });
+    expect(harness.contexts.at(-1)).toMatchObject({
+      estimatedTravelDistance: 300,
+      reservedHorizontalTravel: 300,
+      taskLease: {
+        id: expect.any(String),
+        startedAt: expect.any(Number),
+      },
+    });
   });
 
   it("reads a fresh actual position for each movement segment", async () => {
@@ -280,19 +614,7 @@ describe("Minecraft MCP tools", () => {
   });
 
   it("fails closed on an extreme trusted movement without calling moveTo", async () => {
-    const safety: ActionSafety = {
-      evaluate: (_action, context) =>
-        context.estimatedTravelDistance === Infinity
-          ? {
-              kind: "confirm",
-              reason: "far travel",
-              confirmationId: 1,
-              expiresAt: "2026-07-25T00:02:00.000Z",
-            }
-          : { kind: "allow" },
-      evaluatePermanent: () => ({ kind: "allow" }),
-    };
-    const harness = createToolRegistryHarness({ safety });
+    const harness = createToolRegistryHarness();
     harness.minecraft.snapshot = async () => ({
       ...harness.minecraft.world,
       botPosition: { x: -Number.MAX_VALUE, y: 64, z: 0 },
@@ -305,17 +627,17 @@ describe("Minecraft MCP tools", () => {
         z: 0,
         turnLease: harness.turnLease,
       }),
-    ).resolves.toMatchObject({
+    ).resolves.toEqual({
       isError: true,
-      text: expect.stringContaining("confirmation_required"),
+      text: '{"error":"trusted movement distance is unavailable"}',
     });
-    expect(harness.budget.snapshot().cumulativeHorizontalTravel).toBe(Infinity);
+    expect(harness.budget.snapshot().cumulativeHorizontalTravel).toBe(0);
     expect(harness.minecraft.calls).not.toContainEqual(
       expect.objectContaining({ method: "moveTo" }),
     );
   });
 
-  it("returns an error and saturates travel when the fresh snapshot fails", async () => {
+  it("returns an error without spending travel when the fresh snapshot fails", async () => {
     const harness = createToolRegistryHarness();
     harness.minecraft.snapshot = async () => {
       throw new Error("snapshot unavailable");
@@ -326,7 +648,7 @@ describe("Minecraft MCP tools", () => {
         leased(harness, { x: 1, y: 64, z: 0 }),
       ),
     ).resolves.toEqual({ text: '{"error":"snapshot unavailable"}', isError: true });
-    expect(harness.budget.snapshot().cumulativeHorizontalTravel).toBe(Infinity);
+    expect(harness.budget.snapshot().cumulativeHorizontalTravel).toBe(0);
     expect(harness.minecraft.calls).not.toContainEqual(
       expect.objectContaining({ method: "moveTo" }),
     );

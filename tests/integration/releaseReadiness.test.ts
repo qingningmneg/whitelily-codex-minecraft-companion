@@ -1,5 +1,9 @@
 import { access, readFile } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
+import { formatTaskDisclosureForMinecraft } from "../../src/companion/companionService.js";
+import { TaskController, type ActiveTask } from "../../src/companion/taskController.js";
+import { RuntimeFacade } from "../../src/runtime/runtimeFacade.js";
+import { TaskControllerBudget, type TaskBudgetSnapshot } from "../../src/safety/taskBudget.js";
 import {
   runPublicRepoPreparation,
   runReleaseJunctionRegressions,
@@ -21,11 +25,171 @@ const required = [
   "scripts/package-release.ps1",
   "scripts/release-path-safety.ps1",
   "scripts/release-check.ps1",
+  "docs/runtime-architecture.md",
 ];
 
 describe("public release readiness", () => {
   it("contains every public distribution file", async () => {
     await Promise.all(required.map((path) => access(path)));
+  });
+
+  it("documents the reusable runtime boundary", async () => {
+    const architecture = await readFile("docs/runtime-architecture.md", "utf8");
+    for (const heading of [
+      "RuntimeFacade",
+      "TaskController",
+      "ChatRouter",
+      "MineflayerConnection",
+      "Emergency stop order",
+      "idle --> stopping: stop(reason)",
+      "TurnToolBudget forwards task-wide tool-call, block-change, horizontal-travel, and classifier-derived dangerous-operation counts",
+      "move and follow distance comes from trusted Minecraft snapshots",
+      "deadlines fire independently of later tool calls",
+      "cancels queued and in-flight actions",
+      "publishes one fail-closed `world_changed` event",
+      "normalizes modern `worldState.name` and legacy flat `worldName`",
+      "world invalidation latch",
+      "persists the world invalidation marker across process restart",
+      "Dig cancellation calls Mineflayer's `stopDigging`",
+      "Movement and dig cancellation are bounded by a one-second physical acknowledgement window",
+      "physical transport close",
+      "Explicit disconnect and partial setup teardown use the same physical transport close",
+      "ActionExecutor performs SafetyEngine policy evaluation",
+      "MCP registry does not depend directly on TaskController",
+      "authority-free `prepare()`",
+      "awaits every disclosure chunk before calling `TaskController.start()`",
+      "exactly one `task_stopped` record",
+      "flushes that queue before `stop()` resolves",
+    ]) {
+      expect(architecture).toContain(heading);
+    }
+  });
+
+  it("keeps release disclosure values equal to the later acquired lower limits", () => {
+    const controller = new TaskController(
+      new TaskControllerBudget({
+        now: () => 1_700_000_000_000,
+        randomId: () => "release-task-lease",
+      }),
+    );
+    const requested = {
+      maxToolCalls: 5,
+      maxBlockChanges: 6,
+      maxHorizontalTravel: 7,
+      maxDurationMs: 8_000,
+      maxDangerousOperations: 1,
+    };
+    const prepared = controller.prepare(
+      {
+        goal: "collect safely",
+        expectedActions: ["get_state", "move_to", "dig_block"],
+        limits: {
+          maxToolCalls: 64,
+          maxBlockChanges: 256,
+          maxHorizontalTravel: 1_024,
+          maxDurationMs: 600_000,
+          maxDangerousOperations: 8,
+        },
+        stopCondition: "owner stops or work completes",
+      },
+      requested,
+    );
+    const chunks = formatTaskDisclosureForMinecraft(prepared);
+    const sent = chunks.map((chunk) => chunk.replace(/^任务披露(?:（续）)?：/u, "")).join("");
+
+    expect(controller.current()).toBeNull();
+    expect(sent).toContain("预计动作类别：get_state、move_to、dig_block");
+    expect(sent).toContain("工具调用 5");
+    expect(sent).toContain("方块修改 6");
+    expect(sent).toContain("水平移动 7");
+    expect(sent).toContain("持续时间 8000");
+    expect(sent).toContain("危险操作 1");
+    expect(sent).toContain("停止条件：owner stops or work completes");
+    expect(
+      chunks.every(
+        (chunk) =>
+          chunk.length <= 240 &&
+          !/[\uD800-\uDBFF]$/u.test(chunk) &&
+          !/^[\uDC00-\uDFFF]/u.test(chunk) &&
+          !chunk.startsWith("/"),
+      ),
+    ).toBe(true);
+
+    expect(controller.start(prepared, prepared.limits).disclosure.limits).toEqual(requested);
+    controller.stop("completed");
+  });
+
+  it("enforces the public disclosure and operational fail-closed behavior", async () => {
+    const limits = {
+      maxToolCalls: 64,
+      maxBlockChanges: 256,
+      maxHorizontalTravel: 1_024,
+      maxDurationMs: 600_000,
+      maxDangerousOperations: 8,
+    };
+    const task: ActiveTask = {
+      id: "release-private-lease",
+      lease: { id: "release-private-lease", startedAt: 1_700_000_000_000 },
+      disclosure: {
+        goal: `Inspect ${"C:" + String.raw`\Users\Jane Doe\Private Notes\todo.txt`} password="Jane Doe private password"`,
+        expectedActions: ["place"],
+        limits,
+        stopCondition: "Stop safely",
+      },
+      startedAt: "2023-11-14T22:13:20.000Z",
+    };
+    const budget: TaskBudgetSnapshot = {
+      active: true,
+      stopReason: null,
+      limits,
+      toolCalls: 0,
+      blockChanges: 0,
+      horizontalTravel: 0,
+      dangerousOperations: 0,
+      startedAt: 1_700_000_000_000,
+    };
+    let minecraftListener: ((event: unknown) => void) | undefined;
+    let taskStops = 0;
+    let lifecycleStops = 0;
+    const runtime = new RuntimeFacade({
+      lifecycle: {
+        start: async () => undefined,
+        stop: async () => {
+          lifecycleStops += 1;
+        },
+      },
+      task: {
+        current: () => task,
+        budget: () => budget,
+        stop: () => {
+          taskStops += 1;
+        },
+      },
+      minecraft: {
+        subscribe: (listener) => {
+          minecraftListener = listener as (event: unknown) => void;
+          return () => undefined;
+        },
+      },
+      createPublicTaskId: () => "release-public-task",
+    });
+
+    const published = JSON.stringify(runtime.snapshot());
+    expect(published).not.toContain("Jane Doe");
+    expect(published).not.toContain("Private Notes");
+    expect(published).not.toContain("private password");
+    expect(published).not.toContain(task.lease.id);
+
+    minecraftListener?.({ kind: "world_changed", extra: "private backend state" });
+
+    expect(runtime.snapshot()).toMatchObject({
+      lifecycle: "failed",
+      task: null,
+      lastError: { code: "MINECRAFT_STATE_UNKNOWN" },
+    });
+    expect(taskStops).toBe(1);
+    await runtime.stop("process_exit");
+    expect(lifecycleStops).toBe(1);
   });
 
   it("does not publish personal example values", async () => {
@@ -43,11 +207,16 @@ describe("public release readiness", () => {
     expect(candidate.files.some((file) => file.startsWith("docs/superpowers/"))).toBe(false);
   }, 60_000);
 
-  it("packages the nested Windows smoke-test documentation", async () => {
+  it("packages a closed README documentation bundle from the produced ZIP", async () => {
     const artifact = await runReleasePackage("0.1.0");
     expect(artifact.hasChecksum).toBe(true);
     expect(artifact.stagingRemoved).toBe(true);
     expect(artifact.entries).toContain("docs/windows-smoke-test.md");
+    expect(artifact.entries).toContain("docs/installation-windows.zh-CN.md");
+    expect(artifact.entries).toContain("docs/runtime-architecture.md");
+    expect(artifact.readmeLocalLinks).toContain("docs/installation-windows.zh-CN.md");
+    expect(artifact.readmeLocalLinks).toContain("docs/runtime-architecture.md");
+    expect(artifact.missingReadmeLocalLinks).toEqual([]);
     expect(artifact.rawEntries.every((entry) => !entry.includes("\\"))).toBe(true);
     expect(artifact.checksumMatches).toBe(true);
   }, 120_000);

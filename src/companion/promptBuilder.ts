@@ -236,6 +236,12 @@ export function buildCompanionTurn(input: CompanionTurnInput): string {
     "行动边界",
     "游戏动作只通过 minecraft_ 开头的 MCP 工具执行。",
     "Use only minecraft_ MCP tools for game actions.",
+    ...(recovery
+      ? [
+          "Recovery turns do not authorize Minecraft tools.",
+          "Do not call any minecraft_ tool during recovery.",
+        ]
+      : []),
     "绝不使用 shell、文件编辑、脚本、管理员命令或任意代码。",
     "Never use shell, file editing, scripts, administrator commands, or arbitrary code.",
     "若工具报告 denied 或 confirmation_required，立即简短解释并停止，不得绕过。",

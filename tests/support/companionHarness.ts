@@ -4,9 +4,11 @@ import { join } from "node:path";
 import { setTimeout as nativeDelay } from "node:timers/promises";
 import { ActionExecutor } from "../../src/actions/actionExecutor.js";
 import { parseLocalCommand } from "../../src/commands/commandParser.js";
+import { ChatRouter } from "../../src/companion/chatRouter.js";
 import { CompanionService } from "../../src/companion/companionService.js";
+import { TaskController } from "../../src/companion/taskController.js";
 import type { CodexPort, CodexTurnResult } from "../../src/codex/codexPort.js";
-import type { PersistentState } from "../../src/memory/stateStore.js";
+import type { PersistentState, StateToPersist } from "../../src/memory/stateStore.js";
 import { MemoryStore } from "../../src/memory/memoryStore.js";
 import { StateStore } from "../../src/memory/stateStore.js";
 import { ModeManager } from "../../src/mode/modeManager.js";
@@ -15,6 +17,11 @@ import { createToolRegistry, type ToolResult } from "../../src/mcp/toolRegistry.
 import { FakeMinecraftPort } from "../../src/minecraft/fakeMinecraftPort.js";
 import { ConfirmationStore } from "../../src/safety/confirmationStore.js";
 import { SafetyEngine } from "../../src/safety/safetyEngine.js";
+import {
+  TaskControllerBudget,
+  type TaskLease,
+  type TaskLimits,
+} from "../../src/safety/taskBudget.js";
 
 interface Deferred<T> {
   promise: Promise<T>;
@@ -235,7 +242,7 @@ class FakeCodexPort implements CodexPort {
 }
 
 class GateStateStore extends StateStore {
-  readonly savedStates: Array<Omit<PersistentState, "updatedAt">> = [];
+  readonly savedStates: StateToPersist[] = [];
   private saveIndex = 0;
   private readonly gates = new Map<number, Deferred<void>>();
   private readonly reached = new Map<number, Deferred<void>>();
@@ -248,7 +255,7 @@ class GateStateStore extends StateStore {
     }
   }
 
-  override async save(state: Omit<PersistentState, "updatedAt">): Promise<void> {
+  override async save(state: StateToPersist): Promise<void> {
     this.savedStates.push(structuredClone(state));
     const index = this.saveIndex++;
     const gate = this.gates.get(index);
@@ -277,11 +284,16 @@ export interface CompanionHarnessOptions {
   gatedCodexStarts?: number[];
   codexStartErrors?: Array<Error | undefined>;
   modelResults?: Array<string[] | Error>;
-  persistedState?: Omit<PersistentState, "updatedAt">;
+  persistedState?: StateToPersist;
   gatedStateSaves?: number[];
   gateMemoryFileRename?: boolean;
   activeMinecraftWait?: boolean;
   autonomyCanChat?: boolean;
+  storageDirectory?: string;
+  requestedTaskLimits?: Partial<TaskLimits>;
+  manualConfirmationTimers?: boolean;
+  confirmationTimerSetThrows?: boolean;
+  confirmationTimerClearThrows?: boolean;
 }
 
 class FakeAutonomyScheduler {
@@ -358,7 +370,8 @@ export function outcome(
 }
 
 export async function createCompanionHarness(options: CompanionHarnessOptions = {}) {
-  const directory = await mkdtemp(join(tmpdir(), "whitelily-companion-"));
+  const directory =
+    options.storageDirectory ?? (await mkdtemp(join(tmpdir(), "whitelily-companion-")));
   const minecraft = new FakeMinecraftPort();
   minecraft.ownerOnline = true;
   const codex = new FakeCodexPort(options);
@@ -377,22 +390,53 @@ export async function createCompanionHarness(options: CompanionHarnessOptions = 
   const state = new GateStateStore(join(directory, "state.json"), options.gatedStateSaves ?? []);
   if (options.persistedState) await StateStore.prototype.save.call(state, options.persistedState);
   const confirmations = new ConfirmationStore();
+  const taskAuditEvents: string[] = [];
+  const disclosureChatAtTaskStart: string[][] = [];
+  const taskTerminalReasons: string[] = [];
+  const taskBudget = new TaskControllerBudget();
+  let taskDeadlineCallback: (() => void) | undefined;
+  const taskDeadlineTimer = 1 as unknown as ReturnType<typeof setTimeout>;
+  const taskController = new TaskController(
+    taskBudget,
+    (event, data) => {
+      taskAuditEvents.push("reason" in data ? `${event}:${data.reason}` : event);
+      if (event === "task_started") disclosureChatAtTaskStart.push([...minecraft.chatLog]);
+    },
+    {
+      onTerminal: (reason) => taskTerminalReasons.push(reason),
+      setTimer: (callback) => {
+        taskDeadlineCallback = callback;
+        return taskDeadlineTimer;
+      },
+      clearTimer: (timer) => {
+        if (timer === taskDeadlineTimer) taskDeadlineCallback = undefined;
+      },
+    },
+  );
+  const budget = new TurnToolBudget(taskBudget);
   const executor = new ActionExecutor(
     minecraft,
-    new SafetyEngine(confirmations),
+    new SafetyEngine(confirmations, undefined, (lease) => taskController.isLeaseLive(lease)),
     confirmations,
     "TestOwner",
+    () => taskController.stop("owner_stop"),
+    {
+      isLeaseLive: (lease) => taskController.isLeaseLive(lease),
+      reserveAdditionalTravel: (lease, horizontalTravel) =>
+        taskController.reserveAdditionalTravel(lease, horizontalTravel),
+    },
   );
-  const budget = new TurnToolBudget();
   const autonomy = new FakeAutonomyScheduler(options.autonomyCanChat ?? true);
   const budgetEvents: string[] = [];
   const budgetLeases: Array<string | undefined> = [];
+  const budgetTaskLeaseIds: Array<string | undefined> = [];
   const errors: string[] = [];
   const begin = budget.begin.bind(budget);
   const end = budget.end.bind(budget);
-  budget.begin = () => {
+  budget.begin = (taskLease?: TaskLease) => {
     budgetEvents.push("begin");
-    const lease = begin();
+    budgetTaskLeaseIds.push(taskLease?.id);
+    const lease = begin(taskLease);
     budgetLeases.push(lease);
     return lease;
   };
@@ -403,6 +447,11 @@ export async function createCompanionHarness(options: CompanionHarnessOptions = 
   let activeWaitAbort: AbortSignal | undefined;
   let nextTimerId = 1;
   const mergeTimers = new Map<number, () => void>();
+  let nextConfirmationTimerId = 10_000;
+  const confirmationTimers = new Map<
+    number,
+    { callback: () => void; milliseconds: number; cleared: boolean }
+  >();
   if (options.activeMinecraftWait) {
     minecraft.wait = async (_milliseconds, signal) => {
       activeWaitAbort = signal;
@@ -428,6 +477,7 @@ export async function createCompanionHarness(options: CompanionHarnessOptions = 
     confirmations,
     executor,
     budget,
+    taskController,
     autonomy,
     logger: {
       error: async (_event: string, fields: Record<string, unknown>) => {
@@ -439,9 +489,11 @@ export async function createCompanionHarness(options: CompanionHarnessOptions = 
       owner: { x: 0, y: 64, z: 0 },
     }),
     ownerUsername: "TestOwner",
+    chatRouter: new ChatRouter({ ownerUsername: "TestOwner", maxMessageLength: 4_000 }),
     cwd: directory,
     preferredModel: "gpt-5.6-terra",
     reasoningEffort: "low",
+    requestedTaskLimits: options.requestedTaskLimits,
     setTimer: (callback) => {
       const id = nextTimerId++;
       mergeTimers.set(id, callback);
@@ -450,6 +502,28 @@ export async function createCompanionHarness(options: CompanionHarnessOptions = 
     clearTimer: (timer) => {
       mergeTimers.delete(timer as unknown as number);
     },
+    ...(options.manualConfirmationTimers
+      ? {
+          confirmationNow: () => new Date(),
+          setConfirmationTimer: (callback: () => void, milliseconds: number) => {
+            if (options.confirmationTimerSetThrows) {
+              throw new Error("confirmation timer set failed");
+            }
+            const id = nextConfirmationTimerId++;
+            confirmationTimers.set(id, { callback, milliseconds, cleared: false });
+            return id as unknown as ReturnType<typeof setTimeout>;
+          },
+          clearConfirmationTimer: (timer: ReturnType<typeof setTimeout>) => {
+            if (options.confirmationTimerClearThrows) {
+              throw new Error("confirmation timer clear failed");
+            }
+            const record = confirmationTimers.get(timer as unknown as number);
+            if (record) record.cleared = true;
+          },
+        }
+      : {}),
+  } as ConstructorParameters<typeof CompanionService>[0] & {
+    requestedTaskLimits?: Partial<TaskLimits>;
   });
   const tools = createToolRegistry({
     minecraft,
@@ -472,8 +546,13 @@ export async function createCompanionHarness(options: CompanionHarnessOptions = 
     confirmations,
     executor,
     budget,
+    taskController,
+    taskAuditEvents,
+    disclosureChatAtTaskStart,
+    taskTerminalReasons,
     budgetEvents,
     budgetLeases,
+    budgetTaskLeaseIds,
     autonomy,
     errors,
     service,
@@ -542,6 +621,26 @@ export async function createCompanionHarness(options: CompanionHarnessOptions = 
       const callbacks = [...mergeTimers.values()];
       mergeTimers.clear();
       for (const callback of callbacks) callback();
+    },
+    fireTaskDeadline: () => {
+      const callback = taskDeadlineCallback;
+      if (!callback) throw new Error("no task deadline is pending");
+      taskDeadlineCallback = undefined;
+      callback();
+    },
+    confirmationTimerRecords: () =>
+      [...confirmationTimers.entries()].map(([id, record]) => ({
+        id,
+        milliseconds: record.milliseconds,
+        cleared: record.cleared,
+      })),
+    fireConfirmationTimer: (id: number, includeCleared = false) => {
+      const record = confirmationTimers.get(id);
+      if (!record || (record.cleared && !includeCleared)) {
+        throw new Error("no matching confirmation timer is pending");
+      }
+      record.cleared = true;
+      record.callback();
     },
     untilTurnSettled: async () => {
       await waitForCondition(() => !service.isBusyForAutonomy(), "companion turn work to settle");

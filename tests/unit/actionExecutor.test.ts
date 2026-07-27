@@ -4,12 +4,27 @@ import type { GameAction, SafetyDecision } from "../../src/domain/types.js";
 import { FakeMinecraftPort } from "../../src/minecraft/fakeMinecraftPort.js";
 import { ConfirmationStore } from "../../src/safety/confirmationStore.js";
 import { SafetyEngine, type SafetyContext } from "../../src/safety/safetyEngine.js";
+import type { TaskLease } from "../../src/safety/taskBudget.js";
 import { createActionExecutorHarness } from "../support/actionExecutorHarness.js";
 
 const context: SafetyContext = {
   spawn: { x: 0, y: 64, z: 0 },
   owner: { x: 0, y: 64, z: 0 },
 };
+const taskLease: TaskLease = { id: "task-lease-a", startedAt: 1_000 };
+
+function confirmedExecutor(
+  minecraft: FakeMinecraftPort,
+  safety: ActionSafety,
+  confirmations: ConfirmationStore,
+): ActionExecutor {
+  return new ActionExecutor(minecraft, safety, confirmations, "TestOwner", undefined, {
+    isLeaseLive: (lease) => lease.id === taskLease.id && lease.startedAt === taskLease.startedAt,
+    reserveAdditionalTravel: () => {
+      throw new Error("no additional travel expected");
+    },
+  });
+}
 
 function abortError(): Error {
   const error = new Error("aborted");
@@ -24,6 +39,32 @@ function waitsForAbort(signal: AbortSignal): Promise<void> {
 afterEach(() => vi.useRealTimers());
 
 describe("ActionExecutor", () => {
+  it("invalidates task work synchronously before cancellation aborts the action", async () => {
+    const minecraft = new FakeMinecraftPort();
+    const order: string[] = [];
+    let waitStarted = false;
+    minecraft.wait = (_milliseconds, signal) => {
+      waitStarted = true;
+      signal.addEventListener("abort", () => order.push("action_aborted"), { once: true });
+      return waitsForAbort(signal);
+    };
+    const confirmations = new ConfirmationStore();
+    const executor = new ActionExecutor(
+      minecraft,
+      new SafetyEngine(confirmations),
+      confirmations,
+      "TestOwner",
+      () => order.push("task_invalidated"),
+    );
+    const running = executor.execute({ kind: "wait", milliseconds: 60_000 }, context);
+    await vi.waitFor(() => expect(waitStarted).toBe(true));
+
+    executor.stopAll();
+
+    expect(order).toEqual(["task_invalidated", "action_aborted"]);
+    await expect(running).resolves.toEqual({ status: "cancelled" });
+  });
+
   it("stops a running action locally", async () => {
     const minecraft = new FakeMinecraftPort();
     minecraft.wait = (_milliseconds, signal) => waitsForAbort(signal);
@@ -35,6 +76,36 @@ describe("ActionExecutor", () => {
 
     await expect(running).resolves.toEqual({ status: "cancelled" });
     expect(executor.pendingCount()).toBe(0);
+  });
+
+  it("waits for active port cancellation before publishing one cancelled result", async () => {
+    const minecraft = new FakeMinecraftPort();
+    let settleDig: (() => void) | undefined;
+    minecraft.digBlock = async () =>
+      new Promise<void>((resolve) => {
+        settleDig = resolve;
+      });
+    const executor = createActionExecutorHarness(minecraft, { kind: "allow" });
+    const published: string[] = [];
+    executor.onResult((result) => published.push(result.status));
+    const running = executor.execute(
+      { kind: "dig_block", blockName: "stone", position: { x: 1, y: 64, z: 1 } },
+      context,
+    );
+    await vi.waitFor(() => expect(settleDig).toBeTypeOf("function"));
+    let outcome = "pending";
+    void running.then((result) => {
+      outcome = result.status;
+    });
+
+    executor.stopAll();
+    await Promise.resolve();
+
+    expect(outcome).toBe("pending");
+    expect(published).toEqual([]);
+    settleDig?.();
+    await expect(running).resolves.toEqual({ status: "cancelled" });
+    expect(published).toEqual(["cancelled"]);
   });
 
   it("cancels all queued actions from the old generation and accepts a new action", async () => {
@@ -57,7 +128,7 @@ describe("ActionExecutor", () => {
     expect(minecraft.chatLog).toEqual(["new"]);
   });
 
-  it("returns cancellation immediately but holds the port queue until an abort-ignoring action settles", async () => {
+  it("holds cancellation and the port queue until an abort-ignoring action settles", async () => {
     vi.useFakeTimers();
     const minecraft = new FakeMinecraftPort();
     let settlePlace: (() => void) | undefined;
@@ -76,16 +147,21 @@ describe("ActionExecutor", () => {
     executor.stopAll();
     await vi.advanceTimersByTimeAsync(0);
 
-    await expect(running).resolves.toEqual({ status: "cancelled" });
     await expect(oldQueued).resolves.toEqual({ status: "cancelled" });
-    expect(executor.pendingCount()).toBe(0);
+    let runningOutcome = "pending";
+    void running.then((result) => {
+      runningOutcome = result.status;
+    });
+    expect(runningOutcome).toBe("pending");
+    expect(executor.pendingCount()).toBe(1);
     expect(vi.getTimerCount()).toBe(0);
     const afterStop = executor.execute({ kind: "say", message: "after stop" }, context);
     await vi.advanceTimersByTimeAsync(0);
-    expect(executor.pendingCount()).toBe(1);
+    expect(executor.pendingCount()).toBe(2);
     expect(minecraft.chatLog).toEqual([]);
 
     settlePlace?.();
+    await expect(running).resolves.toEqual({ status: "cancelled" });
     await expect(afterStop).resolves.toEqual({ status: "completed" });
     expect(minecraft.chatLog).toEqual(["after stop"]);
   });
@@ -105,11 +181,12 @@ describe("ActionExecutor", () => {
     await vi.waitFor(() => expect(executor.pendingCount()).toBe(1));
 
     executor.stopAll();
-    await expect(running).resolves.toEqual({ status: "cancelled" });
-    expect(executor.pendingCount()).toBe(0);
+    expect(executor.pendingCount()).toBe(1);
     expect(executor.isBusy()).toBe(true);
 
     settlePlace?.();
+    await expect(running).resolves.toEqual({ status: "cancelled" });
+    expect(executor.pendingCount()).toBe(0);
     await expect(executor.execute({ kind: "say", message: "settled" }, context)).resolves.toEqual({
       status: "completed",
     });
@@ -130,13 +207,13 @@ describe("ActionExecutor", () => {
     );
     await vi.waitFor(() => expect(executor.pendingCount()).toBe(1));
     executor.stopAll();
-    await expect(running).resolves.toEqual({ status: "cancelled" });
 
     const afterStop = executor.execute({ kind: "say", message: "after rejection" }, context);
     await Promise.resolve();
     expect(minecraft.chatLog).toEqual([]);
     rejectPlace?.(new Error("late failure"));
 
+    await expect(running).resolves.toEqual({ status: "cancelled" });
     await expect(afterStop).resolves.toEqual({ status: "completed" });
     expect(minecraft.chatLog).toEqual(["after rejection"]);
   });
@@ -240,7 +317,7 @@ describe("ActionExecutor", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it("keeps smelting alive past 20 seconds, then times out at its 70-second budget without opening the gate", async () => {
+  it("does not publish a smelt timeout until physical cancellation settles", async () => {
     vi.useFakeTimers();
     const minecraft = new FakeMinecraftPort();
     let settleSmelt: (() => void) | undefined;
@@ -256,13 +333,19 @@ describe("ActionExecutor", () => {
 
     await vi.advanceTimersByTimeAsync(20_000);
     expect(executor.pendingCount()).toBe(1);
+    let smeltOutcome = "pending";
+    void smelting.then((result) => {
+      smeltOutcome = result.status;
+    });
     await vi.advanceTimersByTimeAsync(50_000);
 
-    await expect(smelting).resolves.toEqual({ status: "failed", reason: "action timed out" });
+    expect(smeltOutcome).toBe("pending");
+    expect(executor.pendingCount()).toBe(1);
     const afterSmelt = executor.execute({ kind: "say", message: "after smelt" }, context);
     await vi.advanceTimersByTimeAsync(0);
     expect(minecraft.chatLog).toEqual([]);
     settleSmelt?.();
+    await expect(smelting).resolves.toEqual({ status: "failed", reason: "action timed out" });
     await expect(afterSmelt).resolves.toEqual({ status: "completed" });
   });
 
@@ -368,44 +451,120 @@ describe("ActionExecutor", () => {
   it("executes only the stored confirmed action once and cannot be substituted or replayed", async () => {
     const minecraft = new FakeMinecraftPort();
     const confirmations = new ConfirmationStore();
-    const executor = new ActionExecutor(
-      minecraft,
-      new SafetyEngine(confirmations),
-      confirmations,
-      "TestOwner",
-    );
-    const decision = new SafetyEngine(confirmations).evaluate(
+    const safety = new SafetyEngine(confirmations, undefined, () => true);
+    const executor = confirmedExecutor(minecraft, safety, confirmations);
+    const decision = safety.evaluate(
       { kind: "move_to", position: { x: 300, y: 64, z: 0 } },
-      context,
+      { ...context, taskLease, reservedHorizontalTravel: 300 },
     );
     if (decision.kind !== "confirm") throw new Error("expected travel confirmation");
 
-    const result = await Reflect.apply(executor.executeConfirmed, executor, [
-      decision.confirmationId,
-      context,
-      { kind: "place_block", blockName: "tnt", position: { x: 30, y: 64, z: 0 } },
-    ]);
+    const result = await executor.executeConfirmed(decision.confirmationId, context, taskLease);
 
     expect(result).toEqual({ status: "completed" });
     expect(minecraft.calls).toEqual([{ method: "moveTo", args: [{ x: 300, y: 64, z: 0 }] }]);
-    await expect(executor.executeConfirmed(decision.confirmationId, context)).resolves.toEqual({
+    await expect(
+      executor.executeConfirmed(decision.confirmationId, context, taskLease),
+    ).resolves.toEqual({
       status: "confirmation_invalid",
       reason: "missing",
     });
+  });
+
+  it("does not consume another task's confirmation and executes it once for the live owner task", async () => {
+    const minecraft = new FakeMinecraftPort();
+    const confirmations = new ConfirmationStore();
+    const executor = new ActionExecutor(
+      minecraft,
+      {
+        evaluate: () => ({ kind: "allow" }),
+        evaluatePermanent: () => ({ kind: "allow" }),
+      },
+      confirmations,
+      "TestOwner",
+      undefined,
+      {
+        isLeaseLive: (lease) =>
+          lease.id === taskLease.id && lease.startedAt === taskLease.startedAt,
+        reserveAdditionalTravel: () => {
+          throw new Error("no additional travel expected");
+        },
+      },
+    );
+    const ticket = confirmations.createGameAction(
+      "stored",
+      { kind: "say", message: "confirmed" },
+      taskLease,
+    );
+    const otherLease = { id: "task-lease-b", startedAt: taskLease.startedAt };
+
+    await expect(executor.executeConfirmed(ticket.id, context, otherLease)).resolves.toEqual({
+      status: "confirmation_invalid",
+      reason: "wrong_task",
+    });
+    expect(confirmations.hasGameActions(taskLease)).toBe(true);
+    expect(minecraft.chatLog).toEqual([]);
+
+    await expect(executor.executeConfirmed(ticket.id, context, taskLease)).resolves.toEqual({
+      status: "completed",
+    });
+    await expect(executor.executeConfirmed(ticket.id, context, taskLease)).resolves.toEqual({
+      status: "confirmation_invalid",
+      reason: "missing",
+    });
+    expect(minecraft.chatLog).toEqual(["confirmed"]);
+  });
+
+  it("does not dispatch a consumed confirmation after its task capability becomes stale", async () => {
+    const minecraft = new FakeMinecraftPort();
+    const confirmations = new ConfirmationStore();
+    let live = true;
+    const executor = new ActionExecutor(
+      minecraft,
+      {
+        evaluate: () => ({ kind: "allow" }),
+        evaluatePermanent: () => ({ kind: "allow" }),
+      },
+      confirmations,
+      "TestOwner",
+      undefined,
+      {
+        isLeaseLive: () => live,
+        reserveAdditionalTravel: () => {
+          throw new Error("no additional travel expected");
+        },
+      },
+    );
+    const ticket = confirmations.createGameAction(
+      "stored",
+      { kind: "say", message: "must not dispatch" },
+      taskLease,
+    );
+
+    const pending = executor.executeConfirmed(ticket.id, context, taskLease);
+    live = false;
+
+    await expect(pending).resolves.toEqual({ status: "cancelled" });
+    expect(minecraft.chatLog).toEqual([]);
   });
 
   it("reports expired confirmed IDs without calling Minecraft", async () => {
     let now = new Date("2026-07-25T00:00:00Z");
     const minecraft = new FakeMinecraftPort();
     const confirmations = new ConfirmationStore(() => now);
-    const executor = createActionExecutorHarness(minecraft, { kind: "allow" }, confirmations);
-    const ticket = confirmations.create("wait", {
-      kind: "game_action",
-      action: { kind: "wait", milliseconds: 1 },
-    });
+    const safety: ActionSafety = {
+      evaluate: () => ({ kind: "allow" }),
+      evaluatePermanent: () => ({ kind: "allow" }),
+    };
+    const executor = confirmedExecutor(minecraft, safety, confirmations);
+    const ticket = confirmations.createGameAction(
+      "wait",
+      { kind: "wait", milliseconds: 1 },
+      taskLease,
+    );
     now = new Date("2026-07-25T00:02:00Z");
 
-    await expect(executor.executeConfirmed(ticket.id, context)).resolves.toEqual({
+    await expect(executor.executeConfirmed(ticket.id, context, taskLease)).resolves.toEqual({
       status: "confirmation_invalid",
       reason: "expired",
     });
@@ -421,12 +580,13 @@ describe("ActionExecutor", () => {
         throw new Error("permanent safety failed");
       },
     };
-    const executor = new ActionExecutor(minecraft, safety, confirmations, "TestOwner");
-    const ticket = confirmations.create("confirmed", {
-      kind: "game_action",
-      action: { kind: "say", message: "stored" },
-    });
-    const failed = executor.executeConfirmed(ticket.id, context);
+    const executor = confirmedExecutor(minecraft, safety, confirmations);
+    const ticket = confirmations.createGameAction(
+      "confirmed",
+      { kind: "say", message: "stored" },
+      taskLease,
+    );
+    const failed = executor.executeConfirmed(ticket.id, context, taskLease);
     let result: string | undefined;
     void failed.then((value) => {
       result = value.status;
@@ -439,7 +599,7 @@ describe("ActionExecutor", () => {
       status: "failed",
       reason: "Error: permanent safety failed",
     });
-    await expect(executor.executeConfirmed(ticket.id, context)).resolves.toEqual({
+    await expect(executor.executeConfirmed(ticket.id, context, taskLease)).resolves.toEqual({
       status: "confirmation_invalid",
       reason: "missing",
     });
@@ -453,10 +613,17 @@ describe("ActionExecutor", () => {
     vi.spyOn(confirmations, "allowGameAction").mockImplementation(() => {
       throw new Error("confirmation storage failed");
     });
-    const executor = createActionExecutorHarness(minecraft, { kind: "allow" }, confirmations);
+    const executor = confirmedExecutor(
+      minecraft,
+      {
+        evaluate: () => ({ kind: "allow" }),
+        evaluatePermanent: () => ({ kind: "allow" }),
+      },
+      confirmations,
+    );
 
-    expect(() => executor.executeConfirmed(1, context)).not.toThrow();
-    await expect(executor.executeConfirmed(1, context)).resolves.toEqual({
+    expect(() => executor.executeConfirmed(1, context, taskLease)).not.toThrow();
+    await expect(executor.executeConfirmed(1, context, taskLease)).resolves.toEqual({
       status: "failed",
       reason: "Error: confirmation storage failed",
     });
@@ -467,27 +634,25 @@ describe("ActionExecutor", () => {
   it("keeps non-game confirmations pending and rechecks permanent safety before execution", async () => {
     const minecraft = new FakeMinecraftPort();
     const confirmations = new ConfirmationStore();
-    const executor = new ActionExecutor(
-      minecraft,
-      new SafetyEngine(confirmations),
-      confirmations,
-      "TestOwner",
-    );
+    const executor = confirmedExecutor(minecraft, new SafetyEngine(confirmations), confirmations);
     const memory = confirmations.create("clear", { kind: "memory_clear" });
-    const tnt = confirmations.create("seeded", {
-      kind: "game_action",
-      action: { kind: "place_block", blockName: "tnt", position: { x: 30, y: 64, z: 0 } },
-    });
-    const spawn = confirmations.create("seeded", {
-      kind: "game_action",
-      action: { kind: "dig_block", blockName: "stone", position: { x: 1, y: 64, z: 1 } },
-    });
-    const protectedTarget = confirmations.create("seeded", {
-      kind: "game_action",
-      action: { kind: "attack_hostile", entityId: 9 },
-    });
+    const tnt = confirmations.createGameAction(
+      "seeded",
+      { kind: "place_block", blockName: "tnt", position: { x: 30, y: 64, z: 0 } },
+      taskLease,
+    );
+    const spawn = confirmations.createGameAction(
+      "seeded",
+      { kind: "dig_block", blockName: "stone", position: { x: 1, y: 64, z: 1 } },
+      taskLease,
+    );
+    const protectedTarget = confirmations.createGameAction(
+      "seeded",
+      { kind: "attack_hostile", entityId: 9 },
+      taskLease,
+    );
 
-    await expect(executor.executeConfirmed(memory.id, context)).resolves.toEqual({
+    await expect(executor.executeConfirmed(memory.id, context, taskLease)).resolves.toEqual({
       status: "confirmation_invalid",
       reason: "wrong_operation",
     });
@@ -495,16 +660,20 @@ describe("ActionExecutor", () => {
       ok: true,
       operation: { kind: "memory_clear" },
     });
-    await expect(executor.executeConfirmed(tnt.id, context)).resolves.toEqual({
+    await expect(executor.executeConfirmed(tnt.id, context, taskLease)).resolves.toEqual({
       status: "denied",
       reason: "TNT is permanently forbidden",
     });
-    await expect(executor.executeConfirmed(spawn.id, context)).resolves.toEqual({
+    await expect(executor.executeConfirmed(spawn.id, context, taskLease)).resolves.toEqual({
       status: "denied",
       reason: "Spawn protection radius is 16 blocks",
     });
     await expect(
-      executor.executeConfirmed(protectedTarget.id, { ...context, protectedTarget: "villager" }),
+      executor.executeConfirmed(
+        protectedTarget.id,
+        { ...context, protectedTarget: "villager" },
+        taskLease,
+      ),
     ).resolves.toEqual({
       status: "denied",
       reason: "Attacking a villager is permanently forbidden",

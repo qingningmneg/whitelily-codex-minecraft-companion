@@ -4,7 +4,14 @@ import { ActionExecutor } from "./actions/actionExecutor.js";
 import { AutonomyScheduler } from "./autonomy/autonomyScheduler.js";
 import { CodexAppServerClient } from "./codex/appServerClient.js";
 import { selectModel } from "./codex/modelSelector.js";
+import { ChatRouter } from "./companion/chatRouter.js";
 import { CompanionService } from "./companion/companionService.js";
+import {
+  TaskController,
+  type TaskAuditCallback,
+  type TaskAuditData,
+  type TaskAuditEvent,
+} from "./companion/taskController.js";
 import { loadConfig } from "./config/loadConfig.js";
 import type { AppConfig } from "./config/schema.js";
 import { SafeLogger } from "./logging/safeLogger.js";
@@ -17,11 +24,13 @@ import {
 } from "./mcp/toolRegistry.js";
 import { MemoryStore } from "./memory/memoryStore.js";
 import { StateStore } from "./memory/stateStore.js";
-import type { MinecraftPort } from "./minecraft/minecraftPort.js";
+import type { MinecraftEvent, MinecraftPort } from "./minecraft/minecraftPort.js";
 import { MineflayerAdapter } from "./minecraft/mineflayerAdapter.js";
 import { ModeManager } from "./mode/modeManager.js";
+import { RuntimeFacade } from "./runtime/runtimeFacade.js";
 import { ConfirmationStore } from "./safety/confirmationStore.js";
 import { SafetyEngine, type SafetyContext } from "./safety/safetyEngine.js";
+import { TaskControllerBudget } from "./safety/taskBudget.js";
 
 const MCP_HOST = "127.0.0.1" as const;
 const MCP_PORT = 32123;
@@ -46,6 +55,7 @@ interface ManagedCodex {
 interface ManagedMinecraft {
   connect(): Promise<void>;
   disconnect(): Promise<void>;
+  onEvent?(listener: (event: MinecraftEvent) => void): () => void;
 }
 
 interface ManagedCompanion {
@@ -80,11 +90,26 @@ export interface AppCompositionContext {
   paths: AppPaths;
   mode: ModeManager;
   budget: TurnToolBudget;
+  taskController: TaskController;
+  logger: Pick<SafeLogger, "info" | "error">;
 }
 
 export interface CreateAppOptions {
   cwd?: string;
   runtimeFactory?: (context: AppCompositionContext) => AppRuntime | Promise<AppRuntime>;
+}
+
+interface RuntimeCompositionObservers {
+  taskChanged?(): void;
+  modelSelected?(model: string): void;
+  invalidateTaskBeforeStartupCleanup?: boolean;
+}
+
+interface ComposedApp {
+  lifecycle: WhiteLilyAppLifecycle;
+  runtime: AppRuntime;
+  taskBudget: TaskControllerBudget;
+  taskController: TaskController;
 }
 
 interface AttemptedComponents {
@@ -98,6 +123,71 @@ interface StartupAttempt {
   phases: AttemptedComponents;
   cancelled: boolean;
   cleanupPromise?: Promise<void>;
+}
+
+interface WhiteLilyLifecycleHooks {
+  beforeStartupCleanup?(): void | Promise<void>;
+  beforeStopCleanup?(): void;
+  afterCleanup?(): void | Promise<void>;
+}
+
+class PersistentTaskAudit {
+  private tail: Promise<void> = Promise.resolve();
+
+  constructor(
+    private readonly logger: Pick<SafeLogger, "info" | "error">,
+    private readonly budget: TaskControllerBudget,
+  ) {}
+
+  readonly record: TaskAuditCallback = (event, data) => {
+    const fields = taskAuditFields(event, data, this.budget);
+    this.tail = this.tail
+      .catch(() => undefined)
+      .then(() => this.logger.info(event, fields))
+      .catch(() =>
+        Promise.resolve()
+          .then(() =>
+            this.logger.error("task_audit_write_failed", {
+              code: "audit_write_failed",
+            }),
+          )
+          .catch(() => undefined),
+      );
+  };
+
+  async flush(): Promise<void> {
+    let pending: Promise<void>;
+    do {
+      pending = this.tail;
+      await pending;
+    } while (pending !== this.tail);
+  }
+}
+
+function taskAuditFields(
+  event: TaskAuditEvent,
+  data: TaskAuditData,
+  budget: TaskControllerBudget,
+): Record<string, unknown> {
+  const snapshot = budget.snapshot();
+  return {
+    startedAt: data.task.startedAt,
+    expectedActionCategoryCount: data.task.disclosure.expectedActions.length,
+    limits: {
+      maxToolCalls: snapshot.limits.maxToolCalls,
+      maxBlockChanges: snapshot.limits.maxBlockChanges,
+      maxHorizontalTravel: snapshot.limits.maxHorizontalTravel,
+      maxDurationMs: snapshot.limits.maxDurationMs,
+      maxDangerousOperations: snapshot.limits.maxDangerousOperations,
+    },
+    counters: {
+      toolCalls: snapshot.toolCalls,
+      blockChanges: snapshot.blockChanges,
+      horizontalTravel: snapshot.horizontalTravel,
+      dangerousOperations: snapshot.dangerousOperations,
+    },
+    ...(event === "task_stopped" && "reason" in data ? { reason: data.reason } : {}),
+  };
 }
 
 function emptyAttempts(): AttemptedComponents {
@@ -123,6 +213,7 @@ async function initializeStorage(paths: AppPaths): Promise<void> {
         lastMode: "friend",
         paused: false,
         unfinishedTaskSummary: null,
+        worldInvalidated: false,
       },
       null,
       2,
@@ -191,19 +282,26 @@ class McpLifecycle implements ManagedMcp {
 }
 
 function createProductionRuntime(context: AppCompositionContext): AppRuntime {
-  const { config, paths, mode, budget } = context;
+  const { config, paths, mode, budget, taskController, logger } = context;
   const confirmations = new ConfirmationStore();
-  const safety = new SafetyEngine(confirmations, config.safety);
+  const safety = new SafetyEngine(confirmations, config.safety, (lease) =>
+    taskController.isLeaseLive(lease),
+  );
   const minecraft = new MineflayerAdapter(config.minecraft);
   const executor = new ActionExecutor(
     minecraft,
     safety,
     confirmations,
     config.minecraft.ownerUsername,
+    () => taskController.stop("owner_stop"),
+    {
+      isLeaseLive: (lease) => taskController.isLeaseLive(lease),
+      reserveAdditionalTravel: (lease, horizontalTravel) =>
+        taskController.reserveAdditionalTravel(lease, horizontalTravel),
+    },
   );
   const memories = new MemoryStore(paths.memories);
   const state = new StateStore(paths.state);
-  const logger = new SafeLogger(paths.log);
   const codex = new CodexAppServerClient(config, {
     workspacePath: paths.codexWorkspace,
   });
@@ -234,9 +332,14 @@ function createProductionRuntime(context: AppCompositionContext): AppRuntime {
     confirmations,
     executor,
     budget,
+    taskController,
     autonomy,
     safetyContextProvider,
     ownerUsername: config.minecraft.ownerUsername,
+    chatRouter: new ChatRouter({
+      ownerUsername: config.minecraft.ownerUsername,
+      maxMessageLength: 4_000,
+    }),
     cwd: paths.cwd,
     preferredModel: config.codex.preferredModel,
     reasoningEffort: config.codex.reasoningEffort,
@@ -270,9 +373,11 @@ class WhiteLilyAppLifecycle implements WhiteLilyApp {
   #stopPromise: Promise<void> | undefined;
   #stopCompleted = false;
   readonly #runtime: AppRuntime;
+  readonly #hooks: WhiteLilyLifecycleHooks;
 
-  constructor(runtime: AppRuntime) {
+  constructor(runtime: AppRuntime, hooks: WhiteLilyLifecycleHooks = {}) {
     this.#runtime = runtime;
+    this.#hooks = hooks;
   }
 
   start(): Promise<void> {
@@ -346,7 +451,13 @@ class WhiteLilyAppLifecycle implements WhiteLilyApp {
       this.#state = "running";
     } catch (error) {
       attempt.cancelled = true;
+      await Promise.resolve()
+        .then(() => this.#hooks.beforeStartupCleanup?.())
+        .catch(() => undefined);
       await this.#queueCleanup(attempt).catch(() => undefined);
+      await Promise.resolve()
+        .then(() => this.#hooks.afterCleanup?.())
+        .catch(() => undefined);
       this.#state = "terminal";
       if (this.#attempt === attempt) this.#attempt = undefined;
       throw error;
@@ -355,6 +466,11 @@ class WhiteLilyAppLifecycle implements WhiteLilyApp {
 
   async #stopInternal(attempt: StartupAttempt | undefined): Promise<void> {
     let cleanupError: unknown;
+    try {
+      this.#hooks.beforeStopCleanup?.();
+    } catch {
+      // Task invalidation failures cannot block the remaining safety cleanup.
+    }
     if (attempt) {
       try {
         await this.#queueCleanup(attempt);
@@ -362,6 +478,9 @@ class WhiteLilyAppLifecycle implements WhiteLilyApp {
         cleanupError = error;
       }
     }
+    await Promise.resolve()
+      .then(() => this.#hooks.afterCleanup?.())
+      .catch(() => undefined);
     this.#stopCompleted = true;
     if (!this.#startPromise && this.#attempt === attempt) this.#attempt = undefined;
     if (cleanupError !== undefined) throw cleanupError;
@@ -398,6 +517,9 @@ class WhiteLilyAppLifecycle implements WhiteLilyApp {
     if (component === "mcp") {
       await this.#runtime.mcp.stop().catch(() => undefined);
     }
+    await Promise.resolve()
+      .then(() => this.#hooks.afterCleanup?.())
+      .catch(() => undefined);
   }
 
   async #cleanup(attempted: AttemptedComponents): Promise<void> {
@@ -425,6 +547,59 @@ export async function createApp(
   configPath: string,
   options: CreateAppOptions = {},
 ): Promise<WhiteLilyApp> {
+  const composition = await composeApp(configPath, options);
+  return composition.lifecycle;
+}
+
+export async function createRuntimeFacade(
+  configPath: string,
+  options: CreateAppOptions = {},
+): Promise<RuntimeFacade> {
+  const taskListeners = new Set<() => void>();
+  let selectedModel: string | null = null;
+  const composition = await composeApp(configPath, options, {
+    taskChanged: () => {
+      for (const listener of taskListeners) {
+        try {
+          listener();
+        } catch {
+          // Runtime task observers cannot affect task lifecycle.
+        }
+      }
+    },
+    modelSelected: (model) => {
+      selectedModel = model;
+    },
+    invalidateTaskBeforeStartupCleanup: true,
+  });
+  const minecraft = composition.runtime.minecraft.onEvent
+    ? {
+        subscribe: (listener: (event: MinecraftEvent) => void) =>
+          composition.runtime.minecraft.onEvent!(listener),
+      }
+    : undefined;
+  return new RuntimeFacade({
+    lifecycle: composition.lifecycle,
+    task: {
+      current: () => composition.taskController.current(),
+      budget: () => composition.taskBudget.snapshot(),
+      stop: (reason) => composition.taskController.stop(reason),
+      failClosed: () => composition.taskController.failClosed(),
+      subscribe: (listener) => {
+        taskListeners.add(listener);
+        return () => taskListeners.delete(listener);
+      },
+    },
+    ...(minecraft ? { minecraft } : {}),
+    codex: { model: () => selectedModel },
+  });
+}
+
+async function composeApp(
+  configPath: string,
+  options: CreateAppOptions,
+  observers: RuntimeCompositionObservers = {},
+): Promise<ComposedApp> {
   const config = await loadConfig(configPath);
   const cwd = resolve(options.cwd ?? process.cwd());
   const paths: AppPaths = {
@@ -435,12 +610,52 @@ export async function createApp(
     codexWorkspace: join(cwd, "codex-workspace"),
   };
   await initializeStorage(paths);
+  const taskBudget = new TaskControllerBudget();
+  const logger = new SafeLogger(paths.log);
+  const taskAudit = new PersistentTaskAudit(logger, taskBudget);
+  const taskController = new TaskController(taskBudget, (event, data) => {
+    try {
+      observers.taskChanged?.();
+    } finally {
+      taskAudit.record(event, data);
+    }
+  });
   const context: AppCompositionContext = {
     config,
     paths,
     mode: new ModeManager(),
-    budget: new TurnToolBudget(),
+    budget: new TurnToolBudget(taskBudget),
+    taskController,
+    logger,
   };
   const runtime = await (options.runtimeFactory ?? createProductionRuntime)(context);
-  return new WhiteLilyAppLifecycle(runtime);
+  const lifecycleRuntime: AppRuntime = observers.modelSelected
+    ? {
+        preferredModel: runtime.preferredModel,
+        mcp: runtime.mcp,
+        codex: runtime.codex,
+        selectModel: async (available, preferred) => {
+          const model = await runtime.selectModel(available, preferred);
+          observers.modelSelected?.(model);
+          return model;
+        },
+        minecraft: runtime.minecraft,
+        companion: runtime.companion,
+        executor: runtime.executor,
+      }
+    : runtime;
+  return {
+    lifecycle: new WhiteLilyAppLifecycle(lifecycleRuntime, {
+      ...(observers.invalidateTaskBeforeStartupCleanup
+        ? {
+            beforeStartupCleanup: () => taskController.stop("failed"),
+          }
+        : {}),
+      beforeStopCleanup: () => taskController.stop("process_exit"),
+      afterCleanup: () => taskAudit.flush(),
+    }),
+    runtime,
+    taskBudget,
+    taskController,
+  };
 }

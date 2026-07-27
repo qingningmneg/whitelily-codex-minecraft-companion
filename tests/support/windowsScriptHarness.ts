@@ -10,6 +10,7 @@ import {
   readFile,
   readdir,
   readlink,
+  realpath,
   rm,
   writeFile,
 } from "node:fs/promises";
@@ -406,6 +407,16 @@ function normalizeCommandPath(path: string): string {
   return resolve(path).replaceAll("\\", "/").toLocaleLowerCase();
 }
 
+async function commandPathAliases(path: string): Promise<Set<string>> {
+  const aliases = new Set([normalizeCommandPath(path)]);
+  try {
+    aliases.add(normalizeCommandPath(await realpath(path)));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  return aliases;
+}
+
 function powerShellLiteral(value: string): string {
   return value.replaceAll("'", "''");
 }
@@ -609,8 +620,7 @@ export async function runWindowsScriptFixture(
       PATH: systemFixturePath(shimDirectory),
       WHITELILY_TEST_APP_ROOT: fixtureRoot,
       WHITELILY_TEST_INVOCATION_LOG: invocationLog,
-      WHITELILY_TEST_CODEX_STATUS:
-        options.codexStatus ?? "Logged in with ChatGPT as private-user@example.net",
+      WHITELILY_TEST_CODEX_STATUS: options.codexStatus ?? "Logged in using ChatGPT",
       WHITELILY_TEST_CODEX_EXIT: String(options.codexExitCode ?? 0),
       WHITELILY_TEST_CONFIG_VALID: options.configValid === false ? "0" : "1",
       WHITELILY_TEST_DROP_OWNERSHIP_AFTER_MARKER: options.dropOwnershipAfterMarker ? "1" : "0",
@@ -652,17 +662,12 @@ export async function runWindowsScriptFixture(
       const pidText = await readFile(join(fixtureRoot, "data", "whitelily.pid"), "utf8");
       if (/^[1-9]\d*\r?\n?$/.test(pidText)) {
         const pid = Number(pidText.trim());
-        const identity = await queryWindowsProcessIdentity(pid);
         const entryPath = join(fixtureRoot, "dist", "src", "index.js");
-        if (
-          identity === undefined ||
-          !identity.commandLine
-            .replaceAll("\\", "/")
-            .toLocaleLowerCase()
-            .includes(normalizeCommandPath(entryPath))
-        ) {
-          throw new Error("started fixture service identity could not be established");
-        }
+        const identity = await waitForExpectedProcessIdentity(
+          pid,
+          entryPath,
+          "started fixture service",
+        );
         lifecycle.service = {
           pid,
           creationDate: identity.creationDate,
@@ -701,6 +706,10 @@ export async function startOwnedFixtureProcess(
   root: string,
   behavior: "graceful" | "stubborn" | "graceful-replace-pid",
   replacementPid?: number,
+  options: {
+    expectedIdentityPathForTest?: string;
+    onSpawnedPidForTest?: (pid: number) => void;
+  } = {},
 ): Promise<ChildProcess> {
   const fixtureRoot = resolve(root);
   const marker = join(fixtureRoot, "data", "stop.request").replaceAll("'", "''");
@@ -721,10 +730,31 @@ export async function startOwnedFixtureProcess(
     windowsHide: true,
     stdio: "ignore",
   });
+  const close = createClosePromise(child);
+  void close.catch(() => undefined);
   await new Promise<void>((resolveSpawn, reject) => {
     child.once("spawn", resolveSpawn);
     child.once("error", reject);
   });
+  if (child.pid === undefined) throw new Error("owned fixture process did not expose a PID");
+  options.onSpawnedPidForTest?.(child.pid);
+  try {
+    await waitForExpectedProcessIdentity(
+      child.pid,
+      options.expectedIdentityPathForTest ?? join(fixtureRoot, "dist", "src", "index.js"),
+      "owned fixture process",
+    );
+  } catch (error) {
+    try {
+      await terminateOwnedChildTree(child, close);
+    } catch (terminationError) {
+      throw new AggregateError(
+        [error, terminationError],
+        "owned fixture process identity failed and cleanup did not settle",
+      );
+    }
+    throw error;
+  }
   return child;
 }
 
@@ -769,6 +799,37 @@ async function queryWindowsProcessIdentityWithTimeout(
   if (result.exitCode !== 0) throw new Error("Windows process identity query failed");
   if (result.stdout.trim() === "") throw new Error("Windows process identity query was empty");
   return JSON.parse(result.stdout.trim()) as WindowsProcessIdentity;
+}
+
+async function waitForExpectedProcessIdentity(
+  pid: number,
+  expectedCommandPath: string,
+  label: string,
+  timeoutMilliseconds = processOperationTimeoutMilliseconds,
+): Promise<WindowsProcessIdentity> {
+  const expectedAliases = await commandPathAliases(expectedCommandPath);
+  const deadline = performance.now() + timeoutMilliseconds;
+  let lastIdentity: WindowsProcessIdentity | undefined;
+  while (true) {
+    const remaining = Math.floor(deadline - performance.now());
+    if (remaining <= 1_000) break;
+    lastIdentity = await queryWindowsProcessIdentityWithTimeout(
+      pid,
+      Math.min(processOperationTimeoutMilliseconds, remaining - 250),
+    );
+    if (lastIdentity !== undefined) {
+      const commandLine = lastIdentity.commandLine.replaceAll("\\", "/").toLocaleLowerCase();
+      if ([...expectedAliases].some((expected) => commandLine.includes(expected))) {
+        return lastIdentity;
+      }
+    }
+    await new Promise<void>((resolveDelay) => setTimeout(resolveDelay, 25));
+  }
+  const observation =
+    lastIdentity === undefined
+      ? "the process was not observable"
+      : "its command line did not identify the fixture entry";
+  throw new Error(`${label} identity could not be established: ${observation}`);
 }
 
 async function findFixturePidsByCommandFragment(
@@ -1030,8 +1091,14 @@ async function cleanupWindowsFixtureInternal(
 }
 
 export async function cleanupWindowsFixture(root: string): Promise<void> {
-  const fixtureRoot = resolve(root);
-  const temporaryRoot = resolve(tmpdir());
+  let fixtureRoot: string;
+  try {
+    fixtureRoot = await realpath(resolve(root));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    fixtureRoot = resolve(root);
+  }
+  const temporaryRoot = await realpath(resolve(tmpdir()));
   if (
     !fixtureRoot.startsWith(`${temporaryRoot}${sep}`) ||
     !basename(fixtureRoot).startsWith("whitelily-windows-script-")

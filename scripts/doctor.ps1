@@ -150,8 +150,8 @@ else {
   try {
     $loginLines = & $codex.Source login status 2>$null
     $commandSucceeded = $?
-    $loginStatus = $loginLines -join "`n"
-    if ($commandSucceeded -and $loginStatus -match '(?i)ChatGPT') {
+    $loginStatusLines = @($loginLines | ForEach-Object { $_ -split '\r?\n' })
+    if ($commandSucceeded -and ($loginStatusLines -ccontains 'Logged in using ChatGPT')) {
       Write-Check -Status PASS -Label 'Codex login' -Message 'ChatGPT authentication is active.'
     }
     else {

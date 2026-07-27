@@ -1,19 +1,151 @@
 import { describe, expect, it } from "vitest";
 import { ConfirmationStore } from "../../src/safety/confirmationStore.js";
+import type { TaskLease } from "../../src/safety/taskBudget.js";
 
 describe("ConfirmationStore", () => {
+  const taskLease: TaskLease = { id: "task-lease-a", startedAt: 1_000 };
+
+  it("refuses to create a taskless game-action confirmation", () => {
+    const store = new ConfirmationStore(() => new Date("2026-07-25T00:00:00Z"));
+
+    expect(() =>
+      store.create("taskless", {
+        kind: "game_action",
+        action: { kind: "wait", milliseconds: 1 },
+      }),
+    ).toThrow("game confirmations require a task capability");
+  });
+
+  it("atomically matches the originating task capability before consuming a game action", () => {
+    const store = new ConfirmationStore(() => new Date("2026-07-25T00:00:00Z"));
+    const confirmation = store.createGameAction(
+      "travel",
+      { kind: "move_to", position: { x: 300, y: 64, z: 0 } },
+      taskLease,
+      300,
+    );
+
+    expect(
+      store.allowGameAction(confirmation.id, {
+        id: "task-lease-b",
+        startedAt: taskLease.startedAt,
+      }),
+    ).toEqual({ ok: false, reason: "wrong_task" });
+    expect(store.hasGameActions(taskLease)).toBe(true);
+    expect(store.allowGameAction(confirmation.id, taskLease)).toEqual({
+      ok: true,
+      action: { kind: "move_to", position: { x: 300, y: 64, z: 0 } },
+      reservedHorizontalTravel: 300,
+    });
+    expect(store.hasGameActions(taskLease)).toBe(false);
+  });
+
+  it("reveals an isolated game reservation only to the originating live-task caller", () => {
+    const store = new ConfirmationStore(() => new Date("2026-07-25T00:00:00Z"));
+    const confirmation = store.createGameAction(
+      "travel",
+      { kind: "move_to", position: { x: 300, y: 64, z: 0 } },
+      taskLease,
+      300,
+    );
+
+    expect(
+      store.inspectGameAction(confirmation.id, {
+        id: taskLease.id,
+        startedAt: taskLease.startedAt + 1,
+      }),
+    ).toEqual({ ok: false, reason: "wrong_task" });
+    const inspected = store.inspectGameAction(confirmation.id, taskLease);
+    expect(inspected).toEqual({
+      ok: true,
+      action: { kind: "move_to", position: { x: 300, y: 64, z: 0 } },
+      reservedHorizontalTravel: 300,
+    });
+    if (inspected.ok && inspected.action.kind === "move_to") inspected.action.position.x = 0;
+    expect(store.inspectGameAction(confirmation.id, taskLease)).toEqual({
+      ok: true,
+      action: { kind: "move_to", position: { x: 300, y: 64, z: 0 } },
+      reservedHorizontalTravel: 300,
+    });
+  });
+
+  it("clears game capabilities without consuming local memory-clear confirmation", () => {
+    const store = new ConfirmationStore(() => new Date("2026-07-25T00:00:00Z"));
+    store.createGameAction("wait", { kind: "wait", milliseconds: 1 }, taskLease);
+    const memory = store.create("clear", { kind: "memory_clear" });
+
+    store.clearGameActions();
+
+    expect(store.hasGameActions(taskLease)).toBe(false);
+    expect(store.allow(memory.id)).toEqual({ ok: true, operation: { kind: "memory_clear" } });
+  });
+
+  it("isolates game confirmation lifecycle operations from failing observers", () => {
+    let now = new Date("2026-07-25T00:00:00Z");
+    const store = new ConfirmationStore(() => now);
+    const changedEvents: string[] = [];
+    const expiredEvents: TaskLease[] = [];
+    store.onGameActionsChanged(() => {
+      throw new Error("changed observer failed");
+    });
+    store.onGameActionsChanged(() => changedEvents.push("changed"));
+    store.onGameActionsExpired(() => {
+      throw new Error("expiry observer failed");
+    });
+    store.onGameActionsExpired((lease) => expiredEvents.push(lease));
+
+    const allowed = store.createGameAction("allow", { kind: "wait", milliseconds: 1 }, taskLease);
+    expect(store.allowGameAction(allowed.id, taskLease)).toEqual({
+      ok: true,
+      action: { kind: "wait", milliseconds: 1 },
+      reservedHorizontalTravel: 0,
+    });
+
+    store.createGameAction("clear", { kind: "wait", milliseconds: 1 }, taskLease);
+    expect(() => store.clearGameActions()).not.toThrow();
+
+    const expired = store.createGameAction("expire", { kind: "wait", milliseconds: 1 }, taskLease);
+    now = new Date("2026-07-25T00:02:00Z");
+    expect(() => store.get(expired.id)).not.toThrow();
+    expect(store.get(expired.id)).toBeUndefined();
+    expect(changedEvents).toHaveLength(6);
+    expect(expiredEvents).toEqual([taskLease]);
+  });
+
+  it("expires only confirmations owned by the exact task lease", () => {
+    let now = new Date("2026-07-25T00:00:00Z");
+    const store = new ConfirmationStore(() => now);
+    const replacementLease: TaskLease = { id: "task-lease-b", startedAt: 2_000 };
+    const oldConfirmation = store.createGameAction(
+      "old",
+      { kind: "wait", milliseconds: 1 },
+      taskLease,
+    );
+    const replacementConfirmation = store.createGameAction(
+      "replacement",
+      { kind: "wait", milliseconds: 1 },
+      replacementLease,
+    );
+    now = new Date("2026-07-25T00:02:00Z");
+
+    expect(store.expireGameActions(taskLease)).toBe(1);
+    expect(store.get(oldConfirmation.id)).toBeUndefined();
+    expect(store.hasGameActions(replacementLease)).toBe(true);
+    expect(store.allowGameAction(replacementConfirmation.id, replacementLease)).toEqual({
+      ok: false,
+      reason: "expired",
+    });
+  });
+
   it("creates a pending confirmation that can be retrieved without consuming it", () => {
     const store = new ConfirmationStore(() => new Date("2026-07-25T00:00:00Z"));
-    const operation = {
-      kind: "game_action" as const,
-      action: { kind: "wait" as const, milliseconds: 1 },
-    };
+    const operation = { kind: "memory_clear" as const };
 
-    const confirmation = store.create("wait briefly", operation);
+    const confirmation = store.create("clear memories", operation);
 
     expect(confirmation).toMatchObject({
       id: 1,
-      reason: "wait briefly",
+      reason: "clear memories",
       operation,
       expiresAt: new Date("2026-07-25T00:02:00Z"),
     });
@@ -22,11 +154,8 @@ describe("ConfirmationStore", () => {
 
   it("allows a pending confirmation exactly once", () => {
     const store = new ConfirmationStore(() => new Date("2026-07-25T00:00:00Z"));
-    const operation = {
-      kind: "game_action" as const,
-      action: { kind: "wait" as const, milliseconds: 1 },
-    };
-    const confirmation = store.create("wait briefly", operation);
+    const operation = { kind: "memory_clear" as const };
+    const confirmation = store.create("clear memories", operation);
 
     expect(store.allow(confirmation.id)).toEqual({ ok: true, operation });
     expect(store.allow(confirmation.id)).toEqual({ ok: false, reason: "missing" });
@@ -34,31 +163,36 @@ describe("ConfirmationStore", () => {
 
   it("consumes only game-action confirmations and returns an isolated action copy", () => {
     const store = new ConfirmationStore(() => new Date("2026-07-25T00:00:00Z"));
-    const gameAction = store.create("travel", {
-      kind: "game_action",
-      action: { kind: "move_to", position: { x: 300, y: 64, z: 0 } },
-    });
+    const gameAction = store.createGameAction(
+      "travel",
+      { kind: "move_to", position: { x: 300, y: 64, z: 0 } },
+      taskLease,
+    );
     const memoryClear = store.create("clear", { kind: "memory_clear" });
 
-    const approved = store.allowGameAction(gameAction.id);
+    const approved = store.allowGameAction(gameAction.id, taskLease);
     expect(approved).toEqual({
       ok: true,
       action: { kind: "move_to", position: { x: 300, y: 64, z: 0 } },
+      reservedHorizontalTravel: 0,
     });
     if (approved.ok && approved.action.kind === "move_to") approved.action.position.x = 0;
 
-    expect(store.allowGameAction(gameAction.id)).toEqual({ ok: false, reason: "missing" });
-    expect(store.allowGameAction(memoryClear.id)).toEqual({ ok: false, reason: "wrong_operation" });
+    expect(store.allowGameAction(gameAction.id, taskLease)).toEqual({
+      ok: false,
+      reason: "missing",
+    });
+    expect(store.allowGameAction(memoryClear.id, taskLease)).toEqual({
+      ok: false,
+      reason: "wrong_operation",
+    });
     expect(store.get(memoryClear.id)).toMatchObject({ id: memoryClear.id });
   });
 
   it("expires confirmations at the 120-second boundary", () => {
     let now = new Date("2026-07-25T00:00:00Z");
     const store = new ConfirmationStore(() => now);
-    const confirmation = store.create("wait briefly", {
-      kind: "game_action",
-      action: { kind: "wait", milliseconds: 1 },
-    });
+    const confirmation = store.create("clear memories", { kind: "memory_clear" });
 
     now = new Date("2026-07-25T00:02:00Z");
 
@@ -69,10 +203,7 @@ describe("ConfirmationStore", () => {
   it("does not return an expired confirmation from get", () => {
     let now = new Date("2026-07-25T00:00:00Z");
     const store = new ConfirmationStore(() => now);
-    const confirmation = store.create("wait briefly", {
-      kind: "game_action",
-      action: { kind: "wait", milliseconds: 1 },
-    });
+    const confirmation = store.create("clear memories", { kind: "memory_clear" });
 
     now = new Date("2026-07-25T00:02:00Z");
 
@@ -100,7 +231,7 @@ describe("ConfirmationStore", () => {
       kind: "game_action" as const,
       action: { kind: "place_block" as const, blockName: "stone", position: { x: 1, y: 64, z: 2 } },
     };
-    const confirmation = store.create("place stone", operation);
+    const confirmation = store.createGameAction("place stone", operation.action, taskLease);
 
     confirmation.expiresAt.setTime(new Date("2026-07-25T01:00:00Z").getTime());
     if (
@@ -117,16 +248,20 @@ describe("ConfirmationStore", () => {
       blockName: "stone",
       position: { x: 1, y: 64, z: 2 },
     });
-    expect(store.allow(confirmation.id)).toEqual({ ok: false, reason: "expired" });
+    expect(store.allowGameAction(confirmation.id, taskLease)).toEqual({
+      ok: false,
+      reason: "expired",
+    });
   });
 
   it("keeps the stored operation isolated from get results", () => {
     let now = new Date("2026-07-25T00:00:00Z");
     const store = new ConfirmationStore(() => now);
-    const confirmation = store.create("place stone", {
-      kind: "game_action",
-      action: { kind: "place_block", blockName: "stone", position: { x: 1, y: 64, z: 2 } },
-    });
+    const confirmation = store.createGameAction(
+      "place stone",
+      { kind: "place_block", blockName: "stone", position: { x: 1, y: 64, z: 2 } },
+      taskLease,
+    );
     const pending = store.get(confirmation.id)!;
 
     pending.expiresAt.setTime(new Date("2026-07-25T01:00:00Z").getTime());
@@ -147,7 +282,10 @@ describe("ConfirmationStore", () => {
     });
     now = new Date("2026-07-25T00:02:00Z");
 
-    expect(store.allow(confirmation.id)).toEqual({ ok: false, reason: "expired" });
+    expect(store.allowGameAction(confirmation.id, taskLease)).toEqual({
+      ok: false,
+      reason: "expired",
+    });
   });
 
   it("returns an allow operation that cannot mutate the caller input", () => {
@@ -156,16 +294,12 @@ describe("ConfirmationStore", () => {
       kind: "game_action" as const,
       action: { kind: "place_block" as const, blockName: "stone", position: { x: 1, y: 64, z: 2 } },
     };
-    const confirmation = store.create("place stone", operation);
-    const result = store.allow(confirmation.id);
+    const confirmation = store.createGameAction("place stone", operation.action, taskLease);
+    const result = store.allowGameAction(confirmation.id, taskLease);
 
-    if (
-      result.ok &&
-      result.operation.kind === "game_action" &&
-      result.operation.action.kind === "place_block"
-    ) {
-      result.operation.action.blockName = "tnt";
-      result.operation.action.position.x = 99;
+    if (result.ok && result.action.kind === "place_block") {
+      result.action.blockName = "tnt";
+      result.action.position.x = 99;
     }
 
     expect(operation.action).toEqual({
@@ -177,10 +311,11 @@ describe("ConfirmationStore", () => {
 
   it("returns the original operation when a get result action is mutated", () => {
     const store = new ConfirmationStore(() => new Date("2026-07-25T00:00:00Z"));
-    const confirmation = store.create("place stone", {
-      kind: "game_action",
-      action: { kind: "place_block", blockName: "stone", position: { x: 1, y: 64, z: 2 } },
-    });
+    const confirmation = store.createGameAction(
+      "place stone",
+      { kind: "place_block", blockName: "stone", position: { x: 1, y: 64, z: 2 } },
+      taskLease,
+    );
     const pending = store.get(confirmation.id)!;
 
     if (
@@ -191,22 +326,17 @@ describe("ConfirmationStore", () => {
       pending.operation.action.position.x = 99;
     }
 
-    expect(store.allow(confirmation.id)).toEqual({
+    expect(store.allowGameAction(confirmation.id, taskLease)).toEqual({
       ok: true,
-      operation: {
-        kind: "game_action",
-        action: { kind: "place_block", blockName: "stone", position: { x: 1, y: 64, z: 2 } },
-      },
+      action: { kind: "place_block", blockName: "stone", position: { x: 1, y: 64, z: 2 } },
+      reservedHorizontalTravel: 0,
     });
   });
 
   it("returns false and removes an expired confirmation when denied", () => {
     let now = new Date("2026-07-25T00:00:00Z");
     const store = new ConfirmationStore(() => now);
-    const confirmation = store.create("wait briefly", {
-      kind: "game_action",
-      action: { kind: "wait", milliseconds: 1 },
-    });
+    const confirmation = store.create("clear memories", { kind: "memory_clear" });
     now = new Date("2026-07-25T00:02:00Z");
 
     expect(store.deny(confirmation.id)).toBe(false);

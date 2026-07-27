@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const { createBot, pathfinder, GoalNear, GoalFollow } = vi.hoisted(() => {
   class NearGoal {
@@ -35,6 +35,12 @@ vi.mock("mineflayer-pathfinder", () => {
 });
 
 import { MineflayerAdapter } from "../../src/minecraft/mineflayerAdapter.js";
+import { ActionExecutor } from "../../src/actions/actionExecutor.js";
+import {
+  createWorldSnapshot,
+  type EntityTracking,
+} from "../../src/minecraft/mineflayerObservation.js";
+import { ConfirmationStore } from "../../src/safety/confirmationStore.js";
 
 interface FakeEntity {
   id: number;
@@ -68,7 +74,11 @@ class FakeFurnace {
 
 class FakeBot extends EventEmitter {
   throwOnEvent: string | undefined;
-  readonly _client = new EventEmitter();
+  readonly game: { dimension: unknown } = { dimension: "overworld" };
+  readonly _client = Object.assign(new EventEmitter(), {
+    end: vi.fn(),
+    socket: { end: vi.fn(), destroy: vi.fn() },
+  });
   readonly supportFeature = vi.fn(() => false);
   readonly chat = vi.fn();
   readonly loadPlugin = vi.fn();
@@ -82,8 +92,11 @@ class FakeBot extends EventEmitter {
   readonly activateItem = vi.fn();
   readonly attack = vi.fn();
   readonly dig = vi.fn<(...args: unknown[]) => Promise<void>>(async (): Promise<void> => undefined);
+  readonly stopDigging = vi.fn<() => unknown>();
   readonly placeBlock = vi.fn(async () => undefined);
-  readonly craft = vi.fn(async () => undefined);
+  readonly craft = vi.fn<(...args: unknown[]) => Promise<void>>(
+    async (): Promise<void> => undefined,
+  );
   readonly waitForTicks = vi.fn<() => Promise<void>>(async (): Promise<void> => undefined);
   readonly openFurnace = vi.fn<(block: unknown) => Promise<FakeFurnace>>();
   readonly findBlock = vi.fn<(options: unknown) => unknown>(() => null);
@@ -140,6 +153,71 @@ function flush(): Promise<void> {
   return Promise.resolve();
 }
 
+afterEach(() => vi.useRealTimers());
+
+describe("createWorldSnapshot", () => {
+  it("bounds projection output, returns fresh values, and leaves tracking input unchanged", () => {
+    const bot = new FakeBot();
+    bot.inventoryItems = Array.from({ length: 40 }, (_, index) => ({
+      name: `item_${index}`,
+      count: index + 1,
+      type: index,
+    }));
+    for (let index = 0; index < 70; index += 1) {
+      bot.entities[String(index)] = {
+        id: index,
+        name: `hostile_${index}`,
+        type: "hostile",
+        position: { x: index + 1, y: 64, z: 0 },
+      };
+    }
+    const hostileEntityIds = new Set(Array.from({ length: 70 }, (_, index) => index));
+    const droppedItemEntityIds = new Set([100, 101]);
+    const worldSpawn = { x: 10, y: 70, z: -20 };
+    bot.players.TestOwner = {
+      entity: {
+        id: 500,
+        name: "player",
+        type: "player",
+        position: { x: 5, y: 64, z: 5 },
+      },
+    };
+    const tracking: EntityTracking = {
+      worldSpawn,
+      hostileEntityIds,
+      droppedItemEntityIds,
+    };
+
+    const first = createWorldSnapshot(bot as never, "TestOwner", tracking);
+    const second = createWorldSnapshot(bot as never, "TestOwner", tracking);
+
+    expect(first.inventorySummary).toHaveLength(36);
+    expect(first.nearbyEntities).toHaveLength(64);
+    expect(first.nearbyHostiles).toHaveLength(64);
+    expect(hostileEntityIds).toHaveLength(70);
+    expect(droppedItemEntityIds).toEqual(new Set([100, 101]));
+    expect(first).not.toBe(second);
+    expect(first.botPosition).not.toBe(bot.entity.position);
+    expect(first.botPosition).not.toBe(second.botPosition);
+    expect(first.worldSpawn).not.toBe(worldSpawn);
+    expect(first.ownerPosition).not.toBe(bot.players.TestOwner?.entity?.position);
+    expect(first.ownerPosition).not.toBe(second.ownerPosition);
+    expect(first.inventorySummary[0]).not.toBe(second.inventorySummary[0]);
+    expect(first.nearbyEntities?.[0]?.position).not.toBe(second.nearbyEntities?.[0]?.position);
+    expect(first.nearbyHostiles[0]?.position).not.toBe(second.nearbyHostiles[0]?.position);
+
+    first.worldSpawn!.x = 999;
+    first.inventorySummary[0]!.count = 999;
+    first.nearbyEntities![0]!.position.x = 999;
+    expect(second.worldSpawn).toEqual({ x: 10, y: 70, z: -20 });
+    expect(second.inventorySummary[0]).toEqual({ name: "item_0", count: 1 });
+    expect(second.nearbyEntities?.[0]).toMatchObject({
+      id: 0,
+      position: { x: 1, y: 64, z: 0 },
+    });
+  });
+});
+
 describe("MineflayerAdapter", () => {
   beforeEach(() => {
     createBot.mockReset();
@@ -172,6 +250,25 @@ describe("MineflayerAdapter", () => {
     expect(events).toEqual(["owner_online", "chat", "connected", "owner_offline"]);
     expect(createBot).toHaveBeenCalledTimes(1);
     await expect(secondConnect).resolves.toBeUndefined();
+  });
+
+  it("maps only trusted active-bot dimension transitions to the public world event", async () => {
+    const bot = new FakeBot();
+    createBot.mockReturnValue(bot);
+    const adapter = new MineflayerAdapter(config());
+    const events: string[] = [];
+    adapter.onEvent((event) => events.push(event.kind));
+    const connecting = adapter.connect();
+    bot._client.emit("login", { worldName: "minecraft:overworld" });
+    bot.emit("spawn");
+    await connecting;
+
+    bot._client.emit("respawn", { worldName: "minecraft:overworld" });
+    bot.game.dimension = "the_nether";
+    bot._client.emit("respawn", { worldName: "minecraft:the_nether" });
+    bot._client.emit("respawn", { worldName: "minecraft:the_nether" });
+
+    expect(events).toEqual(["connected", "world_changed"]);
   });
 
   it("publishes only protocol-authoritative world spawn and tracks nonzero runtime changes", async () => {
@@ -725,7 +822,185 @@ describe("MineflayerAdapter", () => {
     expect(bot.blockAt).not.toHaveBeenCalled();
   });
 
-  it("waits for an aborted dig to settle before releasing the adapter promise", async () => {
+  it.each(["resolve", "reject"] as const)(
+    "keeps an aborted dig pending until the cancellation fence when the original dig %s",
+    async (originalOutcome) => {
+      vi.useFakeTimers();
+      const bot = new FakeBot();
+      bot.blockAt.mockReturnValue({ name: "stone" });
+      let settleDig: (() => void) | undefined;
+      let acknowledgeStop: (() => void) | undefined;
+      bot.dig.mockImplementation(
+        () =>
+          new Promise<void>((resolve, reject) => {
+            settleDig = () =>
+              originalOutcome === "resolve"
+                ? resolve()
+                : reject(new Error("stale original dig failure"));
+          }),
+      );
+      bot.stopDigging.mockReturnValue(
+        new Promise<void>((resolve) => {
+          acknowledgeStop = resolve;
+        }),
+      );
+      createBot.mockReturnValue(bot);
+      const adapter = new MineflayerAdapter(config());
+      const connecting = adapter.connect();
+      bot.emit("spawn");
+      await connecting;
+
+      const controller = new AbortController();
+      const digging = adapter.digBlock({ x: 1, y: 64, z: 1 }, "stone", controller.signal);
+      await flush();
+      let outcome = "pending";
+      let settlements = 0;
+      void digging.then(
+        () => {
+          outcome = "resolved";
+          settlements += 1;
+        },
+        () => {
+          outcome = "aborted";
+          settlements += 1;
+        },
+      );
+
+      controller.abort();
+      settleDig?.();
+      await flush();
+      await flush();
+      expect(outcome).toBe("pending");
+      expect(bot.stopDigging).toHaveBeenCalledOnce();
+      expect(bot.pathfinder.stop).toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(999);
+      expect(outcome).toBe("pending");
+      expect(bot.end).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(1);
+      await expect(digging).rejects.toMatchObject({ name: "AbortError" });
+      expect(outcome).toBe("aborted");
+      expect(settlements).toBe(1);
+      expect(bot.end).toHaveBeenCalledOnce();
+
+      acknowledgeStop?.();
+      await flush();
+      expect(settlements).toBe(1);
+      vi.useRealTimers();
+    },
+  );
+
+  it("accepts a resolved stopDigging thenable as the physical cancellation acknowledgement", async () => {
+    const bot = new FakeBot();
+    bot.blockAt.mockReturnValue({ name: "stone" });
+    let resolveDig: (() => void) | undefined;
+    bot.dig.mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveDig = resolve;
+        }),
+    );
+    bot.stopDigging.mockReturnValue(Promise.resolve());
+    createBot.mockReturnValue(bot);
+    const adapter = new MineflayerAdapter(config());
+    const connecting = adapter.connect();
+    bot.emit("spawn");
+    await connecting;
+    const controller = new AbortController();
+    const digging = adapter.digBlock({ x: 1, y: 64, z: 1 }, "stone", controller.signal);
+    await flush();
+
+    controller.abort();
+
+    await expect(digging).rejects.toMatchObject({ name: "AbortError" });
+    expect(bot.end).not.toHaveBeenCalled();
+    resolveDig?.();
+    await flush();
+    expect(bot.end).not.toHaveBeenCalled();
+  });
+
+  it("handles a rejected stopDigging thenable and fences the stale dig without an unhandled rejection", async () => {
+    const bot = new FakeBot();
+    bot.blockAt.mockReturnValue({ name: "stone" });
+    bot.dig.mockImplementation(() => new Promise<void>(() => undefined));
+    bot.stopDigging.mockReturnValue(Promise.reject(new Error("stop acknowledgement failed")));
+    createBot.mockReturnValue(bot);
+    const adapter = new MineflayerAdapter(config());
+    const connecting = adapter.connect();
+    bot.emit("spawn");
+    await connecting;
+    const controller = new AbortController();
+    const digging = adapter.digBlock({ x: 1, y: 64, z: 1 }, "stone", controller.signal);
+    await flush();
+
+    controller.abort();
+
+    await expect(digging).rejects.toMatchObject({ name: "AbortError" });
+    expect(bot.end).toHaveBeenCalledOnce();
+  });
+
+  it("times out a never-settling stopDigging thenable and fences the stale dig", async () => {
+    vi.useFakeTimers();
+    const bot = new FakeBot();
+    bot.blockAt.mockReturnValue({ name: "stone" });
+    bot.dig.mockImplementation(() => new Promise<void>(() => undefined));
+    bot.stopDigging.mockReturnValue(new Promise<void>(() => undefined));
+    createBot.mockReturnValue(bot);
+    const adapter = new MineflayerAdapter(config());
+    const connecting = adapter.connect();
+    bot.emit("spawn");
+    await connecting;
+    const controller = new AbortController();
+    const digging = adapter.digBlock({ x: 1, y: 64, z: 1 }, "stone", controller.signal);
+    await flush();
+
+    controller.abort();
+    const rejected = expect(digging).rejects.toMatchObject({ name: "AbortError" });
+    await vi.advanceTimersByTimeAsync(999);
+    expect(bot.end).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+
+    await rejected;
+    expect(bot.end).toHaveBeenCalledOnce();
+  });
+
+  it("fences a dig if physical cancellation does not settle within one second", async () => {
+    vi.useFakeTimers();
+    const bot = new FakeBot();
+    bot.blockAt.mockReturnValue({ name: "stone" });
+    bot.dig.mockImplementation(() => new Promise<void>(() => undefined));
+    createBot.mockReturnValue(bot);
+    const adapter = new MineflayerAdapter(config());
+    const connecting = adapter.connect();
+    bot.emit("spawn");
+    await connecting;
+    const controller = new AbortController();
+    const digging = adapter.digBlock({ x: 1, y: 64, z: 1 }, "stone", controller.signal);
+    await flush();
+    let outcome = "pending";
+    void digging.then(
+      () => {
+        outcome = "resolved";
+      },
+      () => {
+        outcome = "aborted";
+      },
+    );
+
+    controller.abort();
+    expect(bot.stopDigging).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(999);
+    expect(outcome).toBe("pending");
+    expect(bot.end).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+
+    expect(outcome).toBe("aborted");
+    expect(bot.end).toHaveBeenCalledOnce();
+    await adapter.disconnect();
+  });
+
+  it("settles a dig once when disconnect races its physical cancellation", async () => {
     const bot = new FakeBot();
     bot.blockAt.mockReturnValue({ name: "stone" });
     let resolveDig: (() => void) | undefined;
@@ -740,28 +1015,83 @@ describe("MineflayerAdapter", () => {
     const connecting = adapter.connect();
     bot.emit("spawn");
     await connecting;
-
     const controller = new AbortController();
     const digging = adapter.digBlock({ x: 1, y: 64, z: 1 }, "stone", controller.signal);
     await flush();
-    controller.abort();
     let outcome = "pending";
+    let settlements = 0;
     void digging.then(
       () => {
         outcome = "resolved";
+        settlements += 1;
       },
       () => {
         outcome = "aborted";
+        settlements += 1;
       },
     );
 
-    await flush();
-    await flush();
-    await flush();
-    expect(outcome).toBe("pending");
-    expect(bot.pathfinder.stop).toHaveBeenCalled();
+    controller.abort();
+    await adapter.disconnect();
+    await vi.waitFor(() => expect(outcome).toBe("aborted"), { timeout: 100 });
+    expect(bot.stopDigging).toHaveBeenCalledOnce();
+    expect(bot.end).toHaveBeenCalledOnce();
+    expect(settlements).toBe(1);
+
     resolveDig?.();
+    await flush();
+    await flush();
+    expect(outcome).toBe("aborted");
+    expect(settlements).toBe(1);
+  });
+
+  it("stays fenced when stopDigging and fallback bot shutdown both throw", async () => {
+    const bot = new FakeBot();
+    bot.blockAt.mockReturnValue({ name: "stone" });
+    bot.stopDigging.mockImplementation(() => {
+      throw new Error("stop digging failed");
+    });
+    bot.end.mockImplementation(() => {
+      throw new Error("bot shutdown failed");
+    });
+    let resolveDig: (() => void) | undefined;
+    bot.dig.mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveDig = resolve;
+        }),
+    );
+    createBot.mockReturnValue(bot);
+    const adapter = new MineflayerAdapter(config());
+    const connecting = adapter.connect();
+    bot.emit("spawn");
+    await connecting;
+    const controller = new AbortController();
+    const digging = adapter.digBlock({ x: 1, y: 64, z: 1 }, "stone", controller.signal);
+    await flush();
+    let settlements = 0;
+    void digging.then(
+      () => {
+        settlements += 1;
+      },
+      () => {
+        settlements += 1;
+      },
+    );
+
+    controller.abort();
+
     await expect(digging).rejects.toMatchObject({ name: "AbortError" });
+    expect(bot.stopDigging).toHaveBeenCalledOnce();
+    expect(bot.end).toHaveBeenCalledOnce();
+    expect(settlements).toBe(1);
+
+    resolveDig?.();
+    await flush();
+    await flush();
+    expect(bot.end).toHaveBeenCalledOnce();
+    expect(settlements).toBe(1);
+    await adapter.disconnect();
   });
 
   it("normalizes a deferred dig rejection after abort to AbortError", async () => {
@@ -804,8 +1134,297 @@ describe("MineflayerAdapter", () => {
     expect(bot.pathfinder.goto).not.toHaveBeenCalled();
   });
 
-  it("does not place after a deferred equip resolves following abort", async () => {
+  it.each(["move", "follow", "collect"] as const)(
+    "fences a never-settling %s path within one second of cancellation",
+    async (kind) => {
+      vi.useFakeTimers();
+      const bot = new FakeBot();
+      bot.pathfinder.goto.mockImplementation(() => new Promise<void>(() => undefined));
+      bot.players.TestOwner = {
+        entity: {
+          id: 1,
+          name: "player",
+          type: "player",
+          position: { x: 2, y: 64, z: 2 },
+        },
+      };
+      bot.entities["8"] = {
+        id: 8,
+        name: "item",
+        type: "other",
+        position: { x: 3, y: 64, z: 3 },
+      };
+      createBot.mockReturnValue(bot);
+      const adapter = new MineflayerAdapter(config());
+      const connecting = adapter.connect();
+      bot.emit("spawn");
+      await connecting;
+      if (kind === "collect") await adapter.snapshot("TestOwner");
+      const controller = new AbortController();
+      const operation =
+        kind === "move"
+          ? adapter.moveTo({ x: 10, y: 64, z: 10 }, controller.signal)
+          : kind === "follow"
+            ? adapter.followOwner("TestOwner", 2, controller.signal)
+            : adapter.collectDropped(8, controller.signal);
+      let outcome = "pending";
+      void operation.then(
+        () => {
+          outcome = "resolved";
+        },
+        () => {
+          outcome = "aborted";
+        },
+      );
+      await flush();
+
+      controller.abort();
+      await vi.advanceTimersByTimeAsync(999);
+      expect(outcome).toBe("pending");
+      expect(bot.end).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+
+      expect(outcome).toBe("aborted");
+      expect(bot.end).toHaveBeenCalledOnce();
+      await expect(operation).rejects.toMatchObject({ name: "AbortError" });
+    },
+  );
+
+  it("reopens the ActionExecutor gate only after a timed-out path is fenced and uses the replacement session", async () => {
+    vi.useFakeTimers();
+    const first = new FakeBot();
+    const replacement = new FakeBot();
+    first.pathfinder.goto.mockImplementation(() => new Promise<void>(() => undefined));
+    createBot.mockReturnValueOnce(first).mockReturnValueOnce(replacement);
+    const adapter = new MineflayerAdapter(config());
+    const lifecycle: string[] = [];
+    let executor: ActionExecutor | undefined;
+    adapter.onEvent((event) => {
+      lifecycle.push(event.kind);
+      if (event.kind === "world_changed") executor?.stopAll();
+    });
+    const connecting = adapter.connect();
+    first._client.emit("login", { worldState: { name: "minecraft:overworld" } });
+    first.emit("spawn");
+    await connecting;
+    const confirmations = new ConfirmationStore();
+    executor = new ActionExecutor(
+      adapter,
+      {
+        evaluate: () => ({ kind: "allow" }),
+        evaluatePermanent: () => ({ kind: "allow" }),
+      },
+      confirmations,
+      "TestOwner",
+    );
+    const context = {
+      spawn: { x: 0, y: 64, z: 0 },
+      owner: { x: 0, y: 64, z: 0 },
+    };
+    const active = executor.execute(
+      { kind: "move_to", position: { x: 10, y: 64, z: 10 } },
+      context,
+    );
+    const queued = executor.execute({ kind: "jump" }, context);
+    await flush();
+    await flush();
+    await flush();
+    expect(first.pathfinder.goto).toHaveBeenCalledOnce();
+
+    first._client.emit("respawn", { worldState: { name: "custom:mirror_world" } });
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    await expect(Promise.all([active, queued])).resolves.toEqual([
+      { status: "cancelled" },
+      { status: "cancelled" },
+    ]);
+    expect(first.waitForTicks).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1_000);
+    replacement._client.emit("login", { worldState: { name: "custom:mirror_world" } });
+    replacement.emit("spawn");
+    const subsequent = executor.execute(
+      { kind: "move_to", position: { x: 20, y: 64, z: 20 } },
+      context,
+    );
+
+    await expect(subsequent).resolves.toEqual({ status: "completed" });
+    expect(lifecycle).toEqual(["connected", "world_changed", "disconnected", "connected"]);
+    expect(first.pathfinder.goto).toHaveBeenCalledOnce();
+    expect(replacement.pathfinder.goto).toHaveBeenCalledOnce();
+  });
+
+  it("fails the active action and blocks all primitives after every transport fence fallback throws", async () => {
+    vi.useFakeTimers();
     const bot = new FakeBot();
+    bot.pathfinder.goto.mockImplementation(() => new Promise<void>(() => undefined));
+    bot.end.mockImplementation(() => {
+      throw new Error("bot end failed");
+    });
+    bot._client.end.mockImplementation(() => {
+      throw new Error("client end failed");
+    });
+    Object.assign(bot._client, {
+      socket: {
+        end: vi.fn(() => {
+          throw new Error("socket end failed");
+        }),
+        destroy: vi.fn(() => {
+          throw new Error("socket destroy failed");
+        }),
+      },
+    });
+    createBot.mockReturnValue(bot);
+    const adapter = new MineflayerAdapter(config());
+    const connecting = adapter.connect();
+    bot.emit("spawn");
+    await connecting;
+    const confirmations = new ConfirmationStore();
+    const executor = new ActionExecutor(
+      adapter,
+      {
+        evaluate: () => ({ kind: "allow" }),
+        evaluatePermanent: () => ({ kind: "allow" }),
+      },
+      confirmations,
+      "TestOwner",
+    );
+    const context = {
+      spawn: { x: 0, y: 64, z: 0 },
+      owner: { x: 0, y: 64, z: 0 },
+    };
+    const active = executor.execute(
+      { kind: "move_to", position: { x: 10, y: 64, z: 10 } },
+      context,
+    );
+    const queued = executor.execute({ kind: "jump" }, context);
+    await flush();
+    await flush();
+    await flush();
+    expect(bot.pathfinder.goto).toHaveBeenCalledOnce();
+
+    executor.stopAll();
+    const activeResult = expect(active).resolves.toMatchObject({
+      status: "failed",
+      reason: expect.stringContaining("physical transport fence failed"),
+    });
+    const queuedResult = expect(queued).resolves.toEqual({ status: "cancelled" });
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    await activeResult;
+    await queuedResult;
+    await expect(adapter.connect()).rejects.toThrow("adapter is stopped");
+    const subsequent = executor.execute(
+      { kind: "move_to", position: { x: 20, y: 64, z: 20 } },
+      context,
+    );
+    await expect(subsequent).resolves.toMatchObject({
+      status: "failed",
+      reason: expect.stringContaining("not connected"),
+    });
+    expect(bot.pathfinder.goto).toHaveBeenCalledOnce();
+    expect(bot.waitForTicks).not.toHaveBeenCalled();
+  });
+
+  it("rejects a fatal explicit disconnect while settling active and queued actions without new primitives", async () => {
+    const bot = new FakeBot();
+    bot.pathfinder.goto.mockImplementation(() => new Promise<void>(() => undefined));
+    bot.end.mockImplementation(() => {
+      throw new Error("bot end failed");
+    });
+    bot._client.socket.end.mockImplementation(() => {
+      throw new Error("socket end failed");
+    });
+    bot._client.socket.destroy.mockImplementation(() => {
+      throw new Error("socket destroy failed");
+    });
+    createBot.mockReturnValue(bot);
+    const adapter = new MineflayerAdapter(config());
+    const connecting = adapter.connect();
+    bot.emit("spawn");
+    await connecting;
+    const confirmations = new ConfirmationStore();
+    const executor = new ActionExecutor(
+      adapter,
+      {
+        evaluate: () => ({ kind: "allow" }),
+        evaluatePermanent: () => ({ kind: "allow" }),
+      },
+      confirmations,
+      "TestOwner",
+    );
+    const context = {
+      spawn: { x: 0, y: 64, z: 0 },
+      owner: { x: 0, y: 64, z: 0 },
+    };
+    const results: string[] = [];
+    executor.onResult((result) => results.push(result.status));
+    const active = executor.execute(
+      { kind: "move_to", position: { x: 10, y: 64, z: 10 } },
+      context,
+    );
+    const queued = executor.execute({ kind: "jump" }, context);
+    await flush();
+    await flush();
+    await flush();
+    expect(bot.pathfinder.goto).toHaveBeenCalledOnce();
+
+    await expect(adapter.disconnect()).rejects.toThrow("physical transport fence failed");
+    await expect(active).resolves.toEqual({ status: "cancelled" });
+    await expect(queued).resolves.toMatchObject({
+      status: "failed",
+      reason: expect.stringContaining("not connected"),
+    });
+    const subsequent = executor.execute(
+      { kind: "move_to", position: { x: 20, y: 64, z: 20 } },
+      context,
+    );
+    await expect(subsequent).resolves.toMatchObject({
+      status: "failed",
+      reason: expect.stringContaining("not connected"),
+    });
+
+    expect(results).toEqual(["cancelled", "failed", "failed"]);
+    expect(bot.pathfinder.goto).toHaveBeenCalledOnce();
+    expect(bot.waitForTicks).not.toHaveBeenCalled();
+    expect(bot._client.end).not.toHaveBeenCalled();
+    expect(bot._client.socket.end).toHaveBeenCalledOnce();
+    expect(bot._client.socket.destroy).toHaveBeenCalledOnce();
+  });
+
+  it.each(["disconnect", "outage"] as const)(
+    "does not start a queued action after connection-driven %s cancellation",
+    async (cancellationKind) => {
+      vi.useFakeTimers();
+      const bot = new FakeBot();
+      createBot.mockReturnValue(bot);
+      const adapter = new MineflayerAdapter(config());
+      const connecting = adapter.connect();
+      bot.emit("spawn");
+      await connecting;
+      const moving = adapter.moveTo({ x: 10, y: 64, z: 10 }, new AbortController().signal);
+      const rejected = expect(moving).rejects.toMatchObject({ name: "AbortError" });
+
+      if (cancellationKind === "disconnect") {
+        await adapter.disconnect();
+      } else {
+        bot.emit("end", "socket closed");
+      }
+
+      await rejected;
+      await flush();
+      await flush();
+      expect(bot.pathfinder.goto).not.toHaveBeenCalled();
+
+      await adapter.disconnect();
+      vi.useRealTimers();
+    },
+  );
+
+  it("fences a deferred placement before stale equip completion can place", async () => {
+    const bot = new FakeBot();
+    bot.end.mockImplementation(() => {
+      throw new Error("Mineflayer end failed");
+    });
     bot.inventoryItems = [{ name: "stone", type: 1, count: 1 }];
     bot.blockAt.mockReturnValue({ name: "dirt" });
     let resolveEquip: (() => void) | undefined;
@@ -825,10 +1444,67 @@ describe("MineflayerAdapter", () => {
     await flush();
     controller.abort();
 
+    let outcome = "pending";
+    void placing.then(
+      () => {
+        outcome = "resolved";
+      },
+      () => {
+        outcome = "aborted";
+      },
+    );
+    await vi.waitFor(() => expect(outcome).toBe("aborted"), { timeout: 100 });
+    expect(bot.end).toHaveBeenCalledOnce();
+    expect(bot._client.end).not.toHaveBeenCalled();
+    expect(bot._client.socket.end).toHaveBeenCalledOnce();
+    expect(bot._client.socket.destroy).not.toHaveBeenCalled();
+    await adapter.disconnect();
     resolveEquip?.();
     await expect(placing).rejects.toMatchObject({ name: "AbortError" });
     await flush();
     expect(bot.placeBlock).not.toHaveBeenCalled();
+  });
+
+  it("fences a deferred craft and ignores its stale completion after abort", async () => {
+    const bot = new FakeBot();
+    let resolveCraft: (() => void) | undefined;
+    bot.craft.mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveCraft = resolve;
+        }),
+    );
+    (
+      bot as unknown as {
+        recipesFor: () => Array<{ result: { id: number } }>;
+      }
+    ).recipesFor = () => [{ result: { id: 2 } }];
+    createBot.mockReturnValue(bot);
+    const adapter = new MineflayerAdapter(config());
+    const connecting = adapter.connect();
+    bot.emit("spawn");
+    await connecting;
+    const controller = new AbortController();
+    const crafting = adapter.craftItem("stick", 1, controller.signal);
+    await flush();
+    controller.abort();
+
+    let outcome = "pending";
+    void crafting.then(
+      () => {
+        outcome = "resolved";
+      },
+      () => {
+        outcome = "aborted";
+      },
+    );
+    await vi.waitFor(() => expect(outcome).toBe("aborted"), { timeout: 100 });
+    expect(bot.end).toHaveBeenCalledOnce();
+    await adapter.disconnect();
+    resolveCraft?.();
+    await expect(crafting).rejects.toMatchObject({ name: "AbortError" });
+    await flush();
+    expect(bot.end).toHaveBeenCalledOnce();
   });
 
   it("cleans up follow, jump, and wait when each is aborted while running", async () => {
@@ -941,7 +1617,14 @@ describe("MineflayerAdapter", () => {
     await flush();
     expect(openingFurnace.close).toHaveBeenCalled();
     expect(openingFurnace.putInput).not.toHaveBeenCalled();
+    await adapter.disconnect();
 
+    const inputBot = new FakeBot();
+    inputBot.inventoryItems = [
+      { name: "iron_ore", type: 15, count: 1 },
+      { name: "coal", type: 263, count: 1 },
+    ];
+    inputBot.findBlock.mockReturnValue({ position: { x: 1, y: 64, z: 1 } });
     const inputFurnace = new FakeFurnace();
     let resolveInput: (() => void) | undefined;
     inputFurnace.putInput.mockImplementation(
@@ -950,9 +1633,14 @@ describe("MineflayerAdapter", () => {
           resolveInput = resolve;
         }),
     );
-    bot.openFurnace.mockResolvedValue(inputFurnace);
+    inputBot.openFurnace.mockResolvedValue(inputFurnace);
+    createBot.mockReturnValue(inputBot);
+    const inputAdapter = new MineflayerAdapter(config());
+    const inputConnecting = inputAdapter.connect();
+    inputBot.emit("spawn");
+    await inputConnecting;
     const inputController = new AbortController();
-    const inputting = adapter.smeltItem("iron_ore", 1, inputController.signal);
+    const inputting = inputAdapter.smeltItem("iron_ore", 1, inputController.signal);
     await flush();
     await flush();
     await flush();
@@ -962,6 +1650,7 @@ describe("MineflayerAdapter", () => {
     await expect(inputting).rejects.toMatchObject({ name: "AbortError" });
     await flush();
     expect(inputFurnace.putFuel).not.toHaveBeenCalled();
+    await inputAdapter.disconnect();
   });
 
   it("closes a furnace during fuel and output-wait aborts", async () => {
@@ -996,18 +1685,30 @@ describe("MineflayerAdapter", () => {
     resolveFuel?.();
     await expect(fueling).rejects.toMatchObject({ name: "AbortError" });
     await flush();
+    await adapter.disconnect();
 
+    const waitingBot = new FakeBot();
+    waitingBot.inventoryItems = [
+      { name: "iron_ore", type: 15, count: 1 },
+      { name: "coal", type: 263, count: 1 },
+    ];
+    waitingBot.findBlock.mockReturnValue({ position: { x: 1, y: 64, z: 1 } });
     const waitingFurnace = new FakeFurnace();
     let resolveTick: (() => void) | undefined;
-    bot.waitForTicks.mockImplementation(
+    waitingBot.waitForTicks.mockImplementation(
       () =>
         new Promise<void>((resolve) => {
           resolveTick = resolve;
         }),
     );
-    bot.openFurnace.mockResolvedValue(waitingFurnace);
+    waitingBot.openFurnace.mockResolvedValue(waitingFurnace);
+    createBot.mockReturnValue(waitingBot);
+    const waitingAdapter = new MineflayerAdapter(config());
+    const waitingConnecting = waitingAdapter.connect();
+    waitingBot.emit("spawn");
+    await waitingConnecting;
     const waitingController = new AbortController();
-    const smelting = adapter.smeltItem("iron_ore", 1, waitingController.signal);
+    const smelting = waitingAdapter.smeltItem("iron_ore", 1, waitingController.signal);
     await flush();
     await flush();
     await flush();
@@ -1015,6 +1716,59 @@ describe("MineflayerAdapter", () => {
     expect(waitingFurnace.close).toHaveBeenCalled();
     resolveTick?.();
     await expect(smelting).rejects.toMatchObject({ name: "AbortError" });
+    await waitingAdapter.disconnect();
+  });
+
+  it("settles a disconnected primitive once even when its abort cleanup throws", async () => {
+    const bot = new FakeBot();
+    bot.inventoryItems = [
+      { name: "iron_ore", type: 15, count: 1 },
+      { name: "coal", type: 263, count: 1 },
+    ];
+    bot.findBlock.mockReturnValue({ position: { x: 1, y: 64, z: 1 } });
+    const furnace = new FakeFurnace();
+    furnace.close.mockImplementation(() => {
+      throw new Error("window cleanup failed");
+    });
+    let resolveInput: (() => void) | undefined;
+    furnace.putInput.mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveInput = resolve;
+        }),
+    );
+    bot.openFurnace.mockResolvedValue(furnace);
+    createBot.mockReturnValue(bot);
+    const adapter = new MineflayerAdapter(config());
+    const connecting = adapter.connect();
+    bot.emit("spawn");
+    await connecting;
+    const smelting = adapter.smeltItem("iron_ore", 1, new AbortController().signal);
+    await vi.waitFor(() => expect(resolveInput).toBeTypeOf("function"));
+    let outcome = "pending";
+    let settlements = 0;
+    void smelting.then(
+      () => {
+        outcome = "resolved";
+        settlements += 1;
+      },
+      () => {
+        outcome = "aborted";
+        settlements += 1;
+      },
+    );
+
+    await adapter.disconnect();
+    await vi.waitFor(() => expect(outcome).toBe("aborted"), { timeout: 100 });
+    expect(furnace.close).toHaveBeenCalledOnce();
+    expect(bot.end).toHaveBeenCalledOnce();
+    expect(settlements).toBe(1);
+
+    resolveInput?.();
+    await expect(smelting).rejects.toMatchObject({ name: "AbortError" });
+    await flush();
+    expect(furnace.close).toHaveBeenCalledOnce();
+    expect(settlements).toBe(1);
   });
 
   it("retries exactly five times at capped delays and disconnect cancels a pending retry", async () => {

@@ -1,15 +1,21 @@
 import { createBot, type Bot, type Furnace } from "mineflayer";
 import pathfinderPackage from "mineflayer-pathfinder";
 import { Vec3 as PrismarineVec3 } from "vec3";
-import type { Vec3, WorldSnapshot } from "../domain/types.js";
+import type { GameAction, Vec3, WorldSnapshot } from "../domain/types.js";
+import { classifyActionRisk } from "../safety/actionRisk.js";
+import {
+  MineflayerConnection,
+  type MineflayerConnectionEvent,
+  type MineflayerSession,
+} from "./mineflayerConnection.js";
+import { createWorldSnapshot, selectSnapshotEntities } from "./mineflayerObservation.js";
 import type { MinecraftEvent, MinecraftPort } from "./minecraftPort.js";
 
 const { goals, pathfinder } = pathfinderPackage;
 
 const RETRY_DELAYS_MS = [1_000, 2_000, 4_000, 8_000, 15_000] as const;
-const MAX_SNAPSHOT_ENTITIES = 64;
-const MAX_INVENTORY_ITEMS = 36;
 const MAX_SMELT_WAIT_TICKS = 20 * 60;
+const OPERATION_CANCEL_TIMEOUT_MS = 1_000;
 const MAX_KNOWN_HOSTILES = 64;
 const HOSTILE_PROXIMITY_RADIUS_SQUARED = 16 ** 2;
 const FUEL_OUTPUT_CAPACITY: Readonly<Record<string, number>> = {
@@ -24,25 +30,21 @@ export interface MineflayerAdapterConfig {
   ownerUsername: string;
 }
 
-interface BotHandlers {
-  chat: (username: string, message: string) => void;
-  playerJoined: (player: { username: string }) => void;
-  playerLeft: (player: { username: string }) => void;
-  spawn: () => void;
-  death: () => void;
-  end: (reason: string) => void;
-  entitySpawn: (entity: Bot["entity"]) => void;
-  entityMoved: (entity: Bot["entity"]) => void;
-  entityGone: (entity: Bot["entity"]) => void;
-  move: () => void;
-  forcedMove: () => void;
-  spawnPosition: (packet: unknown) => void;
-}
-
 function abortError(): Error {
   const error = new Error("operation aborted");
   error.name = "AbortError";
   return error;
+}
+
+function asError(error: unknown): Error {
+  return error instanceof Error ? error : new Error(String(error));
+}
+
+function isThenable(value: unknown): value is PromiseLike<unknown> {
+  return (
+    ((typeof value === "object" && value !== null) || typeof value === "function") &&
+    typeof (value as { then?: unknown }).then === "function"
+  );
 }
 
 function toVec3(position: { x: number; y: number; z: number }): Vec3 {
@@ -68,21 +70,6 @@ function distanceSquared(
   return (left.x - right.x) ** 2 + (left.y - right.y) ** 2 + (left.z - right.z) ** 2;
 }
 
-const permanentlyDangerousItems = new Set([
-  "tnt",
-  "lava",
-  "lava_bucket",
-  "flowing_lava",
-  "fire",
-  "soul_fire",
-  "flint_and_steel",
-  "fire_charge",
-]);
-
-function canonicalMinecraftName(name: string): string {
-  return name.toLowerCase().replace(/^minecraft:/, "");
-}
-
 function packetSpawnPosition(bot: Bot, packet: unknown): Vec3 | undefined {
   if (packet === null || typeof packet !== "object") return undefined;
   const record = packet as Record<string, unknown>;
@@ -102,62 +89,32 @@ function packetSpawnPosition(bot: Bot, packet: unknown): Vec3 | undefined {
 }
 
 export class MineflayerAdapter implements MinecraftPort {
-  private bot: Bot | undefined;
-  private botHandlers: BotHandlers | undefined;
+  private readonly connection: MineflayerConnection;
   private readonly listeners = new Set<(event: MinecraftEvent) => void>();
-  private readonly activeAborts = new Set<() => void>();
   private readonly hostileEntityIds = new Set<number>();
   private readonly droppedItemEntityIds = new Set<number>();
   private readonly knownHostileEntities = new Map<number, Bot["entity"]>();
   private readonly nearbyHostileEntityIds = new Set<number>();
-  private retryTimer: ReturnType<typeof setTimeout> | undefined;
-  private retryIndex = 0;
-  private explicitlyDisconnected = false;
-  private outageNotified = false;
-  private connected = false;
-  private recovering = false;
-  private retriesExhausted = false;
-  private connectionPromise: Promise<void> | undefined;
-  private resolveConnection: (() => void) | undefined;
-  private rejectConnection: ((error: Error) => void) | undefined;
   private worldSpawn: Vec3 | undefined;
 
-  constructor(private readonly config: MineflayerAdapterConfig) {}
-
-  connect(): Promise<void> {
-    if (this.explicitlyDisconnected || this.retriesExhausted) {
-      return Promise.reject(new Error("adapter is stopped; create a new adapter to restart"));
-    }
-    if (this.connected && this.bot) return Promise.resolve();
-    if (this.connectionPromise) return this.connectionPromise;
-
-    const waiting = this.createConnectionPromise();
-    if (!this.recovering) this.startAttempt();
-    return waiting;
+  constructor(config: MineflayerAdapterConfig) {
+    this.connection = new MineflayerConnection({
+      config,
+      createBot,
+      plugin: pathfinder,
+      retryDelaysMs: RETRY_DELAYS_MS,
+      setTimer: (callback, delay) => setTimeout(callback, delay),
+      clearTimer: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+    });
+    this.connection.onEvent((event) => this.handleConnectionEvent(event));
   }
 
-  async disconnect(): Promise<void> {
-    this.explicitlyDisconnected = true;
-    this.clearRetryTimer();
-    this.stopActiveOperations();
-    this.clearSnapshotAuthorizations();
-    this.clearHostileProximity();
-    this.rejectConnection?.(abortError());
-    this.resolveConnection = undefined;
-    this.rejectConnection = undefined;
-    this.connectionPromise = undefined;
-    this.recovering = false;
+  connect(): Promise<void> {
+    return this.connection.connect();
+  }
 
-    const bot = this.bot;
-    if (bot) {
-      this.detach(bot);
-      this.bot = undefined;
-      this.safelyEndBot(bot, "adapter disconnect");
-    }
-    if (this.connected && !this.outageNotified) {
-      this.emit({ kind: "disconnected", reason: "adapter disconnect" });
-    }
-    this.connected = false;
+  disconnect(): Promise<void> {
+    return this.connection.disconnect();
   }
 
   onEvent(listener: (event: MinecraftEvent) => void): () => void {
@@ -171,13 +128,7 @@ export class MineflayerAdapter implements MinecraftPort {
 
   async snapshot(ownerUsername: string): Promise<WorldSnapshot> {
     const bot = this.requireBot();
-    const entities = Object.values(bot.entities)
-      .sort(
-        (left, right) =>
-          distanceSquared(left.position, bot.entity.position) -
-          distanceSquared(right.position, bot.entity.position),
-      )
-      .slice(0, MAX_SNAPSHOT_ENTITIES);
+    const entities = selectSnapshotEntities(bot);
     const hostiles = entities.filter(isHostile);
     const drops = entities.filter(isDroppedItem);
     this.hostileEntityIds.clear();
@@ -185,31 +136,11 @@ export class MineflayerAdapter implements MinecraftPort {
     for (const entity of hostiles) this.hostileEntityIds.add(entity.id);
     for (const entity of drops) this.droppedItemEntityIds.add(entity.id);
 
-    const ownerPosition = bot.players[ownerUsername]?.entity?.position;
-    return {
-      botPosition: toVec3(bot.entity.position),
-      ...(this.worldSpawn ? { worldSpawn: structuredClone(this.worldSpawn) } : {}),
-      botYaw: bot.entity.yaw,
-      botPitch: bot.entity.pitch,
-      ...(ownerPosition ? { ownerPosition: toVec3(ownerPosition) } : {}),
-      health: bot.health,
-      food: bot.food,
-      timeOfDay: bot.time.timeOfDay,
-      weather: bot.thunderState > 0 ? "thunder" : bot.isRaining ? "rain" : "clear",
-      inventorySummary: bot.inventory
-        .items()
-        .slice(0, MAX_INVENTORY_ITEMS)
-        .map((item) => ({ name: item.name, count: item.count })),
-      nearbyEntities: entities.map((entity) => ({
-        id: entity.id,
-        kind: entity.name ?? entity.type,
-        position: toVec3(entity.position),
-      })),
-      nearbyHostiles: hostiles.map((entity) => ({
-        kind: entity.name ?? entity.type,
-        position: toVec3(entity.position),
-      })),
-    };
+    return createWorldSnapshot(bot, ownerUsername, {
+      ...(this.worldSpawn ? { worldSpawn: this.worldSpawn } : {}),
+      hostileEntityIds: this.hostileEntityIds,
+      droppedItemEntityIds: this.droppedItemEntityIds,
+    });
   }
 
   async findBlock(blockName: string, maxDistance: number): Promise<Vec3 | null> {
@@ -229,30 +160,36 @@ export class MineflayerAdapter implements MinecraftPort {
 
   async moveTo(position: Vec3, signal: AbortSignal): Promise<void> {
     this.assertNotAborted(signal);
-    const bot = this.requireBot();
-    await this.abortable(signal, () =>
-      bot.pathfinder.goto(new goals.GoalNear(position.x, position.y, position.z, 1)),
+    const session = this.requireSession();
+    await this.abortable(signal, session, "motion", () =>
+      session.bot.pathfinder.goto(new goals.GoalNear(position.x, position.y, position.z, 1)),
     );
   }
 
   async followOwner(username: string, distance: number, signal: AbortSignal): Promise<void> {
     this.assertNotAborted(signal);
-    const bot = this.requireBot();
+    const session = this.requireSession();
+    const bot = session.bot;
     const entity = bot.players[username]?.entity;
     if (!entity) throw new Error(`owner ${username} is not online`);
-    await this.abortable(signal, () => bot.pathfinder.goto(new goals.GoalFollow(entity, distance)));
+    await this.abortable(signal, session, "motion", () =>
+      bot.pathfinder.goto(new goals.GoalFollow(entity, distance)),
+    );
   }
 
   async lookAt(position: Vec3, signal: AbortSignal): Promise<void> {
     this.assertNotAborted(signal);
-    const bot = this.requireBot();
-    await this.abortable(signal, () => bot.lookAt(minecraftVec3(position)));
+    const session = this.requireSession();
+    await this.abortable(signal, session, "fence", () =>
+      session.bot.lookAt(minecraftVec3(position)),
+    );
   }
 
   async jump(signal: AbortSignal): Promise<void> {
     this.assertNotAborted(signal);
-    const bot = this.requireBot();
-    await this.abortable(signal, async () => {
+    const session = this.requireSession();
+    const bot = session.bot;
+    await this.abortable(signal, session, "motion", async () => {
       bot.setControlState("jump", true);
       try {
         await bot.waitForTicks(1);
@@ -264,19 +201,21 @@ export class MineflayerAdapter implements MinecraftPort {
 
   async digBlock(position: Vec3, expectedBlockName: string, signal: AbortSignal): Promise<void> {
     this.assertNotAborted(signal);
-    const bot = this.requireBot();
+    const session = this.requireSession();
+    const bot = session.bot;
     this.requireBlock(bot, expectedBlockName);
     const block = bot.blockAt(minecraftVec3(position));
     if (!block || block.name !== expectedBlockName) {
       throw new Error("block at position does not match expected block name");
     }
-    await this.abortable(signal, () => bot.dig(block));
+    await this.abortable(signal, session, "dig", () => bot.dig(block));
   }
 
   async placeBlock(position: Vec3, blockName: string, signal: AbortSignal): Promise<void> {
     this.assertNotAborted(signal);
-    this.assertSafeItem(blockName);
-    const bot = this.requireBot();
+    this.assertSafeAction({ kind: "place_block", position, blockName });
+    const session = this.requireSession();
+    const bot = session.bot;
     this.requireBlock(bot, blockName);
     const item = this.requireItem(bot, blockName);
     const held = bot.inventory.items().find((candidate) => candidate.name === item.name);
@@ -285,26 +224,28 @@ export class MineflayerAdapter implements MinecraftPort {
       minecraftVec3({ x: position.x, y: position.y - 1, z: position.z }),
     );
     if (!reference) throw new Error("no supporting block at placement position");
-    await this.abortable(signal, async () => {
+    await this.abortable(signal, session, "fence", async () => {
       await bot.equip(held, "hand");
-      this.assertNotAborted(signal);
+      this.assertActive(session, signal);
       await bot.placeBlock(reference, new PrismarineVec3(0, 1, 0));
     });
   }
 
   async craftItem(itemName: string, count: number, signal: AbortSignal): Promise<void> {
     this.assertNotAborted(signal);
-    const bot = this.requireBot();
+    const session = this.requireSession();
+    const bot = session.bot;
     const item = this.requireItem(bot, itemName);
     const recipe = bot.recipesFor(item.id, null, 1, null)[0];
     if (!recipe) throw new Error(`no craftable recipe for ${itemName}`);
-    await this.abortable(signal, () => bot.craft(recipe, count));
+    await this.abortable(signal, session, "fence", () => bot.craft(recipe, count));
   }
 
   async smeltItem(itemName: string, count: number, signal: AbortSignal): Promise<void> {
     this.assertNotAborted(signal);
     if (!Number.isSafeInteger(count) || count <= 0) throw new Error("smelt count must be positive");
-    const bot = this.requireBot();
+    const session = this.requireSession();
+    const bot = session.bot;
     const item = this.requireItem(bot, itemName);
     const input = bot.inventory
       .items()
@@ -325,17 +266,19 @@ export class MineflayerAdapter implements MinecraftPort {
     };
     await this.abortable(
       signal,
+      session,
+      "fence",
       async () => {
         window = await bot.openFurnace(furnace);
         try {
-          this.assertNotAborted(signal);
+          this.assertActive(session, signal);
           if (window.inputItem() || window.outputItem() || window.fuelItem()) {
             throw new Error("furnace must be empty before smelting");
           }
           await window.putInput(input.type, null, count);
-          this.assertNotAborted(signal);
+          this.assertActive(session, signal);
           await window.putFuel(fuel.type, null, fuel.count);
-          this.assertNotAborted(signal);
+          this.assertActive(session, signal);
           for (let tick = 0; tick < MAX_SMELT_WAIT_TICKS; tick += 1) {
             const output = window.outputItem();
             if (output && output.count >= count) {
@@ -343,7 +286,7 @@ export class MineflayerAdapter implements MinecraftPort {
               return;
             }
             await bot.waitForTicks(1);
-            this.assertNotAborted(signal);
+            this.assertActive(session, signal);
           }
           throw new Error("smelting timed out");
         } finally {
@@ -356,13 +299,14 @@ export class MineflayerAdapter implements MinecraftPort {
 
   async collectDropped(entityId: number, signal: AbortSignal): Promise<void> {
     this.assertNotAborted(signal);
-    const bot = this.requireBot();
+    const session = this.requireSession();
+    const bot = session.bot;
     if (!this.droppedItemEntityIds.has(entityId)) {
       throw new Error("dropped entity ID was not authorized by the latest snapshot");
     }
     const entity = bot.entities[String(entityId)];
     if (!entity || !isDroppedItem(entity)) throw new Error("dropped item is no longer available");
-    await this.abortable(signal, () =>
+    await this.abortable(signal, session, "motion", () =>
       bot.pathfinder.goto(
         new goals.GoalNear(entity.position.x, entity.position.y, entity.position.z, 1),
       ),
@@ -375,23 +319,25 @@ export class MineflayerAdapter implements MinecraftPort {
     signal: AbortSignal,
   ): Promise<void> {
     this.assertNotAborted(signal);
-    this.assertSafeItem(itemName);
-    const bot = this.requireBot();
+    this.assertSafeAction({ kind: "equip_item", itemName, destination });
+    const session = this.requireSession();
+    const bot = session.bot;
     const item = this.requireItem(bot, itemName);
     const held = bot.inventory.items().find((candidate) => candidate.name === item.name);
     if (!held) throw new Error(`missing ${itemName} in inventory`);
-    await this.abortable(signal, () => bot.equip(held, destination));
+    await this.abortable(signal, session, "fence", () => bot.equip(held, destination));
   }
 
   async attackHostile(entityId: number, signal: AbortSignal): Promise<void> {
     this.assertNotAborted(signal);
-    const bot = this.requireBot();
+    const session = this.requireSession();
+    const bot = session.bot;
     if (!this.hostileEntityIds.has(entityId)) {
       throw new Error("hostile entity ID was not authorized by the latest snapshot");
     }
     const entity = bot.entities[String(entityId)];
     if (!entity || !isHostile(entity)) throw new Error("hostile is no longer available");
-    await this.abortable(signal, () => {
+    await this.abortable(signal, session, "fence", () => {
       bot.attack(entity);
     });
   }
@@ -402,174 +348,63 @@ export class MineflayerAdapter implements MinecraftPort {
       let timer: ReturnType<typeof setTimeout>;
       let settled = false;
       let stop: () => void;
+      let unregister: () => void = () => undefined;
       const done = (error?: Error) => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
         signal.removeEventListener("abort", onAbort);
-        this.activeAborts.delete(stop);
+        unregister();
         if (error) reject(error);
         else resolve();
       };
       const onAbort = () => done(abortError());
       stop = () => onAbort();
       timer = setTimeout(done, Math.max(0, milliseconds));
-      this.activeAborts.add(stop);
+      unregister = this.connection.registerActiveOperation(stop);
       signal.addEventListener("abort", onAbort, { once: true });
     });
   }
 
-  private startAttempt(): void {
-    if (this.explicitlyDisconnected || this.retriesExhausted || this.bot) return;
-    try {
-      const bot = createBot({
-        host: "127.0.0.1",
-        port: this.config.port,
-        username: this.config.botUsername,
-        auth: "offline",
-        hideErrors: false,
-      });
-      this.bot = bot;
-      bot.loadPlugin(pathfinder);
-      this.attach(bot);
-    } catch (error) {
-      if (this.bot) this.cleanupPartialBot(this.bot);
-      this.handleConnectionEnd(undefined, error instanceof Error ? error.message : String(error));
-    }
-  }
-
-  private attach(bot: Bot): void {
-    const handlers: BotHandlers = {
-      chat: (username, message) => this.emit({ kind: "chat", username, message }),
-      playerJoined: (player) => this.emit({ kind: "owner_online", username: player.username }),
-      playerLeft: (player) => this.emit({ kind: "owner_offline", username: player.username }),
-      spawn: () => this.handleSpawn(bot),
-      death: () => this.emit({ kind: "death" }),
-      end: (reason) => this.handleConnectionEnd(bot, reason),
-      entitySpawn: (entity) => this.observeHostile(bot, entity),
-      entityMoved: (entity) => this.observeHostile(bot, entity),
-      entityGone: (entity) => {
-        if (this.bot === bot) this.forgetHostile(entity.id);
-      },
-      move: () => this.reevaluateKnownHostiles(bot),
-      forcedMove: () => this.reevaluateKnownHostiles(bot),
-      spawnPosition: (packet) => {
-        if (this.bot !== bot) return;
-        const position = packetSpawnPosition(bot, packet);
+  private handleConnectionEvent(event: MineflayerConnectionEvent): void {
+    switch (event.kind) {
+      case "connected":
+        this.emit({ kind: "connected" });
+        return;
+      case "outage":
+        this.clearSnapshotAuthorizations();
+        this.clearHostileProximity();
+        this.emit({ kind: "disconnected", reason: event.reason });
+        return;
+      case "world_changed":
+        this.clearSnapshotAuthorizations();
+        this.clearHostileProximity();
+        this.emit({ kind: "world_changed" });
+        return;
+      case "chat":
+      case "owner_online":
+      case "owner_offline":
+      case "death":
+        this.emit(event);
+        return;
+      case "entity_spawn":
+      case "entity_moved":
+        this.observeHostile(event.bot, event.entity);
+        return;
+      case "entity_gone":
+        if (this.connection.currentBot() === event.bot) this.forgetHostile(event.entity.id);
+        return;
+      case "move":
+      case "forced_move":
+        this.reevaluateKnownHostiles(event.bot);
+        return;
+      case "spawn_position": {
+        if (this.connection.currentBot() !== event.bot) return;
+        const position = packetSpawnPosition(event.bot, event.packet);
         if (position) this.worldSpawn = position;
-      },
-    };
-    this.botHandlers = handlers;
-    bot.on("chat", handlers.chat);
-    bot.on("playerJoined", handlers.playerJoined);
-    bot.on("playerLeft", handlers.playerLeft);
-    bot.once("spawn", handlers.spawn);
-    bot.on("death", handlers.death);
-    bot.once("end", handlers.end);
-    bot.on("entitySpawn", handlers.entitySpawn);
-    bot.on("entityMoved", handlers.entityMoved);
-    bot.on("entityGone", handlers.entityGone);
-    bot.on("move", handlers.move);
-    bot.on("forcedMove", handlers.forcedMove);
-    bot._client.on("spawn_position", handlers.spawnPosition);
-  }
-
-  private detach(bot: Bot): void {
-    const handlers = this.botHandlers;
-    if (!handlers) return;
-    this.tryCleanup(() => bot.removeListener("chat", handlers.chat));
-    this.tryCleanup(() => bot.removeListener("playerJoined", handlers.playerJoined));
-    this.tryCleanup(() => bot.removeListener("playerLeft", handlers.playerLeft));
-    this.tryCleanup(() => bot.removeListener("spawn", handlers.spawn));
-    this.tryCleanup(() => bot.removeListener("death", handlers.death));
-    this.tryCleanup(() => bot.removeListener("end", handlers.end));
-    this.tryCleanup(() => bot.removeListener("entitySpawn", handlers.entitySpawn));
-    this.tryCleanup(() => bot.removeListener("entityMoved", handlers.entityMoved));
-    this.tryCleanup(() => bot.removeListener("entityGone", handlers.entityGone));
-    this.tryCleanup(() => bot.removeListener("move", handlers.move));
-    this.tryCleanup(() => bot.removeListener("forcedMove", handlers.forcedMove));
-    this.tryCleanup(() => bot._client.removeListener("spawn_position", handlers.spawnPosition));
-    this.botHandlers = undefined;
-  }
-
-  private cleanupPartialBot(bot: Bot): void {
-    this.detach(bot);
-    this.clearHostileProximity();
-    if (this.bot === bot) this.bot = undefined;
-    this.safelyStopBot(bot);
-    this.safelyEndBot(bot, "adapter setup failed");
-  }
-
-  private handleSpawn(bot: Bot): void {
-    if (this.bot !== bot || this.explicitlyDisconnected || this.connected) return;
-    this.clearRetryTimer();
-    this.connected = true;
-    this.recovering = false;
-    this.outageNotified = false;
-    this.retryIndex = 0;
-    this.emit({ kind: "connected" });
-    this.resolveConnection?.();
-    this.resolveConnection = undefined;
-    this.rejectConnection = undefined;
-    this.connectionPromise = undefined;
-  }
-
-  private handleConnectionEnd(bot: Bot | undefined, reason: string): void {
-    if (bot && this.bot !== bot) return;
-    if (bot) this.detach(bot);
-    if (this.bot === bot) this.bot = undefined;
-    this.stopActiveOperations();
-    this.clearSnapshotAuthorizations();
-    this.clearHostileProximity();
-    this.connected = false;
-    if (this.explicitlyDisconnected) return;
-    this.recovering = true;
-    if (!this.outageNotified) {
-      this.outageNotified = true;
-      this.emit({ kind: "disconnected", reason });
+        return;
+      }
     }
-    this.scheduleRetry();
-  }
-
-  private scheduleRetry(): void {
-    const delay = RETRY_DELAYS_MS[this.retryIndex];
-    if (delay === undefined) {
-      this.retriesExhausted = true;
-      this.recovering = false;
-      this.rejectConnection?.(new Error("Minecraft connection retries exhausted"));
-      this.resolveConnection = undefined;
-      this.rejectConnection = undefined;
-      this.connectionPromise = undefined;
-      return;
-    }
-    if (this.explicitlyDisconnected || this.retriesExhausted) return;
-    this.retryIndex += 1;
-    this.clearRetryTimer();
-    this.retryTimer = setTimeout(() => {
-      this.retryTimer = undefined;
-      this.startAttempt();
-    }, delay);
-  }
-
-  private clearRetryTimer(): void {
-    if (this.retryTimer !== undefined) clearTimeout(this.retryTimer);
-    this.retryTimer = undefined;
-  }
-
-  private tryCleanup(operation: () => void): void {
-    try {
-      operation();
-    } catch {
-      // Listener cleanup is best effort during a failed setup.
-    }
-  }
-
-  private createConnectionPromise(): Promise<void> {
-    this.connectionPromise = new Promise<void>((resolve, reject) => {
-      this.resolveConnection = resolve;
-      this.rejectConnection = reject;
-    });
-    return this.connectionPromise;
   }
 
   private emit(event: MinecraftEvent): void {
@@ -577,8 +412,15 @@ export class MineflayerAdapter implements MinecraftPort {
   }
 
   private requireBot(): Bot {
-    if (!this.bot) throw new Error("Minecraft bot is not connected");
-    return this.bot;
+    const bot = this.connection.currentBot();
+    if (!bot) throw new Error("Minecraft bot is not connected");
+    return bot;
+  }
+
+  private requireSession(): MineflayerSession {
+    const session = this.connection.currentSession();
+    if (!session) throw new Error("Minecraft bot is not connected");
+    return session;
   }
 
   private requireBlock(bot: Bot, name: string) {
@@ -615,7 +457,7 @@ export class MineflayerAdapter implements MinecraftPort {
   }
 
   private observeHostile(bot: Bot, entity: Bot["entity"]): void {
-    if (this.bot !== bot) return;
+    if (this.connection.currentBot() !== bot) return;
     if (!isHostile(entity)) {
       this.forgetHostile(entity.id);
       return;
@@ -637,7 +479,7 @@ export class MineflayerAdapter implements MinecraftPort {
   }
 
   private reevaluateKnownHostiles(bot: Bot): void {
-    if (this.bot !== bot) return;
+    if (this.connection.currentBot() !== bot) return;
     for (const entity of [...this.knownHostileEntities.values()]) {
       if (!isHostile(entity)) {
         this.forgetHostile(entity.id);
@@ -686,20 +528,25 @@ export class MineflayerAdapter implements MinecraftPort {
     if (signal.aborted) throw abortError();
   }
 
-  private assertSafeItem(name: string): void {
-    if (permanentlyDangerousItems.has(canonicalMinecraftName(name))) {
+  private assertActive(session: MineflayerSession, signal: AbortSignal): void {
+    this.assertNotAborted(signal);
+    if (!this.connection.isCurrentSession(session)) throw abortError();
+  }
+
+  private assertSafeAction(action: GameAction): void {
+    if (
+      classifyActionRisk(action, {
+        owner: { x: 0, y: 0, z: 0 },
+      }).level === "dangerous"
+    ) {
       throw new Error("dangerous item is permanently forbidden");
     }
   }
 
-  private stopActiveOperations(): void {
-    this.safelyStopBot(this.bot);
-    for (const abort of this.activeAborts) abort();
-    this.activeAborts.clear();
-  }
-
   private async abortable(
     signal: AbortSignal,
+    session: MineflayerSession,
+    cancellation: "motion" | "dig" | "fence",
     operation: () => Promise<void> | void,
     abortCleanup?: () => void,
   ): Promise<void> {
@@ -708,41 +555,93 @@ export class MineflayerAdapter implements MinecraftPort {
       let settled = false;
       let started = false;
       let aborted = false;
+      let cancelTimer: ReturnType<typeof setTimeout> | undefined;
+      let unregister: () => void = () => undefined;
+      const finishAfterFence = (reason: string) => {
+        try {
+          this.connection.fenceActiveSession(session, reason);
+          finish(abortError());
+        } catch (error) {
+          finish(asError(error));
+        }
+      };
+      const startFenceTimer = (reason: string) => {
+        cancelTimer = setTimeout(() => {
+          cancelTimer = undefined;
+          finishAfterFence(reason);
+        }, OPERATION_CANCEL_TIMEOUT_MS);
+        cancelTimer.unref?.();
+      };
       const onAbort = () => {
+        if (aborted) {
+          if (!this.connection.isCurrentSession(session)) finish(abortError());
+          return;
+        }
         aborted = true;
-        this.stopMotion();
-        abortCleanup?.();
-        if (!started) finish(abortError());
+        this.safelyStopBot(session.bot);
+        try {
+          abortCleanup?.();
+        } catch {
+          finishAfterFence("operation cleanup failed");
+          return;
+        }
+        if (!started || !this.connection.isCurrentSession(session)) {
+          finish(abortError());
+          return;
+        }
+        if (cancellation === "dig") {
+          let cancellationResult: unknown;
+          try {
+            cancellationResult = session.bot.stopDigging();
+          } catch {
+            finishAfterFence("dig cancellation failed");
+            return;
+          }
+          startFenceTimer("dig cancellation timed out");
+          if (isThenable(cancellationResult)) {
+            Promise.resolve(cancellationResult).then(
+              () => finish(abortError()),
+              () => finishAfterFence("dig cancellation acknowledgement failed"),
+            );
+          }
+          return;
+        }
+        if (cancellation === "fence") {
+          finishAfterFence("operation cancelled");
+          return;
+        }
+        startFenceTimer("motion cancellation timed out");
       };
       const cancel = () => onAbort();
       const finish = (error?: Error) => {
         if (settled) return;
         settled = true;
+        if (cancelTimer !== undefined) clearTimeout(cancelTimer);
+        cancelTimer = undefined;
         signal.removeEventListener("abort", onAbort);
-        this.activeAborts.delete(cancel);
+        unregister();
         if (error) reject(error);
         else resolve();
       };
 
-      this.activeAborts.add(cancel);
+      unregister = this.connection.registerActiveOperation(cancel);
       signal.addEventListener("abort", onAbort, { once: true });
       Promise.resolve()
         .then(() => {
-          this.assertNotAborted(signal);
+          if (aborted || settled) return;
+          this.assertActive(session, signal);
           started = true;
           return operation();
         })
-        .then(() => finish(aborted ? abortError() : undefined))
-        .catch((error: unknown) =>
-          finish(
-            aborted ? abortError() : error instanceof Error ? error : new Error(String(error)),
-          ),
-        );
+        .then(() => {
+          if (!aborted) finish();
+          else if (cancellation === "motion") finish(abortError());
+        })
+        .catch((error: unknown) => {
+          if (!aborted) finish(asError(error));
+          else if (cancellation === "motion") finish(abortError());
+        });
     });
-  }
-
-  private stopMotion(): void {
-    this.safelyStopBot(this.bot);
   }
 
   private safelyStopBot(bot: Bot | undefined): void {
@@ -756,9 +655,5 @@ export class MineflayerAdapter implements MinecraftPort {
     } catch {
       // Control state cleanup is best effort during failure paths.
     }
-  }
-
-  private safelyEndBot(bot: Bot, reason: string): void {
-    this.tryCleanup(() => bot.end(reason));
   }
 }

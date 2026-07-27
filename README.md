@@ -29,6 +29,8 @@ For an update, stop WhiteLily, replace/update the files, run setup and doctor ag
 
 Use [the Windows smoke-test checklist](docs/windows-smoke-test.md) before a real play session.
 
+Architecture: [runtime boundary](docs/runtime-architecture.md).
+
 ## Chat commands and modes
 
 Talk normally in Minecraft chat. Owner commands are `!mode friend`, `!mode balanced`, `!mode autonomous`, `!pause`, `!resume`, `!stop`, `!status`, `!allow <confirmation-id>`, `!deny <confirmation-id>`, `!memory show`, `!memory clear`, `!memory search <words>`, and `!memory forget <id>`. Friend mode chats and only acts after confirmation. Balanced mode can observe and propose limited work. Autonomous mode may carry out the explicitly configured, bounded activities; permanent denials still win.

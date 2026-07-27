@@ -1,6 +1,6 @@
 import { ActionExecutor } from "../actions/actionExecutor.js";
 import type { AutonomyReason } from "../autonomy/autonomyScheduler.js";
-import { parseLocalCommand, type LocalCommand } from "../commands/commandParser.js";
+import type { LocalCommand } from "../commands/commandParser.js";
 import type { CodexPort, CodexTurnResult } from "../codex/codexPort.js";
 import { selectModel } from "../codex/modelSelector.js";
 import type { CompanionMode } from "../domain/types.js";
@@ -13,24 +13,95 @@ import type { MinecraftEvent, MinecraftPort } from "../minecraft/minecraftPort.j
 import { ConfirmationStore } from "../safety/confirmationStore.js";
 import type { SafetyContext } from "../safety/safetyEngine.js";
 import {
+  HARD_TASK_LIMITS,
+  type TaskLease,
+  type TaskLimits,
+  type TaskStopReason,
+} from "../safety/taskBudget.js";
+import {
   buildCompanionAutonomousTurn,
   buildCompanionRecoveryTurn,
   buildCompanionTurn,
   companionTurnOutcomeSchema,
   type CompanionTurnOutcome,
 } from "./promptBuilder.js";
+import { ChatRouter } from "./chatRouter.js";
+import { TaskController, type ActiveTask, type TaskDisclosure } from "./taskController.js";
 
 const repairPrompt = "只返回符合既定结构的 JSON，不要使用 Markdown。";
+const recoveryRepairPrompt = [
+  repairPrompt,
+  "Recovery turns do not authorize Minecraft tools.",
+  "Do not call any minecraft_ tool during recovery.",
+].join("\n");
 const unavailableMessage =
   "Codex 暂时不可用，我已安全暂停。你仍可以使用 !status、!stop 和记忆命令。";
 
-function attachToolLease(text: string, lease: string): string {
+function attachToolLease(text: string, lease: string, taskLeaseId?: string): string {
   return [
     text,
     "本回合工具租约",
+    ...(taskLeaseId === undefined
+      ? []
+      : [`本次有界任务租约 ID 为 ${JSON.stringify(taskLeaseId)}。`]),
     `每次 minecraft_ 工具调用都必须把 turnLease 设置为 ${JSON.stringify(lease)}。`,
     "这个随机租约只授权本回合；不要在回复、任务或记忆候选中复述它。",
   ].join("\n");
+}
+
+const expectedTaskActions = [
+  "get_state",
+  "find_block",
+  "say",
+  "move_to",
+  "follow_owner",
+  "look_at",
+  "jump",
+  "dig_block",
+  "place_block",
+  "craft_item",
+  "smelt_item",
+  "collect_dropped",
+  "equip_item",
+  "attack_hostile",
+  "wait",
+] as const;
+
+function turnDisclosure(goal: string): TaskDisclosure {
+  return {
+    goal,
+    expectedActions: [...expectedTaskActions],
+    limits: { ...HARD_TASK_LIMITS },
+    stopCondition: "完成、失败、中断、达到安全边界或预算耗尽时立即停止",
+  };
+}
+
+function conciseGoal(goal: string): string {
+  const normalized = goal.replace(/\s+/gu, " ").trim();
+  const characters = Array.from(normalized);
+  return characters.length <= 80 ? normalized : `${characters.slice(0, 79).join("")}…`;
+}
+
+function disclosureMessage(disclosure: TaskDisclosure): string {
+  return [
+    `任务披露：目标“${conciseGoal(disclosure.goal)}”`,
+    `预计动作类别：${disclosure.expectedActions.join("、")}`,
+    `有效上限：工具调用 ${disclosure.limits.maxToolCalls} 次`,
+    `方块修改 ${disclosure.limits.maxBlockChanges} 次`,
+    `水平移动 ${disclosure.limits.maxHorizontalTravel} 格`,
+    `持续时间 ${disclosure.limits.maxDurationMs} 毫秒`,
+    `危险操作 ${disclosure.limits.maxDangerousOperations} 次`,
+    `停止条件：${disclosure.stopCondition}`,
+  ].join("；");
+}
+
+export function formatTaskDisclosureForMinecraft(disclosure: TaskDisclosure): string[] {
+  const firstPrefix = "任务披露：";
+  const continuationPrefix = "任务披露（续）：";
+  const body = disclosureMessage(disclosure).slice(firstPrefix.length);
+  return splitForMinecraft(body, 240 - continuationPrefix.length).map(
+    (chunk, index) => `${index === 0 ? firstPrefix : continuationPrefix}${chunk}`,
+  );
 }
 
 function memoryValidationSource(
@@ -62,15 +133,24 @@ export interface CompanionServiceDependencies {
   confirmations: ConfirmationStore;
   executor: ActionExecutor;
   budget: TurnToolBudget;
+  taskController: TaskController;
   autonomy: CompanionAutonomyScheduler;
   safetyContextProvider: () => Promise<SafetyContext>;
   ownerUsername: string;
+  chatRouter: ChatRouter;
   cwd: string;
   preferredModel: string;
   reasoningEffort: "low" | "medium";
+  requestedTaskLimits?: Partial<TaskLimits>;
   logger?: Pick<SafeLogger, "error">;
   setTimer?: (callback: () => void, milliseconds: number) => ReturnType<typeof setTimeout>;
   clearTimer?: (timer: ReturnType<typeof setTimeout>) => void;
+  confirmationNow?: () => Date;
+  setConfirmationTimer?: (
+    callback: () => void,
+    milliseconds: number,
+  ) => ReturnType<typeof setTimeout>;
+  clearConfirmationTimer?: (timer: ReturnType<typeof setTimeout>) => void;
 }
 
 export interface CompanionAutonomyScheduler {
@@ -93,11 +173,11 @@ interface ActiveTurn {
 
 const noOpLogger: Pick<SafeLogger, "error"> = { error: async () => undefined };
 
-function splitForMinecraft(reply: string): string[] {
+function splitForMinecraft(reply: string, maxLength = 240): string[] {
   const chunks: string[] = [];
   let chunk = "";
   for (const character of reply) {
-    if (chunk.length > 0 && chunk.length + character.length > 240) {
+    if (chunk.length > 0 && chunk.length + character.length > maxLength) {
       chunks.push(chunk);
       chunk = "";
     }
@@ -116,6 +196,14 @@ function compactTask(outcome: CompanionTurnOutcome): string | null {
   });
 }
 
+function taskLeaseKey(taskLease: TaskLease): string {
+  return `${taskLease.id}\u0000${taskLease.startedAt}`;
+}
+
+function sameTaskLease(first: TaskLease, second: TaskLease): boolean {
+  return first.id === second.id && first.startedAt === second.startedAt;
+}
+
 export class CompanionService {
   private readonly logger: Pick<SafeLogger, "error">;
   private readonly setTimer: (
@@ -123,9 +211,16 @@ export class CompanionService {
     milliseconds: number,
   ) => ReturnType<typeof setTimeout>;
   private readonly clearTimer: (timer: ReturnType<typeof setTimeout>) => void;
+  private readonly confirmationNow: () => Date;
+  private readonly setConfirmationTimer: (
+    callback: () => void,
+    milliseconds: number,
+  ) => ReturnType<typeof setTimeout>;
+  private readonly clearConfirmationTimer: (timer: ReturnType<typeof setTimeout>) => void;
   private unsubscribe: (() => void) | undefined;
   private unsubscribeActionResult: (() => void) | undefined;
   private mergeTimer: ReturnType<typeof setTimeout> | undefined;
+  private confirmationExpiryTimer: ReturnType<typeof setTimeout> | undefined;
   private mergedMessages: string[] = [];
   private generation = 0;
   private running = false;
@@ -135,17 +230,30 @@ export class CompanionService {
   private codexHealthy = true;
   private activeTurn: ActiveTurn | undefined;
   private turnTail: Promise<void> = Promise.resolve();
+  private confirmationTail: Promise<void> = Promise.resolve();
   private recoveryFlight: Promise<void> | undefined;
   private unfinishedTaskSummary: string | null = null;
   private readonly startupEvents: MinecraftEvent[] = [];
   private turnWorkCount = 0;
   private autonomousRequestCount = 0;
   private externallyManagedCodex = false;
+  private worldInvalidated = false;
+  private readonly pendingConfirmationTerminalReasons = new Map<string, "failed" | "owner_stop">();
 
   constructor(private readonly dependencies: CompanionServiceDependencies) {
     this.logger = dependencies.logger ?? noOpLogger;
     this.setTimer = dependencies.setTimer ?? setTimeout;
     this.clearTimer = dependencies.clearTimer ?? clearTimeout;
+    this.confirmationNow = dependencies.confirmationNow ?? (() => new Date());
+    this.setConfirmationTimer = dependencies.setConfirmationTimer ?? setTimeout;
+    this.clearConfirmationTimer = dependencies.clearConfirmationTimer ?? clearTimeout;
+    dependencies.taskController.onTerminal((reason, forceCleanup) =>
+      this.handleTaskTerminal(reason, forceCleanup),
+    );
+    dependencies.confirmations.onGameActionsChanged(() => this.scheduleConfirmationExpiry());
+    dependencies.confirmations.onGameActionsExpired((taskLease) =>
+      this.queueFailedConfirmation(taskLease),
+    );
   }
 
   async start(preselectedModel?: string): Promise<void> {
@@ -170,7 +278,8 @@ export class CompanionService {
       this.dependencies.mode.setMode("friend");
       this.dependencies.mode.completeTask();
       this.unfinishedTaskSummary = persisted.unfinishedTaskSummary;
-      if (this.unfinishedTaskSummary) this.dependencies.mode.pause();
+      this.worldInvalidated = persisted.worldInvalidated;
+      if (this.worldInvalidated || this.unfinishedTaskSummary) this.dependencies.mode.pause();
       else this.dependencies.mode.resume();
 
       if (preselectedModel === undefined) {
@@ -188,6 +297,7 @@ export class CompanionService {
       if (generation !== this.generation) return;
       this.codexHealthy = this.unfinishedTaskSummary === null;
       this.running = true;
+      this.scheduleConfirmationExpiry();
       this.unsubscribeActionResult = this.dependencies.executor.onResult((result) => {
         if (!this.running || result.status !== "failed") return;
         try {
@@ -224,6 +334,7 @@ export class CompanionService {
     if (!this.running && !this.starting) return;
     this.running = false;
     this.generation += 1;
+    this.clearConfirmationExpiry();
     this.dependencies.autonomy.stop();
     this.unsubscribeActionResult?.();
     this.unsubscribeActionResult = undefined;
@@ -231,12 +342,14 @@ export class CompanionService {
     this.startupEvents.splice(0);
     this.unsubscribe?.();
     this.unsubscribe = undefined;
+    this.dependencies.taskController.stop("process_exit");
     this.dependencies.executor.stopAll();
     this.dependencies.confirmations.clear();
     this.interruptActive();
     this.activeTurn = undefined;
     const tail = this.turnTail;
     const recovery = this.recoveryFlight;
+    const confirmation = this.confirmationTail.catch(() => undefined);
     const stoppingCodex = this.externallyManagedCodex
       ? Promise.resolve()
       : this.dependencies.codex
@@ -246,25 +359,26 @@ export class CompanionService {
           );
     const pendingWork =
       this.externallyManagedCodex && recovery
-        ? []
-        : [tail.catch(() => undefined), recovery?.catch(() => undefined)];
+        ? [confirmation]
+        : [tail.catch(() => undefined), recovery?.catch(() => undefined), confirmation];
     await Promise.all([...pendingWork, stoppingCodex]);
   }
 
   private async handleEvent(event: MinecraftEvent): Promise<void> {
     if (!this.running) return;
     if (event.kind === "chat") {
-      if (event.username !== this.dependencies.ownerUsername) return;
-      const command = parseLocalCommand(event.message);
-      if (command) {
-        await this.handleCommand(command);
+      const route = this.dependencies.chatRouter.route(event);
+      if (route.kind === "ignore") return;
+      if (route.kind === "command") {
+        await this.handleCommand(route.command);
         return;
       }
-      this.onOwnerMessage(event.message);
+      this.onOwnerMessage(route.text);
       return;
     }
     if (event.kind === "owner_offline") {
       if (event.username !== this.dependencies.ownerUsername) return;
+      this.dependencies.taskController.stop("disconnect");
       this.invalidateCurrentTurn();
       this.dependencies.confirmations.clear();
       this.dependencies.executor.stopAll();
@@ -276,7 +390,20 @@ export class CompanionService {
       this.dependencies.autonomy.notifyThreat();
       return;
     }
+    if (event.kind === "world_changed") {
+      this.worldInvalidated = true;
+      this.dependencies.taskController.stop("world_changed");
+      this.invalidateCurrentTurn();
+      this.dependencies.confirmations.clear();
+      this.dependencies.executor.stopAll();
+      this.dependencies.mode.stop();
+      this.unfinishedTaskSummary = null;
+      this.dependencies.autonomy.notifyModeChanged();
+      await this.persist();
+      return;
+    }
     if (event.kind === "death" || event.kind === "disconnected") {
+      this.dependencies.taskController.stop("disconnect");
       this.invalidateCurrentTurn();
       this.dependencies.confirmations.clear();
       this.dependencies.executor.stopAll();
@@ -290,15 +417,20 @@ export class CompanionService {
       this.dependencies.mode.setMode("friend");
       this.dependencies.autonomy.notifyModeChanged();
       this.dependencies.mode.completeTask();
-      if (this.unfinishedTaskSummary) this.dependencies.mode.pause();
+      if (this.worldInvalidated || this.unfinishedTaskSummary) this.dependencies.mode.pause();
       else this.dependencies.mode.resume();
       await this.persist();
     }
   }
 
   private onOwnerMessage(message: string): void {
-    if (this.dependencies.mode.getMode() === "autonomous" || this.autonomousRequestCount > 0) {
+    if (
+      this.dependencies.mode.getMode() === "autonomous" ||
+      this.autonomousRequestCount > 0 ||
+      this.dependencies.taskController.current() !== null
+    ) {
       this.dependencies.mode.completeTask();
+      this.dependencies.taskController.stop("owner_stop");
       this.dependencies.executor.stopAll();
       this.invalidateCurrentTurn();
       this.dependencies.mode.resume();
@@ -331,6 +463,7 @@ export class CompanionService {
       this.turnWorkCount += 1;
       if (!this.isCurrent(generation) || !this.threadId || this.dependencies.mode.snapshot().paused)
         return;
+      const disclosure = turnDisclosure(text);
       let prompt: string;
       try {
         const input = {
@@ -343,7 +476,7 @@ export class CompanionService {
         await this.failClosed(generation, error);
         return;
       }
-      const outcome = await this.resolveOutcome(prompt, generation, text);
+      const outcome = await this.resolveOutcome(prompt, generation, text, disclosure);
       if (!outcome || !this.isCurrent(generation)) return;
       await this.persistOutcome(outcome, generation, text);
       if (!this.isCurrent(generation)) return;
@@ -357,6 +490,7 @@ export class CompanionService {
     if (!this.running) return;
     const state = this.dependencies.mode.snapshot();
     if (state.mode === "friend" || state.paused) return;
+    if (this.dependencies.taskController.current() !== null) return;
     const generation = this.generation;
     this.autonomousRequestCount += 1;
     const queued = this.turnTail
@@ -378,6 +512,7 @@ export class CompanionService {
       this.turnWorkCount > 0 ||
       this.activeTurn !== undefined ||
       this.recoveryFlight !== undefined ||
+      this.dependencies.taskController.current() !== null ||
       this.dependencies.executor.isBusy() ||
       this.mergeTimer !== undefined ||
       this.mergedMessages.length > 0
@@ -390,9 +525,11 @@ export class CompanionService {
       if (!this.isCurrent(generation) || !this.threadId) return;
       const state = this.dependencies.mode.snapshot();
       if (state.mode === "friend" || state.paused) return;
+      if (this.dependencies.taskController.current() !== null) return;
       if (!(await this.dependencies.minecraft.isOwnerOnline(this.dependencies.ownerUsername)))
         return;
       if (!this.isCurrent(generation)) return;
+      const disclosure = turnDisclosure(`自主微任务：${reason}`);
       let prompt: string;
       try {
         prompt = buildCompanionAutonomousTurn({
@@ -405,7 +542,7 @@ export class CompanionService {
         await this.failClosed(generation, error);
         return;
       }
-      const outcome = await this.resolveOutcome(prompt, generation);
+      const outcome = await this.resolveOutcome(prompt, generation, undefined, disclosure);
       if (!outcome || !this.isCurrent(generation)) return;
       await this.persistOutcome(outcome, generation);
       if (!this.isCurrent(generation)) return;
@@ -419,21 +556,64 @@ export class CompanionService {
     prompt: string,
     generation: number,
     ownerText?: string,
+    disclosure?: TaskDisclosure,
   ): Promise<CompanionTurnOutcome | undefined> {
     let outcome: CompanionTurnOutcome | undefined;
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-      const result = await this.sendAttempt(attempt === 0 ? prompt : repairPrompt, generation);
-      if (!result) return;
-      const parsed = companionTurnOutcomeSchema.safeParse(this.parseJson(result.text));
-      if (!parsed.success || !this.memoryCandidatesValid(parsed.data, ownerText)) continue;
-      outcome = parsed.data;
-      break;
-    }
-    if (!outcome) {
-      await this.failClosed(generation, new Error("invalid structured Codex output"));
+    let task: ActiveTask | undefined;
+    let taskStopReason: TaskStopReason = "failed";
+    try {
+      if (disclosure) {
+        const prepared = this.dependencies.taskController.prepare(
+          disclosure,
+          this.dependencies.requestedTaskLimits,
+        );
+        for (const chunk of formatTaskDisclosureForMinecraft(prepared)) {
+          if (!this.isCurrent(generation)) return undefined;
+          await this.dependencies.minecraft.say(chunk);
+        }
+        if (!this.isCurrent(generation)) return undefined;
+        task = this.dependencies.taskController.start(prepared, prepared.limits);
+      }
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const result = await this.sendAttempt(
+          attempt === 0 ? prompt : repairPrompt,
+          generation,
+          true,
+          task,
+        );
+        if (!result) return undefined;
+        const parsed = companionTurnOutcomeSchema.safeParse(this.parseJson(result.text));
+        if (!parsed.success || !this.memoryCandidatesValid(parsed.data, ownerText)) continue;
+        outcome = parsed.data;
+        break;
+      }
+      if (!outcome) {
+        if (task) {
+          this.dependencies.taskController.stop("failed");
+          task = undefined;
+        }
+        await this.failClosed(generation, new Error("invalid structured Codex output"));
+        return undefined;
+      }
+      taskStopReason = "completed";
+      return outcome;
+    } catch (error) {
+      if (task) {
+        this.dependencies.taskController.stop("failed");
+        task = undefined;
+      }
+      await this.failClosed(generation, error);
       return undefined;
+    } finally {
+      if (task && this.dependencies.taskController.current()?.id === task.id) {
+        if (
+          taskStopReason !== "completed" ||
+          !this.dependencies.confirmations.hasGameActions(task.lease)
+        ) {
+          this.dependencies.taskController.stop(taskStopReason);
+        }
+      }
     }
-    return outcome;
   }
 
   private async sendOutcomeReply(
@@ -465,6 +645,8 @@ export class CompanionService {
     text: string,
     generation: number,
     failClosedOnError = true,
+    task?: ActiveTask,
+    toolsEnabled = true,
   ): Promise<CodexTurnResult | undefined> {
     if (!this.threadId || !this.isCurrent(generation)) return undefined;
     let cancel!: () => void;
@@ -476,27 +658,31 @@ export class CompanionService {
     this.activeTurn = active;
     let budgetStarted = false;
     try {
-      const toolLease = this.dependencies.budget.begin();
-      budgetStarted = true;
-      const original = this.dependencies.codex.sendTurn(
-        attemptThreadId,
-        attachToolLease(text, toolLease),
-        (turnId) => {
-          if (!this.isCurrent(generation) || this.activeTurn !== active) {
-            void this.dependencies.codex
-              .interrupt(attemptThreadId, turnId)
-              .catch((error: unknown) =>
-                this.logger.error("codex_interrupt_failed", { code: String(error) }),
-              );
-            return;
-          }
-          active.turnId = turnId;
-        },
-      );
+      if (task && this.dependencies.taskController.current()?.id !== task.id) {
+        return undefined;
+      }
+      let turnText = text;
+      if (toolsEnabled) {
+        const toolLease = this.dependencies.budget.begin(task?.lease);
+        budgetStarted = true;
+        turnText = attachToolLease(text, toolLease, task?.lease.id);
+      }
+      const original = this.dependencies.codex.sendTurn(attemptThreadId, turnText, (turnId) => {
+        if (!this.isCurrent(generation) || this.activeTurn !== active) {
+          void this.dependencies.codex
+            .interrupt(attemptThreadId, turnId)
+            .catch((error: unknown) =>
+              this.logger.error("codex_interrupt_failed", { code: String(error) }),
+            );
+          return;
+        }
+        active.turnId = turnId;
+      });
       const result = await Promise.race([original, cancelled]);
       if (!result) return undefined;
       if (!this.isCurrent(generation)) return undefined;
       if (result.status !== "completed") {
+        if (task) this.dependencies.taskController.stop("failed");
         if (failClosedOnError) {
           await this.failClosed(generation, new Error(`Codex turn ${result.status}`));
         }
@@ -505,6 +691,7 @@ export class CompanionService {
       return result;
     } catch (error) {
       if (failClosedOnError) await this.failClosed(generation, error);
+      else if (task) this.dependencies.taskController.stop("failed");
       return undefined;
     } finally {
       try {
@@ -617,8 +804,10 @@ export class CompanionService {
       let recovered: CompanionTurnOutcome | undefined;
       for (let attempt = 0; attempt < 2; attempt += 1) {
         const result = await this.sendAttempt(
-          attempt === 0 ? prompt : repairPrompt,
+          attempt === 0 ? prompt : recoveryRepairPrompt,
           generation,
+          false,
+          undefined,
           false,
         );
         if (!result) throw new Error("Codex recovery turn failed");
@@ -676,6 +865,7 @@ export class CompanionService {
       switch (command.kind) {
         case "mode":
           if (this.autonomousRequestCount > 0) {
+            this.dependencies.taskController.stop("owner_stop");
             this.dependencies.executor.stopAll();
             this.invalidateCurrentTurn();
           }
@@ -687,6 +877,7 @@ export class CompanionService {
           );
           return;
         case "pause":
+          this.dependencies.taskController.stop("owner_stop");
           this.invalidateCurrentTurn();
           this.dependencies.executor.stopAll();
           this.dependencies.mode.pause();
@@ -695,7 +886,9 @@ export class CompanionService {
           await this.say("已暂停，当前任务已保留。");
           return;
         case "resume":
+          this.worldInvalidated = false;
           if (!this.codexHealthy || this.unfinishedTaskSummary) {
+            await this.persist();
             await this.recoverSingleFlight();
             return;
           }
@@ -704,6 +897,8 @@ export class CompanionService {
           await this.say("已恢复。");
           return;
         case "stop":
+          this.worldInvalidated = false;
+          this.dependencies.taskController.stop("owner_stop");
           this.invalidateCurrentTurn();
           this.dependencies.executor.stopAll();
           this.dependencies.confirmations.clear();
@@ -750,11 +945,10 @@ export class CompanionService {
           return;
         }
         case "deny":
-          this.dependencies.confirmations.deny(command.confirmationId);
-          await this.say("已取消确认。");
+          await this.serializeConfirmation(() => this.deny(command.confirmationId));
           return;
         case "allow":
-          await this.allow(command.confirmationId);
+          await this.serializeConfirmation(() => this.allow(command.confirmationId));
           return;
       }
     } catch (error) {
@@ -763,13 +957,85 @@ export class CompanionService {
     }
   }
 
-  private async allow(id: number): Promise<void> {
-    const pendingBeforeContext = this.dependencies.confirmations.get(id);
-    if (!pendingBeforeContext) {
-      await this.say("确认不存在或已过期。");
+  private serializeConfirmation(operation: () => Promise<void>): Promise<void> {
+    const queued = this.confirmationTail.then(operation, operation);
+    this.confirmationTail = queued.catch(() => undefined);
+    return queued;
+  }
+
+  private scheduleConfirmationExpiry(): void {
+    this.clearConfirmationExpiry();
+    if (!this.running) return;
+    const next = this.dependencies.confirmations.nextGameActionExpiry();
+    if (!next) return;
+    const delay = Math.max(0, next.expiresAt.getTime() - this.confirmationNow().getTime());
+    const taskLease = { ...next.taskLease };
+    let timer!: ReturnType<typeof setTimeout>;
+    try {
+      timer = this.setConfirmationTimer(() => {
+        if (this.confirmationExpiryTimer !== timer) return;
+        this.confirmationExpiryTimer = undefined;
+        if (!this.running) return;
+        const current = this.dependencies.taskController.current();
+        if (!current || !sameTaskLease(current.lease, taskLease)) {
+          this.scheduleConfirmationExpiry();
+          return;
+        }
+        const expired = this.dependencies.confirmations.expireGameActions(taskLease);
+        if (expired === 0) this.scheduleConfirmationExpiry();
+      }, delay);
+    } catch (error) {
+      this.failConfirmationTimer(taskLease, error);
       return;
     }
-    if (pendingBeforeContext.operation.kind === "game_action") {
+    this.confirmationExpiryTimer = timer;
+    (timer as ReturnType<typeof setTimeout> & { unref?: () => void }).unref?.();
+  }
+
+  private clearConfirmationExpiry(): void {
+    const timer = this.confirmationExpiryTimer;
+    this.confirmationExpiryTimer = undefined;
+    if (timer === undefined) return;
+    try {
+      this.clearConfirmationTimer(timer);
+    } catch (error) {
+      this.logConfirmationSafetyError("confirmation_expiry_timer_clear_failed", error);
+    }
+  }
+
+  private failConfirmationTimer(taskLease: TaskLease, error: unknown): void {
+    this.dependencies.confirmations.clearGameActions();
+    this.queueFailedConfirmation(taskLease);
+    this.logConfirmationSafetyError("confirmation_expiry_timer_set_failed", error);
+  }
+
+  private queueFailedConfirmation(taskLease: TaskLease): void {
+    if (!this.running) return;
+    const safeLease = { ...taskLease };
+    const key = taskLeaseKey(safeLease);
+    this.pendingConfirmationTerminalReasons.set(key, "failed");
+    void this.serializeConfirmation(async () => {
+      if (!this.pendingConfirmationTerminalReasons.has(key)) return;
+      await this.settleConfirmationTask(safeLease, "failed");
+    }).catch((error: unknown) => {
+      this.logConfirmationSafetyError("confirmation_expiry_settlement_failed", error);
+    });
+  }
+
+  private logConfirmationSafetyError(event: string, error: unknown): void {
+    try {
+      void this.logger.error(event, { code: String(error) }).catch(() => undefined);
+    } catch {
+      // Timer safety must not depend on diagnostic observers.
+    }
+  }
+
+  private async allow(id: number): Promise<void> {
+    const task = this.dependencies.taskController.current();
+    const inspected = task
+      ? this.dependencies.confirmations.inspectGameAction(id, task.lease)
+      : undefined;
+    if (task && inspected?.ok) {
       let context: SafetyContext;
       try {
         context = await this.dependencies.safetyContextProvider();
@@ -777,14 +1043,49 @@ export class CompanionService {
         await this.say("无法取得安全上下文，确认未被使用。");
         return;
       }
-      const pending = this.dependencies.confirmations.get(id);
-      if (!pending || pending.operation.kind !== "game_action") {
+      let additionalHorizontalTravel = 0;
+      if (inspected.action.kind === "move_to") {
+        let snapshot;
+        try {
+          snapshot = await this.dependencies.minecraft.snapshot(this.dependencies.ownerUsername);
+        } catch {
+          await this.say("无法取得安全上下文，确认未被使用。");
+          return;
+        }
+        const freshDistance = Math.hypot(
+          inspected.action.position.x - snapshot.botPosition.x,
+          inspected.action.position.z - snapshot.botPosition.z,
+        );
+        if (!Number.isFinite(freshDistance)) {
+          await this.say("无法取得安全上下文，确认未被使用。");
+          return;
+        }
+        additionalHorizontalTravel = Math.max(
+          0,
+          freshDistance - inspected.reservedHorizontalTravel,
+        );
+      }
+      const result = await this.dependencies.executor.executeConfirmed(
+        id,
+        { ...context, taskLease: { ...task.lease } },
+        task.lease,
+        additionalHorizontalTravel,
+      );
+      await this.settleConfirmationTask(
+        task.lease,
+        result.status === "completed" ? "completed" : "failed",
+      );
+      await this.say(result.status === "completed" ? "已执行确认动作。" : "确认动作未能执行。");
+      return;
+    }
+    if (task && inspected && !inspected.ok) {
+      if (inspected.reason === "expired") {
+        await this.settleConfirmationTask(task.lease, "failed");
+      }
+      if (inspected.reason === "expired" || inspected.reason === "wrong_task") {
         await this.say("确认不存在或已过期。");
         return;
       }
-      const result = await this.dependencies.executor.executeConfirmed(id, context);
-      await this.say(result.status === "completed" ? "已执行确认动作。" : "确认动作未能执行。");
-      return;
     }
     const pending = this.dependencies.confirmations.get(id);
     if (!pending || pending.operation.kind !== "memory_clear") {
@@ -800,6 +1101,64 @@ export class CompanionService {
     await this.say("确认不存在或已过期。");
   }
 
+  private async deny(id: number): Promise<void> {
+    const task = this.dependencies.taskController.current();
+    if (task) {
+      const denied = this.dependencies.confirmations.denyGameAction(id, task.lease);
+      if (denied.ok) {
+        await this.settleConfirmationTask(task.lease, "owner_stop");
+        await this.say("已取消确认。");
+        return;
+      }
+      if (denied.reason === "expired") {
+        await this.settleConfirmationTask(task.lease, "failed");
+      }
+      if (denied.reason === "expired" || denied.reason === "wrong_task") {
+        await this.say("已取消确认。");
+        return;
+      }
+    }
+    this.dependencies.confirmations.deny(id);
+    await this.say("已取消确认。");
+  }
+
+  private async settleConfirmationTask(
+    taskLease: TaskLease,
+    reason: "completed" | "failed" | "owner_stop",
+  ): Promise<boolean> {
+    this.dependencies.confirmations.expireGameActions(taskLease);
+    const key = taskLeaseKey(taskLease);
+    const pendingReason = this.pendingConfirmationTerminalReasons.get(key);
+    if (reason === "failed" || (reason === "owner_stop" && pendingReason !== "failed")) {
+      this.pendingConfirmationTerminalReasons.set(key, reason);
+    }
+    if (this.dependencies.confirmations.hasGameActions(taskLease)) return false;
+    if (!this.dependencies.taskController.isLeaseLive(taskLease)) {
+      this.pendingConfirmationTerminalReasons.delete(key);
+      return false;
+    }
+    const terminalReason = this.pendingConfirmationTerminalReasons.get(key) ?? reason;
+    this.dependencies.taskController.stop(terminalReason);
+    this.invalidateCurrentTurn();
+    try {
+      this.dependencies.executor.stopAll();
+    } catch (error) {
+      this.logConfirmationSafetyError("confirmation_settlement_executor_stop_failed", error);
+    }
+    if (terminalReason === "completed") this.dependencies.mode.completeTask();
+    else this.dependencies.mode.stop();
+    this.unfinishedTaskSummary = null;
+    await this.persist();
+    if (terminalReason === "completed") {
+      try {
+        this.dependencies.autonomy.notifyGoalCompleted();
+      } catch (error) {
+        await this.logger.error("autonomy_goal_notification_failed", { code: String(error) });
+      }
+    }
+    return true;
+  }
+
   private interruptActive(): void {
     const active = this.activeTurn;
     if (!active) return;
@@ -812,6 +1171,31 @@ export class CompanionService {
       );
   }
 
+  private handleTaskTerminal(reason: TaskStopReason, forceCleanup = false): void {
+    this.pendingConfirmationTerminalReasons.clear();
+    try {
+      this.dependencies.confirmations.clearGameActions();
+    } catch (error) {
+      void this.logger.error("task_terminal_confirmation_clear_failed", { code: String(error) });
+    }
+    if (!forceCleanup && reason !== "timeout" && reason !== "budget_exhausted") return;
+    this.invalidateCurrentTurn();
+    try {
+      this.dependencies.executor.stopAll();
+    } catch (error) {
+      void this.logger.error("task_terminal_executor_stop_failed", { code: String(error) });
+    }
+    try {
+      this.dependencies.mode.stop();
+    } catch (error) {
+      void this.logger.error("task_terminal_mode_stop_failed", { code: String(error) });
+    }
+    this.unfinishedTaskSummary = null;
+    void this.persist().catch((error: unknown) =>
+      this.logger.error("task_terminal_state_save_failed", { code: String(error) }),
+    );
+  }
+
   private invalidateCurrentTurn(): void {
     this.interruptActive();
     this.activeTurn = undefined;
@@ -822,6 +1206,7 @@ export class CompanionService {
   private async failClosed(generation: number, error: unknown): Promise<void> {
     if (!this.isCurrent(generation) || !this.codexHealthy) return;
     this.codexHealthy = false;
+    this.dependencies.taskController.stop("model_unavailable");
     this.dependencies.executor.stopAll();
     this.dependencies.mode.pause();
     await this.persist();
@@ -837,6 +1222,7 @@ export class CompanionService {
       lastMode: state.mode,
       paused: state.paused,
       unfinishedTaskSummary: this.unfinishedTaskSummary,
+      worldInvalidated: this.worldInvalidated,
     });
   }
 

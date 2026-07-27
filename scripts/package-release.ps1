@@ -89,7 +89,7 @@ try {
   Expand-Archive -LiteralPath $sourceArchive -DestinationPath $export -Force
   Invoke-ExportPrivacyScan $export
   $stage = Initialize-SafeDirectoryRoot $stage $releaseRoot
-  $allow = @("src", "dist", "scripts", "codex-workspace", ".codex", "docs/windows-smoke-test.md", "package.json", "package-lock.json", "config.example.toml", "README.md", "README.zh-CN.md", "LICENSE", "NOTICE", "CONTRIBUTING.md", "SECURITY.md", "CHANGELOG.md")
+  $allow = @("src", "dist", "scripts", "codex-workspace", ".codex", "docs/windows-smoke-test.md", "docs/installation-windows.zh-CN.md", "docs/runtime-architecture.md", "package.json", "package-lock.json", "config.example.toml", "README.md", "README.zh-CN.md", "LICENSE", "NOTICE", "CONTRIBUTING.md", "SECURITY.md", "CHANGELOG.md")
   foreach ($item in $allow) {
     $source = Join-Path $export $item
     if (Test-Path -LiteralPath $source) {

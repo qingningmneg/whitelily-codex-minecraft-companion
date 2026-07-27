@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { MinecraftEvent } from "../../src/minecraft/minecraftPort.js";
+import type { TaskDisclosure } from "../../src/companion/taskController.js";
 import {
   createCompanionHarness,
   outcome,
@@ -8,6 +9,14 @@ import {
 
 const unavailable = "Codex 暂时不可用，我已安全暂停。你仍可以使用 !status、!stop 和记忆命令。";
 const harnesses: Array<Awaited<ReturnType<typeof createCompanionHarness>>> = [];
+
+function withoutTaskDisclosures(messages: readonly string[]): string[] {
+  return messages.filter((message) => !message.startsWith("任务披露"));
+}
+
+function reconstructTaskDisclosure(messages: readonly string[]): string {
+  return messages.map((message) => message.replace(/^任务披露(?:（续）)?：/u, "")).join("");
+}
 
 async function harness(options: CompanionHarnessOptions = {}) {
   const created = await createCompanionHarness(options);
@@ -33,6 +42,44 @@ async function startPlayerTurn(
   await value.untilCodexTurns(expectedTurns);
 }
 
+async function startPendingMoveConfirmation(
+  value: Awaited<ReturnType<typeof createCompanionHarness>>,
+  destinationX = 300,
+) {
+  await value.start();
+  await startPlayerTurn(value, "travel far");
+  const task = value.taskController.current();
+  expect(task).not.toBeNull();
+  const result = await value.executeRawTool("minecraft_move_to", {
+    x: destinationX,
+    y: 64,
+    z: 0,
+    turnLease: value.budgetLeases[0],
+  });
+  const parsed = JSON.parse(result.text) as { status?: string; confirmationId?: number };
+  expect(parsed).toMatchObject({
+    status: "confirmation_required",
+    confirmationId: expect.any(Number),
+  });
+  value.codex.releaseTurnResult(0);
+  await value.untilChat("ready");
+  return { task: task!, confirmationId: parsed.confirmationId! };
+}
+
+function activeConfirmationOutcome(reply = "ready", goal = "finish confirmed travel") {
+  return outcome({
+    reply,
+    task: {
+      goal,
+      allowedActions: ["move_to"],
+      actionBudget: 2,
+      successCondition: "arrive safely",
+      stopCondition: "owner stops",
+      status: "active",
+    },
+  });
+}
+
 afterEach(async () => {
   vi.useRealTimers();
   await Promise.all(
@@ -44,6 +91,474 @@ afterEach(async () => {
 });
 
 describe("CompanionService lifecycle", () => {
+  it("splits long Unicode disclosure labels into bounded command-safe chunks", async () => {
+    const companionModule =
+      (await import("../../src/companion/companionService.js")) as typeof import("../../src/companion/companionService.js") & {
+        formatTaskDisclosureForMinecraft?: (disclosure: TaskDisclosure) => string[];
+      };
+    expect(companionModule.formatTaskDisclosureForMinecraft).toBeTypeOf("function");
+    const firstAction = `观察${"😀".repeat(300)}`;
+    const secondAction = `/${"移动🌍".repeat(200)}`;
+    const chunks = companionModule.formatTaskDisclosureForMinecraft!({
+      goal: `整理${"🌸".repeat(300)}`,
+      expectedActions: [firstAction, secondAction],
+      limits: {
+        maxToolCalls: 5,
+        maxBlockChanges: 6,
+        maxHorizontalTravel: 7,
+        maxDurationMs: 8_000,
+        maxDangerousOperations: 1,
+      },
+      stopCondition: `主人停止或${"完成✅".repeat(100)}`,
+    });
+
+    const reconstructed = reconstructTaskDisclosure(chunks);
+    expect(reconstructed).toContain(firstAction);
+    expect(reconstructed).toContain(secondAction);
+    expect(chunks.every((chunk) => chunk.startsWith("任务披露"))).toBe(true);
+    expect(
+      chunks.every(
+        (chunk) =>
+          chunk.length <= 240 &&
+          Array.from(chunk).length <= 240 &&
+          !/[\uD800-\uDBFF]$/u.test(chunk) &&
+          !/^[\uDC00-\uDFFF]/u.test(chunk) &&
+          !chunk.startsWith("/"),
+      ),
+    ).toBe(true);
+  });
+
+  it("sends the complete goal, action categories, five effective limits, and stop condition before task authority or Codex", async () => {
+    const value = await harness({ deferredTurns: [0] });
+    await value.start();
+
+    await startPlayerTurn(value, "collect four oak logs");
+
+    const disclosure = reconstructTaskDisclosure(value.disclosureChatAtTaskStart[0] ?? []);
+    expect(disclosure).toContain("collect four oak logs");
+    for (const category of [
+      "get_state",
+      "find_block",
+      "say",
+      "move_to",
+      "follow_owner",
+      "look_at",
+      "jump",
+      "dig_block",
+      "place_block",
+      "craft_item",
+      "smelt_item",
+      "collect_dropped",
+      "equip_item",
+      "attack_hostile",
+      "wait",
+    ]) {
+      expect(disclosure).toContain(category);
+    }
+    expect(disclosure).toContain("工具调用 64");
+    expect(disclosure).toContain("方块修改 256");
+    expect(disclosure).toContain("水平移动 1024");
+    expect(disclosure).toContain("持续时间 600000");
+    expect(disclosure).toContain("危险操作 8");
+    expect(disclosure).toContain("完成、失败、中断、达到安全边界或预算耗尽时立即停止");
+    expect(value.codex.turns).toHaveLength(1);
+  });
+
+  it("discloses and acquires every requested lower limit", async () => {
+    const limits = {
+      maxToolCalls: 5,
+      maxBlockChanges: 6,
+      maxHorizontalTravel: 7,
+      maxDurationMs: 8_000,
+      maxDangerousOperations: 1,
+    };
+    const value = await harness({ deferredTurns: [0], requestedTaskLimits: limits });
+    await value.start();
+
+    await startPlayerTurn(value, "bounded task");
+
+    const disclosure = reconstructTaskDisclosure(value.disclosureChatAtTaskStart[0] ?? []);
+    expect(disclosure).toContain("工具调用 5");
+    expect(disclosure).toContain("方块修改 6");
+    expect(disclosure).toContain("水平移动 7");
+    expect(disclosure).toContain("持续时间 8000");
+    expect(disclosure).toContain("危险操作 1");
+    expect(value.taskController.current()?.disclosure.limits).toEqual(limits);
+  });
+
+  it("opens no task, Codex turn, or Minecraft action when disclosure delivery fails", async () => {
+    const value = await harness();
+    await value.start();
+    let disclosureAttempts = 0;
+    value.minecraft.say = async () => {
+      disclosureAttempts += 1;
+      throw new Error("disclosure transport failed");
+    };
+
+    value.minecraft.emit({
+      kind: "chat",
+      username: "TestOwner",
+      message: "must not gain authority",
+    });
+    await value.untilMergeTimer();
+    value.fireMergeTimers();
+    await vi.waitFor(() => expect(disclosureAttempts).toBeGreaterThan(0));
+    await value.untilTurnSettled();
+
+    expect(value.taskController.current()).toBeNull();
+    expect(value.taskAuditEvents).toEqual([]);
+    expect(value.codex.turns).toEqual([]);
+    expect(value.budgetEvents).toEqual([]);
+    expect(value.minecraft.calls).toEqual([]);
+  });
+
+  it("discloses an owner task before Codex receives the same task lease as the tool budget", async () => {
+    const value = await harness({ deferredTurns: [0] });
+    await value.start();
+
+    await startPlayerTurn(value, "collect four oak logs");
+
+    const task = value.taskController.current();
+    expect(task).not.toBeNull();
+    expect(value.minecraft.chatLog[0]).toContain("任务披露");
+    expect(value.minecraft.chatLog[0]).toContain("collect four oak logs");
+    expect(value.codex.turns[0]?.text).toContain(task?.lease.id);
+    expect(value.budgetTaskLeaseIds).toEqual([task?.lease.id]);
+    expect(value.taskAuditEvents).toEqual(["task_started"]);
+
+    value.codex.releaseTurnResult(0, outcome());
+    await value.untilTurnSettled();
+    expect(value.taskController.current()).toBeNull();
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:completed"]);
+  });
+
+  it("discloses an autonomous microtask before opening its leased Codex turn", async () => {
+    const value = await harness({ deferredTurns: [0] });
+    await value.start();
+    await emitCommand(value, "!mode balanced");
+    value.minecraft.chatLog.splice(0);
+
+    const turn = value.service.requestAutonomousTurn("nearby_threat");
+    await value.untilCodexTurns(1);
+
+    const task = value.taskController.current();
+    expect(task?.disclosure.goal).toContain("nearby_threat");
+    expect(value.minecraft.chatLog[0]).toContain("任务披露");
+    expect(value.codex.turns[0]?.text).toContain(task?.lease.id);
+    expect(value.budgetTaskLeaseIds).toEqual([task?.lease.id]);
+
+    value.codex.releaseTurnResult(0, outcome());
+    await turn;
+    expect(value.taskController.current()).toBeNull();
+  });
+
+  it("invalidates an owner task before !stop cancels its deferred Codex turn", async () => {
+    const value = await harness({ deferredTurns: [0] });
+    await value.start();
+    await startPlayerTurn(value, "keep collecting");
+    const leaseId = value.taskController.current()?.lease.id;
+
+    await emitCommand(value, "!stop");
+
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:owner_stop"]);
+    expect(value.taskController.current()).toBeNull();
+    expect(
+      value.taskController.consume({
+        leaseId: leaseId ?? "",
+        kind: "say",
+        now: Date.now(),
+      }),
+    ).toEqual({ ok: false, reason: "task lease is invalid" });
+  });
+
+  it("invalidates active task work as disconnect before outage cancellation", async () => {
+    const value = await harness({ deferredTurns: [0] });
+    await value.start();
+    await startPlayerTurn(value, "keep collecting");
+    const leaseId = value.taskController.current()?.lease.id;
+
+    value.minecraft.emit({ kind: "disconnected" });
+    await value.untilState((state) => state.paused);
+    await value.untilTurnSettled();
+
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:disconnect"]);
+    expect(
+      value.taskController.consume({
+        leaseId: leaseId ?? "",
+        kind: "say",
+        now: Date.now(),
+      }),
+    ).toEqual({ ok: false, reason: "task lease is invalid" });
+  });
+
+  it("synchronously invalidates world-bound work once and persists the paused stop", async () => {
+    const value = await harness({
+      deferredTurns: [0],
+      activeMinecraftWait: true,
+    });
+    await value.start();
+    await startPlayerTurn(value, "keep building in this world");
+    const leaseId = value.taskController.current()?.lease.id;
+    const running = value.executor.execute(
+      { kind: "wait", milliseconds: 5_000 },
+      { spawn: { x: 0, y: 64, z: 0 }, owner: { x: 0, y: 64, z: 0 } },
+    );
+    const queued = value.executor.execute(
+      { kind: "jump" },
+      { spawn: { x: 0, y: 64, z: 0 }, owner: { x: 0, y: 64, z: 0 } },
+    );
+    const confirmation = value.confirmations.create("pending", { kind: "memory_clear" });
+    await value.untilActiveWaitStarted();
+
+    value.minecraft.emit({ kind: "world_changed" });
+
+    expect(value.taskController.current()).toBeNull();
+    expect(
+      value.taskController.consume({
+        leaseId: leaseId ?? "",
+        kind: "say",
+        now: Date.now(),
+      }),
+    ).toEqual({ ok: false, reason: "task lease is invalid" });
+    expect(value.activeWaitWasAborted()).toBe(true);
+    expect(value.confirmations.get(confirmation.id)).toBeUndefined();
+    expect(value.mode.snapshot()).toMatchObject({ paused: true, taskId: null });
+
+    const savesBeforeReconnectSequence = value.savedStates.length;
+    value.minecraft.emit({ kind: "world_changed" });
+    value.minecraft.emit({ kind: "disconnected", reason: "world fence" });
+    value.minecraft.emit({ kind: "connected" });
+    await expect(Promise.all([running, queued])).resolves.toEqual([
+      { status: "cancelled" },
+      { status: "cancelled" },
+    ]);
+    await value.untilTurnSettled();
+    await vi.waitFor(
+      () =>
+        expect(value.savedStates.length).toBeGreaterThanOrEqual(savesBeforeReconnectSequence + 3),
+      { timeout: 1_000 },
+    );
+
+    expect(value.minecraft.calls).not.toContainEqual(expect.objectContaining({ method: "jump" }));
+    expect(value.codex.interruptions).toEqual([{ threadId: "thread-1", turnId: "turn-1" }]);
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:world_changed"]);
+    expect(value.taskTerminalReasons).toEqual(["world_changed"]);
+    expect(value.mode.snapshot()).toMatchObject({ paused: true, taskId: null });
+    expect(value.savedStates.at(-1)).toMatchObject({
+      paused: true,
+      unfinishedTaskSummary: null,
+    });
+  });
+
+  it.each(["!resume", "!stop"] as const)(
+    "persists world invalidation across new service instances until explicit %s clears it",
+    async (command) => {
+      const first = await harness();
+      await first.start();
+      first.minecraft.emit({ kind: "world_changed" });
+      await first.untilState((state) => state.paused);
+      await first.stop();
+
+      const second = await harness({ storageDirectory: first.directory });
+      await second.start();
+
+      expect(second.mode.snapshot()).toMatchObject({ paused: true, taskId: null });
+      await expect(second.state.load()).resolves.toMatchObject({
+        paused: true,
+        unfinishedTaskSummary: null,
+        worldInvalidated: true,
+      });
+
+      await emitCommand(second, command);
+      await expect(second.state.load()).resolves.toMatchObject({
+        paused: command === "!stop",
+        unfinishedTaskSummary: null,
+        worldInvalidated: false,
+      });
+      await second.stop();
+
+      const third = await harness({ storageDirectory: first.directory });
+      await third.start();
+
+      expect(third.mode.snapshot()).toMatchObject({ paused: false, taskId: null });
+      await expect(third.state.load()).resolves.toMatchObject({
+        worldInvalidated: false,
+      });
+    },
+  );
+
+  it.each(["deadline", "budget overflow"] as const)(
+    "%s actively cancels in-flight and queued work with one terminal transition",
+    async (trigger) => {
+      const value = await harness({
+        deferredTurns: [0],
+        activeMinecraftWait: true,
+      });
+      await value.start();
+      await startPlayerTurn(value, `trigger ${trigger}`);
+      const activeTurnLease = value.budgetLeases[0];
+      if (!activeTurnLease) throw new Error("expected an active turn lease");
+      const taskLease = value.taskController.current()?.lease;
+      if (!taskLease) throw new Error("expected an active task lease");
+      let inFlightResult: unknown;
+      let queuedResult: unknown;
+      void value.executor
+        .execute(
+          { kind: "wait", milliseconds: 5_000 },
+          { spawn: { x: 0, y: 64, z: 0 }, owner: { x: 0, y: 64, z: 0 } },
+        )
+        .then((result) => {
+          inFlightResult = result;
+        });
+      void value.executor
+        .execute({ kind: "jump" }, { spawn: { x: 0, y: 64, z: 0 }, owner: { x: 0, y: 64, z: 0 } })
+        .then((result) => {
+          queuedResult = result;
+        });
+      const pending = value.confirmations.createGameAction(
+        "pending",
+        { kind: "say", message: "must not dispatch" },
+        taskLease,
+      );
+      await value.untilActiveWaitStarted();
+      let cleanupBeforeAudit:
+        { stoppedAuditPending: boolean; taskInactive: boolean; leaseRejected: boolean } | undefined;
+      const stopAll = value.executor.stopAll.bind(value.executor);
+      value.executor.stopAll = () => {
+        cleanupBeforeAudit = {
+          stoppedAuditPending: !value.taskAuditEvents.some((event) =>
+            event.startsWith("task_stopped:"),
+          ),
+          taskInactive: value.taskController.current() === null,
+          leaseRejected:
+            value.taskController.consume({
+              leaseId: taskLease.id,
+              kind: "say",
+              now: Date.now(),
+            }).ok === false,
+        };
+        stopAll();
+      };
+
+      if (trigger === "deadline") {
+        value.fireTaskDeadline();
+      } else {
+        let overflowResult: unknown;
+        for (let call = 0; call < 65; call += 1) {
+          overflowResult = await value.executeRawTool("minecraft_get_state", {
+            turnLease: activeTurnLease,
+          });
+        }
+        expect(overflowResult).toEqual({
+          text: '{"error":"tool call budget exhausted"}',
+          isError: true,
+        });
+      }
+      for (let turn = 0; turn < 8; turn += 1) await Promise.resolve();
+
+      const reason = trigger === "deadline" ? "timeout" : "budget_exhausted";
+      expect(inFlightResult).toEqual({ status: "cancelled" });
+      expect(queuedResult).toEqual({ status: "cancelled" });
+      expect(value.activeWaitWasAborted()).toBe(true);
+      expect(value.minecraft.calls).not.toContainEqual(expect.objectContaining({ method: "jump" }));
+      expect(value.codex.interruptions).toEqual([{ threadId: "thread-1", turnId: "turn-1" }]);
+      expect(value.confirmations.get(pending.id)).toBeUndefined();
+      expect(value.budget.snapshot().active).toBe(false);
+      expect(value.taskController.current()).toBeNull();
+      expect(cleanupBeforeAudit).toEqual({
+        stoppedAuditPending: true,
+        taskInactive: true,
+        leaseRejected: true,
+      });
+      expect(value.taskAuditEvents).toEqual(["task_started", `task_stopped:${reason}`]);
+      expect(value.taskTerminalReasons).toEqual([reason]);
+      expect(() => value.fireTaskDeadline()).toThrow("no task deadline is pending");
+    },
+  );
+
+  it("uses the central task terminal hook to cancel active work on a failed task", async () => {
+    const value = await harness({
+      deferredTurns: [0],
+      activeMinecraftWait: true,
+    });
+    await value.start();
+    await startPlayerTurn(value, "trigger failed terminal cleanup");
+    let inFlightResult: unknown;
+    let queuedResult: unknown;
+    void value.executor
+      .execute(
+        { kind: "wait", milliseconds: 5_000 },
+        { spawn: { x: 0, y: 64, z: 0 }, owner: { x: 0, y: 64, z: 0 } },
+      )
+      .then((result) => {
+        inFlightResult = result;
+      });
+    void value.executor
+      .execute({ kind: "jump" }, { spawn: { x: 0, y: 64, z: 0 }, owner: { x: 0, y: 64, z: 0 } })
+      .then((result) => {
+        queuedResult = result;
+      });
+    const taskLease = value.taskController.current()?.lease;
+    if (!taskLease) throw new Error("expected an active task lease");
+    const pending = value.confirmations.createGameAction(
+      "pending",
+      { kind: "say", message: "must not dispatch" },
+      taskLease,
+    );
+    await value.untilActiveWaitStarted();
+
+    value.taskController.failClosed();
+    for (let turn = 0; turn < 8; turn += 1) await Promise.resolve();
+
+    expect(inFlightResult).toEqual({ status: "cancelled" });
+    expect(queuedResult).toEqual({ status: "cancelled" });
+    expect(value.activeWaitWasAborted()).toBe(true);
+    expect(value.minecraft.calls).not.toContainEqual(expect.objectContaining({ method: "jump" }));
+    expect(value.codex.interruptions).toEqual([{ threadId: "thread-1", turnId: "turn-1" }]);
+    expect(value.confirmations.get(pending.id)).toBeUndefined();
+    expect(value.taskController.current()).toBeNull();
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:failed"]);
+    expect(value.taskTerminalReasons).toEqual(["failed"]);
+  });
+
+  it.each([
+    ["completed", { text: outcome(), status: "completed" }],
+    ["failed", { text: "", status: "failed" }],
+    ["interrupted", { text: "", status: "interrupted" }],
+  ] as const)("stops the task after a %s Codex terminal result", async (label, response) => {
+    const value = await harness({ codexResponses: [response] });
+    await value.start();
+    await value.ownerSays(`terminal ${label}`);
+
+    expect(value.taskController.current()).toBeNull();
+    expect(value.taskAuditEvents).toEqual([
+      "task_started",
+      `task_stopped:${label === "completed" ? "completed" : "failed"}`,
+    ]);
+  });
+
+  it("stops rejected model transport once as model_unavailable and cancels active action work", async () => {
+    const value = await harness({
+      activeMinecraftWait: true,
+      codexResponses: [new Error("model transport rejected")],
+    });
+    await value.start();
+    const action = value.executor.execute(
+      { kind: "wait", milliseconds: 5_000 },
+      { spawn: { x: 0, y: 64, z: 0 }, owner: { x: 0, y: 64, z: 0 } },
+    );
+    await value.untilActiveWaitStarted();
+
+    await value.ownerSays("trigger rejected model transport");
+
+    await expect(action).resolves.toEqual({ status: "cancelled" });
+    expect(value.activeWaitWasAborted()).toBe(true);
+    expect(value.taskController.current()).toBeNull();
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:model_unavailable"]);
+    expect(value.mode.snapshot().paused).toBe(true);
+    expect(withoutTaskDisclosures(value.minecraft.chatLog)).toEqual([unavailable]);
+  });
+
   it("starts and stops its autonomy scheduler without duplicate lifecycle subscriptions", async () => {
     const value = await harness();
 
@@ -70,6 +585,18 @@ describe("CompanionService lifecycle", () => {
     );
 
     expect(value.autonomy.actionsFailed).toBe(1);
+  });
+
+  it("ignores visitor commands and normalizes owner chat before the model turn", async () => {
+    const value = await harness();
+    await value.start();
+
+    value.minecraft.emit({ kind: "chat", username: "Visitor", message: "!stop" });
+    expect(value.mode.snapshot().paused).toBe(false);
+
+    await startPlayerTurn(value, "first\r\nsecond");
+
+    expect(value.codex.turns[0]?.text).toContain('"ownerMessage":"first  second"');
   });
 
   it("owner-offline immediately interrupts active work, clears confirmation, pauses, and persists", async () => {
@@ -209,6 +736,53 @@ describe("CompanionService lifecycle", () => {
     expect(value.minecraft.chatLog).not.toContain("too late");
   });
 
+  it("drains an in-flight confirmation resolution before stop resolves", async () => {
+    const value = await harness({
+      deferredTurns: [0],
+      codexResponses: [outcome({ reply: "ready" })],
+    });
+    const { confirmationId } = await startPendingMoveConfirmation(value);
+    let releaseAction!: () => void;
+    let markActionStarted!: () => void;
+    const actionGate = new Promise<void>((resolve) => {
+      releaseAction = resolve;
+    });
+    const actionStarted = new Promise<void>((resolve) => {
+      markActionStarted = resolve;
+    });
+    value.minecraft.moveTo = async (_position, signal) => {
+      markActionStarted();
+      await actionGate;
+      if (signal.aborted) {
+        const error = new Error("aborted");
+        error.name = "AbortError";
+        throw error;
+      }
+    };
+    value.minecraft.emit({
+      kind: "chat",
+      username: "TestOwner",
+      message: `!allow ${confirmationId}`,
+    });
+    await actionStarted;
+
+    let stopSettled = false;
+    const stopping = value.stop().then(() => {
+      stopSettled = true;
+    });
+    try {
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      expect(stopSettled).toBe(false);
+    } finally {
+      releaseAction();
+      await stopping;
+    }
+    const chatAfterStop = [...value.minecraft.chatLog];
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+    expect(value.minecraft.chatLog).toEqual(chatAfterStop);
+  });
+
   it("drains startup events emitted before initialization and during awaited replay in order", async () => {
     const value = await harness({
       gateInitialCodexStart: true,
@@ -237,11 +811,36 @@ describe("CompanionService lifecycle", () => {
     expect(value.mode.snapshot()).toMatchObject({ mode: "balanced", paused: true });
     expect(await value.state.load()).toMatchObject({ lastMode: "balanced", paused: true });
     expect(value.savedStates).toEqual([
-      { lastMode: "autonomous", paused: false, unfinishedTaskSummary: null },
-      { lastMode: "autonomous", paused: true, unfinishedTaskSummary: null },
-      { lastMode: "friend", paused: false, unfinishedTaskSummary: null },
-      { lastMode: "balanced", paused: false, unfinishedTaskSummary: null },
-      { lastMode: "balanced", paused: true, unfinishedTaskSummary: null },
+      {
+        lastMode: "autonomous",
+        paused: false,
+        unfinishedTaskSummary: null,
+        worldInvalidated: false,
+      },
+      {
+        lastMode: "autonomous",
+        paused: true,
+        unfinishedTaskSummary: null,
+        worldInvalidated: false,
+      },
+      {
+        lastMode: "friend",
+        paused: false,
+        unfinishedTaskSummary: null,
+        worldInvalidated: false,
+      },
+      {
+        lastMode: "balanced",
+        paused: false,
+        unfinishedTaskSummary: null,
+        worldInvalidated: false,
+      },
+      {
+        lastMode: "balanced",
+        paused: true,
+        unfinishedTaskSummary: null,
+        worldInvalidated: false,
+      },
     ]);
   });
 
@@ -298,7 +897,7 @@ describe("CompanionService lifecycle", () => {
       paused: true,
       unfinishedTaskSummary: null,
     });
-    expect(value.minecraft.chatLog).toEqual(["已停止当前任务和所有动作。"]);
+    expect(withoutTaskDisclosures(value.minecraft.chatLog)).toEqual(["已停止当前任务和所有动作。"]);
   });
 
   it("owner input interrupts an autonomous action and turn before the new player turn starts", async () => {
@@ -419,6 +1018,55 @@ describe("CompanionService lifecycle", () => {
 });
 
 describe("CompanionService recovery", () => {
+  it("keeps Minecraft tools disabled across recovery schema-repair attempts", async () => {
+    const value = await harness({
+      persistedState: {
+        lastMode: "autonomous",
+        paused: true,
+        unfinishedTaskSummary: '{"goal":"finish bridge","stop":"owner stops"}',
+      },
+      deferredTurns: [0, 1],
+      threadIds: ["thread-start", "thread-recovery"],
+    });
+    await value.start();
+
+    value.minecraft.emit({ kind: "chat", username: "TestOwner", message: "!resume" });
+    await value.untilCodexTurns(1);
+    const firstPrompt = value.codex.turns[0]?.text ?? "";
+    const firstLease = /"([A-Za-z0-9_-]{43})"/u.exec(firstPrompt)?.[1] ?? "a".repeat(43);
+    const firstToolAttempt = await value.executeRawTool("minecraft_jump", {
+      turnLease: firstLease,
+    });
+
+    value.codex.releaseTurnResult(0, "not json");
+    await value.untilCodexTurns(2);
+    const repairPrompt = value.codex.turns[1]?.text ?? "";
+    const repairLease = /"([A-Za-z0-9_-]{43})"/u.exec(repairPrompt)?.[1] ?? "b".repeat(43);
+    const repairToolAttempt = await value.executeRawTool("minecraft_jump", {
+      turnLease: repairLease,
+    });
+    value.codex.releaseTurnResult(1, outcome());
+    await value.untilChat("已恢复。");
+
+    expect(firstPrompt).not.toContain("turnLease");
+    expect(repairPrompt).not.toContain("turnLease");
+    expect(firstPrompt).toContain("Recovery turns do not authorize Minecraft tools.");
+    expect(repairPrompt).toContain("Recovery turns do not authorize Minecraft tools.");
+    expect(firstToolAttempt).toEqual({
+      text: '{"error":"tool turn has not begun"}',
+      isError: true,
+    });
+    expect(repairToolAttempt).toEqual({
+      text: '{"error":"tool turn has not begun"}',
+      isError: true,
+    });
+    expect(value.minecraft.calls).not.toContainEqual(expect.objectContaining({ method: "jump" }));
+    expect(value.budgetEvents).toEqual([]);
+    expect(value.budget.snapshot().active).toBe(false);
+    expect(value.taskController.current()).toBeNull();
+    expect(value.taskAuditEvents).toEqual([]);
+  });
+
   it("two concurrent resumes share one restart, thread, recovery turn, response, and budget pair", async () => {
     vi.useFakeTimers();
     const value = await harness({
@@ -429,7 +1077,7 @@ describe("CompanionService recovery", () => {
     await value.start();
     await startPlayerTurn(value, "trigger quota");
     await value.untilChat(unavailable);
-    expect(value.minecraft.chatLog).toEqual([unavailable]);
+    expect(withoutTaskDisclosures(value.minecraft.chatLog)).toEqual([unavailable]);
     value.minecraft.chatLog.splice(0);
     value.budgetEvents.splice(0);
 
@@ -445,7 +1093,7 @@ describe("CompanionService recovery", () => {
     expect(value.codex.startedThreads[1]?.model).toBe("gpt-5.6-terra");
     expect(value.codex.turns).toHaveLength(2);
     expect(value.codex.turns[1]).toMatchObject({ threadId: "thread-recovery" });
-    expect(value.budgetEvents).toEqual(["begin", "end"]);
+    expect(value.budgetEvents).toEqual([]);
     expect(value.budget.snapshot().active).toBe(false);
     expect(value.minecraft.chatLog).toEqual(["已恢复。"]);
   });
@@ -541,7 +1189,7 @@ describe("CompanionService recovery", () => {
       await value.start();
       await startPlayerTurn(value, "hello");
       await value.untilChat(unavailable);
-      expect(value.minecraft.chatLog).toEqual([unavailable]);
+      expect(withoutTaskDisclosures(value.minecraft.chatLog)).toEqual([unavailable]);
       expect(value.mode.snapshot().paused).toBe(true);
 
       await emitCommand(value, "!resume");
@@ -577,7 +1225,7 @@ describe("CompanionService recovery", () => {
       await value.untilChat(unavailable);
 
       expect(value.mode.snapshot().paused).toBe(true);
-      expect(value.minecraft.chatLog).toEqual([unavailable, unavailable]);
+      expect(withoutTaskDisclosures(value.minecraft.chatLog)).toEqual([unavailable, unavailable]);
       await emitCommand(value, "!status");
       expect(value.minecraft.chatLog.at(-1)).toContain("Codex：不可用");
       expect(value.minecraft.chatLog).not.toContain("已恢复。");
@@ -751,22 +1399,22 @@ describe("CompanionService output and commands", () => {
     await value.start();
 
     await value.service.requestAutonomousTurn("nearby_threat");
-    expect(value.minecraft.chatLog).toEqual([]);
+    expect(withoutTaskDisclosures(value.minecraft.chatLog)).toEqual([]);
     expect(value.codex.turns).toHaveLength(0);
 
     await emitCommand(value, "!mode balanced");
     value.minecraft.chatLog.splice(0);
     value.autonomy.canChat = false;
     await value.service.requestAutonomousTurn("balanced_idle");
-    expect(value.minecraft.chatLog).toEqual([]);
+    expect(withoutTaskDisclosures(value.minecraft.chatLog)).toEqual([]);
     expect(value.autonomy.proactiveMarks).toBe(0);
     await expect(value.memories.search("suppressed")).resolves.toHaveLength(1);
 
     value.autonomy.canChat = true;
     await value.service.requestAutonomousTurn("goal_completed");
-    expect(value.minecraft.chatLog.join("")).toBe(longReply);
+    expect(withoutTaskDisclosures(value.minecraft.chatLog).join("")).toBe(longReply);
     expect(
-      value.minecraft.chatLog.every(
+      withoutTaskDisclosures(value.minecraft.chatLog).every(
         (chunk) =>
           chunk.length <= 240 && !/[\uD800-\uDBFF]$/.test(chunk) && !/^[\uDC00-\uDFFF]/.test(chunk),
       ),
@@ -785,7 +1433,7 @@ describe("CompanionService output and commands", () => {
 
     await value.service.requestAutonomousTurn("nearby_threat");
 
-    expect(value.minecraft.chatLog).toEqual(["自主模式主动消息"]);
+    expect(withoutTaskDisclosures(value.minecraft.chatLog)).toEqual(["自主模式主动消息"]);
     expect(value.autonomy.proactiveMarks).toBe(1);
   });
 
@@ -822,6 +1470,16 @@ describe("CompanionService output and commands", () => {
     await value.service.requestAutonomousTurn("autonomous_idle");
 
     expect(value.budgetEvents).toEqual(["begin", "end", "begin", "end"]);
+    expect(new Set(value.budgetTaskLeaseIds).size).toBe(1);
+    const sharedTaskLeaseId = value.budgetTaskLeaseIds[0];
+    if (!sharedTaskLeaseId) throw new Error("expected a shared task lease");
+    for (const turn of value.codex.turns) {
+      expect(turn.text).toContain(sharedTaskLeaseId);
+    }
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:completed"]);
+    expect(
+      value.minecraft.chatLog.filter((message) => message.startsWith("任务披露：")),
+    ).toHaveLength(1);
     expect(value.budget.snapshot().active).toBe(false);
     expect(value.autonomy.proactiveMarks).toBe(0);
   });
@@ -860,12 +1518,11 @@ describe("CompanionService output and commands", () => {
     await startPlayerTurn(value, "chunk");
     await value.untilTurnSettled();
 
-    expect(value.minecraft.chatLog.join("")).toBe(reply);
-    expect(value.minecraft.chatLog.every((chunk) => chunk.length > 0 && chunk.length <= 240)).toBe(
-      true,
-    );
+    const replyChunks = withoutTaskDisclosures(value.minecraft.chatLog);
+    expect(replyChunks.join("")).toBe(reply);
+    expect(replyChunks.every((chunk) => chunk.length > 0 && chunk.length <= 240)).toBe(true);
     expect(
-      value.minecraft.chatLog.every(
+      replyChunks.every(
         (chunk) => !/[\uD800-\uDBFF]$/.test(chunk) && !/^[\uDC00-\uDFFF]/.test(chunk),
       ),
     ).toBe(true);
@@ -921,36 +1578,841 @@ describe("CompanionService output and commands", () => {
     expect(value.minecraft.chatLog.at(-1)).toBe("已取消确认。");
   });
 
-  it("executes one exact game confirmation once without consuming or authorizing other ids", async () => {
-    const value = await harness();
-    await value.start();
-    const first = value.confirmations.create("say once", {
-      kind: "game_action",
-      action: { kind: "say", message: "confirmed-one" },
+  it("keeps the originating task alive while confirmation waits and closes it once after allow", async () => {
+    const value = await harness({
+      deferredTurns: [0],
+      codexResponses: [outcome({ reply: "ready" })],
     });
-    const second = value.confirmations.create("say two", {
-      kind: "game_action",
-      action: { kind: "say", message: "confirmed-two" },
-    });
-    const memoryClear = value.confirmations.create("clear", { kind: "memory_clear" });
+    const { task, confirmationId } = await startPendingMoveConfirmation(value);
+    expect(value.taskController.current()?.lease).toEqual(task.lease);
+    expect(value.taskAuditEvents).toEqual(["task_started"]);
 
-    await emitCommand(value, `!allow ${first.id}`);
-    expect(value.minecraft.chatLog.filter((item) => item === "confirmed-one")).toHaveLength(1);
-    await emitCommand(value, `!allow ${first.id}`);
-    expect(value.minecraft.chatLog.filter((item) => item === "confirmed-one")).toHaveLength(1);
-    expect(value.confirmations.get(second.id)?.operation.kind).toBe("game_action");
-    await expect(
-      value.executor.executeConfirmed(memoryClear.id, {
-        spawn: { x: 0, y: 64, z: 0 },
-        owner: { x: 0, y: 64, z: 0 },
-      }),
-    ).resolves.toEqual({ status: "confirmation_invalid", reason: "wrong_operation" });
-    expect(value.confirmations.get(memoryClear.id)?.operation.kind).toBe("memory_clear");
-    await emitCommand(value, `!allow ${memoryClear.id}`);
-    expect(value.minecraft.chatLog.at(-1)).toBe("已清除记忆。");
-    expect(value.confirmations.get(second.id)?.operation.kind).toBe("game_action");
-    expect(value.minecraft.chatLog).not.toContain("confirmed-two");
+    await emitCommand(value, `!allow ${confirmationId}`);
+    expect(value.minecraft.calls.filter((call) => call.method === "moveTo")).toHaveLength(1);
+    expect(value.taskController.current()).toBeNull();
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:completed"]);
+
+    await emitCommand(value, `!allow ${confirmationId}`);
+    expect(value.minecraft.calls.filter((call) => call.method === "moveTo")).toHaveLength(1);
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:completed"]);
   });
+
+  it("persists final confirmation allow before restart without restoring active continuation", async () => {
+    const value = await harness({
+      deferredTurns: [0],
+      codexResponses: [activeConfirmationOutcome()],
+    });
+    const { confirmationId } = await startPendingMoveConfirmation(value);
+    expect(value.mode.snapshot()).toMatchObject({
+      paused: false,
+      taskId: "finish confirmed travel",
+    });
+    expect(await value.state.load()).toMatchObject({
+      paused: false,
+      unfinishedTaskSummary: expect.any(String),
+    });
+
+    await emitCommand(value, `!allow ${confirmationId}`);
+
+    expect(value.mode.snapshot()).toMatchObject({ paused: false, taskId: null });
+    expect(await value.state.load()).toMatchObject({
+      paused: false,
+      unfinishedTaskSummary: null,
+    });
+    expect(value.autonomy.goalsCompleted).toBe(1);
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:completed"]);
+
+    await value.stop();
+    const restarted = await harness({ storageDirectory: value.directory });
+    await restarted.start();
+    expect(restarted.mode.snapshot().taskId).toBeNull();
+    expect(await restarted.state.load()).toMatchObject({ unfinishedTaskSummary: null });
+    expect(restarted.codex.turns).toEqual([]);
+    expect(restarted.taskAuditEvents).toEqual([]);
+  });
+
+  it("fences the originating turn when final allow settles before its active outcome", async () => {
+    const value = await harness({
+      deferredTurns: [0],
+      codexResponses: [activeConfirmationOutcome()],
+    });
+    await value.start();
+    await startPlayerTurn(value, "travel before replying");
+    const result = await value.executeRawTool("minecraft_move_to", {
+      x: 300,
+      y: 64,
+      z: 0,
+      turnLease: value.budgetLeases[0],
+    });
+    const confirmationId = (JSON.parse(result.text) as { confirmationId: number }).confirmationId;
+    const stopAll = vi.spyOn(value.executor, "stopAll");
+
+    await emitCommand(value, `!allow ${confirmationId}`);
+
+    expect(stopAll).toHaveBeenCalled();
+    expect(value.codex.interruptions).toEqual([{ threadId: "thread-1", turnId: "turn-1" }]);
+    expect(value.mode.snapshot()).toMatchObject({ paused: false, taskId: null });
+    expect(await value.state.load()).toMatchObject({
+      paused: false,
+      unfinishedTaskSummary: null,
+    });
+    expect(value.autonomy.goalsCompleted).toBe(1);
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:completed"]);
+
+    value.codex.releaseTurnResult(0);
+    await value.untilTurnSettled();
+
+    expect(value.minecraft.chatLog).not.toContain("ready");
+    expect(value.mode.snapshot()).toMatchObject({ paused: false, taskId: null });
+    expect(await value.state.load()).toMatchObject({ unfinishedTaskSummary: null });
+    expect(value.autonomy.goalsCompleted).toBe(1);
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:completed"]);
+
+    await value.stop();
+    const restarted = await harness({ storageDirectory: value.directory });
+    await restarted.start();
+    expect(restarted.mode.snapshot().taskId).toBeNull();
+    expect(restarted.codex.turns).toEqual([]);
+  });
+
+  it("keeps the originating task alive while confirmation waits and closes it once after deny", async () => {
+    const value = await harness({
+      deferredTurns: [0],
+      codexResponses: [outcome({ reply: "ready" })],
+    });
+    const { task, confirmationId } = await startPendingMoveConfirmation(value);
+    expect(value.taskController.current()?.lease).toEqual(task.lease);
+
+    await emitCommand(value, `!deny ${confirmationId}`);
+
+    expect(value.minecraft.calls.filter((call) => call.method === "moveTo")).toHaveLength(0);
+    expect(value.confirmations.get(confirmationId)).toBeUndefined();
+    expect(value.taskController.current()).toBeNull();
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:owner_stop"]);
+  });
+
+  it("persists final confirmation deny as stopped before restart", async () => {
+    const value = await harness({
+      deferredTurns: [0],
+      codexResponses: [activeConfirmationOutcome()],
+    });
+    const { confirmationId } = await startPendingMoveConfirmation(value);
+
+    await emitCommand(value, `!deny ${confirmationId}`);
+
+    expect(value.mode.snapshot()).toEqual({
+      mode: "friend",
+      paused: true,
+      taskId: null,
+    });
+    expect(await value.state.load()).toMatchObject({
+      paused: true,
+      unfinishedTaskSummary: null,
+    });
+    expect(value.autonomy.goalsCompleted).toBe(0);
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:owner_stop"]);
+
+    await value.stop();
+    const restarted = await harness({ storageDirectory: value.directory });
+    await restarted.start();
+    expect(restarted.mode.snapshot().taskId).toBeNull();
+    expect(await restarted.state.load()).toMatchObject({ unfinishedTaskSummary: null });
+    expect(restarted.codex.turns).toEqual([]);
+    expect(restarted.taskAuditEvents).toEqual([]);
+  });
+
+  it("persists a failed confirmed action as stopped before restart", async () => {
+    const value = await harness({
+      deferredTurns: [0],
+      codexResponses: [activeConfirmationOutcome()],
+    });
+    const { confirmationId } = await startPendingMoveConfirmation(value);
+    let dispatches = 0;
+    value.minecraft.moveTo = async () => {
+      dispatches += 1;
+      throw new Error("path blocked");
+    };
+
+    await emitCommand(value, `!allow ${confirmationId}`);
+
+    expect(dispatches).toBeGreaterThan(0);
+    expect(value.mode.snapshot()).toEqual({
+      mode: "friend",
+      paused: true,
+      taskId: null,
+    });
+    expect(await value.state.load()).toMatchObject({
+      paused: true,
+      unfinishedTaskSummary: null,
+    });
+    expect(value.autonomy.goalsCompleted).toBe(0);
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:failed"]);
+
+    await value.stop();
+    const restarted = await harness({ storageDirectory: value.directory });
+    await restarted.start();
+    expect(restarted.mode.snapshot().taskId).toBeNull();
+    expect(await restarted.state.load()).toMatchObject({ unfinishedTaskSummary: null });
+    expect(restarted.codex.turns).toEqual([]);
+    expect(restarted.taskAuditEvents).toEqual([]);
+  });
+
+  it("re-snapshots confirmed movement and exhausts the task on only the extra travel", async () => {
+    const value = await harness({
+      deferredTurns: [0],
+      codexResponses: [outcome({ reply: "ready" })],
+      requestedTaskLimits: { maxHorizontalTravel: 350 },
+    });
+    const { confirmationId } = await startPendingMoveConfirmation(value);
+    value.minecraft.world.botPosition = { x: -60, y: 64, z: 0 };
+
+    await emitCommand(value, `!allow ${confirmationId}`);
+
+    expect(value.minecraft.calls.filter((call) => call.method === "moveTo")).toHaveLength(0);
+    expect(value.taskController.current()).toBeNull();
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:budget_exhausted"]);
+  });
+
+  it("keeps the task alive until its last game confirmation is resolved", async () => {
+    const value = await harness({
+      deferredTurns: [0],
+      codexResponses: [outcome({ reply: "ready" })],
+    });
+    await value.start();
+    await startPlayerTurn(value, "travel twice");
+    const task = value.taskController.current();
+    expect(task).not.toBeNull();
+    const ids: number[] = [];
+    for (const x of [300, 310]) {
+      const result = await value.executeRawTool("minecraft_move_to", {
+        x,
+        y: 64,
+        z: 0,
+        turnLease: value.budgetLeases[0],
+      });
+      const parsed = JSON.parse(result.text) as { confirmationId?: number };
+      expect(parsed.confirmationId).toEqual(expect.any(Number));
+      ids.push(parsed.confirmationId!);
+    }
+    value.codex.releaseTurnResult(0);
+    await value.untilChat("ready");
+
+    await emitCommand(value, `!allow ${ids[0]}`);
+
+    expect(value.taskController.current()?.lease).toEqual(task?.lease);
+    expect(value.confirmations.get(ids[1]!)).toBeDefined();
+    expect(value.taskAuditEvents).toEqual(["task_started"]);
+
+    await emitCommand(value, `!allow ${ids[1]}`);
+
+    expect(value.minecraft.calls.filter((call) => call.method === "moveTo")).toHaveLength(2);
+    expect(value.taskController.current()).toBeNull();
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:completed"]);
+  });
+
+  it("persists active continuation until the final game confirmation settles", async () => {
+    const value = await harness({
+      deferredTurns: [0],
+      codexResponses: [activeConfirmationOutcome()],
+    });
+    await value.start();
+    await startPlayerTurn(value, "travel twice");
+    const ids: number[] = [];
+    for (const x of [300, 310]) {
+      const result = await value.executeRawTool("minecraft_move_to", {
+        x,
+        y: 64,
+        z: 0,
+        turnLease: value.budgetLeases[0],
+      });
+      const parsed = JSON.parse(result.text) as { confirmationId?: number };
+      expect(parsed.confirmationId).toEqual(expect.any(Number));
+      ids.push(parsed.confirmationId!);
+    }
+    value.codex.releaseTurnResult(0);
+    await value.untilChat("ready");
+    const activeSummary =
+      '{"goal":"finish confirmed travel","success":"arrive safely","stop":"owner stops"}';
+
+    await emitCommand(value, `!allow ${ids[0]}`);
+
+    expect(value.mode.snapshot()).toMatchObject({
+      paused: false,
+      taskId: "finish confirmed travel",
+    });
+    expect(await value.state.load()).toMatchObject({
+      paused: false,
+      unfinishedTaskSummary: activeSummary,
+    });
+    expect(value.autonomy.goalsCompleted).toBe(0);
+    expect(value.taskAuditEvents).toEqual(["task_started"]);
+
+    await emitCommand(value, `!allow ${ids[1]}`);
+
+    expect(value.mode.snapshot()).toMatchObject({ paused: false, taskId: null });
+    expect(await value.state.load()).toMatchObject({
+      paused: false,
+      unfinishedTaskSummary: null,
+    });
+    expect(value.autonomy.goalsCompleted).toBe(1);
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:completed"]);
+
+    await value.stop();
+    const restarted = await harness({ storageDirectory: value.directory });
+    await restarted.start();
+    expect(restarted.mode.snapshot().taskId).toBeNull();
+    expect(await restarted.state.load()).toMatchObject({ unfinishedTaskSummary: null });
+    expect(restarted.codex.turns).toEqual([]);
+  });
+
+  it("remembers a confirmed-action failure until the final ticket settles", async () => {
+    const value = await harness({
+      deferredTurns: [0],
+      codexResponses: [activeConfirmationOutcome()],
+    });
+    await value.start();
+    await startPlayerTurn(value, "travel twice");
+    const ids: number[] = [];
+    for (const x of [300, 310]) {
+      const result = await value.executeRawTool("minecraft_move_to", {
+        x,
+        y: 64,
+        z: 0,
+        turnLease: value.budgetLeases[0],
+      });
+      ids.push((JSON.parse(result.text) as { confirmationId: number }).confirmationId);
+    }
+    value.codex.releaseTurnResult(0);
+    await value.untilChat("ready");
+    let dispatches = 0;
+    value.minecraft.moveTo = async () => {
+      dispatches += 1;
+      throw new Error("first path blocked");
+    };
+
+    await emitCommand(value, `!allow ${ids[0]}`);
+
+    expect(value.taskController.current()).not.toBeNull();
+    expect(value.taskAuditEvents).toEqual(["task_started"]);
+    expect(await value.state.load()).toMatchObject({
+      paused: false,
+      unfinishedTaskSummary:
+        '{"goal":"finish confirmed travel","success":"arrive safely","stop":"owner stops"}',
+    });
+    value.minecraft.moveTo = async () => {
+      dispatches += 1;
+    };
+
+    await emitCommand(value, `!allow ${ids[1]}`);
+
+    expect(dispatches).toBeGreaterThan(1);
+    expect(value.mode.snapshot()).toEqual({ mode: "friend", paused: true, taskId: null });
+    expect(await value.state.load()).toMatchObject({
+      paused: true,
+      unfinishedTaskSummary: null,
+    });
+    expect(value.autonomy.goalsCompleted).toBe(0);
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:failed"]);
+
+    await value.stop();
+    const restarted = await harness({ storageDirectory: value.directory });
+    await restarted.start();
+    expect(restarted.mode.snapshot().taskId).toBeNull();
+    expect(restarted.codex.turns).toEqual([]);
+  });
+
+  it("remembers an owner denial until the final ticket settles", async () => {
+    const value = await harness({
+      deferredTurns: [0],
+      codexResponses: [activeConfirmationOutcome()],
+    });
+    await value.start();
+    await startPlayerTurn(value, "travel twice");
+    const ids: number[] = [];
+    for (const x of [300, 310]) {
+      const result = await value.executeRawTool("minecraft_move_to", {
+        x,
+        y: 64,
+        z: 0,
+        turnLease: value.budgetLeases[0],
+      });
+      ids.push((JSON.parse(result.text) as { confirmationId: number }).confirmationId);
+    }
+    value.codex.releaseTurnResult(0);
+    await value.untilChat("ready");
+
+    await emitCommand(value, `!deny ${ids[0]}`);
+
+    expect(value.taskController.current()).not.toBeNull();
+    expect(value.taskAuditEvents).toEqual(["task_started"]);
+
+    await emitCommand(value, `!allow ${ids[1]}`);
+
+    expect(value.minecraft.calls.filter((call) => call.method === "moveTo")).toHaveLength(1);
+    expect(value.mode.snapshot()).toEqual({ mode: "friend", paused: true, taskId: null });
+    expect(await value.state.load()).toMatchObject({
+      paused: true,
+      unfinishedTaskSummary: null,
+    });
+    expect(value.autonomy.goalsCompleted).toBe(0);
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:owner_stop"]);
+  });
+
+  it("serializes back-to-back allows so every consumed ticket executes before task closure", async () => {
+    const value = await harness({
+      deferredTurns: [0],
+      codexResponses: [outcome({ reply: "ready" })],
+    });
+    await value.start();
+    await startPlayerTurn(value, "travel twice");
+    const ids: number[] = [];
+    for (const x of [300, 310]) {
+      const result = await value.executeRawTool("minecraft_move_to", {
+        x,
+        y: 64,
+        z: 0,
+        turnLease: value.budgetLeases[0],
+      });
+      const parsed = JSON.parse(result.text) as { confirmationId?: number };
+      expect(parsed.confirmationId).toEqual(expect.any(Number));
+      ids.push(parsed.confirmationId!);
+    }
+    value.codex.releaseTurnResult(0);
+    await value.untilChat("ready");
+    const priorChatCount = value.minecraft.chatLog.length;
+
+    value.minecraft.emit({
+      kind: "chat",
+      username: "TestOwner",
+      message: `!allow ${ids[0]}`,
+    });
+    value.minecraft.emit({
+      kind: "chat",
+      username: "TestOwner",
+      message: `!allow ${ids[1]}`,
+    });
+    await vi.waitFor(() => expect(value.minecraft.chatLog.length).toBe(priorChatCount + 2));
+
+    expect(value.minecraft.calls.filter((call) => call.method === "moveTo")).toHaveLength(2);
+    expect(value.confirmations.get(ids[0]!)).toBeUndefined();
+    expect(value.confirmations.get(ids[1]!)).toBeUndefined();
+    expect(value.taskController.current()).toBeNull();
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:completed"]);
+  });
+
+  it("closes a waiting task when its last game confirmation expires", async () => {
+    vi.useFakeTimers();
+    const startedAt = new Date("2026-07-27T00:00:00.000Z");
+    vi.setSystemTime(startedAt);
+    const value = await harness({
+      deferredTurns: [0],
+      codexResponses: [outcome({ reply: "ready" })],
+    });
+    const { confirmationId } = await startPendingMoveConfirmation(value);
+    vi.setSystemTime(new Date(startedAt.getTime() + 120_000));
+
+    await emitCommand(value, `!allow ${confirmationId}`);
+
+    expect(value.confirmations.get(confirmationId)).toBeUndefined();
+    expect(value.taskController.current()).toBeNull();
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:failed"]);
+    expect(value.minecraft.calls.filter((call) => call.method === "moveTo")).toHaveLength(0);
+  });
+
+  it("naturally expires a waiting confirmation and persists fail-closed state", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-27T00:00:00.000Z"));
+    const value = await harness({
+      deferredTurns: [0],
+      codexResponses: [activeConfirmationOutcome()],
+    });
+    const { task, confirmationId } = await startPendingMoveConfirmation(value);
+
+    await vi.advanceTimersByTimeAsync(119_999);
+    expect(value.taskController.current()?.lease).toEqual(task.lease);
+    expect(value.confirmations.get(confirmationId)).toBeDefined();
+    expect(value.taskAuditEvents).toEqual(["task_started"]);
+
+    await vi.advanceTimersByTimeAsync(1);
+    await vi.waitFor(async () =>
+      expect(await value.state.load()).toMatchObject({
+        paused: true,
+        unfinishedTaskSummary: null,
+      }),
+    );
+
+    expect(value.taskController.current()).toBeNull();
+    expect(value.confirmations.get(confirmationId)).toBeUndefined();
+    expect(value.mode.snapshot()).toEqual({
+      mode: "friend",
+      paused: true,
+      taskId: null,
+    });
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:failed"]);
+    expect(value.minecraft.calls.filter((call) => call.method === "moveTo")).toHaveLength(0);
+
+    await value.stop();
+    const restarted = await harness({ storageDirectory: value.directory });
+    await restarted.start();
+    expect(restarted.mode.snapshot().taskId).toBeNull();
+    expect(await restarted.state.load()).toMatchObject({ unfinishedTaskSummary: null });
+    expect(restarted.codex.turns).toEqual([]);
+  });
+
+  it("fences the originating turn when its final confirmation naturally expires", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-27T00:00:00.000Z"));
+    const value = await harness({
+      deferredTurns: [0],
+      codexResponses: [activeConfirmationOutcome()],
+      manualConfirmationTimers: true,
+    });
+    await value.start();
+    await startPlayerTurn(value, "travel before expiry");
+    const result = await value.executeRawTool("minecraft_move_to", {
+      x: 300,
+      y: 64,
+      z: 0,
+      turnLease: value.budgetLeases[0],
+    });
+    const confirmationId = (JSON.parse(result.text) as { confirmationId: number }).confirmationId;
+    const expiryTimer = value.confirmationTimerRecords().find((timer) => !timer.cleared);
+    expect(expiryTimer).toMatchObject({ milliseconds: 120_000, cleared: false });
+
+    vi.setSystemTime(new Date("2026-07-27T00:02:00.000Z"));
+    value.fireConfirmationTimer(expiryTimer!.id);
+    await vi.waitFor(async () =>
+      expect(await value.state.load()).toMatchObject({
+        paused: true,
+        unfinishedTaskSummary: null,
+      }),
+    );
+
+    expect(value.confirmations.get(confirmationId)).toBeUndefined();
+    expect(value.codex.interruptions).toEqual([{ threadId: "thread-1", turnId: "turn-1" }]);
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:failed"]);
+
+    value.codex.releaseTurnResult(0);
+    await value.untilTurnSettled();
+
+    expect(value.minecraft.chatLog).not.toContain("ready");
+    expect(value.mode.snapshot()).toEqual({ mode: "friend", paused: true, taskId: null });
+    expect(await value.state.load()).toMatchObject({ unfinishedTaskSummary: null });
+    expect(value.autonomy.goalsCompleted).toBe(0);
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:failed"]);
+  });
+
+  it("reschedules staggered game confirmations and settles only after the final expiry", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-27T00:00:00.000Z"));
+    const value = await harness({
+      deferredTurns: [0],
+      codexResponses: [activeConfirmationOutcome()],
+      manualConfirmationTimers: true,
+    });
+    await value.start();
+    await startPlayerTurn(value, "travel twice");
+    const ids: number[] = [];
+    const first = await value.executeRawTool("minecraft_move_to", {
+      x: 300,
+      y: 64,
+      z: 0,
+      turnLease: value.budgetLeases[0],
+    });
+    ids.push((JSON.parse(first.text) as { confirmationId: number }).confirmationId);
+    vi.setSystemTime(new Date("2026-07-27T00:00:30.000Z"));
+    const second = await value.executeRawTool("minecraft_move_to", {
+      x: 310,
+      y: 64,
+      z: 0,
+      turnLease: value.budgetLeases[0],
+    });
+    ids.push((JSON.parse(second.text) as { confirmationId: number }).confirmationId);
+    value.codex.releaseTurnResult(0);
+    await value.untilChat("ready");
+
+    vi.setSystemTime(new Date("2026-07-27T00:02:00.000Z"));
+    const firstExpiryTimer = value.confirmationTimerRecords().find((timer) => !timer.cleared);
+    expect(firstExpiryTimer).toMatchObject({ milliseconds: 90_000, cleared: false });
+    value.fireConfirmationTimer(firstExpiryTimer!.id);
+    await Promise.resolve();
+
+    expect(value.confirmations.get(ids[0]!)).toBeUndefined();
+    expect(value.confirmations.get(ids[1]!)).toBeDefined();
+    expect(value.taskController.current()).not.toBeNull();
+    expect(await value.state.load()).toMatchObject({
+      paused: false,
+      unfinishedTaskSummary:
+        '{"goal":"finish confirmed travel","success":"arrive safely","stop":"owner stops"}',
+    });
+    expect(value.taskAuditEvents).toEqual(["task_started"]);
+
+    vi.setSystemTime(new Date("2026-07-27T00:02:30.000Z"));
+    const finalExpiryTimer = value.confirmationTimerRecords().find((timer) => !timer.cleared);
+    expect(finalExpiryTimer).toMatchObject({ milliseconds: 30_000, cleared: false });
+    value.fireConfirmationTimer(finalExpiryTimer!.id);
+    await vi.waitFor(async () =>
+      expect(await value.state.load()).toMatchObject({
+        paused: true,
+        unfinishedTaskSummary: null,
+      }),
+    );
+
+    expect(value.confirmations.get(ids[1]!)).toBeUndefined();
+    expect(value.taskController.current()).toBeNull();
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:failed"]);
+  });
+
+  it("rearms confirmation expiry when a timer callback fires before wall-clock expiry", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-27T00:00:00.000Z"));
+    const value = await harness({
+      deferredTurns: [0],
+      codexResponses: [activeConfirmationOutcome()],
+      manualConfirmationTimers: true,
+    });
+    const { task, confirmationId } = await startPendingMoveConfirmation(value);
+    const earlyTimer = value.confirmationTimerRecords().find((timer) => !timer.cleared);
+    expect(earlyTimer).toMatchObject({ milliseconds: 120_000, cleared: false });
+
+    value.fireConfirmationTimer(earlyTimer!.id);
+    await Promise.resolve();
+
+    expect(value.confirmations.get(confirmationId)).toBeDefined();
+    expect(value.taskController.current()?.lease).toEqual(task.lease);
+    expect(value.taskAuditEvents).toEqual(["task_started"]);
+    const rearmedTimer = value.confirmationTimerRecords().find((timer) => !timer.cleared);
+    expect(rearmedTimer).toMatchObject({ milliseconds: 120_000, cleared: false });
+    expect(rearmedTimer?.id).not.toBe(earlyTimer?.id);
+  });
+
+  it("fails a confirmation task closed when expiry timer creation throws", async () => {
+    const value = await harness({
+      deferredTurns: [0],
+      codexResponses: [activeConfirmationOutcome()],
+      manualConfirmationTimers: true,
+      confirmationTimerSetThrows: true,
+    });
+    await value.start();
+    await startPlayerTurn(value, "travel with broken timer");
+    const result = await value.executeRawTool("minecraft_move_to", {
+      x: 300,
+      y: 64,
+      z: 0,
+      turnLease: value.budgetLeases[0],
+    });
+    const confirmationId = (JSON.parse(result.text) as { confirmationId: number }).confirmationId;
+
+    await vi.waitFor(async () =>
+      expect(await value.state.load()).toMatchObject({
+        paused: true,
+        unfinishedTaskSummary: null,
+      }),
+    );
+
+    expect(value.confirmations.get(confirmationId)).toBeUndefined();
+    expect(value.taskController.current()).toBeNull();
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:failed"]);
+    expect(value.errors).toContain("Error: confirmation timer set failed");
+
+    value.codex.releaseTurnResult(0);
+    await value.untilTurnSettled();
+    expect(value.minecraft.chatLog).not.toContain("ready");
+    expect(await value.state.load()).toMatchObject({ unfinishedTaskSummary: null });
+  });
+
+  it("ignores a cleared old-lease expiry timer after a replacement task starts", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-27T00:00:00.000Z"));
+    const value = await harness({
+      deferredTurns: [0, 1],
+      codexResponses: [
+        activeConfirmationOutcome(),
+        activeConfirmationOutcome("second ready", "second confirmed travel"),
+      ],
+      manualConfirmationTimers: true,
+    });
+    const first = await startPendingMoveConfirmation(value);
+    const oldTimer = value.confirmationTimerRecords().find((timer) => !timer.cleared);
+    expect(oldTimer).toBeDefined();
+
+    vi.setSystemTime(new Date("2026-07-27T00:00:30.000Z"));
+    await emitCommand(value, "!stop");
+    await emitCommand(value, "!resume");
+    await startPlayerTurn(value, "replacement travel", 2);
+    const replacementTask = value.taskController.current();
+    expect(replacementTask).not.toBeNull();
+    const replacementResult = await value.executeRawTool("minecraft_move_to", {
+      x: 400,
+      y: 64,
+      z: 0,
+      turnLease: value.budgetLeases[1],
+    });
+    const replacementId = (JSON.parse(replacementResult.text) as { confirmationId: number })
+      .confirmationId;
+    value.codex.releaseTurnResult(1);
+    await value.untilChat("second ready");
+    const replacementTimer = value.confirmationTimerRecords().find((timer) => !timer.cleared);
+    expect(replacementTimer).toBeDefined();
+
+    vi.setSystemTime(new Date("2026-07-27T00:02:00.000Z"));
+    value.fireConfirmationTimer(oldTimer!.id, true);
+    await Promise.resolve();
+
+    expect(value.confirmations.get(first.confirmationId)).toBeUndefined();
+    expect(value.confirmations.get(replacementId)).toBeDefined();
+    expect(value.taskController.current()?.lease).toEqual(replacementTask?.lease);
+    expect(value.confirmationTimerRecords().find((timer) => !timer.cleared)?.id).toBe(
+      replacementTimer?.id,
+    );
+    expect(value.taskAuditEvents).toEqual([
+      "task_started",
+      "task_stopped:owner_stop",
+      "task_started",
+    ]);
+    expect(value.minecraft.calls.filter((call) => call.method === "moveTo")).toHaveLength(0);
+  });
+
+  it("cancels confirmation expiry timing when service stop invalidates the lease", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-27T00:00:00.000Z"));
+    const value = await harness({
+      deferredTurns: [0],
+      codexResponses: [activeConfirmationOutcome()],
+      manualConfirmationTimers: true,
+    });
+    const { confirmationId } = await startPendingMoveConfirmation(value);
+    const timer = value.confirmationTimerRecords().find((record) => !record.cleared);
+    expect(timer).toBeDefined();
+
+    await value.stop();
+
+    expect(value.confirmationTimerRecords().find((record) => !record.cleared)).toBeUndefined();
+    vi.setSystemTime(new Date("2026-07-27T00:02:00.000Z"));
+    value.fireConfirmationTimer(timer!.id, true);
+    await Promise.resolve();
+    expect(value.confirmations.get(confirmationId)).toBeUndefined();
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:process_exit"]);
+    expect(value.minecraft.calls.filter((call) => call.method === "moveTo")).toHaveLength(0);
+  });
+
+  it("contains expiry timer clearing failures during service stop", async () => {
+    const value = await harness({
+      deferredTurns: [0],
+      codexResponses: [activeConfirmationOutcome()],
+      manualConfirmationTimers: true,
+      confirmationTimerClearThrows: true,
+    });
+    const { confirmationId } = await startPendingMoveConfirmation(value);
+    const timer = value.confirmationTimerRecords().find((record) => !record.cleared);
+    expect(timer).toBeDefined();
+
+    await expect(value.stop()).resolves.toBeUndefined();
+
+    expect(value.errors).toContain("Error: confirmation timer clear failed");
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:process_exit"]);
+    value.fireConfirmationTimer(timer!.id);
+    await Promise.resolve();
+    expect(value.confirmations.get(confirmationId)).toBeUndefined();
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:process_exit"]);
+    expect(value.minecraft.calls.filter((call) => call.method === "moveTo")).toHaveLength(0);
+  });
+
+  it("does not stop in-flight task work for an unrelated missing confirmation id", async () => {
+    const value = await harness({
+      deferredTurns: [0],
+      codexResponses: [outcome({ reply: "ready" })],
+    });
+    await value.start();
+    await startPlayerTurn(value, "continue working");
+    const task = value.taskController.current();
+    expect(task).not.toBeNull();
+
+    await emitCommand(value, "!allow 999");
+
+    expect(value.taskController.current()?.lease).toEqual(task?.lease);
+    expect(value.taskAuditEvents).toEqual(["task_started"]);
+
+    value.codex.releaseTurnResult(0);
+    await value.untilTurnSettled();
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:completed"]);
+  });
+
+  it("treats a new owner request as replacing a task that is waiting for confirmation", async () => {
+    const value = await harness({
+      deferredTurns: [0],
+      codexResponses: [outcome({ reply: "ready" }), outcome({ reply: "new work ready" })],
+    });
+    const { confirmationId } = await startPendingMoveConfirmation(value);
+
+    value.minecraft.emit({ kind: "chat", username: "TestOwner", message: "start new work" });
+    await value.untilMergeTimer();
+    value.fireMergeTimers();
+    await value.untilCodexTurns(2);
+    await value.untilTurnSettled();
+
+    expect(value.codex.turns).toHaveLength(2);
+    expect(value.confirmations.get(confirmationId)).toBeUndefined();
+    expect(value.taskController.current()).toBeNull();
+    expect(value.taskAuditEvents).toEqual([
+      "task_started",
+      "task_stopped:owner_stop",
+      "task_started",
+      "task_stopped:completed",
+    ]);
+    expect(value.errors).not.toContain("Error: a task is already active");
+    expect(value.minecraft.chatLog).toContain("new work ready");
+  });
+
+  it.each(["balanced", "autonomous"] as const)(
+    "keeps a waiting confirmation busy against a %s autonomy trigger",
+    async (mode) => {
+      const value = await harness({
+        deferredTurns: [0],
+        codexResponses: [outcome({ reply: "ready" })],
+      });
+      const { task, confirmationId } = await startPendingMoveConfirmation(value);
+      value.mode.setMode(mode);
+
+      expect(value.service.isBusyForAutonomy()).toBe(true);
+      await value.service.requestAutonomousTurn("nearby_threat");
+
+      expect(value.codex.turns).toHaveLength(1);
+      expect(value.taskController.current()?.lease).toEqual(task.lease);
+      expect(value.confirmations.get(confirmationId)).toBeDefined();
+      expect(value.taskAuditEvents).toEqual(["task_started"]);
+      expect(value.mode.snapshot()).toMatchObject({ mode, paused: false });
+    },
+  );
+
+  it.each([
+    "completed",
+    "failed",
+    "timeout",
+    "budget_exhausted",
+    "owner_stop",
+    "emergency_stop",
+    "disconnect",
+    "world_changed",
+    "model_unavailable",
+    "process_exit",
+  ] as const)(
+    "invalidates a waiting game capability when the task ends with %s",
+    async (reason) => {
+      const value = await harness({
+        deferredTurns: [0],
+        codexResponses: [outcome({ reply: "ready" })],
+      });
+      const { confirmationId } = await startPendingMoveConfirmation(value);
+
+      value.taskController.stop(reason);
+      await emitCommand(value, `!allow ${confirmationId}`);
+
+      expect(value.confirmations.get(confirmationId)).toBeUndefined();
+      expect(value.minecraft.calls.filter((call) => call.method === "moveTo")).toHaveLength(0);
+      expect(value.taskAuditEvents).toEqual(["task_started", `task_stopped:${reason}`]);
+    },
+  );
 
   it("rejects an entire model memory candidate set containing a real-world address", async () => {
     vi.useFakeTimers();
@@ -971,7 +2433,7 @@ describe("CompanionService output and commands", () => {
     await value.untilChat(unavailable);
 
     await expect(value.memories.list()).resolves.toEqual([]);
-    expect(value.minecraft.chatLog).toEqual([unavailable]);
+    expect(withoutTaskDisclosures(value.minecraft.chatLog)).toEqual([unavailable]);
   });
 
   it("repairs an unlabeled verbatim owner-memory proposal before any persistence", async () => {
@@ -1087,7 +2549,7 @@ describe("CompanionService failures", () => {
     await value.untilChat(unavailable);
 
     expect(value.budgetEvents).toEqual(["begin", "end", "begin", "end"]);
-    expect(value.minecraft.chatLog).toEqual([unavailable]);
+    expect(withoutTaskDisclosures(value.minecraft.chatLog)).toEqual([unavailable]);
     expect(value.mode.snapshot().paused).toBe(true);
   });
 
@@ -1105,7 +2567,7 @@ describe("CompanionService failures", () => {
       await value.untilChat(unavailable);
 
       expect(value.budgetEvents).toEqual(["begin", "end"]);
-      expect(value.minecraft.chatLog).toEqual([unavailable]);
+      expect(withoutTaskDisclosures(value.minecraft.chatLog)).toEqual([unavailable]);
       expect(value.mode.snapshot().paused).toBe(true);
     },
   );

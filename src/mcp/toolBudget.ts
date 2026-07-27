@@ -1,7 +1,14 @@
 import { randomBytes } from "node:crypto";
 import type { GameAction } from "../domain/types.js";
+import { TaskControllerBudget, type TaskLease } from "../safety/taskBudget.js";
 
 export type ToolActionKind = GameAction["kind"] | "get_state" | "find_block";
+
+export interface TrustedToolConsumption {
+  blockChanges?: 0 | 1;
+  horizontalTravel?: number;
+  dangerousOperations?: 0 | 1;
+}
 
 export interface TurnToolBudgetSnapshot {
   active: boolean;
@@ -23,8 +30,6 @@ export type BudgetConsumeResult =
         | "tool call budget exhausted";
     };
 
-const MAX_TOOL_CALLS = 64;
-
 export class TurnToolBudget {
   private active = false;
   private ended = false;
@@ -33,8 +38,12 @@ export class TurnToolBudget {
   private attemptedPlaceCount = 0;
   private cumulativeHorizontalTravel = 0;
   private activeLease: string | undefined;
+  private taskLease: TaskLease | undefined;
+  private ownsTaskLease = false;
 
-  begin(): string {
+  constructor(private readonly taskBudget = new TaskControllerBudget()) {}
+
+  begin(taskLease?: TaskLease): string {
     if (this.active) throw new Error("tool turn is already active");
     this.active = true;
     this.ended = false;
@@ -42,6 +51,8 @@ export class TurnToolBudget {
     this.attemptedDigCount = 0;
     this.attemptedPlaceCount = 0;
     this.cumulativeHorizontalTravel = 0;
+    this.taskLease = taskLease ?? this.taskBudget.begin();
+    this.ownsTaskLease = taskLease === undefined;
     this.activeLease = randomBytes(32).toString("base64url");
     return this.activeLease;
   }
@@ -51,17 +62,59 @@ export class TurnToolBudget {
     this.active = false;
     this.ended = true;
     this.activeLease = undefined;
+    if (this.ownsTaskLease) this.taskBudget.invalidate("completed");
+    this.taskLease = undefined;
+    this.ownsTaskLease = false;
   }
 
-  consume(kind: ToolActionKind, lease?: string): BudgetConsumeResult {
+  checkLease(lease?: string): BudgetConsumeResult {
     if (!this.active) {
       return { ok: false, reason: this.ended ? "tool turn has ended" : "tool turn has not begun" };
     }
-    if (lease === undefined || lease !== this.activeLease) {
+    if (lease === undefined || lease !== this.activeLease || this.taskLease === undefined) {
       return { ok: false, reason: "tool turn lease is invalid" };
     }
-    if (this.totalCalls >= MAX_TOOL_CALLS)
-      return { ok: false, reason: "tool call budget exhausted" };
+    return { ok: true, snapshot: this.snapshot() };
+  }
+
+  currentTaskLease(lease?: string): TaskLease | undefined {
+    if (!this.checkLease(lease).ok || !this.taskLease) return undefined;
+    return this.taskBudget.isLeaseActive(this.taskLease) ? { ...this.taskLease } : undefined;
+  }
+
+  consume(
+    kind: ToolActionKind,
+    lease?: string,
+    trustedConsumption: TrustedToolConsumption = {},
+  ): BudgetConsumeResult {
+    const authorization = this.checkLease(lease);
+    if (!authorization.ok) return authorization;
+    const taskLease = this.taskLease;
+    if (!taskLease) return { ok: false, reason: "tool turn lease is invalid" };
+    const taskResult = this.taskBudget.consume({
+      lease: taskLease,
+      kind,
+      now: this.taskBudget.currentTime(),
+      ...(trustedConsumption.blockChanges === undefined
+        ? {}
+        : { blockChanges: trustedConsumption.blockChanges }),
+      ...(trustedConsumption.horizontalTravel === undefined
+        ? {}
+        : { horizontalTravel: trustedConsumption.horizontalTravel }),
+      ...(trustedConsumption.dangerousOperations === undefined
+        ? {}
+        : { dangerousOperations: trustedConsumption.dangerousOperations }),
+    });
+    if (!taskResult.ok) {
+      return {
+        ok: false,
+        reason:
+          taskResult.reason === "task lease is invalid" &&
+          this.taskBudget.snapshot().stopReason !== "budget_exhausted"
+            ? "tool turn lease is invalid"
+            : "tool call budget exhausted",
+      };
+    }
 
     this.totalCalls += 1;
     if (kind === "dig_block") this.attemptedDigCount += 1;

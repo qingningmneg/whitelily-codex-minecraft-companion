@@ -310,6 +310,28 @@ describe("CodexAppServerClient", () => {
     expect(processStarted).toBe(false);
   });
 
+  it("accepts an exact ChatGPT login line within CRLF status output", async () => {
+    const harness = createJsonRpcLineTransportHarness();
+    const client = new CodexAppServerClient(
+      config,
+      dependencies(harness, login("Codex status\r\nLogged in using ChatGPT\r\nReady\r\n")),
+    );
+
+    await expect(client.assertChatGptLogin()).resolves.toBeUndefined();
+  });
+
+  it.each([" Logged in using ChatGPT", "Logged in using ChatGPT ", "Logged in using ChatGPT\t"])(
+    "rejects a whitespace-mutated ChatGPT login line: %j",
+    async (stdout) => {
+      const harness = createJsonRpcLineTransportHarness();
+      const client = new CodexAppServerClient(config, dependencies(harness, login(`${stdout}\n`)));
+
+      await expect(client.assertChatGptLogin()).rejects.toThrow(
+        "Codex must be signed in with ChatGPT",
+      );
+    },
+  );
+
   it("adds a doctor hint when login status cannot access Codex credentials", async () => {
     const harness = createJsonRpcLineTransportHarness();
     const client = new CodexAppServerClient(

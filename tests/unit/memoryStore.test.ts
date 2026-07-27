@@ -43,6 +43,12 @@ describe("MemoryStore", () => {
     "PASSWORD=hunter2",
     `${openAiApiKey}=sk-test-abcdefghijklmnopqrstuvwxyz123456`,
     "DATABASE_URL=postgres://player:secret@localhost/world",
+    "Authorization: Bearer abc+def==",
+    "Bearer abcdefghijklmnop+private==",
+    "authorization: bearer abcdefghijklmnop/private=",
+    "https://opaque-access-token@example.invalid/world",
+    "redis://cache-user%3Aprivate-password@example.invalid/0",
+    "https://first-private@second-private:password@[::1]/world",
     "email=player@example.invalid",
     "PHONE=13800138000",
   ])("refuses sensitive data in a memory summary: %s", async (summary) => {
