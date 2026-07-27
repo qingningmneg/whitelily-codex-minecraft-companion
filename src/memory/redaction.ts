@@ -150,12 +150,13 @@ function isUriSchemeCharacter(value: string | undefined): boolean {
 }
 
 function isUriAuthorityBoundary(value: string): boolean {
+  const codePoint = value.charCodeAt(0);
   return (
+    value === " " ||
+    (codePoint >= 0x09 && codePoint <= 0x0d) ||
     value === "/" ||
     value === "?" ||
     value === "#" ||
-    value === "\r" ||
-    value === "\n" ||
     value === '"' ||
     value === "'" ||
     value === "<" ||

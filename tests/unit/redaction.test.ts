@@ -147,6 +147,52 @@ describe("redactSecrets", () => {
     expect(redacted).toContain("https://[REDACTED_URI_CREDENTIALS]@example.invalid/world");
   });
 
+  it.each([
+    [
+      "space after a credential-free authority",
+      "https://public.invalid then postgres://player:db-password@localhost/database",
+      "https://public.invalid then postgres://[REDACTED_URI_CREDENTIALS]@localhost/database",
+    ],
+    [
+      "tab after a credential-free authority",
+      "https://public.invalid\tpostgres://player:tab-password@localhost/database",
+      "https://public.invalid\tpostgres://[REDACTED_URI_CREDENTIALS]@localhost/database",
+    ],
+    [
+      "CRLF after a credential-free authority",
+      "https://public.invalid\r\npostgres://player:crlf-password@localhost/database",
+      "https://public.invalid\r\npostgres://[REDACTED_URI_CREDENTIALS]@localhost/database",
+    ],
+    [
+      "vertical tab after a credential-free authority",
+      "https://public.invalid\vpostgres://player:vertical-password@localhost/database",
+      "https://public.invalid\vpostgres://[REDACTED_URI_CREDENTIALS]@localhost/database",
+    ],
+    [
+      "form feed after a credential-free authority",
+      "https://public.invalid\fpostgres://player:form-password@localhost/database",
+      "https://public.invalid\fpostgres://[REDACTED_URI_CREDENTIALS]@localhost/database",
+    ],
+    [
+      "space after a credential-free URI with a path",
+      "https://public.invalid/docs then postgres://player:path-password@localhost/database",
+      "https://public.invalid/docs then postgres://[REDACTED_URI_CREDENTIALS]@localhost/database",
+    ],
+    [
+      "credential URI before a credential-free URI",
+      "postgres://player:first-password@localhost/database https://public.invalid",
+      "postgres://[REDACTED_URI_CREDENTIALS]@localhost/database https://public.invalid",
+    ],
+    [
+      "two credential URIs separated by CRLF",
+      "postgres://player:first-password@localhost/database\r\nredis://cache:second-password@localhost/0",
+      "postgres://[REDACTED_URI_CREDENTIALS]@localhost/database\r\nredis://[REDACTED_URI_CREDENTIALS]@localhost/0",
+    ],
+  ])("continues scanning complete URI userinfo across %s", (_case, input, expected) => {
+    expect(redactSecrets(input)).toBe(expected);
+    expect(containsSensitiveData(input)).toBe(true);
+  });
+
   it.each(["public_url", "PUBLIC_URL"])("preserves credential-free URLs under %s", (key) => {
     const input = JSON.stringify({ [key]: "https://example.invalid/docs" });
 
