@@ -28,6 +28,33 @@ describe("redactSecrets", () => {
     expect(containsSensitiveData(input)).toBe(true);
   });
 
+  it.each([
+    [
+      `before {"client-secret":"client secret with spaces","display-name":"Public Companion"} after`,
+      "client secret with spaces",
+      `"display-name":"Public Companion"`,
+    ],
+    [
+      `before {'access.token':'access token with \\'escaped quote\\' and spaces','display-name':'Public Agent'} after`,
+      "access token with",
+      `'display-name':'Public Agent'`,
+    ],
+    [
+      `before {"task-lease-id":"private lease with spaces","ordinary-field":"Public Value"} after`,
+      "private lease with spaces",
+      `"ordinary-field":"Public Value"`,
+    ],
+  ])(
+    "redacts normalized quoted JSON-like credential keys without changing ordinary prose: %s",
+    (input, privateValue, publicValue) => {
+      const output = redactSecrets(input);
+
+      expect(output).not.toContain(privateValue);
+      expect(output).toContain(publicValue);
+      expect(containsSensitiveData(input)).toBe(true);
+    },
+  );
+
   it("leaves ordinary game summaries unchanged", () => {
     const summary = "玩家喜欢在山顶建家，正在收集橡木。";
 
@@ -97,6 +124,27 @@ describe("redactSecrets", () => {
     expect(textOutput).not.toContain("redis-password");
     expect(jsonOutput).not.toContain("redis-password");
     expect(containsSensitiveData(JSON.stringify({ endpoint: url }))).toBe(true);
+  });
+
+  it("scans credential-free URI authorities with linear growth and still redacts userinfo", () => {
+    const measure = (colonCount: number): number => {
+      const input = `https://${":".repeat(colonCount)}/public`;
+      const started = performance.now();
+      for (let round = 0; round < 3; round += 1) {
+        expect(redactSecrets(input)).toBe(input);
+      }
+      return performance.now() - started;
+    };
+    measure(2_000);
+    const small = measure(8_000);
+    const large = measure(16_000);
+
+    expect(large).toBeLessThan(small * 3.2 + 5);
+
+    const credential = `https://user:${":".repeat(2_000)}private-password@example.invalid/world`;
+    const redacted = redactSecrets(credential);
+    expect(redacted).not.toContain("private-password");
+    expect(redacted).toContain("https://[REDACTED_URI_CREDENTIALS]@example.invalid/world");
   });
 
   it.each(["public_url", "PUBLIC_URL"])("preserves credential-free URLs under %s", (key) => {

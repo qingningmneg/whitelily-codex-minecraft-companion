@@ -934,6 +934,88 @@ describe("RuntimeFacade", () => {
     expect(task.disclosure.stopCondition).toContain("Private Notes");
   });
 
+  it("never exposes path suffixes after valid punctuation or bare profile fragments", () => {
+    const punctuatedDrive =
+      "C:" + String.raw`\Users\Jane,Doe\Folder(1)\draft[final]{private};notes.txt`;
+    const escapedQuotedDrive =
+      "D:" + String.raw`\Users\Jane Doe\Quote\"Inside\Private Notes\draft.txt`;
+    const forwardDrive = "E:/" + "Users/Jane Doe/Forward,Notes/(draft)[private]{v1}.txt";
+    const fileSingleSlash = "file:/C:/" + "Users/Jane Doe/Single,Slash/(private)[draft]{v1}.txt";
+    const task = activeTaskFixture();
+    task.disclosure = {
+      ...task.disclosure,
+      goal: `Inspect ${punctuatedDrive}\nthen "${escapedQuotedDrive}" and "${fileSingleSlash}"`,
+      expectedActions: [
+        `read '${forwardDrive}'`,
+        String.raw`read "Users\Jane Doe\Bare,Profile\(private)[draft]{v1}.txt"`,
+        String.raw`read '//server/Jane Doe/Forward,Share/(private)[draft]{v1}.txt'`,
+        String.raw`read "\\server/Jane Doe\Mixed,Share/(private)[draft]{v1}.txt"`,
+        "read 'home/Jane Doe/Bare,Home/(private)[draft]{v1}.txt'",
+      ],
+      stopCondition:
+        `Stop after file://server/Jane Doe/Raw,Share/(private)[draft]{v1}.txt\n` +
+        `or "file:///home/Jane Doe/Triple,Slash/(private)[draft]{v1}.txt"\n` +
+        `or /var/lib/Jane Doe/Unix,Path/(private)[draft]{v1}.txt\n` +
+        `or ~/Jane Doe/Home,Path/(private)[draft]{v1}.txt`,
+    };
+    let taskListener: (() => void) | undefined;
+    const runtime = new RuntimeFacade({
+      lifecycle: {
+        start: async () => undefined,
+        stop: async () => undefined,
+      },
+      task: {
+        current: () => task,
+        budget: activeBudgetFixture,
+        stop: () => undefined,
+        subscribe: (listener) => {
+          taskListener = listener;
+          return () => undefined;
+        },
+      },
+      createPublicTaskId: () => "public-punctuated-path-task",
+    });
+    const events: RuntimeEvent[] = [];
+    runtime.subscribe((event) => {
+      if (event.kind === "task") events.push(event);
+    });
+
+    taskListener?.();
+
+    for (const serialized of [
+      JSON.stringify(runtime.snapshot()),
+      JSON.stringify(events),
+      JSON.stringify({ snapshot: runtime.snapshot(), events }),
+    ]) {
+      for (const privateSuffix of [
+        "Jane,Doe",
+        "Jane Doe",
+        "Folder(1)",
+        "draft[final]",
+        "{private}",
+        "Quote",
+        "Inside",
+        "Private Notes",
+        "Forward,Notes",
+        "Bare,Profile",
+        "Forward,Share",
+        "Mixed,Share",
+        "Bare,Home",
+        "Raw,Share",
+        "Triple,Slash",
+        "Unix,Path",
+        "Home,Path",
+        "(private)",
+        "[draft]",
+        "{v1}",
+      ]) {
+        expect(serialized).not.toContain(privateSuffix);
+      }
+      expect(serialized).not.toContain("fil[REDACTED_PATH]");
+      expect(serialized).not.toContain("file:");
+    }
+  });
+
   it("bounds public disclosure text by Unicode code points without splitting safe text", () => {
     const task = activeTaskFixture();
     task.disclosure = {

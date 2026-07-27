@@ -14,7 +14,7 @@ const textPatterns: Array<[RegExp, string]> = [
 ];
 
 const assignmentPattern =
-  /(?<![A-Za-z0-9_])(["']?)([A-Za-z][A-Za-z0-9_]*)(\1)\s*(?:=|:|\\u003[dD]|\\u003[aA])\s*/g;
+  /(?<![A-Za-z0-9_])(["']?)([A-Za-z][A-Za-z0-9_.-]*)(\1)\s*(?:=|:|\\u003[dD]|\\u003[aA])\s*/g;
 const profilePrefixes = [
   "%userprofile%",
   "%localappdata%",
@@ -23,6 +23,7 @@ const profilePrefixes = [
   "%homepath%",
 ] as const;
 const homePrefixes = ["${home}", "$home"] as const;
+const bareProfilePrefixes = ["users", "home"] as const;
 
 function redactText(input: string): string {
   const assignmentsRedacted = redactSensitiveAssignments(input);
@@ -98,9 +99,68 @@ function consumeAssignmentValue(
 }
 
 function redactUriCredentials(input: string): string {
-  return input.replace(/\b([A-Za-z][A-Za-z0-9+.-]*:\/\/)([^@/]*:[^@/]*)@/g, (_match, scheme) => {
-    return `${scheme}[REDACTED_URI_CREDENTIALS]@`;
-  });
+  let output = "";
+  let cursor = 0;
+  let index = 0;
+  while (index < input.length) {
+    const previous = index === 0 ? undefined : input[index - 1];
+    if (
+      !isAsciiLetter(input[index]) ||
+      (previous !== undefined && isUriSchemeCharacter(previous))
+    ) {
+      index += 1;
+      continue;
+    }
+
+    let schemeEnd = index + 1;
+    while (isUriSchemeCharacter(input[schemeEnd])) schemeEnd += 1;
+    if (input[schemeEnd] !== ":" || input[schemeEnd + 1] !== "/" || input[schemeEnd + 2] !== "/") {
+      index = schemeEnd;
+      continue;
+    }
+
+    const authorityStart = schemeEnd + 3;
+    let authorityEnd = authorityStart;
+    let firstAt = -1;
+    let colonBeforeAt = false;
+    while (authorityEnd < input.length && !isUriAuthorityBoundary(input[authorityEnd]!)) {
+      const character = input[authorityEnd]!;
+      if (character === "@" && firstAt < 0) {
+        firstAt = authorityEnd;
+      } else if (character === ":" && firstAt < 0) {
+        colonBeforeAt = true;
+      }
+      authorityEnd += 1;
+    }
+
+    if (firstAt >= 0 && colonBeforeAt) {
+      output += input.slice(cursor, authorityStart);
+      output += "[REDACTED_URI_CREDENTIALS]@";
+      cursor = firstAt + 1;
+      index = firstAt + 1;
+      continue;
+    }
+    index = authorityEnd;
+  }
+  return output + input.slice(cursor);
+}
+
+function isUriSchemeCharacter(value: string | undefined): boolean {
+  return value !== undefined && (isAsciiLetter(value) || /[0-9+.-]/.test(value));
+}
+
+function isUriAuthorityBoundary(value: string): boolean {
+  return (
+    value === "/" ||
+    value === "?" ||
+    value === "#" ||
+    value === "\r" ||
+    value === "\n" ||
+    value === '"' ||
+    value === "'" ||
+    value === "<" ||
+    value === ">"
+  );
 }
 
 function redactLocalPaths(input: string): string {
@@ -115,7 +175,7 @@ function redactLocalPaths(input: string): string {
       const character = input[end]!;
       if (quote !== undefined) {
         if (character === quote && !isEscaped(input, end)) break;
-      } else if (/[,;)\]}\r\n<>]/.test(character) || character === '"' || character === "'") {
+      } else if (character === "\r" || character === "\n") {
         break;
       }
       end += 1;
@@ -129,10 +189,7 @@ function redactLocalPaths(input: string): string {
 }
 
 function isLocalPathStart(input: string, index: number): boolean {
-  if (
-    startsWithAsciiIgnoreCase(input, index, "file://") ||
-    startsWithAsciiIgnoreCase(input, index, "file:\\\\")
-  ) {
+  if (startsWithAsciiIgnoreCase(input, index, "file:") && isPathSeparator(input[index + 5])) {
     return true;
   }
   for (const prefix of profilePrefixes) {
@@ -159,6 +216,16 @@ function isLocalPathStart(input: string, index: number): boolean {
 
   const previous = index === 0 ? undefined : input[index - 1];
   const atBoundary = previous === undefined || !/[A-Za-z0-9:/\\]/.test(previous);
+  if (atBoundary) {
+    for (const prefix of bareProfilePrefixes) {
+      if (
+        startsWithAsciiIgnoreCase(input, index, prefix) &&
+        isPathSeparator(input[index + prefix.length])
+      ) {
+        return true;
+      }
+    }
+  }
   if (
     atBoundary &&
     isPathSeparator(input[index]) &&
