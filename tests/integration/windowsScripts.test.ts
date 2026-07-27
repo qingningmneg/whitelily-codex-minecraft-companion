@@ -558,8 +558,8 @@ describe("Windows scripts", { timeout: 30_000 }, () => {
     const running = observe(
       runWindowsScriptFixture(root, "doctor.ps1", [], {
         existingConfig: '[minecraft]\nowner_username = "FixtureOwner"\n',
-        codexDelayMilliseconds: 10_000,
-        operationTimeoutMilliseconds: 5_000,
+        codexDelayMilliseconds: 30_000,
+        operationTimeoutMilliseconds: 12_000,
       }),
     );
 
@@ -567,6 +567,7 @@ describe("Windows scripts", { timeout: 30_000 }, () => {
       join(root, "command-invocations.log"),
       "codex login status",
       "delayed Codex invocation",
+      15_000,
     );
     let descendants: number[] = [];
     const descendantDeadline = performance.now() + 3_000;

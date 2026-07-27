@@ -254,7 +254,7 @@ export class CodexAppServerClient implements CodexPort {
     const rpc = new JsonRpcProcess(transport, { requestTimeoutMs: this.requestTimeoutMs });
     try {
       const params: InitializeParams = {
-        clientInfo: { name: "whitelily-companion", title: null, version: "0.1.0" },
+        clientInfo: { name: "whitelily-companion", title: null, version: "0.1.1" },
         capabilities: { experimentalApi: false, requestAttestation: false },
       };
       rpc.onNotification((notification) => this.handleNotification(notification));

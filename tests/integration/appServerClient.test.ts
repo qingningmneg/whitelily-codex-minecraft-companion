@@ -197,7 +197,7 @@ describe("CodexAppServerClient", () => {
       id: 1,
       method: "initialize",
       params: {
-        clientInfo: { name: "whitelily-companion", title: null, version: "0.1.0" },
+        clientInfo: { name: "whitelily-companion", title: null, version: "0.1.1" },
         capabilities: { experimentalApi: false, requestAttestation: false },
       },
     });

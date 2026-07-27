@@ -7,7 +7,7 @@ import type { RuntimeEvent } from "./runtime/runtimeEvents.js";
 import type { TaskStopReason } from "./safety/taskBudget.js";
 
 export const APP_NAME = "whitelily-codex-minecraft-companion";
-export const APP_VERSION = "0.1.0";
+export const APP_VERSION = "0.1.1";
 
 type SignalName = "SIGINT" | "SIGTERM";
 type PollHandle = ReturnType<typeof setInterval> | number;
