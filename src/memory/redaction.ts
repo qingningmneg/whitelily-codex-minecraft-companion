@@ -3,6 +3,16 @@ const markerPrefixedValue = String.raw`\[REDACTED(?:_[A-Z]+)?\][^\r\n]*`;
 const markerPrefixWithSuffix = String.raw`\[REDACTED(?:_[A-Z]+)?\](?=\S|\s+\S)[^\r\n]*`;
 const exactMarkerValue = String.raw`\[REDACTED(?:_[A-Z]+)?\](?:\s|$)`;
 
+const localPathPatterns = [
+  /\bfile:(?:[\\/]{2,})(?:[A-Za-z]:)?[\\/]*[^\s"'<>|]+/gi,
+  /%(?:USERPROFILE|LOCALAPPDATA|APPDATA|HOMEDRIVE|HOMEPATH)%(?:[\\/]+[^\s"'<>|]+)*/gi,
+  /(?:\$\{HOME\}|\$HOME|~)(?:[\\/]+[^\s"'<>|]+)+/g,
+  /\b[A-Za-z]:[\\/]+[^\s"'<>|]+/g,
+  /\\{2,}[^\\/\s"'<>|]+\\+[^\\/\s"'<>|]+(?:\\+[^\s"'<>|]+)*/g,
+  /(?<![A-Za-z0-9:/])\/(?:[^\s"'<>|/]+\/)*[^\s"'<>|/]+/g,
+  /\b(?:Users|home)[\\/]+[^\\/\s"'<>|]+(?:[\\/]+[^\s"'<>|]+)*/gi,
+] as const;
+
 const textPatterns: Array<[RegExp, string]> = [
   [
     new RegExp(
@@ -49,6 +59,13 @@ const textPatterns: Array<[RegExp, string]> = [
       "gi",
     ),
     "$1=[REDACTED]",
+  ],
+  [
+    new RegExp(
+      String.raw`\b((?:task|turn)?_?lease(?:_?id)?)\s*${escapedAssignment}\s*(?!${exactMarkerValue})\S+`,
+      "gi",
+    ),
+    "$1=[REDACTED_LEASE]",
   ],
   [/(authorization\s*:\s*)?bearer\s+[A-Za-z0-9._~-]{16,}\b/gi, "$1Bearer [REDACTED_TOKEN]"],
   [/\bsk-[A-Za-z0-9_-]{20,}\b/gi, "[REDACTED_OPENAI_KEY]"],
@@ -102,6 +119,9 @@ function sensitiveKeyReplacement(key: string): string | undefined {
   if (/(?:password|passwd|pwd)/.test(normalized)) return "[REDACTED_PASSWORD]";
   if (/(?:email|mail)/.test(normalized)) return "[REDACTED_EMAIL]";
   if (/(?:phone|mobile|telephone|tel)/.test(normalized)) return "[REDACTED_PHONE]";
+  if (/^(?:lease(?:id)?|(?:task|turn)lease(?:id)?)$/.test(normalized)) {
+    return "[REDACTED_LEASE]";
+  }
   if (/(?:key|token|secret|credential|dsn|connectionstring)/.test(normalized)) {
     return "[REDACTED]";
   }
@@ -145,6 +165,14 @@ function parseJson(input: string): { parsed: unknown; redacted: unknown } | unde
 export function redactSecrets(input: string): string {
   const json = parseJson(input);
   return json === undefined ? redactText(input) : JSON.stringify(json.redacted);
+}
+
+export function redactPublicText(input: string): string {
+  const withoutLocalPaths = localPathPatterns.reduce(
+    (value, pattern) => value.replace(pattern, "[REDACTED_PATH]"),
+    input,
+  );
+  return redactSecrets(withoutLocalPaths);
 }
 
 export function containsSensitiveData(input: string): boolean {

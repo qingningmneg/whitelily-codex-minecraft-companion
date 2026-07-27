@@ -197,7 +197,9 @@ export class CompanionService {
     this.logger = dependencies.logger ?? noOpLogger;
     this.setTimer = dependencies.setTimer ?? setTimeout;
     this.clearTimer = dependencies.clearTimer ?? clearTimeout;
-    dependencies.taskController.onTerminal((reason) => this.handleTaskTerminal(reason));
+    dependencies.taskController.onTerminal((reason, context) =>
+      this.handleTaskTerminal(reason, context.forceCleanup),
+    );
   }
 
   async start(preselectedModel?: string): Promise<void> {
@@ -929,8 +931,8 @@ export class CompanionService {
       );
   }
 
-  private handleTaskTerminal(reason: TaskStopReason): void {
-    if (reason !== "timeout" && reason !== "budget_exhausted") return;
+  private handleTaskTerminal(reason: TaskStopReason, forceCleanup = false): void {
+    if (!forceCleanup && reason !== "timeout" && reason !== "budget_exhausted") return;
     this.invalidateCurrentTurn();
     try {
       this.dependencies.executor.stopAll();

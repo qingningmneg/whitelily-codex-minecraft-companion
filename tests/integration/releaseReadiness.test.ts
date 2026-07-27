@@ -33,6 +33,11 @@ describe("public release readiness", () => {
     const architecture = await readFile("docs/runtime-architecture.md", "utf8");
     for (const heading of [
       "RuntimeFacade",
+      "synchronously latches the first terminal cause",
+      "revokes the task before publishing an empty task state",
+      "fences later task/Minecraft events",
+      "A dedicated serializer handles every allowed task-disclosure string",
+      "without cutting a redaction marker",
       "TaskController",
       "ChatRouter",
       "MineflayerConnection",

@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { ActiveTask, TaskDisclosure } from "../companion/taskController.js";
+import { redactPublicText } from "../memory/redaction.js";
 import type { MinecraftEvent } from "../minecraft/minecraftPort.js";
 import type { TaskBudgetSnapshot, TaskLimits, TaskStopReason } from "../safety/taskBudget.js";
 import type { PublicTaskSnapshot, RuntimeEvent, RuntimeSnapshot } from "./runtimeEvents.js";
@@ -13,6 +14,7 @@ interface RuntimeTaskAccess {
   current(): ActiveTask | null;
   budget(): TaskBudgetSnapshot;
   stop(reason: TaskStopReason): void;
+  failClosed?(reason: TaskStopReason): void;
   subscribe?(listener: () => void): () => void;
 }
 
@@ -98,20 +100,23 @@ export class RuntimeFacade {
   constructor(dependencies: RuntimeFacadeDependencies) {
     this.#dependencies = dependencies;
     this.#refreshTask(false);
+    if (this.#terminal) return;
     try {
       this.#unsubscribeTask = dependencies.task?.subscribe?.(() => {
         if (this.#taskEventsFenced) return;
         this.#refreshTask(true);
       });
     } catch {
-      this.#recordError("TASK_STATE_UNKNOWN", "Task state is unavailable", false);
+      this.#failTaskState(false);
     }
+    if (this.#terminal) return;
     try {
       this.#unsubscribeMinecraft = dependencies.minecraft?.subscribe((event) => {
+        if (this.#terminal) return;
         this.#observeMinecraft(event);
       });
     } catch {
-      this.#recordError("MINECRAFT_STATE_UNKNOWN", "Minecraft state is unavailable", false);
+      this.#failMinecraftState(false);
     }
   }
 
@@ -266,6 +271,7 @@ export class RuntimeFacade {
   }
 
   #observeMinecraft(event: MinecraftEvent): void {
+    if (this.#terminal) return;
     try {
       if (typeof event !== "object" || event === null || typeof event.kind !== "string") {
         this.#failMinecraftState();
@@ -301,9 +307,12 @@ export class RuntimeFacade {
     }
   }
 
-  #failMinecraftState(): void {
-    this.#setMinecraft("disconnected");
-    this.#recordError("MINECRAFT_STATE_UNKNOWN", "Minecraft state is unavailable");
+  #failMinecraftState(publish = true): void {
+    this.#failOperationalState(
+      "MINECRAFT_STATE_UNKNOWN",
+      "Minecraft state is unavailable",
+      publish,
+    );
   }
 
   #inspectTask(): InspectedTaskState {
@@ -356,8 +365,55 @@ export class RuntimeFacade {
   }
 
   #failTaskState(publish: boolean): void {
-    this.#clearTask(publish);
-    this.#recordError("TASK_STATE_UNKNOWN", "Task state is unavailable", publish);
+    this.#failOperationalState("TASK_STATE_UNKNOWN", "Task state is unavailable", publish);
+  }
+
+  #failOperationalState(code: string, message: string, publish: boolean): void {
+    if (this.#terminal) return;
+    this.#terminal = true;
+    this.#taskEventsFenced = true;
+    const error = {
+      code: code.slice(0, 64),
+      message: message.slice(0, 160),
+    };
+    try {
+      const task = this.#dependencies.task;
+      if (task?.failClosed) task.failClosed("failed");
+      else task?.stop("failed");
+    } catch {
+      // The terminal facade and lifecycle cleanup remain authoritative.
+    }
+    this.#privateTaskIdentity = undefined;
+    this.#publicTaskId = undefined;
+    this.#snapshot = {
+      lifecycle: "failed",
+      minecraft: { state: "disconnected", sessionId: null },
+      codex: { state: "stopped", model: null },
+      task: null,
+      lastError: error,
+    };
+    const cleanup = Promise.resolve()
+      .then(() => this.#dependencies.lifecycle.stop())
+      .catch(() => undefined)
+      .then(() => {
+        this.#teardownObservers();
+      });
+    this.#stopPromise = cleanup;
+    if (!publish) return;
+    this.#publish({ kind: "task", task: null });
+    this.#publish({
+      kind: "minecraft",
+      state: { state: "disconnected", sessionId: null },
+    });
+    this.#publish({
+      kind: "codex",
+      state: { state: "stopped", model: null },
+    });
+    this.#publish({
+      kind: "error",
+      error: { code: error.code, message: error.message },
+    });
+    this.#publish({ kind: "lifecycle", state: "failed" });
   }
 
   #clearTask(publish: boolean): void {
@@ -465,28 +521,31 @@ function parseActiveTask(value: unknown, budget: TaskBudgetSnapshot): InspectedT
   const limits = parseLimits(disclosure.limits);
   if (
     typeof goal !== "string" ||
-    goal.length === 0 ||
-    goal.length > 4_000 ||
+    goal.trim().length === 0 ||
     typeof stopCondition !== "string" ||
-    stopCondition.length === 0 ||
-    stopCondition.length > 4_000 ||
+    stopCondition.trim().length === 0 ||
     !expectedActions ||
     !limits ||
     !limitsEqual(limits, budget.limits)
   ) {
     return { kind: "unknown" };
   }
-
-  return {
-    kind: "active",
-    identity: `${leaseId}\u0000${leaseStartedAt}`,
-    leaseId,
-    disclosure: {
+  const publicDisclosure = serializePublicDisclosure(
+    {
       goal,
       expectedActions,
       limits,
       stopCondition,
     },
+    [id, leaseId],
+  );
+  if (!publicDisclosure) return { kind: "unknown" };
+
+  return {
+    kind: "active",
+    identity: `${leaseId}\u0000${leaseStartedAt}`,
+    leaseId,
+    disclosure: publicDisclosure,
     startedAt,
     budget: cloneBudget(budget),
   };
@@ -567,10 +626,59 @@ function parseExpectedActions(value: unknown): string[] | null {
   if (!Array.isArray(value) || value.length > 16 || !hasExactArrayKeys(value)) {
     return null;
   }
-  if (value.some((item) => typeof item !== "string" || item.length === 0 || item.length > 256)) {
+  if (value.some((item) => typeof item !== "string" || item.trim().length === 0)) {
     return null;
   }
   return value.map((item) => item as string);
+}
+
+function serializePublicDisclosure(
+  disclosure: TaskDisclosure,
+  privateValues: readonly string[],
+): TaskDisclosure | null {
+  try {
+    const goal = serializePublicString(disclosure.goal, 4_000, privateValues);
+    const stopCondition = serializePublicString(disclosure.stopCondition, 4_000, privateValues);
+    const expectedActions = disclosure.expectedActions.map((action) =>
+      serializePublicString(action, 256, privateValues),
+    );
+    if (!goal || !stopCondition || expectedActions.some((action) => action === null)) {
+      return null;
+    }
+    return {
+      goal,
+      expectedActions: expectedActions as string[],
+      limits: cloneLimits(disclosure.limits),
+      stopCondition,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function serializePublicString(
+  value: string,
+  maxCodePoints: number,
+  privateValues: readonly string[],
+): string | null {
+  let sanitized = value.toWellFormed();
+  for (const privateValue of privateValues) {
+    if (privateValue.length > 0) {
+      sanitized = sanitized.replaceAll(privateValue, "[REDACTED_LEASE]");
+    }
+  }
+  sanitized = redactPublicText(sanitized);
+  const truncated = Array.from(sanitized).slice(0, maxCodePoints).join("");
+  const markerStart = truncated.lastIndexOf("[");
+  const completeMarker =
+    markerStart < 0
+      ? undefined
+      : sanitized.slice(markerStart).match(/^\[REDACTED(?:_[A-Z]+)?\]/u)?.[0];
+  const bounded =
+    completeMarker !== undefined && !truncated.slice(markerStart).startsWith(completeMarker)
+      ? truncated.slice(0, markerStart)
+      : truncated;
+  return bounded.trim().length === 0 ? null : bounded;
 }
 
 function isExactRecord<const K extends readonly string[]>(
@@ -583,14 +691,33 @@ function isExactRecord<const K extends readonly string[]>(
   const prototype = Object.getPrototypeOf(value);
   if (prototype !== Object.prototype && prototype !== null) return false;
   const actual = Reflect.ownKeys(value);
-  return actual.length === keys.length && keys.every((key) => actual.includes(key));
+  return (
+    actual.length === keys.length &&
+    keys.every((key) => {
+      if (!actual.includes(key)) return false;
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      return descriptor?.enumerable === true && "value" in descriptor;
+    })
+  );
 }
 
 function hasExactArrayKeys(value: unknown[]): boolean {
   const actual = Reflect.ownKeys(value);
   if (actual.length !== value.length + 1 || !actual.includes("length")) return false;
+  const lengthDescriptor = Object.getOwnPropertyDescriptor(value, "length");
+  if (
+    !lengthDescriptor ||
+    lengthDescriptor.enumerable ||
+    !("value" in lengthDescriptor) ||
+    lengthDescriptor.value !== value.length
+  ) {
+    return false;
+  }
   for (let index = 0; index < value.length; index += 1) {
-    if (!actual.includes(String(index))) return false;
+    const key = String(index);
+    if (!actual.includes(key)) return false;
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (descriptor?.enumerable !== true || !("value" in descriptor)) return false;
   }
   return true;
 }

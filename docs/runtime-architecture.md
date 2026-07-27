@@ -8,7 +8,7 @@ This document defines the stable runtime boundary used by the CLI today and rese
 
 RuntimeFacade depends inward on `WhiteLilyAppLifecycle` for component lifecycle ownership, on `TaskController` for task state and invalidation, and on Minecraft and Codex observers for public state. No lower layer depends on RuntimeFacade. `WhiteLilyAppLifecycle` remains the sole component cleanup executor: RuntimeFacade asks it to stop, but does not clean up its components itself.
 
-`start()` coalesces concurrent starts and is idempotent while running. `stop(reason)` coalesces concurrent stops and is idempotent after `stopped` or `failed`. A stopped or failed facade is terminal: it cannot restart; create a new runtime instance. Startup or stop failure moves the facade to `failed`, and unknown task or Minecraft state fails closed in the public state rather than exposing untrusted data.
+`start()` coalesces concurrent starts and is idempotent while running. `stop(reason)` coalesces concurrent stops and is idempotent after `stopped` or `failed`. A stopped or failed facade is terminal: it cannot restart; create a new runtime instance. Startup or stop failure moves the facade to `failed`. Unknown task shape, invalid public-task identity, or unknown Minecraft state synchronously latches the first terminal cause, revokes the task before publishing an empty task state, fences later task/Minecraft events, and starts the same lifecycle cleanup used by an explicit stop. Constructor-time observer failures use an internally observed cleanup promise, so cleanup rejection cannot become an unhandled rejection or replace the first public error.
 
 ```mermaid
 stateDiagram-v2
@@ -25,7 +25,7 @@ stateDiagram-v2
   stopped --> [*]: terminal; no restart
 ```
 
-Events are delivered FIFO. Listener reentrancy is isolated by queueing nested publications, and listener failures cannot alter the runtime lifecycle. `snapshot()` and event payloads are immutable, exact-shape public values: invalid or extra-shaped internal data is rejected rather than partially published. Public task identifiers are newly generated, safe IDs; task lease IDs never cross this boundary. Minecraft `sessionId` is `null` until a safe source exists.
+Events are delivered FIFO. Listener reentrancy is isolated by queueing nested publications, and listener failures cannot alter the runtime lifecycle. `snapshot()` and event payloads are immutable, exact-shape public values: extra, symbol, non-enumerable, accessor-backed, or prototype-injected internal fields are rejected rather than partially published. A dedicated serializer handles every allowed task-disclosure string at this first internal-to-public boundary. It applies credential and lease redaction, replaces Windows drive/UNC/profile paths and Unix home/absolute paths (including local `file:` URIs), converts malformed Unicode to well-formed text, and bounds goals/stop conditions to 4,000 Unicode code points and action labels to 256 without cutting a redaction marker. Internal controller state is not modified. Public task identifiers are newly generated safe IDs, and private task or turn lease IDs never cross this boundary. Minecraft `sessionId` is `null` until a safe source exists.
 
 ## WhiteLilyAppLifecycle
 
@@ -47,7 +47,7 @@ Its dependencies point inward to the managed MCP, Codex, Minecraft, CompanionSer
 | Duration             |    10 minutes |
 | Dangerous operations |    8 per task |
 
-All five task-wide dimensions fail closed on exhaustion. A deadline or overflow revokes the task lease, records one terminal transition, fences and interrupts the Codex turn, cancels queued and in-flight actions, and clears pending confirmations. `TaskController`, `TaskControllerBudget`, and `TurnToolBudget` are internal safety controls, not desktop-sidecar APIs.
+All five task-wide dimensions fail closed on exhaustion. A deadline or overflow revokes the task lease, records one terminal transition, fences and interrupts the Codex turn, cancels queued and in-flight actions, and clears pending confirmations. RuntimeFacade uses the same internal terminal notification with a composition-only forced-cleanup context when an observer becomes unknown; ordinary Codex `failed` results retain their existing model-failure flow. `TaskController`, `TaskControllerBudget`, and `TurnToolBudget` are internal safety controls, not desktop-sidecar APIs.
 
 ## ChatRouter
 

@@ -497,6 +497,8 @@ export async function createRuntimeFacade(
       current: () => composition.taskController.current(),
       budget: () => composition.taskBudget.snapshot(),
       stop: (reason) => composition.taskController.stop(reason),
+      failClosed: (reason) =>
+        composition.taskController.stop(reason, { forceTerminalCleanup: true }),
       subscribe: (listener) => {
         taskListeners.add(listener);
         return () => taskListeners.delete(listener);

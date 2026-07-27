@@ -308,6 +308,45 @@ describe("CompanionService lifecycle", () => {
     },
   );
 
+  it("uses the central task terminal hook to cancel active work on a failed task", async () => {
+    const value = await harness({
+      deferredTurns: [0],
+      activeMinecraftWait: true,
+    });
+    await value.start();
+    await startPlayerTurn(value, "trigger failed terminal cleanup");
+    let inFlightResult: unknown;
+    let queuedResult: unknown;
+    void value.executor
+      .execute(
+        { kind: "wait", milliseconds: 5_000 },
+        { spawn: { x: 0, y: 64, z: 0 }, owner: { x: 0, y: 64, z: 0 } },
+      )
+      .then((result) => {
+        inFlightResult = result;
+      });
+    void value.executor
+      .execute({ kind: "jump" }, { spawn: { x: 0, y: 64, z: 0 }, owner: { x: 0, y: 64, z: 0 } })
+      .then((result) => {
+        queuedResult = result;
+      });
+    const pending = value.confirmations.create("pending", { kind: "memory_clear" });
+    await value.untilActiveWaitStarted();
+
+    value.taskController.stop("failed", { forceTerminalCleanup: true });
+    for (let turn = 0; turn < 8; turn += 1) await Promise.resolve();
+
+    expect(inFlightResult).toEqual({ status: "cancelled" });
+    expect(queuedResult).toEqual({ status: "cancelled" });
+    expect(value.activeWaitWasAborted()).toBe(true);
+    expect(value.minecraft.calls).not.toContainEqual(expect.objectContaining({ method: "jump" }));
+    expect(value.codex.interruptions).toEqual([{ threadId: "thread-1", turnId: "turn-1" }]);
+    expect(value.confirmations.get(pending.id)).toBeUndefined();
+    expect(value.taskController.current()).toBeNull();
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:failed"]);
+    expect(value.taskTerminalReasons).toEqual(["failed"]);
+  });
+
   it.each([
     ["completed", { text: outcome(), status: "completed" }],
     ["failed", { text: "", status: "failed" }],
