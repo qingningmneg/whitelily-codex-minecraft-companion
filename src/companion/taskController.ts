@@ -28,17 +28,9 @@ export type TaskAuditData = { task: ActiveTask } | { task: ActiveTask; reason: T
 export type TaskAuditCallback = (event: TaskAuditEvent, data: TaskAuditData) => void;
 
 export interface TaskControllerDependencies {
-  onTerminal?: (reason: TaskStopReason, context: TaskTerminalContext) => void;
+  onTerminal?: (reason: TaskStopReason, forceCleanup: boolean) => void;
   setTimer?: (callback: () => void, milliseconds: number) => ReturnType<typeof setTimeout>;
   clearTimer?: (timer: ReturnType<typeof setTimeout>) => void;
-}
-
-export interface TaskTerminalContext {
-  readonly forceCleanup: boolean;
-}
-
-export interface TaskStopOptions {
-  readonly forceTerminalCleanup?: boolean;
 }
 
 type TaskControllerConsumption = Omit<TaskConsumption, "lease"> & { leaseId: string };
@@ -68,7 +60,7 @@ export class TaskController {
   private activeTask: ActiveTask | undefined;
   private deadlineTimer: ReturnType<typeof setTimeout> | undefined;
   private readonly terminalListeners = new Set<
-    (reason: TaskStopReason, context: TaskTerminalContext) => void
+    (reason: TaskStopReason, forceCleanup: boolean) => void
   >();
   private readonly setTimer: (
     callback: () => void,
@@ -136,13 +128,18 @@ export class TaskController {
     return result;
   }
 
-  stop(reason: TaskStopReason, options: TaskStopOptions = {}): void {
+  stop(reason: TaskStopReason): void {
     this.reconcileBudget();
     if (!taskStopReasons.has(reason)) {
       this.finish("failed");
       throw new Error("task stop reason is invalid");
     }
-    this.finish(reason, false, options.forceTerminalCleanup === true);
+    this.finish(reason);
+  }
+
+  failClosed(): void {
+    this.reconcileBudget();
+    this.finish("failed", false, true);
   }
 
   current(): ActiveTask | null {
@@ -150,7 +147,7 @@ export class TaskController {
     return this.activeTask ? cloneActiveTask(this.activeTask) : null;
   }
 
-  onTerminal(listener: (reason: TaskStopReason, context: TaskTerminalContext) => void): () => void {
+  onTerminal(listener: (reason: TaskStopReason, forceCleanup: boolean) => void): () => void {
     this.terminalListeners.add(listener);
     return () => this.terminalListeners.delete(listener);
   }
@@ -172,13 +169,13 @@ export class TaskController {
     this.clearDeadline();
     if (!budgetAlreadyStopped) this.budget.invalidate(reason);
     try {
-      this.dependencies.onTerminal?.(reason, { forceCleanup: forceTerminalCleanup });
+      this.dependencies.onTerminal?.(reason, forceTerminalCleanup);
     } catch {
       // Terminal observers cannot affect task lifecycle or lease invalidation.
     }
     for (const listener of this.terminalListeners) {
       try {
-        listener(reason, { forceCleanup: forceTerminalCleanup });
+        listener(reason, forceTerminalCleanup);
       } catch {
         // Terminal observers cannot affect task lifecycle or lease invalidation.
       }

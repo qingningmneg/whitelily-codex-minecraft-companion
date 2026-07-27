@@ -333,7 +333,7 @@ describe("CompanionService lifecycle", () => {
     const pending = value.confirmations.create("pending", { kind: "memory_clear" });
     await value.untilActiveWaitStarted();
 
-    value.taskController.stop("failed", { forceTerminalCleanup: true });
+    value.taskController.failClosed();
     for (let turn = 0; turn < 8; turn += 1) await Promise.resolve();
 
     expect(inFlightResult).toEqual({ status: "cancelled" });

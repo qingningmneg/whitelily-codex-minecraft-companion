@@ -297,6 +297,20 @@ describe("TaskController", () => {
     expect(order).toEqual(["cleanup:timeout", "audit:timeout:true:false:true"]);
   });
 
+  it("provides a dedicated fail-closed capability without changing ordinary failed stops", () => {
+    const forcedCleanup: boolean[] = [];
+    const controller = fixedController();
+    controller.onTerminal((_reason, forced) => forcedCleanup.push(forced));
+
+    controller.start(disclosure);
+    controller.stop("failed");
+    controller.start(disclosure);
+    controller.failClosed();
+
+    expect(forcedCleanup).toEqual([false, true]);
+    expect(controller.current()).toBeNull();
+  });
+
   it("fires the deadline terminal hook without another consume call", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-07-27T08:00:00.000Z"));

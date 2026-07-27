@@ -197,8 +197,8 @@ export class CompanionService {
     this.logger = dependencies.logger ?? noOpLogger;
     this.setTimer = dependencies.setTimer ?? setTimeout;
     this.clearTimer = dependencies.clearTimer ?? clearTimeout;
-    dependencies.taskController.onTerminal((reason, context) =>
-      this.handleTaskTerminal(reason, context.forceCleanup),
+    dependencies.taskController.onTerminal((reason, forceCleanup) =>
+      this.handleTaskTerminal(reason, forceCleanup),
     );
   }
 

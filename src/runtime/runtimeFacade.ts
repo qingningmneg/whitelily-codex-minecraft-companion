@@ -14,7 +14,7 @@ interface RuntimeTaskAccess {
   current(): ActiveTask | null;
   budget(): TaskBudgetSnapshot;
   stop(reason: TaskStopReason): void;
-  failClosed?(reason: TaskStopReason): void;
+  failClosed?(): void;
   subscribe?(listener: () => void): () => void;
 }
 
@@ -273,11 +273,12 @@ export class RuntimeFacade {
   #observeMinecraft(event: MinecraftEvent): void {
     if (this.#terminal) return;
     try {
-      if (typeof event !== "object" || event === null || typeof event.kind !== "string") {
+      const kind = validateMinecraftEvent(event as unknown);
+      if (kind === null) {
         this.#failMinecraftState();
         return;
       }
-      switch (event.kind) {
+      switch (kind) {
         case "connected":
           if (this.#snapshot.lifecycle === "starting" || this.#snapshot.lifecycle === "running") {
             this.#setMinecraft("connected");
@@ -343,7 +344,7 @@ export class RuntimeFacade {
       }
       if (this.#privateTaskIdentity !== inspected.identity) {
         const publicId = (this.#dependencies.createPublicTaskId ?? randomUUID)();
-        if (!/^[A-Za-z0-9_-]{1,128}$/.test(publicId) || publicId === inspected.leaseId) {
+        if (!/^[A-Za-z0-9_-]{1,128}$/.test(publicId) || publicId.includes(inspected.leaseId)) {
           this.#failTaskState(publish);
           return;
         }
@@ -378,7 +379,7 @@ export class RuntimeFacade {
     };
     try {
       const task = this.#dependencies.task;
-      if (task?.failClosed) task.failClosed("failed");
+      if (task?.failClosed) task.failClosed();
       else task?.stop("failed");
     } catch {
       // The terminal facade and lifecycle cleanup remain authoritative.
@@ -484,6 +485,85 @@ export class RuntimeFacade {
       this.#publishing = false;
     }
   }
+}
+
+function validateMinecraftEvent(value: unknown): MinecraftEvent["kind"] | null {
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    Array.isArray(value) ||
+    Object.getPrototypeOf(value) !== Object.prototype
+  ) {
+    return null;
+  }
+  const kindDescriptor = Object.getOwnPropertyDescriptor(value, "kind");
+  if (
+    kindDescriptor?.enumerable !== true ||
+    !("value" in kindDescriptor) ||
+    typeof kindDescriptor.value !== "string"
+  ) {
+    return null;
+  }
+  const kind = kindDescriptor.value;
+  switch (kind) {
+    case "connected":
+    case "disconnected": {
+      const hasReason = Object.prototype.hasOwnProperty.call(value, "reason");
+      if (!isExactRecord(value, hasReason ? ["kind", "reason"] : ["kind"])) return null;
+      return !hasReason || isBoundedMinecraftString(value.reason, 256, true) ? kind : null;
+    }
+    case "world_changed":
+    case "death":
+      return isExactRecord(value, ["kind"]) ? kind : null;
+    case "chat":
+      return isExactRecord(value, ["kind", "username", "message"]) &&
+        isBoundedMinecraftString(value.username, 64) &&
+        isBoundedMinecraftString(value.message, 4_096, true)
+        ? kind
+        : null;
+    case "owner_online":
+    case "owner_offline":
+      return isExactRecord(value, ["kind", "username"]) &&
+        isBoundedMinecraftString(value.username, 64)
+        ? kind
+        : null;
+    case "hostile_nearby":
+      return isExactRecord(value, ["kind", "entityId", "entityKind", "position"]) &&
+        typeof value.entityId === "number" &&
+        Number.isSafeInteger(value.entityId) &&
+        isBoundedMinecraftString(value.entityKind, 128) &&
+        isExactFiniteVec3(value.position)
+        ? kind
+        : null;
+    default:
+      return null;
+  }
+}
+
+function isBoundedMinecraftString(
+  value: unknown,
+  maxCodePoints: number,
+  allowEmpty = false,
+): value is string {
+  return (
+    typeof value === "string" &&
+    value === value.toWellFormed() &&
+    (allowEmpty || value.length > 0) &&
+    Array.from(value).length <= maxCodePoints
+  );
+}
+
+function isExactFiniteVec3(value: unknown): boolean {
+  return (
+    isExactRecord(value, ["x", "y", "z"]) &&
+    Object.getPrototypeOf(value) === Object.prototype &&
+    typeof value.x === "number" &&
+    Number.isFinite(value.x) &&
+    typeof value.y === "number" &&
+    Number.isFinite(value.y) &&
+    typeof value.z === "number" &&
+    Number.isFinite(value.z)
+  );
 }
 
 function parseActiveTask(value: unknown, budget: TaskBudgetSnapshot): InspectedTaskState {
@@ -623,13 +703,22 @@ function parseLimits(value: unknown): TaskLimits | null {
 }
 
 function parseExpectedActions(value: unknown): string[] | null {
-  if (!Array.isArray(value) || value.length > 16 || !hasExactArrayKeys(value)) {
+  if (
+    !Array.isArray(value) ||
+    Object.getPrototypeOf(value) !== Array.prototype ||
+    value.length > 16 ||
+    !hasExactArrayKeys(value)
+  ) {
     return null;
   }
-  if (value.some((item) => typeof item !== "string" || item.trim().length === 0)) {
-    return null;
+  const actions: string[] = [];
+  for (let index = 0; index < value.length; index += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+    const item = descriptor && "value" in descriptor ? descriptor.value : undefined;
+    if (typeof item !== "string" || item.trim().length === 0) return null;
+    actions.push(item);
   }
-  return value.map((item) => item as string);
+  return actions;
 }
 
 function serializePublicDisclosure(
@@ -639,15 +728,16 @@ function serializePublicDisclosure(
   try {
     const goal = serializePublicString(disclosure.goal, 4_000, privateValues);
     const stopCondition = serializePublicString(disclosure.stopCondition, 4_000, privateValues);
-    const expectedActions = disclosure.expectedActions.map((action) =>
-      serializePublicString(action, 256, privateValues),
-    );
-    if (!goal || !stopCondition || expectedActions.some((action) => action === null)) {
-      return null;
+    const expectedActions: string[] = [];
+    for (let index = 0; index < disclosure.expectedActions.length; index += 1) {
+      const action = serializePublicString(disclosure.expectedActions[index]!, 256, privateValues);
+      if (action === null) return null;
+      expectedActions.push(action);
     }
+    if (!goal || !stopCondition) return null;
     return {
       goal,
-      expectedActions: expectedActions as string[],
+      expectedActions,
       limits: cloneLimits(disclosure.limits),
       stopCondition,
     };
@@ -661,6 +751,7 @@ function serializePublicString(
   maxCodePoints: number,
   privateValues: readonly string[],
 ): string | null {
+  if (value.length > maxCodePoints * 8) return null;
   let sanitized = value.toWellFormed();
   for (const privateValue of privateValues) {
     if (privateValue.length > 0) {
@@ -745,9 +836,13 @@ function cloneLimits(limits: TaskLimits): TaskLimits {
 }
 
 function cloneDisclosure(disclosure: TaskDisclosure): TaskDisclosure {
+  const expectedActions: string[] = [];
+  for (let index = 0; index < disclosure.expectedActions.length; index += 1) {
+    expectedActions.push(disclosure.expectedActions[index]!);
+  }
   return {
     goal: disclosure.goal,
-    expectedActions: disclosure.expectedActions.map((action) => action),
+    expectedActions,
     limits: cloneLimits(disclosure.limits),
     stopCondition: disclosure.stopCondition,
   };

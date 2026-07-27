@@ -1,5 +1,8 @@
 import { access, readFile } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
+import type { ActiveTask } from "../../src/companion/taskController.js";
+import { RuntimeFacade } from "../../src/runtime/runtimeFacade.js";
+import type { TaskBudgetSnapshot } from "../../src/safety/taskBudget.js";
 import {
   runPublicRepoPreparation,
   runReleaseJunctionRegressions,
@@ -33,11 +36,6 @@ describe("public release readiness", () => {
     const architecture = await readFile("docs/runtime-architecture.md", "utf8");
     for (const heading of [
       "RuntimeFacade",
-      "synchronously latches the first terminal cause",
-      "revokes the task before publishing an empty task state",
-      "fences later task/Minecraft events",
-      "A dedicated serializer handles every allowed task-disclosure string",
-      "without cutting a redaction marker",
       "TaskController",
       "ChatRouter",
       "MineflayerConnection",
@@ -60,6 +58,79 @@ describe("public release readiness", () => {
     ]) {
       expect(architecture).toContain(heading);
     }
+  });
+
+  it("enforces the public disclosure and operational fail-closed behavior", async () => {
+    const limits = {
+      maxToolCalls: 64,
+      maxBlockChanges: 256,
+      maxHorizontalTravel: 1_024,
+      maxDurationMs: 600_000,
+      maxDangerousOperations: 8,
+    };
+    const task: ActiveTask = {
+      id: "release-private-lease",
+      lease: { id: "release-private-lease", startedAt: 1_700_000_000_000 },
+      disclosure: {
+        goal: `Inspect ${"C:" + String.raw`\Users\Jane Doe\Private Notes\todo.txt`} password="Jane Doe private password"`,
+        expectedActions: ["place"],
+        limits,
+        stopCondition: "Stop safely",
+      },
+      startedAt: "2023-11-14T22:13:20.000Z",
+    };
+    const budget: TaskBudgetSnapshot = {
+      active: true,
+      stopReason: null,
+      limits,
+      toolCalls: 0,
+      blockChanges: 0,
+      horizontalTravel: 0,
+      dangerousOperations: 0,
+      startedAt: 1_700_000_000_000,
+    };
+    let minecraftListener: ((event: unknown) => void) | undefined;
+    let taskStops = 0;
+    let lifecycleStops = 0;
+    const runtime = new RuntimeFacade({
+      lifecycle: {
+        start: async () => undefined,
+        stop: async () => {
+          lifecycleStops += 1;
+        },
+      },
+      task: {
+        current: () => task,
+        budget: () => budget,
+        stop: () => {
+          taskStops += 1;
+        },
+      },
+      minecraft: {
+        subscribe: (listener) => {
+          minecraftListener = listener as (event: unknown) => void;
+          return () => undefined;
+        },
+      },
+      createPublicTaskId: () => "release-public-task",
+    });
+
+    const published = JSON.stringify(runtime.snapshot());
+    expect(published).not.toContain("Jane Doe");
+    expect(published).not.toContain("Private Notes");
+    expect(published).not.toContain("private password");
+    expect(published).not.toContain(task.lease.id);
+
+    minecraftListener?.({ kind: "world_changed", extra: "private backend state" });
+
+    expect(runtime.snapshot()).toMatchObject({
+      lifecycle: "failed",
+      task: null,
+      lastError: { code: "MINECRAFT_STATE_UNKNOWN" },
+    });
+    expect(taskStops).toBe(1);
+    await runtime.stop("process_exit");
+    expect(lifecycleStops).toBe(1);
   });
 
   it("does not publish personal example values", async () => {

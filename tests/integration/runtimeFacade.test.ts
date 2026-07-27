@@ -55,6 +55,67 @@ function activeBudgetFixture(): TaskBudgetSnapshot {
   };
 }
 
+let minecraftAccessorReads = 0;
+const accessorBackedOwnerOffline = { kind: "owner_offline" };
+Object.defineProperty(accessorBackedOwnerOffline, "username", {
+  enumerable: true,
+  get: () => {
+    minecraftAccessorReads += 1;
+    return "owner";
+  },
+});
+const nonEnumerableOwnerOnline = { kind: "owner_online" };
+Object.defineProperty(nonEnumerableOwnerOnline, "username", {
+  enumerable: false,
+  value: "owner",
+});
+const inheritedDeathEvent = Object.assign(Object.create({ inherited: true }) as object, {
+  kind: "death",
+});
+
+const malformedMinecraftCases: ReadonlyArray<readonly [string, unknown]> = [
+  ["connected reason has the wrong type", { kind: "connected", reason: 42 }],
+  ["connected reason exceeds its bound", { kind: "connected", reason: "r".repeat(257) }],
+  ["disconnected has an extra field", { kind: "disconnected", extra: true }],
+  ["world_changed has a symbol field", { kind: "world_changed", [Symbol("private")]: true }],
+  ["chat has a non-string message", { kind: "chat", username: "owner", message: 42 }],
+  ["chat username exceeds its bound", { kind: "chat", username: "u".repeat(65), message: "hi" }],
+  [
+    "chat message exceeds its bound",
+    { kind: "chat", username: "owner", message: "m".repeat(4_097) },
+  ],
+  ["owner_online has a non-enumerable username", nonEnumerableOwnerOnline],
+  ["owner_offline has an accessor username", accessorBackedOwnerOffline],
+  ["death has a custom prototype", inheritedDeathEvent],
+  [
+    "hostile_nearby has a non-finite entity ID",
+    {
+      kind: "hostile_nearby",
+      entityId: Number.POSITIVE_INFINITY,
+      entityKind: "zombie",
+      position: { x: 0, y: 64, z: 0 },
+    },
+  ],
+  [
+    "hostile_nearby entity kind exceeds its bound",
+    {
+      kind: "hostile_nearby",
+      entityId: 1,
+      entityKind: "z".repeat(129),
+      position: { x: 0, y: 64, z: 0 },
+    },
+  ],
+  [
+    "hostile_nearby has a non-finite Vec3",
+    {
+      kind: "hostile_nearby",
+      entityId: 1,
+      entityKind: "zombie",
+      position: { x: 0, y: Number.NaN, z: 0 },
+    },
+  ],
+] as const;
+
 function createRuntimeFacadeHarness() {
   const cleanup: string[] = [];
   const stopReasons: TaskStopReason[] = [];
@@ -545,7 +606,7 @@ describe("RuntimeFacade", () => {
   });
 
   it("maps Minecraft and Codex startup, connection, outage, and terminal states", async () => {
-    let minecraftListener: ((event: { kind: string }) => void) | undefined;
+    let minecraftListener: ((event: { kind: string; reason?: string }) => void) | undefined;
     let selectedModel: string | null = null;
     const runtime = new RuntimeFacade({
       lifecycle: {
@@ -556,7 +617,7 @@ describe("RuntimeFacade", () => {
       },
       minecraft: {
         subscribe: (listener) => {
-          minecraftListener = listener as (event: { kind: string }) => void;
+          minecraftListener = listener as (event: { kind: string; reason?: string }) => void;
           return () => {
             minecraftListener = undefined;
           };
@@ -593,8 +654,8 @@ describe("RuntimeFacade", () => {
     });
     minecraftListener?.({
       kind: "disconnected",
-      sessionId: "C:\\unsafe\\session",
-    } as { kind: string });
+      reason: "network outage",
+    });
     expect(runtime.snapshot().minecraft).toEqual({
       state: "reconnecting",
       sessionId: null,
@@ -796,6 +857,83 @@ describe("RuntimeFacade", () => {
     expect(Object.isFrozen(taskEvents.at(-1))).toBe(true);
   });
 
+  it("fully consumes spaced and quoted paths and embedded credentials in every public disclosure", () => {
+    const windowsRaw = "C:" + String.raw`\Users\Jane Doe\Private Notes\todo.txt`;
+    const windowsEscaped = "C:" + String.raw`\\Users\\Jane Doe\\Escaped Notes\\todo.txt`;
+    const windowsForward = "D:/" + "Users/Jane Doe/Forward Notes/todo.txt";
+    const fileWindows = "file:///C:/" + "Users/Jane%20Doe/Private%20Notes/todo.txt";
+    const task = activeTaskFixture();
+    task.disclosure = {
+      ...task.disclosure,
+      goal: `Inspect ${windowsRaw}, "${windowsEscaped}", and '${windowsForward}'; password="Jane Doe private phrase" token='Jane Doe\\'s token value'`,
+      expectedActions: [
+        String.raw`read "\\server\Jane Doe\Secret Share\plan.txt" credential="credential value with spaces"`,
+        String.raw`read '//server/Jane Doe/Forward Share/plan.txt' secret='secret value with spaces'`,
+        String.raw`read '\\server/Jane Doe/Mixed Share\plan.txt' lease="lease value with spaces"`,
+        `inspect before {"password":"Jane Doe json password","token":"Jane Doe json token","note":"safe"} after`,
+        "connect https://Jane%20Doe:secret%20password@example.invalid/world",
+      ],
+      stopCondition: `Stop after ${fileWindows}, "file:///home/Jane Doe/Private Notes/todo.txt", ~/Jane Doe/Home Notes/todo.txt, and /var/lib/Jane Doe/Unix Notes/todo.txt; password='final spaced password'`,
+    };
+    let taskListener: (() => void) | undefined;
+    const runtime = new RuntimeFacade({
+      lifecycle: {
+        start: async () => undefined,
+        stop: async () => undefined,
+      },
+      task: {
+        current: () => task,
+        budget: activeBudgetFixture,
+        stop: () => undefined,
+        subscribe: (listener) => {
+          taskListener = listener;
+          return () => undefined;
+        },
+      },
+      createPublicTaskId: () => "public-spaced-redaction-task",
+    });
+    const taskEvents: RuntimeEvent[] = [];
+    runtime.subscribe((event) => {
+      if (event.kind === "task") taskEvents.push(event);
+    });
+
+    taskListener?.();
+
+    const publicValues = [
+      JSON.stringify(runtime.snapshot()),
+      JSON.stringify(taskEvents),
+      JSON.stringify({ snapshot: runtime.snapshot(), events: taskEvents }),
+    ];
+    for (const serialized of publicValues) {
+      for (const privateSuffix of [
+        "Jane Doe",
+        "Private Notes",
+        "Escaped Notes",
+        "Forward Notes",
+        "Secret Share",
+        "Forward Share",
+        "Mixed Share",
+        "private phrase",
+        "token value",
+        "credential value",
+        "secret value",
+        "lease value",
+        "json password",
+        "json token",
+        "secret%20password",
+        "Home Notes",
+        "Unix Notes",
+        "final spaced password",
+      ]) {
+        expect(serialized).not.toContain(privateSuffix);
+      }
+      expect(serialized).toContain("safe");
+    }
+    expect(task.disclosure.goal).toContain("Jane Doe");
+    expect(task.disclosure.expectedActions[3]).toContain("json password");
+    expect(task.disclosure.stopCondition).toContain("Private Notes");
+  });
+
   it("bounds public disclosure text by Unicode code points without splitting safe text", () => {
     const task = activeTaskFixture();
     task.disclosure = {
@@ -826,6 +964,60 @@ describe("RuntimeFacade", () => {
     expect(disclosure?.goal.endsWith("🌸")).toBe(true);
     expect(disclosure?.expectedActions[0]?.endsWith("🌿")).toBe(true);
     expect(disclosure?.stopCondition.endsWith("🛑")).toBe(true);
+  });
+
+  it("fails closed before scanning a disclosure string above the raw work bound", () => {
+    const task = activeTaskFixture();
+    task.disclosure.goal = "x".repeat(32_001);
+    let taskStops = 0;
+    const runtime = new RuntimeFacade({
+      lifecycle: {
+        start: async () => undefined,
+        stop: async () => undefined,
+      },
+      task: {
+        current: () => task,
+        budget: activeBudgetFixture,
+        stop: () => {
+          taskStops += 1;
+        },
+      },
+    });
+
+    expect(runtime.snapshot()).toMatchObject({
+      lifecycle: "failed",
+      task: null,
+      lastError: { code: "TASK_STATE_UNKNOWN" },
+    });
+    expect(taskStops).toBe(1);
+  });
+
+  it("scans a near-limit adversarial disclosure in bounded linear time", () => {
+    const task = activeTaskFixture();
+    const adversarialUnit = String.raw`a"'\b`;
+    task.disclosure.goal = adversarialUnit
+      .repeat(Math.ceil(32_000 / adversarialUnit.length))
+      .slice(0, 32_000);
+    const started = performance.now();
+
+    const runtime = new RuntimeFacade({
+      lifecycle: {
+        start: async () => undefined,
+        stop: async () => undefined,
+      },
+      task: {
+        current: () => task,
+        budget: activeBudgetFixture,
+        stop: () => undefined,
+      },
+      createPublicTaskId: () => "public-linear-scan-task",
+    });
+    const snapshot = runtime.snapshot();
+    const elapsed = performance.now() - started;
+
+    expect(snapshot.lifecycle).toBe("idle");
+    expect(Array.from(snapshot.task?.disclosure.goal ?? "")).toHaveLength(4_000);
+    expect(elapsed).toBeLessThan(500);
   });
 
   it("never truncates a sanitization marker into a misleading fragment", () => {
@@ -1022,6 +1214,42 @@ describe("RuntimeFacade", () => {
       lastError: { code: "TASK_STATE_UNKNOWN" },
     });
     expect(accessorReads).toBe(0);
+  });
+
+  it("rejects a non-native expectedActions array without invoking overridden methods", () => {
+    const task = activeTaskFixture();
+    let overriddenCalls = 0;
+    const injectedPrototype = Object.create(Array.prototype) as {
+      map: typeof Array.prototype.map;
+      some: typeof Array.prototype.some;
+    };
+    injectedPrototype.map = () => {
+      overriddenCalls += 1;
+      throw new Error("overridden map must not run");
+    };
+    injectedPrototype.some = () => {
+      overriddenCalls += 1;
+      throw new Error("overridden some must not run");
+    };
+    Object.setPrototypeOf(task.disclosure.expectedActions, injectedPrototype);
+    const runtime = new RuntimeFacade({
+      lifecycle: {
+        start: async () => undefined,
+        stop: async () => undefined,
+      },
+      task: {
+        current: () => task,
+        budget: activeBudgetFixture,
+        stop: () => undefined,
+      },
+    });
+
+    expect(runtime.snapshot()).toMatchObject({
+      lifecycle: "failed",
+      task: null,
+      lastError: { code: "TASK_STATE_UNKNOWN" },
+    });
+    expect(overriddenCalls).toBe(0);
   });
 
   it("terminally revokes an active task whose observed shape becomes unknown", async () => {
@@ -1362,6 +1590,193 @@ describe("RuntimeFacade", () => {
     expect(taskStops).toBe(1);
     await expect(runtime.stop("process_exit")).resolves.toBeUndefined();
     expect(lifecycleStops).toBe(1);
+  });
+
+  it.each([
+    ["private lease as a prefix", (leaseId: string) => `${leaseId}-public`],
+    ["private lease as a suffix", (leaseId: string) => `public-${leaseId}`],
+  ])("terminally rejects a generated public ID containing the %s", async (_label, publicId) => {
+    const task = activeTaskFixture();
+    let taskStops = 0;
+    let lifecycleStops = 0;
+    const runtime = new RuntimeFacade({
+      lifecycle: {
+        start: async () => undefined,
+        stop: async () => {
+          lifecycleStops += 1;
+        },
+      },
+      task: {
+        current: () => task,
+        budget: activeBudgetFixture,
+        stop: () => {
+          taskStops += 1;
+        },
+      },
+      createPublicTaskId: () => publicId(task.lease.id),
+    });
+
+    expect(runtime.snapshot()).toMatchObject({
+      lifecycle: "failed",
+      task: null,
+      lastError: { code: "TASK_STATE_UNKNOWN" },
+    });
+    expect(JSON.stringify(runtime.snapshot())).not.toContain(task.lease.id);
+    expect(taskStops).toBe(1);
+    await expect(runtime.stop("process_exit")).resolves.toBeUndefined();
+    expect(lifecycleStops).toBe(1);
+  });
+
+  it("terminally fails closed without publishing a task when public ID generation throws", async () => {
+    let taskSubscriptions = 0;
+    let taskStops = 0;
+    let lifecycleStops = 0;
+    const runtime = new RuntimeFacade({
+      lifecycle: {
+        start: async () => undefined,
+        stop: async () => {
+          lifecycleStops += 1;
+        },
+      },
+      task: {
+        current: activeTaskFixture,
+        budget: activeBudgetFixture,
+        stop: () => {
+          taskStops += 1;
+        },
+        subscribe: () => {
+          taskSubscriptions += 1;
+          return () => undefined;
+        },
+      },
+      createPublicTaskId: () => {
+        throw new Error("private generator failure");
+      },
+    });
+    const events: RuntimeEvent[] = [];
+    runtime.subscribe((event) => events.push(event));
+
+    expect(runtime.snapshot()).toMatchObject({
+      lifecycle: "failed",
+      task: null,
+      lastError: { code: "TASK_STATE_UNKNOWN" },
+    });
+    expect(events).toEqual([]);
+    expect(taskSubscriptions).toBe(0);
+    expect(taskStops).toBe(1);
+    await expect(runtime.stop("process_exit")).resolves.toBeUndefined();
+    expect(lifecycleStops).toBe(1);
+  });
+
+  it.each(malformedMinecraftCases)(
+    "terminally rejects a known Minecraft event when %s",
+    async (_label, malformedEvent) => {
+      let minecraftListener: ((event: unknown) => void) | undefined;
+      let taskStops = 0;
+      let lifecycleStops = 0;
+      const runtime = new RuntimeFacade({
+        lifecycle: {
+          start: async () => undefined,
+          stop: async () => {
+            lifecycleStops += 1;
+          },
+        },
+        task: {
+          current: activeTaskFixture,
+          budget: activeBudgetFixture,
+          stop: () => {
+            taskStops += 1;
+          },
+        },
+        minecraft: {
+          subscribe: (listener) => {
+            minecraftListener = listener as (event: unknown) => void;
+            return () => undefined;
+          },
+        },
+        createPublicTaskId: () => "public-malformed-minecraft-task",
+      });
+      await runtime.start();
+
+      minecraftListener?.(malformedEvent);
+
+      expect(runtime.snapshot()).toMatchObject({
+        lifecycle: "failed",
+        minecraft: { state: "disconnected", sessionId: null },
+        task: null,
+        lastError: { code: "MINECRAFT_STATE_UNKNOWN" },
+      });
+      expect(taskStops).toBe(1);
+      await expect(runtime.stop("process_exit")).resolves.toBeUndefined();
+      expect(lifecycleStops).toBe(1);
+    },
+  );
+
+  it("does not invoke an accessor while rejecting a malformed Minecraft event", () => {
+    minecraftAccessorReads = 0;
+    let minecraftListener: ((event: unknown) => void) | undefined;
+    const runtime = new RuntimeFacade({
+      lifecycle: {
+        start: async () => undefined,
+        stop: async () => undefined,
+      },
+      minecraft: {
+        subscribe: (listener) => {
+          minecraftListener = listener as (event: unknown) => void;
+          return () => undefined;
+        },
+      },
+    });
+
+    minecraftListener?.(accessorBackedOwnerOffline);
+
+    expect(runtime.snapshot()).toMatchObject({
+      lifecycle: "failed",
+      lastError: { code: "MINECRAFT_STATE_UNKNOWN" },
+    });
+    expect(minecraftAccessorReads).toBe(0);
+  });
+
+  it("accepts exact bounded Minecraft event variants including world_changed", async () => {
+    let minecraftListener: ((event: unknown) => void) | undefined;
+    const runtime = new RuntimeFacade({
+      lifecycle: {
+        start: async () => undefined,
+        stop: async () => undefined,
+      },
+      minecraft: {
+        subscribe: (listener) => {
+          minecraftListener = listener as (event: unknown) => void;
+          return () => undefined;
+        },
+      },
+    });
+    await runtime.start();
+
+    for (const event of [
+      { kind: "connected" },
+      { kind: "connected", reason: "ready" },
+      { kind: "disconnected", reason: "retry" },
+      { kind: "chat", username: "owner", message: "hello" },
+      { kind: "owner_online", username: "owner" },
+      { kind: "owner_offline", username: "owner" },
+      { kind: "death" },
+      {
+        kind: "hostile_nearby",
+        entityId: 1,
+        entityKind: "zombie",
+        position: { x: 0.5, y: 64, z: -2.5 },
+      },
+      { kind: "world_changed" },
+    ]) {
+      minecraftListener?.(event);
+    }
+
+    expect(runtime.snapshot()).toMatchObject({
+      lifecycle: "running",
+      minecraft: { state: "reconnecting", sessionId: null },
+      lastError: null,
+    });
   });
 
   it("isolates listener exceptions and fails unknown backend state closed", () => {
