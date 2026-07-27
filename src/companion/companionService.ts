@@ -222,6 +222,7 @@ export class CompanionService {
       this.dependencies.mode.setMode("friend");
       this.dependencies.mode.completeTask();
       this.unfinishedTaskSummary = persisted.unfinishedTaskSummary;
+      this.worldInvalidated = persisted.worldInvalidated;
       if (this.worldInvalidated || this.unfinishedTaskSummary) this.dependencies.mode.pause();
       else this.dependencies.mode.resume();
 
@@ -809,6 +810,7 @@ export class CompanionService {
         case "resume":
           this.worldInvalidated = false;
           if (!this.codexHealthy || this.unfinishedTaskSummary) {
+            await this.persist();
             await this.recoverSingleFlight();
             return;
           }
@@ -977,6 +979,7 @@ export class CompanionService {
       lastMode: state.mode,
       paused: state.paused,
       unfinishedTaskSummary: this.unfinishedTaskSummary,
+      worldInvalidated: this.worldInvalidated,
     });
   }
 

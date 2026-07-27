@@ -427,7 +427,8 @@ describe("WhiteLilyApp composition", () => {
     cleanups.push(harness.cleanup);
     expect(await harness.readData()).toEqual({
       memories: "[]\n",
-      state: '{\n  "lastMode": "friend",\n  "paused": false,\n  "unfinishedTaskSummary": null\n}\n',
+      state:
+        '{\n  "lastMode": "friend",\n  "paused": false,\n  "unfinishedTaskSummary": null,\n  "worldInvalidated": false\n}\n',
       log: "",
     });
     await mkdir(join(harness.directory, "data"), { recursive: true });

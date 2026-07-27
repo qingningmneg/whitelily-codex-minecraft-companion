@@ -331,11 +331,15 @@ describe("MineflayerConnection", () => {
   });
 
   it("detaches partial handlers and safely ends bots when setup throws", () => {
+    const socketEnd = vi.fn();
     const harness = createMineflayerConnectionHarness({
       configureBot: (bot) => {
         bot.throwOnEvent = "death";
         bot.end.mockImplementation(() => {
           throw new Error("end failed");
+        });
+        Object.assign(bot._client, {
+          socket: { end: socketEnd, destroy: vi.fn() },
         });
       },
     });
@@ -347,6 +351,7 @@ describe("MineflayerConnection", () => {
     expect(harness.bots[0]?.pathfinder.stop).toHaveBeenCalledOnce();
     expect(harness.bots[0]?.clearControlStates).toHaveBeenCalledOnce();
     expect(harness.bots[0]?.end).toHaveBeenCalledOnce();
+    expect(socketEnd).toHaveBeenCalledOnce();
     expect(harness.scheduledDelays()).toEqual([1_000]);
   });
 
@@ -419,6 +424,193 @@ describe("MineflayerConnection", () => {
 
     expect(secondCancel).toHaveBeenCalledOnce();
     expect(connection.state()).toBe("stopped");
+  });
+
+  it("keeps the active bot bound until explicit disconnect establishes a socket fallback fence", async () => {
+    const harness = createMineflayerConnectionHarness();
+    const connection = new MineflayerConnection(harness.dependencies);
+    const kinds: string[] = [];
+    connection.onEvent((event) => kinds.push(event.kind));
+    const connecting = connection.connect();
+    harness.spawn();
+    await connecting;
+    const bot = harness.bots[0]!;
+    bot.end.mockImplementation(() => {
+      throw new Error("bot end failed");
+    });
+    const socketEnd = vi.fn(() => {
+      expect(connection.currentBot()).toBe(bot);
+    });
+    const socketDestroy = vi.fn();
+    Object.assign(bot._client, {
+      socket: { end: socketEnd, destroy: socketDestroy },
+    });
+    const cancel = vi.fn();
+    connection.registerActiveOperation(cancel);
+
+    await expect(connection.disconnect()).resolves.toBeUndefined();
+
+    expect(bot.end).toHaveBeenCalledOnce();
+    expect(bot._client.end).not.toHaveBeenCalled();
+    expect(socketEnd).toHaveBeenCalledOnce();
+    expect(socketDestroy).not.toHaveBeenCalled();
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(connection.currentBot()).toBeUndefined();
+    expect(connection.state()).toBe("stopped");
+    const beforeStaleEvent = [...kinds];
+    bot.emit("chat", "Owner", "stale");
+    bot.emit("end", "stale end");
+    expect(kinds).toEqual(beforeStaleEvent);
+
+    await expect(connection.disconnect()).resolves.toBeUndefined();
+    expect(bot.end).toHaveBeenCalledOnce();
+    expect(socketEnd).toHaveBeenCalledOnce();
+  });
+
+  it("rejects explicit disconnect and terminates without retry when every transport close fails", async () => {
+    const harness = createMineflayerConnectionHarness();
+    const connection = new MineflayerConnection(harness.dependencies);
+    const connecting = connection.connect();
+    harness.spawn();
+    await connecting;
+    const bot = harness.bots[0]!;
+    bot.end.mockImplementation(() => {
+      throw new Error("bot end failed");
+    });
+    const socketEnd = vi.fn(() => {
+      throw new Error("socket end failed");
+    });
+    const socketDestroy = vi.fn(() => {
+      throw new Error("socket destroy failed");
+    });
+    Object.assign(bot._client, {
+      socket: { end: socketEnd, destroy: socketDestroy },
+    });
+    const firstCancel = vi.fn();
+    const secondCancel = vi.fn();
+    connection.registerActiveOperation(firstCancel);
+    connection.registerActiveOperation(secondCancel);
+
+    let disconnectSettlements = 0;
+    const disconnecting = connection.disconnect();
+    void disconnecting.then(
+      () => {
+        disconnectSettlements += 1;
+      },
+      () => {
+        disconnectSettlements += 1;
+      },
+    );
+    await expect(disconnecting).rejects.toThrow("physical transport fence failed");
+    await Promise.resolve();
+
+    expect(bot._client.end).not.toHaveBeenCalled();
+    expect(socketEnd).toHaveBeenCalledOnce();
+    expect(socketDestroy).toHaveBeenCalledOnce();
+    expect(firstCancel).toHaveBeenCalledOnce();
+    expect(secondCancel).toHaveBeenCalledOnce();
+    expect(disconnectSettlements).toBe(1);
+    expect(connection.currentBot()).toBeUndefined();
+    expect(connection.state()).toBe("exhausted");
+    expect(harness.pendingTimers()).toBe(0);
+    await expect(connection.connect()).rejects.toThrow("adapter is stopped");
+    await expect(connection.disconnect()).rejects.toThrow("physical transport fence failed");
+    expect(firstCancel).toHaveBeenCalledOnce();
+    expect(secondCancel).toHaveBeenCalledOnce();
+  });
+
+  it.each(["load_plugin", "attach"] as const)(
+    "uses a socket fallback to isolate a partial bot after %s setup failure",
+    async (failurePoint) => {
+      let harness!: ReturnType<typeof createMineflayerConnectionHarness>;
+      const socketEnd = vi.fn(() => {
+        expect(harness.scheduledDelays()).toEqual([]);
+      });
+      const socketDestroy = vi.fn();
+      harness = createMineflayerConnectionHarness({
+        configureBot: (bot) => {
+          if (failurePoint === "load_plugin") {
+            bot.loadPlugin.mockImplementation(() => {
+              throw new Error("load plugin failed");
+            });
+          } else {
+            bot.throwOnEvent = "death";
+          }
+          bot.end.mockImplementation(() => {
+            throw new Error("bot end failed");
+          });
+          Object.assign(bot._client, {
+            socket: { end: socketEnd, destroy: socketDestroy },
+          });
+        },
+      });
+      const connection = new MineflayerConnection(harness.dependencies);
+      let rejection: unknown;
+      const connecting = connection.connect().catch((error: unknown) => {
+        rejection = error;
+      });
+      const bot = harness.bots[0]!;
+
+      expect(bot.end).toHaveBeenCalledOnce();
+      expect(bot._client.end).not.toHaveBeenCalled();
+      expect(socketEnd).toHaveBeenCalledOnce();
+      expect(socketDestroy).not.toHaveBeenCalled();
+      expect(connection.currentBot()).toBeUndefined();
+      expect(connection.state()).toBe("retrying");
+      expect(harness.scheduledDelays()).toEqual([1_000]);
+      const eventNames = bot.eventNames();
+      bot.emit("spawn");
+      bot.emit("end", "stale");
+      expect(bot.eventNames()).toEqual(eventNames);
+
+      await connection.disconnect();
+      await connecting;
+      expect(rejection).toMatchObject({ name: "AbortError" });
+      expect(harness.pendingTimers()).toBe(0);
+    },
+  );
+
+  it("rejects setup connect and never retries when partial-bot transport fencing fails", async () => {
+    const socketEnd = vi.fn(() => {
+      throw new Error("socket end failed");
+    });
+    const socketDestroy = vi.fn(() => {
+      throw new Error("socket destroy failed");
+    });
+    const harness = createMineflayerConnectionHarness({
+      configureBot: (bot) => {
+        bot.loadPlugin.mockImplementation(() => {
+          throw new Error("load plugin failed");
+        });
+        bot.end.mockImplementation(() => {
+          throw new Error("bot end failed");
+        });
+        Object.assign(bot._client, {
+          socket: { end: socketEnd, destroy: socketDestroy },
+        });
+      },
+    });
+    const connection = new MineflayerConnection(harness.dependencies);
+    let rejection: unknown;
+    const connecting = connection.connect().catch((error: unknown) => {
+      rejection = error;
+    });
+    await Promise.resolve();
+    const observedState = connection.state();
+    const observedTimers = harness.pendingTimers();
+    if (observedState !== "exhausted") await connection.disconnect();
+    await connecting;
+
+    expect(rejection).toMatchObject({
+      name: "MineflayerTransportFenceError",
+      message: expect.stringContaining("physical transport fence failed"),
+    });
+    expect(observedState).toBe("exhausted");
+    expect(observedTimers).toBe(0);
+    expect(connection.currentBot()).toBeUndefined();
+    expect(socketEnd).toHaveBeenCalledOnce();
+    expect(socketDestroy).toHaveBeenCalledOnce();
+    expect(harness.bots[0]?.eventNames()).toEqual([]);
   });
 
   it.each(["client_end", "socket_end", "socket_destroy"] as const)(

@@ -1297,6 +1297,72 @@ describe("MineflayerAdapter", () => {
     expect(bot.waitForTicks).not.toHaveBeenCalled();
   });
 
+  it("rejects a fatal explicit disconnect while settling active and queued actions without new primitives", async () => {
+    const bot = new FakeBot();
+    bot.pathfinder.goto.mockImplementation(() => new Promise<void>(() => undefined));
+    bot.end.mockImplementation(() => {
+      throw new Error("bot end failed");
+    });
+    bot._client.socket.end.mockImplementation(() => {
+      throw new Error("socket end failed");
+    });
+    bot._client.socket.destroy.mockImplementation(() => {
+      throw new Error("socket destroy failed");
+    });
+    createBot.mockReturnValue(bot);
+    const adapter = new MineflayerAdapter(config());
+    const connecting = adapter.connect();
+    bot.emit("spawn");
+    await connecting;
+    const confirmations = new ConfirmationStore();
+    const executor = new ActionExecutor(
+      adapter,
+      {
+        evaluate: () => ({ kind: "allow" }),
+        evaluatePermanent: () => ({ kind: "allow" }),
+      },
+      confirmations,
+      "TestOwner",
+    );
+    const context = {
+      spawn: { x: 0, y: 64, z: 0 },
+      owner: { x: 0, y: 64, z: 0 },
+    };
+    const results: string[] = [];
+    executor.onResult((result) => results.push(result.status));
+    const active = executor.execute(
+      { kind: "move_to", position: { x: 10, y: 64, z: 10 } },
+      context,
+    );
+    const queued = executor.execute({ kind: "jump" }, context);
+    await flush();
+    await flush();
+    await flush();
+    expect(bot.pathfinder.goto).toHaveBeenCalledOnce();
+
+    await expect(adapter.disconnect()).rejects.toThrow("physical transport fence failed");
+    await expect(active).resolves.toEqual({ status: "cancelled" });
+    await expect(queued).resolves.toMatchObject({
+      status: "failed",
+      reason: expect.stringContaining("not connected"),
+    });
+    const subsequent = executor.execute(
+      { kind: "move_to", position: { x: 20, y: 64, z: 20 } },
+      context,
+    );
+    await expect(subsequent).resolves.toMatchObject({
+      status: "failed",
+      reason: expect.stringContaining("not connected"),
+    });
+
+    expect(results).toEqual(["cancelled", "failed", "failed"]);
+    expect(bot.pathfinder.goto).toHaveBeenCalledOnce();
+    expect(bot.waitForTicks).not.toHaveBeenCalled();
+    expect(bot._client.end).not.toHaveBeenCalled();
+    expect(bot._client.socket.end).toHaveBeenCalledOnce();
+    expect(bot._client.socket.destroy).toHaveBeenCalledOnce();
+  });
+
   it.each(["disconnect", "outage"] as const)(
     "does not start a queued action after connection-driven %s cancellation",
     async (cancellationKind) => {

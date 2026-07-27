@@ -8,7 +8,7 @@ import { ChatRouter } from "../../src/companion/chatRouter.js";
 import { CompanionService } from "../../src/companion/companionService.js";
 import { TaskController } from "../../src/companion/taskController.js";
 import type { CodexPort, CodexTurnResult } from "../../src/codex/codexPort.js";
-import type { PersistentState } from "../../src/memory/stateStore.js";
+import type { PersistentState, StateToPersist } from "../../src/memory/stateStore.js";
 import { MemoryStore } from "../../src/memory/memoryStore.js";
 import { StateStore } from "../../src/memory/stateStore.js";
 import { ModeManager } from "../../src/mode/modeManager.js";
@@ -238,7 +238,7 @@ class FakeCodexPort implements CodexPort {
 }
 
 class GateStateStore extends StateStore {
-  readonly savedStates: Array<Omit<PersistentState, "updatedAt">> = [];
+  readonly savedStates: StateToPersist[] = [];
   private saveIndex = 0;
   private readonly gates = new Map<number, Deferred<void>>();
   private readonly reached = new Map<number, Deferred<void>>();
@@ -251,7 +251,7 @@ class GateStateStore extends StateStore {
     }
   }
 
-  override async save(state: Omit<PersistentState, "updatedAt">): Promise<void> {
+  override async save(state: StateToPersist): Promise<void> {
     this.savedStates.push(structuredClone(state));
     const index = this.saveIndex++;
     const gate = this.gates.get(index);
@@ -280,11 +280,12 @@ export interface CompanionHarnessOptions {
   gatedCodexStarts?: number[];
   codexStartErrors?: Array<Error | undefined>;
   modelResults?: Array<string[] | Error>;
-  persistedState?: Omit<PersistentState, "updatedAt">;
+  persistedState?: StateToPersist;
   gatedStateSaves?: number[];
   gateMemoryFileRename?: boolean;
   activeMinecraftWait?: boolean;
   autonomyCanChat?: boolean;
+  storageDirectory?: string;
 }
 
 class FakeAutonomyScheduler {
@@ -361,7 +362,8 @@ export function outcome(
 }
 
 export async function createCompanionHarness(options: CompanionHarnessOptions = {}) {
-  const directory = await mkdtemp(join(tmpdir(), "whitelily-companion-"));
+  const directory =
+    options.storageDirectory ?? (await mkdtemp(join(tmpdir(), "whitelily-companion-")));
   const minecraft = new FakeMinecraftPort();
   minecraft.ownerOnline = true;
   const codex = new FakeCodexPort(options);

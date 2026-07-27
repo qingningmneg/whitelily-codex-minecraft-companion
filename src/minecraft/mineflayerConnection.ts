@@ -126,6 +126,7 @@ export class MineflayerConnection {
   private rejectConnection: ((error: Error) => void) | undefined;
   private worldIdentity: WorldIdentity | undefined;
   private sessionGeneration = 0;
+  private terminalFenceError: MineflayerTransportFenceError | undefined;
 
   constructor(private readonly dependencies: MineflayerConnectionDependencies) {}
 
@@ -152,20 +153,28 @@ export class MineflayerConnection {
 
   async disconnect(): Promise<void> {
     if (this.lifecycleState === "stopped") return;
+    if (this.terminalFenceError) throw this.terminalFenceError;
     const wasConnected = this.lifecycleState === "connected";
     this.lifecycleState = "stopped";
     this.clearRetryTimer();
-    this.rejectConnection?.(abortError());
-    this.clearConnectionPromise();
 
     const bot = this.bot;
     if (bot) {
-      this.detach(bot);
-      this.bot = undefined;
-      this.worldIdentity = undefined;
       this.safelyStopBot(bot);
-      this.safelyEndBot(bot, "adapter disconnect");
+      const fenceErrors = this.establishTransportFence(bot, "adapter disconnect");
+      if (fenceErrors.length > 0) {
+        const error = this.createTransportFenceError("adapter disconnect", fenceErrors);
+        this.handleFenceFailure(bot, error);
+        throw error;
+      }
+      if (this.bot === bot) {
+        this.detach(bot);
+        this.bot = undefined;
+        this.worldIdentity = undefined;
+      }
     }
+    this.rejectConnection?.(abortError());
+    this.clearConnectionPromise();
     this.cancelActiveOperations();
     if (wasConnected && !this.outageNotified) {
       this.emit({ kind: "outage", reason: "adapter disconnect" });
@@ -200,10 +209,7 @@ export class MineflayerConnection {
     this.safelyStopBot(session.bot);
     const fenceErrors = this.establishTransportFence(session.bot, reason);
     if (fenceErrors.length > 0) {
-      const error = new MineflayerTransportFenceError(
-        reason,
-        new AggregateError(fenceErrors, "Every available Minecraft transport close failed"),
-      );
+      const error = this.createTransportFenceError(reason, fenceErrors);
       this.handleFenceFailure(session.bot, error);
       throw error;
     }
@@ -237,8 +243,15 @@ export class MineflayerConnection {
       bot.loadPlugin(this.dependencies.plugin);
       this.attach(bot);
     } catch (error) {
-      if (this.bot) this.cleanupPartialBot(this.bot);
-      this.handleEnd(undefined, error instanceof Error ? error.message : String(error));
+      const reason = error instanceof Error ? error.message : String(error);
+      if (this.bot) {
+        try {
+          this.cleanupPartialBot(this.bot, reason);
+        } catch {
+          return;
+        }
+      }
+      this.handleEnd(undefined, reason);
     }
   }
 
@@ -298,11 +311,20 @@ export class MineflayerConnection {
     this.botHandlers = undefined;
   }
 
-  private cleanupPartialBot(bot: Bot): void {
+  private cleanupPartialBot(bot: Bot, setupReason: string): void {
     this.detach(bot);
-    if (this.bot === bot) this.bot = undefined;
     this.safelyStopBot(bot);
-    this.safelyEndBot(bot, "adapter setup failed");
+    const reason = `adapter setup failed: ${setupReason}`;
+    const fenceErrors = this.establishTransportFence(bot, reason);
+    if (fenceErrors.length > 0) {
+      const error = this.createTransportFenceError(reason, fenceErrors);
+      this.handleFenceFailure(bot, error);
+      throw error;
+    }
+    if (this.bot === bot) {
+      this.bot = undefined;
+      this.worldIdentity = undefined;
+    }
   }
 
   private handleSpawn(bot: Bot): void {
@@ -433,10 +455,6 @@ export class MineflayerConnection {
     this.tryCleanup(() => bot?.clearControlStates?.());
   }
 
-  private safelyEndBot(bot: Bot, reason: string): void {
-    this.tryCleanup(() => bot.end(reason));
-  }
-
   private establishTransportFence(bot: Bot, reason: string): Error[] {
     const candidate = bot as unknown as {
       end?: (reason?: string) => void;
@@ -502,13 +520,26 @@ export class MineflayerConnection {
     return errors;
   }
 
+  private createTransportFenceError(
+    reason: string,
+    fenceErrors: Error[],
+  ): MineflayerTransportFenceError {
+    return new MineflayerTransportFenceError(
+      reason,
+      new AggregateError(fenceErrors, "Every available Minecraft transport close failed"),
+    );
+  }
+
   private handleFenceFailure(bot: Bot, error: MineflayerTransportFenceError): void {
-    if (this.bot !== bot) return;
-    this.detach(bot);
-    this.bot = undefined;
+    if (this.bot && this.bot !== bot) return;
+    if (this.bot === bot) {
+      this.detach(bot);
+      this.bot = undefined;
+    }
     this.worldIdentity = undefined;
     this.clearRetryTimer();
     this.lifecycleState = "exhausted";
+    this.terminalFenceError = error;
     this.rejectConnection?.(error);
     this.clearConnectionPromise();
     if (!this.outageNotified) {

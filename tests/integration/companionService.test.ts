@@ -186,6 +186,43 @@ describe("CompanionService lifecycle", () => {
     });
   });
 
+  it.each(["!resume", "!stop"] as const)(
+    "persists world invalidation across new service instances until explicit %s clears it",
+    async (command) => {
+      const first = await harness();
+      await first.start();
+      first.minecraft.emit({ kind: "world_changed" });
+      await first.untilState((state) => state.paused);
+      await first.stop();
+
+      const second = await harness({ storageDirectory: first.directory });
+      await second.start();
+
+      expect(second.mode.snapshot()).toMatchObject({ paused: true, taskId: null });
+      await expect(second.state.load()).resolves.toMatchObject({
+        paused: true,
+        unfinishedTaskSummary: null,
+        worldInvalidated: true,
+      });
+
+      await emitCommand(second, command);
+      await expect(second.state.load()).resolves.toMatchObject({
+        paused: command === "!stop",
+        unfinishedTaskSummary: null,
+        worldInvalidated: false,
+      });
+      await second.stop();
+
+      const third = await harness({ storageDirectory: first.directory });
+      await third.start();
+
+      expect(third.mode.snapshot()).toMatchObject({ paused: false, taskId: null });
+      await expect(third.state.load()).resolves.toMatchObject({
+        worldInvalidated: false,
+      });
+    },
+  );
+
   it.each(["deadline", "budget overflow"] as const)(
     "%s actively cancels in-flight and queued work with one terminal transition",
     async (trigger) => {
@@ -514,11 +551,36 @@ describe("CompanionService lifecycle", () => {
     expect(value.mode.snapshot()).toMatchObject({ mode: "balanced", paused: true });
     expect(await value.state.load()).toMatchObject({ lastMode: "balanced", paused: true });
     expect(value.savedStates).toEqual([
-      { lastMode: "autonomous", paused: false, unfinishedTaskSummary: null },
-      { lastMode: "autonomous", paused: true, unfinishedTaskSummary: null },
-      { lastMode: "friend", paused: false, unfinishedTaskSummary: null },
-      { lastMode: "balanced", paused: false, unfinishedTaskSummary: null },
-      { lastMode: "balanced", paused: true, unfinishedTaskSummary: null },
+      {
+        lastMode: "autonomous",
+        paused: false,
+        unfinishedTaskSummary: null,
+        worldInvalidated: false,
+      },
+      {
+        lastMode: "autonomous",
+        paused: true,
+        unfinishedTaskSummary: null,
+        worldInvalidated: false,
+      },
+      {
+        lastMode: "friend",
+        paused: false,
+        unfinishedTaskSummary: null,
+        worldInvalidated: false,
+      },
+      {
+        lastMode: "balanced",
+        paused: false,
+        unfinishedTaskSummary: null,
+        worldInvalidated: false,
+      },
+      {
+        lastMode: "balanced",
+        paused: true,
+        unfinishedTaskSummary: null,
+        worldInvalidated: false,
+      },
     ]);
   });
 

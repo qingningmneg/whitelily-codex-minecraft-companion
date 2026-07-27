@@ -17,7 +17,49 @@ describe("StateStore", () => {
       lastMode: "friend",
       paused: false,
       unfinishedTaskSummary: null,
+      worldInvalidated: false,
     });
+  });
+
+  it("loads a legacy state without a world marker as safely not invalidated", async () => {
+    const path = await statePath();
+    await writeFile(
+      path,
+      JSON.stringify({
+        lastMode: "friend",
+        paused: false,
+        unfinishedTaskSummary: null,
+      }),
+      "utf8",
+    );
+
+    await expect(new StateStore(path).load()).resolves.toMatchObject({
+      paused: false,
+      worldInvalidated: false,
+    });
+  });
+
+  it("persists the world invalidation marker without persisting runtime authority", async () => {
+    const path = await statePath();
+    await new StateStore(path).save({
+      lastMode: "friend",
+      paused: true,
+      unfinishedTaskSummary: null,
+      worldInvalidated: true,
+      leaseId: "must-not-persist",
+      goal: "must-not-persist",
+      chat: "must-not-persist",
+    } as never);
+
+    const stored = JSON.parse(await readFile(path, "utf8")) as Record<string, unknown>;
+    expect(stored).toMatchObject({
+      paused: true,
+      unfinishedTaskSummary: null,
+      worldInvalidated: true,
+    });
+    expect(stored).not.toHaveProperty("leaseId");
+    expect(stored).not.toHaveProperty("goal");
+    expect(stored).not.toHaveProperty("chat");
   });
 
   it("persists only a compact unfinished-task summary", async () => {
@@ -92,6 +134,12 @@ describe("StateStore", () => {
     { lastMode: "unsafe", paused: false, unfinishedTaskSummary: null },
     { lastMode: "friend", paused: "false", unfinishedTaskSummary: null },
     { lastMode: "friend", paused: false, unfinishedTaskSummary: 7 },
+    {
+      lastMode: "friend",
+      paused: true,
+      unfinishedTaskSummary: null,
+      worldInvalidated: "true",
+    },
     { lastMode: "friend", paused: false, unfinishedTaskSummary: null, updatedAt: 7 },
     { lastMode: "friend", paused: false, unfinishedTaskSummary: null, chat: "raw transcript" },
   ])("rejects a tampered state shape: %j", async (state) => {

@@ -146,6 +146,7 @@ async function initializeStorage(paths: AppPaths): Promise<void> {
         lastMode: "friend",
         paused: false,
         unfinishedTaskSummary: null,
+        worldInvalidated: false,
       },
       null,
       2,

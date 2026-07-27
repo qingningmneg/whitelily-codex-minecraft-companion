@@ -7,13 +7,19 @@ export interface PersistentState {
   lastMode: CompanionMode;
   paused: boolean;
   unfinishedTaskSummary: string | null;
+  worldInvalidated: boolean;
   updatedAt?: string;
 }
+
+export type StateToPersist = Omit<PersistentState, "updatedAt" | "worldInvalidated"> & {
+  worldInvalidated?: boolean;
+};
 
 const initialState: PersistentState = {
   lastMode: "friend",
   paused: false,
   unfinishedTaskSummary: null,
+  worldInvalidated: false,
 };
 const modes = new Set<CompanionMode>(["friend", "balanced", "autonomous"]);
 const writeQueues = new Map<string, Promise<unknown>>();
@@ -27,16 +33,31 @@ function serializeByPath<T>(path: string, operation: () => Promise<T>): Promise<
   });
 }
 
-function isPersistentState(value: unknown): value is PersistentState {
+interface StoredState {
+  lastMode: CompanionMode;
+  paused: boolean;
+  unfinishedTaskSummary: string | null;
+  worldInvalidated?: boolean;
+  updatedAt?: string;
+}
+
+function isPersistentState(value: unknown): value is StoredState {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
   const state = value as Record<string, unknown>;
-  const allowed = new Set(["lastMode", "paused", "unfinishedTaskSummary", "updatedAt"]);
+  const allowed = new Set([
+    "lastMode",
+    "paused",
+    "unfinishedTaskSummary",
+    "worldInvalidated",
+    "updatedAt",
+  ]);
   if (!Object.keys(state).every((key) => allowed.has(key))) return false;
   return (
     typeof state.lastMode === "string" &&
     modes.has(state.lastMode as CompanionMode) &&
     typeof state.paused === "boolean" &&
     (typeof state.unfinishedTaskSummary === "string" || state.unfinishedTaskSummary === null) &&
+    (state.worldInvalidated === undefined || typeof state.worldInvalidated === "boolean") &&
     (state.updatedAt === undefined ||
       (typeof state.updatedAt === "string" && !Number.isNaN(Date.parse(state.updatedAt))))
   );
@@ -58,15 +79,17 @@ export class StateStore {
       lastMode: parsed.lastMode,
       paused: parsed.paused,
       unfinishedTaskSummary: parsed.unfinishedTaskSummary,
+      worldInvalidated: parsed.worldInvalidated ?? false,
       ...(parsed.updatedAt === undefined ? {} : { updatedAt: parsed.updatedAt }),
     };
   }
 
-  save(state: Omit<PersistentState, "updatedAt">): Promise<void> {
+  save(state: StateToPersist): Promise<void> {
     const persisted: PersistentState = {
       lastMode: state.lastMode,
       paused: state.paused,
       unfinishedTaskSummary: state.unfinishedTaskSummary,
+      worldInvalidated: state.worldInvalidated ?? false,
       updatedAt: new Date().toISOString(),
     };
     if (!isPersistentState(persisted))
