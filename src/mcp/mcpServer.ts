@@ -26,7 +26,7 @@ interface ActiveRequest {
 }
 
 function createServerForRequest(dependencies: ToolRegistryDependencies): McpServer {
-  const server = new McpServer({ name: "whitelily-minecraft", version: "0.1.0" });
+  const server = new McpServer({ name: "whitelily-minecraft", version: "0.1.1" });
   for (const [name, tool] of Object.entries(createToolRegistry(dependencies))) {
     server.registerTool(
       name,

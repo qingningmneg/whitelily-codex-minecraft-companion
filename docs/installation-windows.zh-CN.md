@@ -1,6 +1,6 @@
 # Windows 11 + PCL2 安装指南
 
-本指南适用于 WhiteLily v0.1.0、Windows 11、Plain Craft Launcher 2（PCL2）和 Minecraft Java 版 1.21.5。
+本指南适用于 WhiteLily v0.1.1、Windows 11、Plain Craft Launcher 2（PCL2）和 Minecraft Java 版 1.21.5。
 
 白百合不是 Minecraft 客户端模组。她会在 Windows 后台运行，以 Mineflayer 机器人身份加入你开放到局域网的世界；你仍然只需在 Minecraft 聊天框中和她交流。
 
@@ -42,14 +42,14 @@ codex login
 
 推荐从 GitHub Releases 下载：
 
-- `whitelily-0.1.0-windows-x64.zip`
-- `whitelily-0.1.0-windows-x64.zip.sha256`
+- `whitelily-0.1.1-windows-x64.zip`
+- `whitelily-0.1.1-windows-x64.zip.sha256`
 
 两个文件放在同一目录后，在该目录打开 PowerShell，计算 ZIP 的 SHA-256：
 
 ```powershell
-(Get-FileHash -Algorithm SHA256 .\whitelily-0.1.0-windows-x64.zip).Hash.ToLowerInvariant()
-Get-Content .\whitelily-0.1.0-windows-x64.zip.sha256
+(Get-FileHash -Algorithm SHA256 .\whitelily-0.1.1-windows-x64.zip).Hash.ToLowerInvariant()
+Get-Content .\whitelily-0.1.1-windows-x64.zip.sha256
 ```
 
 两处显示的 64 位十六进制哈希必须一致。如果不一致，不要运行压缩包中的脚本，请重新下载。
