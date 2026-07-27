@@ -272,10 +272,16 @@ export function createToolRegistry(dependencies: ToolRegistryDependencies) {
       dangerousOperations: classifyActionRisk(action, initialContext).dangerousOperations,
     });
     if (exhausted) return exhausted;
+    const taskLease = dependencies.budget.currentTaskLease(lease);
+    if (!taskLease) return errorResult("tool turn lease is invalid");
     if (horizontalTravel !== undefined)
       dependencies.budget.recordHorizontalTravel(horizontalTravel);
     try {
-      const context = actionContext(baseContext, action, dependencies.budget);
+      const context = {
+        ...actionContext(baseContext, action, dependencies.budget),
+        taskLease,
+        ...(horizontalTravel === undefined ? {} : { reservedHorizontalTravel: horizontalTravel }),
+      };
       return toToolResult(await dependencies.executor.execute(action, context));
     } catch (error) {
       return errorResult(safeMessage(error));
@@ -487,6 +493,8 @@ export function createToolRegistry(dependencies: ToolRegistryDependencies) {
           dangerousOperations: classifyActionRisk(action, context).dangerousOperations,
         });
         if (exhausted) return exhausted;
+        const taskLease = dependencies.budget.currentTaskLease(lease);
+        if (!taskLease) return errorResult("tool turn lease is invalid");
         try {
           if (!hasDroppedItem(currentSnapshot(), droppedId))
             return errorResult("dropped entity ID is not present in the latest snapshot");
@@ -494,7 +502,12 @@ export function createToolRegistry(dependencies: ToolRegistryDependencies) {
           return errorResult(safeMessage(error));
         }
         try {
-          return toToolResult(await dependencies.executor.execute(action, context));
+          return toToolResult(
+            await dependencies.executor.execute(action, {
+              ...context,
+              taskLease,
+            }),
+          );
         } catch (error) {
           return errorResult(safeMessage(error));
         }

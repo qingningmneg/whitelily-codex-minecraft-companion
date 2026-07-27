@@ -79,6 +79,18 @@ describe("TurnToolBudget", () => {
     expect(taskBudget.snapshot().toolCalls).toBe(0);
   });
 
+  it("exposes the live task capability only to its matching active turn", () => {
+    const taskBudget = new TaskControllerBudget();
+    const taskLease = taskBudget.begin();
+    const budget = new TurnToolBudget(taskBudget);
+    const turnLease = budget.begin(taskLease);
+
+    expect(budget.currentTaskLease(turnLease)).toEqual(taskLease);
+    expect(budget.currentTaskLease("x".repeat(43))).toBeUndefined();
+    taskBudget.invalidate("owner_stop");
+    expect(budget.currentTaskLease(turnLease)).toBeUndefined();
+  });
+
   it("delegates accepted calls to its supplied task lease", () => {
     const taskBudget = new TaskControllerBudget();
     const taskLease = taskBudget.begin();

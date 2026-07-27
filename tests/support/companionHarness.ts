@@ -413,10 +413,15 @@ export async function createCompanionHarness(options: CompanionHarnessOptions = 
   const budget = new TurnToolBudget(taskBudget);
   const executor = new ActionExecutor(
     minecraft,
-    new SafetyEngine(confirmations),
+    new SafetyEngine(confirmations, undefined, (lease) => taskController.isLeaseLive(lease)),
     confirmations,
     "TestOwner",
     () => taskController.stop("owner_stop"),
+    {
+      isLeaseLive: (lease) => taskController.isLeaseLive(lease),
+      reserveAdditionalTravel: (lease, horizontalTravel) =>
+        taskController.reserveAdditionalTravel(lease, horizontalTravel),
+    },
   );
   const autonomy = new FakeAutonomyScheduler(options.autonomyCanChat ?? true);
   const budgetEvents: string[] = [];

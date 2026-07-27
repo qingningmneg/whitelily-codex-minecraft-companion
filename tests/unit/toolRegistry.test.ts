@@ -583,7 +583,14 @@ describe("Minecraft MCP tools", () => {
 
     expect(result).toEqual({ text: '{"status":"completed"}' });
     expect(harness.budget.snapshot().cumulativeHorizontalTravel).toBe(300);
-    expect(harness.contexts.at(-1)).toMatchObject({ estimatedTravelDistance: 300 });
+    expect(harness.contexts.at(-1)).toMatchObject({
+      estimatedTravelDistance: 300,
+      reservedHorizontalTravel: 300,
+      taskLease: {
+        id: expect.any(String),
+        startedAt: expect.any(Number),
+      },
+    });
   });
 
   it("reads a fresh actual position for each movement segment", async () => {

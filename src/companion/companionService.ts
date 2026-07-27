@@ -204,6 +204,7 @@ export class CompanionService {
   private codexHealthy = true;
   private activeTurn: ActiveTurn | undefined;
   private turnTail: Promise<void> = Promise.resolve();
+  private confirmationTail: Promise<void> = Promise.resolve();
   private recoveryFlight: Promise<void> | undefined;
   private unfinishedTaskSummary: string | null = null;
   private readonly startupEvents: MinecraftEvent[] = [];
@@ -312,6 +313,7 @@ export class CompanionService {
     this.activeTurn = undefined;
     const tail = this.turnTail;
     const recovery = this.recoveryFlight;
+    const confirmation = this.confirmationTail.catch(() => undefined);
     const stoppingCodex = this.externallyManagedCodex
       ? Promise.resolve()
       : this.dependencies.codex
@@ -321,8 +323,8 @@ export class CompanionService {
           );
     const pendingWork =
       this.externallyManagedCodex && recovery
-        ? []
-        : [tail.catch(() => undefined), recovery?.catch(() => undefined)];
+        ? [confirmation]
+        : [tail.catch(() => undefined), recovery?.catch(() => undefined), confirmation];
     await Promise.all([...pendingWork, stoppingCodex]);
   }
 
@@ -386,7 +388,11 @@ export class CompanionService {
   }
 
   private onOwnerMessage(message: string): void {
-    if (this.dependencies.mode.getMode() === "autonomous" || this.autonomousRequestCount > 0) {
+    if (
+      this.dependencies.mode.getMode() === "autonomous" ||
+      this.autonomousRequestCount > 0 ||
+      this.dependencies.taskController.current() !== null
+    ) {
       this.dependencies.mode.completeTask();
       this.dependencies.taskController.stop("owner_stop");
       this.dependencies.executor.stopAll();
@@ -448,6 +454,7 @@ export class CompanionService {
     if (!this.running) return;
     const state = this.dependencies.mode.snapshot();
     if (state.mode === "friend" || state.paused) return;
+    if (this.dependencies.taskController.current() !== null) return;
     const generation = this.generation;
     this.autonomousRequestCount += 1;
     const queued = this.turnTail
@@ -469,6 +476,7 @@ export class CompanionService {
       this.turnWorkCount > 0 ||
       this.activeTurn !== undefined ||
       this.recoveryFlight !== undefined ||
+      this.dependencies.taskController.current() !== null ||
       this.dependencies.executor.isBusy() ||
       this.mergeTimer !== undefined ||
       this.mergedMessages.length > 0
@@ -481,6 +489,7 @@ export class CompanionService {
       if (!this.isCurrent(generation) || !this.threadId) return;
       const state = this.dependencies.mode.snapshot();
       if (state.mode === "friend" || state.paused) return;
+      if (this.dependencies.taskController.current() !== null) return;
       if (!(await this.dependencies.minecraft.isOwnerOnline(this.dependencies.ownerUsername)))
         return;
       if (!this.isCurrent(generation)) return;
@@ -561,7 +570,12 @@ export class CompanionService {
       return undefined;
     } finally {
       if (task && this.dependencies.taskController.current()?.id === task.id) {
-        this.dependencies.taskController.stop(taskStopReason);
+        if (
+          taskStopReason !== "completed" ||
+          !this.dependencies.confirmations.hasGameActions(task.lease)
+        ) {
+          this.dependencies.taskController.stop(taskStopReason);
+        }
       }
     }
   }
@@ -895,11 +909,10 @@ export class CompanionService {
           return;
         }
         case "deny":
-          this.dependencies.confirmations.deny(command.confirmationId);
-          await this.say("已取消确认。");
+          await this.serializeConfirmation(() => this.deny(command.confirmationId));
           return;
         case "allow":
-          await this.allow(command.confirmationId);
+          await this.serializeConfirmation(() => this.allow(command.confirmationId));
           return;
       }
     } catch (error) {
@@ -908,13 +921,18 @@ export class CompanionService {
     }
   }
 
+  private serializeConfirmation(operation: () => Promise<void>): Promise<void> {
+    const queued = this.confirmationTail.then(operation, operation);
+    this.confirmationTail = queued.catch(() => undefined);
+    return queued;
+  }
+
   private async allow(id: number): Promise<void> {
-    const pendingBeforeContext = this.dependencies.confirmations.get(id);
-    if (!pendingBeforeContext) {
-      await this.say("确认不存在或已过期。");
-      return;
-    }
-    if (pendingBeforeContext.operation.kind === "game_action") {
+    const task = this.dependencies.taskController.current();
+    const inspected = task
+      ? this.dependencies.confirmations.inspectGameAction(id, task.lease)
+      : undefined;
+    if (task && inspected?.ok) {
       let context: SafetyContext;
       try {
         context = await this.dependencies.safetyContextProvider();
@@ -922,14 +940,55 @@ export class CompanionService {
         await this.say("无法取得安全上下文，确认未被使用。");
         return;
       }
-      const pending = this.dependencies.confirmations.get(id);
-      if (!pending || pending.operation.kind !== "game_action") {
+      let additionalHorizontalTravel = 0;
+      if (inspected.action.kind === "move_to") {
+        let snapshot;
+        try {
+          snapshot = await this.dependencies.minecraft.snapshot(this.dependencies.ownerUsername);
+        } catch {
+          await this.say("无法取得安全上下文，确认未被使用。");
+          return;
+        }
+        const freshDistance = Math.hypot(
+          inspected.action.position.x - snapshot.botPosition.x,
+          inspected.action.position.z - snapshot.botPosition.z,
+        );
+        if (!Number.isFinite(freshDistance)) {
+          await this.say("无法取得安全上下文，确认未被使用。");
+          return;
+        }
+        additionalHorizontalTravel = Math.max(
+          0,
+          freshDistance - inspected.reservedHorizontalTravel,
+        );
+      }
+      const result = await this.dependencies.executor.executeConfirmed(
+        id,
+        { ...context, taskLease: { ...task.lease } },
+        task.lease,
+        additionalHorizontalTravel,
+      );
+      if (this.dependencies.taskController.isLeaseLive(task.lease)) {
+        if (result.status !== "completed") {
+          this.dependencies.taskController.stop("failed");
+        } else if (!this.dependencies.confirmations.hasGameActions(task.lease)) {
+          this.dependencies.taskController.stop("completed");
+        }
+      }
+      await this.say(result.status === "completed" ? "已执行确认动作。" : "确认动作未能执行。");
+      return;
+    }
+    if (task && inspected && !inspected.ok) {
+      if (
+        inspected.reason === "expired" &&
+        this.dependencies.taskController.isLeaseLive(task.lease)
+      ) {
+        this.dependencies.taskController.stop("failed");
+      }
+      if (inspected.reason === "expired" || inspected.reason === "wrong_task") {
         await this.say("确认不存在或已过期。");
         return;
       }
-      const result = await this.dependencies.executor.executeConfirmed(id, context);
-      await this.say(result.status === "completed" ? "已执行确认动作。" : "确认动作未能执行。");
-      return;
     }
     const pending = this.dependencies.confirmations.get(id);
     if (!pending || pending.operation.kind !== "memory_clear") {
@@ -945,6 +1004,32 @@ export class CompanionService {
     await this.say("确认不存在或已过期。");
   }
 
+  private async deny(id: number): Promise<void> {
+    const task = this.dependencies.taskController.current();
+    if (task) {
+      const denied = this.dependencies.confirmations.denyGameAction(id, task.lease);
+      if (denied.ok) {
+        if (
+          this.dependencies.taskController.isLeaseLive(task.lease) &&
+          !this.dependencies.confirmations.hasGameActions(task.lease)
+        ) {
+          this.dependencies.taskController.stop("owner_stop");
+        }
+        await this.say("已取消确认。");
+        return;
+      }
+      if (denied.reason === "expired" && this.dependencies.taskController.isLeaseLive(task.lease)) {
+        this.dependencies.taskController.stop("failed");
+      }
+      if (denied.reason === "expired" || denied.reason === "wrong_task") {
+        await this.say("已取消确认。");
+        return;
+      }
+    }
+    this.dependencies.confirmations.deny(id);
+    await this.say("已取消确认。");
+  }
+
   private interruptActive(): void {
     const active = this.activeTurn;
     if (!active) return;
@@ -958,17 +1043,17 @@ export class CompanionService {
   }
 
   private handleTaskTerminal(reason: TaskStopReason, forceCleanup = false): void {
+    try {
+      this.dependencies.confirmations.clearGameActions();
+    } catch (error) {
+      void this.logger.error("task_terminal_confirmation_clear_failed", { code: String(error) });
+    }
     if (!forceCleanup && reason !== "timeout" && reason !== "budget_exhausted") return;
     this.invalidateCurrentTurn();
     try {
       this.dependencies.executor.stopAll();
     } catch (error) {
       void this.logger.error("task_terminal_executor_stop_failed", { code: String(error) });
-    }
-    try {
-      this.dependencies.confirmations.clear();
-    } catch (error) {
-      void this.logger.error("task_terminal_confirmation_clear_failed", { code: String(error) });
     }
     try {
       this.dependencies.mode.stop();

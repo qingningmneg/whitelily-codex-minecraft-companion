@@ -64,6 +64,29 @@ describe("TaskControllerBudget", () => {
     });
   });
 
+  it("charges only additional confirmed travel without adding a second tool call", () => {
+    const budget = new TaskControllerBudget({ now: () => 0 });
+    const lease = budget.begin({ maxHorizontalTravel: 400 });
+    expect(budget.consume({ lease, kind: "move_to", now: 1, horizontalTravel: 300 }).ok).toBe(true);
+
+    expect(budget.consumeAdditionalTravel(lease, 2, 100).ok).toBe(true);
+    expect(budget.snapshot()).toMatchObject({
+      active: true,
+      toolCalls: 1,
+      horizontalTravel: 400,
+    });
+    expect(budget.consumeAdditionalTravel(lease, 3, 1)).toEqual({
+      ok: false,
+      reason: "task budget exhausted",
+    });
+    expect(budget.snapshot()).toMatchObject({
+      active: false,
+      stopReason: "budget_exhausted",
+      toolCalls: 1,
+      horizontalTravel: 400,
+    });
+  });
+
   it("rejects malformed consumption input as an invalid lease without throwing", () => {
     const budget = new TaskControllerBudget({ now: () => 0 });
     budget.begin();

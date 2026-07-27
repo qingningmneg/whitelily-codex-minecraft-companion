@@ -1,6 +1,6 @@
 import { appendFile, mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
-import { redactSecrets } from "../memory/redaction.js";
+import { redactPublicText, redactSecrets } from "../memory/redaction.js";
 
 const writeQueues = new Map<string, Promise<unknown>>();
 
@@ -23,7 +23,7 @@ function isFullChatField(key: string): boolean {
 }
 
 function sanitize(value: unknown, seen = new WeakSet<object>()): unknown {
-  if (typeof value === "string") return redactSecrets(value);
+  if (typeof value === "string") return redactPublicText(value);
   if (typeof value === "bigint") return value.toString();
   if (typeof value === "undefined" || typeof value === "function" || typeof value === "symbol") {
     return "[UNSERIALIZABLE]";
@@ -34,7 +34,7 @@ function sanitize(value: unknown, seen = new WeakSet<object>()): unknown {
     try {
       const code = (value as Error & { code?: unknown }).code;
       return {
-        name: redactSecrets(value.name),
+        name: redactPublicText(value.name),
         ...(code === undefined ? {} : { code: sanitize(code, seen) }),
       };
     } finally {

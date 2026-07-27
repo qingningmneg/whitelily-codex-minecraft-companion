@@ -822,46 +822,74 @@ describe("MineflayerAdapter", () => {
     expect(bot.blockAt).not.toHaveBeenCalled();
   });
 
-  it("physically stops a deferred dig and never completes it after abort", async () => {
-    const bot = new FakeBot();
-    bot.blockAt.mockReturnValue({ name: "stone" });
-    let resolveDig: (() => void) | undefined;
-    bot.dig.mockImplementation(
-      () =>
+  it.each(["resolve", "reject"] as const)(
+    "keeps an aborted dig pending until the cancellation fence when the original dig %s",
+    async (originalOutcome) => {
+      vi.useFakeTimers();
+      const bot = new FakeBot();
+      bot.blockAt.mockReturnValue({ name: "stone" });
+      let settleDig: (() => void) | undefined;
+      let acknowledgeStop: (() => void) | undefined;
+      bot.dig.mockImplementation(
+        () =>
+          new Promise<void>((resolve, reject) => {
+            settleDig = () =>
+              originalOutcome === "resolve"
+                ? resolve()
+                : reject(new Error("stale original dig failure"));
+          }),
+      );
+      bot.stopDigging.mockReturnValue(
         new Promise<void>((resolve) => {
-          resolveDig = resolve;
+          acknowledgeStop = resolve;
         }),
-    );
-    createBot.mockReturnValue(bot);
-    const adapter = new MineflayerAdapter(config());
-    const connecting = adapter.connect();
-    bot.emit("spawn");
-    await connecting;
+      );
+      createBot.mockReturnValue(bot);
+      const adapter = new MineflayerAdapter(config());
+      const connecting = adapter.connect();
+      bot.emit("spawn");
+      await connecting;
 
-    const controller = new AbortController();
-    const digging = adapter.digBlock({ x: 1, y: 64, z: 1 }, "stone", controller.signal);
-    await flush();
-    controller.abort();
-    let outcome = "pending";
-    void digging.then(
-      () => {
-        outcome = "resolved";
-      },
-      () => {
-        outcome = "aborted";
-      },
-    );
+      const controller = new AbortController();
+      const digging = adapter.digBlock({ x: 1, y: 64, z: 1 }, "stone", controller.signal);
+      await flush();
+      let outcome = "pending";
+      let settlements = 0;
+      void digging.then(
+        () => {
+          outcome = "resolved";
+          settlements += 1;
+        },
+        () => {
+          outcome = "aborted";
+          settlements += 1;
+        },
+      );
 
-    await flush();
-    await flush();
-    await flush();
-    expect(outcome).toBe("pending");
-    expect(bot.stopDigging).toHaveBeenCalledOnce();
-    expect(bot.pathfinder.stop).toHaveBeenCalled();
-    resolveDig?.();
-    await expect(digging).rejects.toMatchObject({ name: "AbortError" });
-    expect(outcome).toBe("aborted");
-  });
+      controller.abort();
+      settleDig?.();
+      await flush();
+      await flush();
+      expect(outcome).toBe("pending");
+      expect(bot.stopDigging).toHaveBeenCalledOnce();
+      expect(bot.pathfinder.stop).toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(999);
+      expect(outcome).toBe("pending");
+      expect(bot.end).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(1);
+      await expect(digging).rejects.toMatchObject({ name: "AbortError" });
+      expect(outcome).toBe("aborted");
+      expect(settlements).toBe(1);
+      expect(bot.end).toHaveBeenCalledOnce();
+
+      acknowledgeStop?.();
+      await flush();
+      expect(settlements).toBe(1);
+      vi.useRealTimers();
+    },
+  );
 
   it("accepts a resolved stopDigging thenable as the physical cancellation acknowledgement", async () => {
     const bot = new FakeBot();

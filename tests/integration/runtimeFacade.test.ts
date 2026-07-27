@@ -788,7 +788,7 @@ describe("RuntimeFacade", () => {
     const task = activeTaskFixture();
     task.disclosure = {
       ...task.disclosure,
-      goal: `Collect spruce safely password=hunter2 Bearer abcdefghijklmnopqrstuvwxyz.123456 at C:\\Users\\Owner\\private with ${task.lease.id}`,
+      goal: `Collect spruce safely password=hunter2 Bearer abcdefghijklmnopqrstuvwxyz.123456 Bearer abcdefghijklmnop+private== authorization: bearer abcdefghijklmnop/private= at C:\\Users\\Owner\\private with ${task.lease.id}`,
       expectedActions: [
         "move SERVICE_TOKEN=private-action-token",
         "place redis://player:private-uri-password@localhost/world",
@@ -796,6 +796,8 @@ describe("RuntimeFacade", () => {
         JSON.stringify({ token: "json-private-secret", note: "craft safely" }),
         "wait turnLease=turn-private-lease-id",
         "read file:///home/file-owner/private and file:///D:/PrivateWorkspace/owner/private",
+        "connect https://opaque-access-token@example.invalid/world",
+        "connect redis://cache-user%3Aprivate-password@example.invalid/0",
       ],
       stopCondition:
         "Stop safely under %USERPROFILE%\\WhiteLily or ~/private or /home/owner/private or /var/tmp/private",
@@ -831,11 +833,15 @@ describe("RuntimeFacade", () => {
     expect(task.disclosure.goal).toContain("hunter2");
     expect(task.disclosure.goal).toContain(task.lease.id);
     expect(snapshot.task?.disclosure.stopCondition).toContain("Stop safely");
-    expect(snapshot.task?.disclosure.expectedActions).toHaveLength(6);
+    expect(snapshot.task?.disclosure.expectedActions).toHaveLength(8);
     expect(cliJson).toContain("craft safely");
     for (const sensitive of [
       "hunter2",
       "abcdefghijklmnopqrstuvwxyz.123456",
+      "+private==",
+      "/private=",
+      "opaque-access-token",
+      "cache-user%3Aprivate-password",
       "private-action-token",
       "private-uri-password",
       "json-private-secret",

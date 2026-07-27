@@ -1,6 +1,7 @@
 import type { GameAction, SafetyDecision, Vec3 } from "../domain/types.js";
 import { ConfirmationStore } from "./confirmationStore.js";
 import { canonicalMinecraftName, classifyActionRisk } from "./actionRisk.js";
+import type { TaskLease } from "./taskBudget.js";
 
 export interface SafetyContext {
   spawn?: Vec3;
@@ -11,6 +12,8 @@ export interface SafetyContext {
   isPassiveTarget?: boolean;
   protectedTarget?: "player" | "villager" | "pet";
   isValuableItem?: boolean;
+  taskLease?: TaskLease;
+  reservedHorizontalTravel?: number;
 }
 
 export interface SafetyLimits {
@@ -35,6 +38,7 @@ export class SafetyEngine {
   constructor(
     private readonly confirmations: ConfirmationStore,
     private readonly limits: SafetyLimits = defaultLimits,
+    private readonly isTaskLeaseLive: (lease: TaskLease) => boolean = () => false,
   ) {}
 
   evaluatePermanent(action: GameAction, context: SafetyContext): SafetyDecision {
@@ -68,10 +72,22 @@ export class SafetyEngine {
 
     if (!reason) return { kind: "allow" };
 
-    const pending = this.confirmations.create(reason, {
-      kind: "game_action",
+    if (!context.taskLease || !this.isTaskLeaseLive(context.taskLease)) {
+      return {
+        kind: "deny",
+        reason: "A live task capability is required for confirmation",
+      };
+    }
+    const reservedHorizontalTravel =
+      action.kind === "move_to"
+        ? (context.reservedHorizontalTravel ?? horizontalDistance(action.position, context.owner))
+        : 0;
+    const pending = this.confirmations.createGameAction(
+      reason,
       action,
-    });
+      context.taskLease,
+      reservedHorizontalTravel,
+    );
     return {
       kind: "confirm",
       reason,

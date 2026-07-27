@@ -13,7 +13,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, join, resolve } from "node:path";
+import { basename, join, posix, resolve } from "node:path";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
@@ -49,6 +49,8 @@ export interface ReleasePackage {
   checksumMatches: boolean;
   firstHash: string;
   secondHash: string;
+  readmeLocalLinks: string[];
+  missingReadmeLocalLinks: string[];
 }
 
 async function run(command: string, args: string[], cwd: string): Promise<string> {
@@ -171,6 +173,17 @@ export async function runReleasePackage(version: string): Promise<ReleasePackage
       join(repositoryRoot, "docs", "windows-smoke-test.md"),
       join(fixture, "docs", "windows-smoke-test.md"),
     );
+    await cp(
+      join(repositoryRoot, "docs", "installation-windows.zh-CN.md"),
+      join(fixture, "docs", "installation-windows.zh-CN.md"),
+    );
+    await cp(
+      join(repositoryRoot, "docs", "runtime-architecture.md"),
+      join(fixture, "docs", "runtime-architecture.md"),
+    );
+    for (const file of ["README.md", "README.zh-CN.md", "SECURITY.md", "CONTRIBUTING.md"]) {
+      await cp(join(repositoryRoot, file), join(fixture, file));
+    }
     await cp(join(repositoryRoot, "config.example.toml"), join(fixture, "config.example.toml"));
     await writeFile(join(fixture, "src", "index.txt"), "fixture runtime source\n", "utf8");
     await writeFile(
@@ -254,6 +267,24 @@ export async function runReleasePackage(version: string): Promise<ReleasePackage
       .map((entry) => entry.trim())
       .filter(Boolean);
     const entries = rawEntries.map((entry) => entry.replaceAll("\\", "/"));
+    const entrySet = new Set(entries);
+    const readmeLocalLinks: string[] = [];
+    for (const readme of ["README.md", "README.zh-CN.md"]) {
+      const packagedReadme = await run("tar", ["-xOf", zip, readme], fixture);
+      for (const match of packagedReadme.matchAll(/\[[^\]]*\]\(([^)]+)\)/gu)) {
+        const rawTarget = match[1]!.trim().replace(/^<|>$/gu, "");
+        if (rawTarget.startsWith("#") || /^[A-Za-z][A-Za-z0-9+.-]*:/u.test(rawTarget)) {
+          continue;
+        }
+        const withoutFragment = rawTarget.split("#", 1)[0]!;
+        if (!withoutFragment) continue;
+        readmeLocalLinks.push(posix.normalize(posix.join(posix.dirname(readme), withoutFragment)));
+      }
+    }
+    const uniqueReadmeLocalLinks = [...new Set(readmeLocalLinks)].sort();
+    const missingReadmeLocalLinks = uniqueReadmeLocalLinks.filter(
+      (target) => !entrySet.has(target),
+    );
     const credentialEntry = `src/${credentialName}.txt`;
     const hasUntrackedCredential = entries.includes(credentialEntry);
     const checksum = (await readFile(`${zip}.sha256`, "utf8")).trim().split(/\s+/)[0];
@@ -279,6 +310,8 @@ export async function runReleasePackage(version: string): Promise<ReleasePackage
       checksumMatches: checksum === firstHash,
       firstHash,
       secondHash,
+      readmeLocalLinks: uniqueReadmeLocalLinks,
+      missingReadmeLocalLinks,
     };
   } finally {
     if (basename(fixture).startsWith("whitelily-release-package-")) {

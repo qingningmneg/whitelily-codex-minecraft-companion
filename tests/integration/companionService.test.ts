@@ -42,6 +42,30 @@ async function startPlayerTurn(
   await value.untilCodexTurns(expectedTurns);
 }
 
+async function startPendingMoveConfirmation(
+  value: Awaited<ReturnType<typeof createCompanionHarness>>,
+  destinationX = 300,
+) {
+  await value.start();
+  await startPlayerTurn(value, "travel far");
+  const task = value.taskController.current();
+  expect(task).not.toBeNull();
+  const result = await value.executeRawTool("minecraft_move_to", {
+    x: destinationX,
+    y: 64,
+    z: 0,
+    turnLease: value.budgetLeases[0],
+  });
+  const parsed = JSON.parse(result.text) as { status?: string; confirmationId?: number };
+  expect(parsed).toMatchObject({
+    status: "confirmation_required",
+    confirmationId: expect.any(Number),
+  });
+  value.codex.releaseTurnResult(0);
+  await value.untilChat("ready");
+  return { task: task!, confirmationId: parsed.confirmationId! };
+}
+
 afterEach(async () => {
   vi.useRealTimers();
   await Promise.all(
@@ -360,8 +384,8 @@ describe("CompanionService lifecycle", () => {
       await startPlayerTurn(value, `trigger ${trigger}`);
       const activeTurnLease = value.budgetLeases[0];
       if (!activeTurnLease) throw new Error("expected an active turn lease");
-      const taskLeaseId = value.taskController.current()?.lease.id;
-      if (!taskLeaseId) throw new Error("expected an active task lease");
+      const taskLease = value.taskController.current()?.lease;
+      if (!taskLease) throw new Error("expected an active task lease");
       let inFlightResult: unknown;
       let queuedResult: unknown;
       void value.executor
@@ -377,7 +401,11 @@ describe("CompanionService lifecycle", () => {
         .then((result) => {
           queuedResult = result;
         });
-      const pending = value.confirmations.create("pending", { kind: "memory_clear" });
+      const pending = value.confirmations.createGameAction(
+        "pending",
+        { kind: "say", message: "must not dispatch" },
+        taskLease,
+      );
       await value.untilActiveWaitStarted();
       let cleanupBeforeAudit:
         { stoppedAuditPending: boolean; taskInactive: boolean; leaseRejected: boolean } | undefined;
@@ -390,7 +418,7 @@ describe("CompanionService lifecycle", () => {
           taskInactive: value.taskController.current() === null,
           leaseRejected:
             value.taskController.consume({
-              leaseId: taskLeaseId,
+              leaseId: taskLease.id,
               kind: "say",
               now: Date.now(),
             }).ok === false,
@@ -456,7 +484,13 @@ describe("CompanionService lifecycle", () => {
       .then((result) => {
         queuedResult = result;
       });
-    const pending = value.confirmations.create("pending", { kind: "memory_clear" });
+    const taskLease = value.taskController.current()?.lease;
+    if (!taskLease) throw new Error("expected an active task lease");
+    const pending = value.confirmations.createGameAction(
+      "pending",
+      { kind: "say", message: "must not dispatch" },
+      taskLease,
+    );
     await value.untilActiveWaitStarted();
 
     value.taskController.failClosed();
@@ -686,6 +720,53 @@ describe("CompanionService lifecycle", () => {
     value.codex.releaseTurnStart(0);
     value.codex.releaseTurnResult(0, outcome({ reply: "too late" }));
     expect(value.minecraft.chatLog).not.toContain("too late");
+  });
+
+  it("drains an in-flight confirmation resolution before stop resolves", async () => {
+    const value = await harness({
+      deferredTurns: [0],
+      codexResponses: [outcome({ reply: "ready" })],
+    });
+    const { confirmationId } = await startPendingMoveConfirmation(value);
+    let releaseAction!: () => void;
+    let markActionStarted!: () => void;
+    const actionGate = new Promise<void>((resolve) => {
+      releaseAction = resolve;
+    });
+    const actionStarted = new Promise<void>((resolve) => {
+      markActionStarted = resolve;
+    });
+    value.minecraft.moveTo = async (_position, signal) => {
+      markActionStarted();
+      await actionGate;
+      if (signal.aborted) {
+        const error = new Error("aborted");
+        error.name = "AbortError";
+        throw error;
+      }
+    };
+    value.minecraft.emit({
+      kind: "chat",
+      username: "TestOwner",
+      message: `!allow ${confirmationId}`,
+    });
+    await actionStarted;
+
+    let stopSettled = false;
+    const stopping = value.stop().then(() => {
+      stopSettled = true;
+    });
+    try {
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      expect(stopSettled).toBe(false);
+    } finally {
+      releaseAction();
+      await stopping;
+    }
+    const chatAfterStop = [...value.minecraft.chatLog];
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+    expect(value.minecraft.chatLog).toEqual(chatAfterStop);
   });
 
   it("drains startup events emitted before initialization and during awaited replay in order", async () => {
@@ -1483,36 +1564,250 @@ describe("CompanionService output and commands", () => {
     expect(value.minecraft.chatLog.at(-1)).toBe("已取消确认。");
   });
 
-  it("executes one exact game confirmation once without consuming or authorizing other ids", async () => {
-    const value = await harness();
-    await value.start();
-    const first = value.confirmations.create("say once", {
-      kind: "game_action",
-      action: { kind: "say", message: "confirmed-one" },
+  it("keeps the originating task alive while confirmation waits and closes it once after allow", async () => {
+    const value = await harness({
+      deferredTurns: [0],
+      codexResponses: [outcome({ reply: "ready" })],
     });
-    const second = value.confirmations.create("say two", {
-      kind: "game_action",
-      action: { kind: "say", message: "confirmed-two" },
-    });
-    const memoryClear = value.confirmations.create("clear", { kind: "memory_clear" });
+    const { task, confirmationId } = await startPendingMoveConfirmation(value);
+    expect(value.taskController.current()?.lease).toEqual(task.lease);
+    expect(value.taskAuditEvents).toEqual(["task_started"]);
 
-    await emitCommand(value, `!allow ${first.id}`);
-    expect(value.minecraft.chatLog.filter((item) => item === "confirmed-one")).toHaveLength(1);
-    await emitCommand(value, `!allow ${first.id}`);
-    expect(value.minecraft.chatLog.filter((item) => item === "confirmed-one")).toHaveLength(1);
-    expect(value.confirmations.get(second.id)?.operation.kind).toBe("game_action");
-    await expect(
-      value.executor.executeConfirmed(memoryClear.id, {
-        spawn: { x: 0, y: 64, z: 0 },
-        owner: { x: 0, y: 64, z: 0 },
-      }),
-    ).resolves.toEqual({ status: "confirmation_invalid", reason: "wrong_operation" });
-    expect(value.confirmations.get(memoryClear.id)?.operation.kind).toBe("memory_clear");
-    await emitCommand(value, `!allow ${memoryClear.id}`);
-    expect(value.minecraft.chatLog.at(-1)).toBe("已清除记忆。");
-    expect(value.confirmations.get(second.id)?.operation.kind).toBe("game_action");
-    expect(value.minecraft.chatLog).not.toContain("confirmed-two");
+    await emitCommand(value, `!allow ${confirmationId}`);
+    expect(value.minecraft.calls.filter((call) => call.method === "moveTo")).toHaveLength(1);
+    expect(value.taskController.current()).toBeNull();
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:completed"]);
+
+    await emitCommand(value, `!allow ${confirmationId}`);
+    expect(value.minecraft.calls.filter((call) => call.method === "moveTo")).toHaveLength(1);
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:completed"]);
   });
+
+  it("keeps the originating task alive while confirmation waits and closes it once after deny", async () => {
+    const value = await harness({
+      deferredTurns: [0],
+      codexResponses: [outcome({ reply: "ready" })],
+    });
+    const { task, confirmationId } = await startPendingMoveConfirmation(value);
+    expect(value.taskController.current()?.lease).toEqual(task.lease);
+
+    await emitCommand(value, `!deny ${confirmationId}`);
+
+    expect(value.minecraft.calls.filter((call) => call.method === "moveTo")).toHaveLength(0);
+    expect(value.confirmations.get(confirmationId)).toBeUndefined();
+    expect(value.taskController.current()).toBeNull();
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:owner_stop"]);
+  });
+
+  it("re-snapshots confirmed movement and exhausts the task on only the extra travel", async () => {
+    const value = await harness({
+      deferredTurns: [0],
+      codexResponses: [outcome({ reply: "ready" })],
+      requestedTaskLimits: { maxHorizontalTravel: 350 },
+    });
+    const { confirmationId } = await startPendingMoveConfirmation(value);
+    value.minecraft.world.botPosition = { x: -60, y: 64, z: 0 };
+
+    await emitCommand(value, `!allow ${confirmationId}`);
+
+    expect(value.minecraft.calls.filter((call) => call.method === "moveTo")).toHaveLength(0);
+    expect(value.taskController.current()).toBeNull();
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:budget_exhausted"]);
+  });
+
+  it("keeps the task alive until its last game confirmation is resolved", async () => {
+    const value = await harness({
+      deferredTurns: [0],
+      codexResponses: [outcome({ reply: "ready" })],
+    });
+    await value.start();
+    await startPlayerTurn(value, "travel twice");
+    const task = value.taskController.current();
+    expect(task).not.toBeNull();
+    const ids: number[] = [];
+    for (const x of [300, 310]) {
+      const result = await value.executeRawTool("minecraft_move_to", {
+        x,
+        y: 64,
+        z: 0,
+        turnLease: value.budgetLeases[0],
+      });
+      const parsed = JSON.parse(result.text) as { confirmationId?: number };
+      expect(parsed.confirmationId).toEqual(expect.any(Number));
+      ids.push(parsed.confirmationId!);
+    }
+    value.codex.releaseTurnResult(0);
+    await value.untilChat("ready");
+
+    await emitCommand(value, `!allow ${ids[0]}`);
+
+    expect(value.taskController.current()?.lease).toEqual(task?.lease);
+    expect(value.confirmations.get(ids[1]!)).toBeDefined();
+    expect(value.taskAuditEvents).toEqual(["task_started"]);
+
+    await emitCommand(value, `!allow ${ids[1]}`);
+
+    expect(value.minecraft.calls.filter((call) => call.method === "moveTo")).toHaveLength(2);
+    expect(value.taskController.current()).toBeNull();
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:completed"]);
+  });
+
+  it("serializes back-to-back allows so every consumed ticket executes before task closure", async () => {
+    const value = await harness({
+      deferredTurns: [0],
+      codexResponses: [outcome({ reply: "ready" })],
+    });
+    await value.start();
+    await startPlayerTurn(value, "travel twice");
+    const ids: number[] = [];
+    for (const x of [300, 310]) {
+      const result = await value.executeRawTool("minecraft_move_to", {
+        x,
+        y: 64,
+        z: 0,
+        turnLease: value.budgetLeases[0],
+      });
+      const parsed = JSON.parse(result.text) as { confirmationId?: number };
+      expect(parsed.confirmationId).toEqual(expect.any(Number));
+      ids.push(parsed.confirmationId!);
+    }
+    value.codex.releaseTurnResult(0);
+    await value.untilChat("ready");
+    const priorChatCount = value.minecraft.chatLog.length;
+
+    value.minecraft.emit({
+      kind: "chat",
+      username: "TestOwner",
+      message: `!allow ${ids[0]}`,
+    });
+    value.minecraft.emit({
+      kind: "chat",
+      username: "TestOwner",
+      message: `!allow ${ids[1]}`,
+    });
+    await vi.waitFor(() => expect(value.minecraft.chatLog.length).toBe(priorChatCount + 2));
+
+    expect(value.minecraft.calls.filter((call) => call.method === "moveTo")).toHaveLength(2);
+    expect(value.confirmations.get(ids[0]!)).toBeUndefined();
+    expect(value.confirmations.get(ids[1]!)).toBeUndefined();
+    expect(value.taskController.current()).toBeNull();
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:completed"]);
+  });
+
+  it("closes a waiting task when its last game confirmation expires", async () => {
+    vi.useFakeTimers();
+    const startedAt = new Date("2026-07-27T00:00:00.000Z");
+    vi.setSystemTime(startedAt);
+    const value = await harness({
+      deferredTurns: [0],
+      codexResponses: [outcome({ reply: "ready" })],
+    });
+    const { confirmationId } = await startPendingMoveConfirmation(value);
+    vi.setSystemTime(new Date(startedAt.getTime() + 120_000));
+
+    await emitCommand(value, `!allow ${confirmationId}`);
+
+    expect(value.confirmations.get(confirmationId)).toBeUndefined();
+    expect(value.taskController.current()).toBeNull();
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:failed"]);
+    expect(value.minecraft.calls.filter((call) => call.method === "moveTo")).toHaveLength(0);
+  });
+
+  it("does not stop in-flight task work for an unrelated missing confirmation id", async () => {
+    const value = await harness({
+      deferredTurns: [0],
+      codexResponses: [outcome({ reply: "ready" })],
+    });
+    await value.start();
+    await startPlayerTurn(value, "continue working");
+    const task = value.taskController.current();
+    expect(task).not.toBeNull();
+
+    await emitCommand(value, "!allow 999");
+
+    expect(value.taskController.current()?.lease).toEqual(task?.lease);
+    expect(value.taskAuditEvents).toEqual(["task_started"]);
+
+    value.codex.releaseTurnResult(0);
+    await value.untilTurnSettled();
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:completed"]);
+  });
+
+  it("treats a new owner request as replacing a task that is waiting for confirmation", async () => {
+    const value = await harness({
+      deferredTurns: [0],
+      codexResponses: [outcome({ reply: "ready" }), outcome({ reply: "new work ready" })],
+    });
+    const { confirmationId } = await startPendingMoveConfirmation(value);
+
+    value.minecraft.emit({ kind: "chat", username: "TestOwner", message: "start new work" });
+    await value.untilMergeTimer();
+    value.fireMergeTimers();
+    await value.untilCodexTurns(2);
+    await value.untilTurnSettled();
+
+    expect(value.codex.turns).toHaveLength(2);
+    expect(value.confirmations.get(confirmationId)).toBeUndefined();
+    expect(value.taskController.current()).toBeNull();
+    expect(value.taskAuditEvents).toEqual([
+      "task_started",
+      "task_stopped:owner_stop",
+      "task_started",
+      "task_stopped:completed",
+    ]);
+    expect(value.errors).not.toContain("Error: a task is already active");
+    expect(value.minecraft.chatLog).toContain("new work ready");
+  });
+
+  it.each(["balanced", "autonomous"] as const)(
+    "keeps a waiting confirmation busy against a %s autonomy trigger",
+    async (mode) => {
+      const value = await harness({
+        deferredTurns: [0],
+        codexResponses: [outcome({ reply: "ready" })],
+      });
+      const { task, confirmationId } = await startPendingMoveConfirmation(value);
+      value.mode.setMode(mode);
+
+      expect(value.service.isBusyForAutonomy()).toBe(true);
+      await value.service.requestAutonomousTurn("nearby_threat");
+
+      expect(value.codex.turns).toHaveLength(1);
+      expect(value.taskController.current()?.lease).toEqual(task.lease);
+      expect(value.confirmations.get(confirmationId)).toBeDefined();
+      expect(value.taskAuditEvents).toEqual(["task_started"]);
+      expect(value.mode.snapshot()).toMatchObject({ mode, paused: false });
+    },
+  );
+
+  it.each([
+    "completed",
+    "failed",
+    "timeout",
+    "budget_exhausted",
+    "owner_stop",
+    "emergency_stop",
+    "disconnect",
+    "world_changed",
+    "model_unavailable",
+    "process_exit",
+  ] as const)(
+    "invalidates a waiting game capability when the task ends with %s",
+    async (reason) => {
+      const value = await harness({
+        deferredTurns: [0],
+        codexResponses: [outcome({ reply: "ready" })],
+      });
+      const { confirmationId } = await startPendingMoveConfirmation(value);
+
+      value.taskController.stop(reason);
+      await emitCommand(value, `!allow ${confirmationId}`);
+
+      expect(value.confirmations.get(confirmationId)).toBeUndefined();
+      expect(value.minecraft.calls.filter((call) => call.method === "moveTo")).toHaveLength(0);
+      expect(value.taskAuditEvents).toEqual(["task_started", `task_stopped:${reason}`]);
+    },
+  );
 
   it("rejects an entire model memory candidate set containing a real-world address", async () => {
     vi.useFakeTimers();

@@ -284,7 +284,9 @@ class McpLifecycle implements ManagedMcp {
 function createProductionRuntime(context: AppCompositionContext): AppRuntime {
   const { config, paths, mode, budget, taskController, logger } = context;
   const confirmations = new ConfirmationStore();
-  const safety = new SafetyEngine(confirmations, config.safety);
+  const safety = new SafetyEngine(confirmations, config.safety, (lease) =>
+    taskController.isLeaseLive(lease),
+  );
   const minecraft = new MineflayerAdapter(config.minecraft);
   const executor = new ActionExecutor(
     minecraft,
@@ -292,6 +294,11 @@ function createProductionRuntime(context: AppCompositionContext): AppRuntime {
     confirmations,
     config.minecraft.ownerUsername,
     () => taskController.stop("owner_stop"),
+    {
+      isLeaseLive: (lease) => taskController.isLeaseLive(lease),
+      reserveAdditionalTravel: (lease, horizontalTravel) =>
+        taskController.reserveAdditionalTravel(lease, horizontalTravel),
+    },
   );
   const memories = new MemoryStore(paths.memories);
   const state = new StateStore(paths.state);

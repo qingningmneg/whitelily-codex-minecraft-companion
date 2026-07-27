@@ -4,10 +4,11 @@ import { SafetyEngine } from "../../src/safety/safetyEngine.js";
 
 const origin = { x: 0, y: 64, z: 0 };
 const outsideSpawn = { x: 20, y: 64, z: 0 };
+const taskLease = { id: "task-lease-a", startedAt: 1_000 };
 
 function createSafety() {
   const confirmations = new ConfirmationStore(() => new Date("2026-07-25T00:00:00Z"));
-  return { confirmations, engine: new SafetyEngine(confirmations) };
+  return { confirmations, engine: new SafetyEngine(confirmations, undefined, () => true) };
 }
 
 describe("SafetyEngine", () => {
@@ -114,9 +115,24 @@ describe("SafetyEngine", () => {
     expect(
       engine.evaluate(
         { kind: "dig_block", blockName: "stone", position: outsideSpawn },
-        { spawn: origin, owner: outsideSpawn, estimatedBreakCount: 33 },
+        { spawn: origin, owner: outsideSpawn, estimatedBreakCount: 33, taskLease },
       ),
     ).toMatchObject({ kind: "confirm", reason: "Break count 33 exceeds 32", confirmationId: 1 });
+  });
+
+  it("does not create a confirmation when a threshold action lacks a live task capability", () => {
+    const { confirmations, engine } = createSafety();
+
+    expect(
+      engine.evaluate(
+        { kind: "dig_block", blockName: "stone", position: outsideSpawn },
+        { spawn: origin, owner: outsideSpawn, estimatedBreakCount: 33 },
+      ),
+    ).toEqual({
+      kind: "deny",
+      reason: "A live task capability is required for confirmation",
+    });
+    expect(confirmations.get(1)).toBeUndefined();
   });
 
   it("does not apply accumulated dig estimates to unrelated actions", () => {
@@ -147,7 +163,7 @@ describe("SafetyEngine", () => {
     expect(
       engine.evaluate(
         { kind: "place_block", blockName: "stone", position: outsideSpawn },
-        { spawn: origin, owner: outsideSpawn, estimatedPlaceCount: 129 },
+        { spawn: origin, owner: outsideSpawn, estimatedPlaceCount: 129, taskLease },
       ),
     ).toMatchObject({ kind: "confirm", reason: "Place count 129 exceeds 128", confirmationId: 1 });
   });
@@ -169,7 +185,7 @@ describe("SafetyEngine", () => {
     expect(
       engine.evaluate(
         { kind: "move_to", position: { x: 256, y: 64, z: 0 } },
-        { spawn: origin, owner: origin },
+        { spawn: origin, owner: origin, taskLease, reservedHorizontalTravel: 256.01 },
       ),
     ).toEqual({ kind: "allow" });
   });
@@ -180,7 +196,7 @@ describe("SafetyEngine", () => {
     expect(
       engine.evaluate(
         { kind: "move_to", position: { x: 256.01, y: 64, z: 0 } },
-        { spawn: origin, owner: origin },
+        { spawn: origin, owner: origin, taskLease, reservedHorizontalTravel: 256.01 },
       ),
     ).toMatchObject({
       kind: "confirm",
@@ -195,7 +211,13 @@ describe("SafetyEngine", () => {
     expect(
       engine.evaluate(
         { kind: "move_to", position: { x: 1, y: 64, z: 0 } },
-        { spawn: origin, owner: origin, estimatedTravelDistance: 256.01 },
+        {
+          spawn: origin,
+          owner: origin,
+          estimatedTravelDistance: 256.01,
+          taskLease,
+          reservedHorizontalTravel: 1,
+        },
       ),
     ).toMatchObject({ kind: "confirm", reason: "Travel distance exceeds 256 blocks" });
   });
@@ -206,7 +228,7 @@ describe("SafetyEngine", () => {
     expect(
       engine.evaluate(
         { kind: "attack_hostile", entityId: 7 },
-        { spawn: origin, owner: outsideSpawn, isPassiveTarget: true },
+        { spawn: origin, owner: outsideSpawn, isPassiveTarget: true, taskLease },
       ),
     ).toMatchObject({
       kind: "confirm",
@@ -221,7 +243,7 @@ describe("SafetyEngine", () => {
     expect(
       engine.evaluate(
         { kind: "equip_item", itemName: "diamond_sword", destination: "hand" },
-        { spawn: origin, owner: outsideSpawn, isValuableItem: true },
+        { spawn: origin, owner: outsideSpawn, isValuableItem: true, taskLease },
       ),
     ).toMatchObject({
       kind: "confirm",

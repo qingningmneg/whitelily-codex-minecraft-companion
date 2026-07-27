@@ -143,4 +143,53 @@ describe("SafeLogger", () => {
     expect(() => JSON.parse(output)).not.toThrow();
     expect(output).not.toContain("actual-secret");
   });
+
+  it("fully redacts token68 and URI userinfo credential forms", async () => {
+    const path = await logPath();
+    await new SafeLogger(path).info("credentials_seen", {
+      bearerPlus: "Bearer abcdefghijklmnop+private==",
+      bearerSlash: "authorization: bearer abcdefghijklmnop/private=",
+      firstEndpoint: "https://opaque-access-token@example.invalid/world",
+      secondEndpoint: "redis://cache-user%3Aprivate-password@example.invalid/0",
+      thirdEndpoint: "https://first-private@second-private:password@[::1]/world",
+    });
+
+    const output = await readFile(path, "utf8");
+    expect(() => JSON.parse(output)).not.toThrow();
+    for (const sensitive of [
+      "+private==",
+      "/private=",
+      "opaque-access-token",
+      "cache-user%3Aprivate-password",
+      "first-private",
+      "second-private:password",
+    ]) {
+      expect(output).not.toContain(sensitive);
+    }
+    expect(output).toContain("[REDACTED_TOKEN]");
+    expect(output).toContain("[REDACTED_URI_CREDENTIALS]");
+  });
+
+  it("redacts local paths from retained structured fields without dropping safe data", async () => {
+    const path = await logPath();
+    await new SafeLogger(path).error("filesystem_failed", {
+      windows: String.raw`ENOENT opening C:\Users\Owner Name\AppData\Local\WhiteLily\state.json`,
+      unc: String.raw`failed at \\workstation\Owner Share\private\audit.jsonl`,
+      unix: "permission denied at /home/owner/.whitelily/private.log",
+      counter: 7,
+      reason: "audit_write_failed",
+    });
+
+    const output = await readFile(path, "utf8");
+    const event = JSON.parse(output) as Record<string, unknown>;
+    for (const sensitive of [
+      String.raw`C:\Users\Owner Name`,
+      String.raw`\\workstation\Owner Share`,
+      "/home/owner",
+    ]) {
+      expect(output).not.toContain(sensitive);
+    }
+    expect(output).toContain("[REDACTED_PATH]");
+    expect(event).toMatchObject({ counter: 7, reason: "audit_write_failed" });
+  });
 });

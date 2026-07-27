@@ -207,11 +207,16 @@ describe("public release readiness", () => {
     expect(candidate.files.some((file) => file.startsWith("docs/superpowers/"))).toBe(false);
   }, 60_000);
 
-  it("packages the nested Windows smoke-test documentation", async () => {
+  it("packages a closed README documentation bundle from the produced ZIP", async () => {
     const artifact = await runReleasePackage("0.1.0");
     expect(artifact.hasChecksum).toBe(true);
     expect(artifact.stagingRemoved).toBe(true);
     expect(artifact.entries).toContain("docs/windows-smoke-test.md");
+    expect(artifact.entries).toContain("docs/installation-windows.zh-CN.md");
+    expect(artifact.entries).toContain("docs/runtime-architecture.md");
+    expect(artifact.readmeLocalLinks).toContain("docs/installation-windows.zh-CN.md");
+    expect(artifact.readmeLocalLinks).toContain("docs/runtime-architecture.md");
+    expect(artifact.missingReadmeLocalLinks).toEqual([]);
     expect(artifact.rawEntries.every((entry) => !entry.includes("\\"))).toBe(true);
     expect(artifact.checksumMatches).toBe(true);
   }, 120_000);

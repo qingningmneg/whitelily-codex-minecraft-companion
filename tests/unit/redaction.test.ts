@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { containsSensitiveData, redactSecrets } from "../../src/memory/redaction.js";
+import {
+  containsSensitiveData,
+  redactPublicText,
+  redactSecrets,
+} from "../../src/memory/redaction.js";
 
 const openAiApiKey = ["OPENAI", "_API", "_KEY"].join("");
 const codexAccessToken = ["codex", "_access", "_token"].join("");
@@ -26,6 +30,48 @@ describe("redactSecrets", () => {
   ])("redacts %s", (input, expected) => {
     expect(redactSecrets(input)).toBe(expected);
     expect(containsSensitiveData(input)).toBe(true);
+  });
+
+  it.each([
+    [
+      "complete token68 with plus and padding",
+      "Bearer abcdefghijklmnop+private==",
+      "Bearer [REDACTED_TOKEN]",
+    ],
+    [
+      "complete token68 with slash and padding",
+      "authorization: bearer abcdefghijklmnop/private=",
+      "authorization: Bearer [REDACTED_TOKEN]",
+    ],
+    [
+      "token-only URI userinfo",
+      "https://opaque-access-token@example.invalid/world",
+      "https://[REDACTED_URI_CREDENTIALS]@example.invalid/world",
+    ],
+    [
+      "percent-encoded URI userinfo separator",
+      "redis://cache-user%3Aprivate-password@example.invalid/0",
+      "redis://[REDACTED_URI_CREDENTIALS]@example.invalid/0",
+    ],
+    [
+      "complete URI userinfo through the final at-sign",
+      "https://first-private@second-private:password@[::1]/world",
+      "https://[REDACTED_URI_CREDENTIALS]@[::1]/world",
+    ],
+  ])("atomically redacts %s", (_case, input, expected) => {
+    expect(redactSecrets(input)).toBe(expected);
+    expect(containsSensitiveData(input)).toBe(true);
+  });
+
+  it("keeps the URI credential marker stable at the path-aware boundary", () => {
+    const output = redactPublicText(
+      "https://opaque-access-token@example.invalid/world from C:\\Users\\Owner\\private",
+    );
+
+    expect(output).toContain("https://[REDACTED_URI_CREDENTIALS]@example.invalid");
+    expect(output).toContain("[REDACTED_PATH]");
+    expect(output).not.toContain("opaque-access-token");
+    expect(output).not.toContain("C:\\Users\\Owner");
   });
 
   it.each([

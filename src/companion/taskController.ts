@@ -156,6 +156,30 @@ export class TaskController {
     return this.activeTask ? cloneActiveTask(this.activeTask) : null;
   }
 
+  isLeaseLive(lease: TaskLease): boolean {
+    this.reconcileBudget();
+    const active = this.activeTask;
+    return (
+      active !== undefined &&
+      active.lease.id === lease.id &&
+      active.lease.startedAt === lease.startedAt &&
+      this.budget.isLeaseActive(lease)
+    );
+  }
+
+  reserveAdditionalTravel(lease: TaskLease, horizontalTravel: number): TaskBudgetDecision {
+    this.reconcileBudget();
+    if (!this.isLeaseLive(lease)) return { ok: false, reason: "task lease is invalid" };
+    const result = this.budget.consumeAdditionalTravel(
+      { ...lease },
+      this.budget.currentTime(),
+      horizontalTravel,
+    );
+    const snapshot = this.budget.snapshot();
+    if (!snapshot.active) this.finish(snapshot.stopReason ?? "failed", true);
+    return result;
+  }
+
   onTerminal(listener: (reason: TaskStopReason, forceCleanup: boolean) => void): () => void {
     this.terminalListeners.add(listener);
     return () => this.terminalListeners.delete(listener);

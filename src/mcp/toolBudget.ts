@@ -77,6 +77,11 @@ export class TurnToolBudget {
     return { ok: true, snapshot: this.snapshot() };
   }
 
+  currentTaskLease(lease?: string): TaskLease | undefined {
+    if (!this.checkLease(lease).ok || !this.taskLease) return undefined;
+    return this.taskBudget.isLeaseActive(this.taskLease) ? { ...this.taskLease } : undefined;
+  }
+
   consume(
     kind: ToolActionKind,
     lease?: string,

@@ -2,6 +2,7 @@ import type { GameAction, SafetyDecision } from "../domain/types.js";
 import type { MinecraftPort } from "../minecraft/minecraftPort.js";
 import type { ConfirmationStore } from "../safety/confirmationStore.js";
 import type { SafetyContext } from "../safety/safetyEngine.js";
+import type { TaskBudgetDecision, TaskLease } from "../safety/taskBudget.js";
 
 export interface ActionSafety {
   evaluate(action: GameAction, context: SafetyContext): SafetyDecision;
@@ -13,7 +14,10 @@ export type ActionResult =
   | { status: "cancelled" }
   | { status: "denied"; reason: string }
   | { status: "confirmation_required"; confirmationId: number; reason: string }
-  | { status: "confirmation_invalid"; reason: "missing" | "expired" | "wrong_operation" }
+  | {
+      status: "confirmation_invalid";
+      reason: "missing" | "expired" | "wrong_operation" | "wrong_task";
+    }
   | { status: "failed"; reason: string };
 
 export type ActionResultListener = (result: Readonly<ActionResult>) => void;
@@ -34,7 +38,18 @@ interface ActionJob {
   controller?: AbortController;
   timeout: ReturnType<typeof setTimeout> | undefined;
   timedOut: boolean;
+  taskLease?: TaskLease;
 }
+
+export interface ConfirmedActionAuthority {
+  isLeaseLive(lease: TaskLease): boolean;
+  reserveAdditionalTravel(lease: TaskLease, horizontalTravel: number): TaskBudgetDecision;
+}
+
+const noConfirmedActionAuthority: ConfirmedActionAuthority = {
+  isLeaseLive: () => false,
+  reserveAdditionalTravel: () => ({ ok: false, reason: "task lease is invalid" }),
+};
 
 function deferred<T>(): Deferred<T> {
   let resolvePromise!: (value: T) => void;
@@ -74,19 +89,42 @@ export class ActionExecutor {
     private readonly confirmations: ConfirmationStore,
     private readonly ownerUsername: string,
     private readonly beforeStopAll: () => void = () => undefined,
+    private readonly confirmedActionAuthority: ConfirmedActionAuthority = noConfirmedActionAuthority,
   ) {}
 
   execute(action: GameAction, context: SafetyContext): Promise<ActionResult> {
     return this.enqueue(action, context, false);
   }
 
-  executeConfirmed(confirmationId: number, context: SafetyContext): Promise<ActionResult> {
+  executeConfirmed(
+    confirmationId: number,
+    context: SafetyContext,
+    taskLease?: TaskLease,
+    additionalHorizontalTravel = 0,
+  ): Promise<ActionResult> {
     try {
-      const approved = this.confirmations.allowGameAction(confirmationId);
+      if (!taskLease || !this.confirmedActionAuthority.isLeaseLive(taskLease)) {
+        return Promise.resolve({ status: "confirmation_invalid", reason: "wrong_task" });
+      }
+      const approved = this.confirmations.allowGameAction(confirmationId, taskLease);
       if (!approved.ok) {
         return Promise.resolve({ status: "confirmation_invalid", reason: approved.reason });
       }
-      return this.enqueue(approved.action, context, true);
+      if (!this.confirmedActionAuthority.isLeaseLive(taskLease)) {
+        return Promise.resolve({ status: "confirmation_invalid", reason: "wrong_task" });
+      }
+      if (additionalHorizontalTravel > 0) {
+        const reserved = this.confirmedActionAuthority.reserveAdditionalTravel(
+          taskLease,
+          additionalHorizontalTravel,
+        );
+        if (!reserved.ok) {
+          const result = { status: "failed" as const, reason: reserved.reason };
+          this.publishResult(result);
+          return Promise.resolve(result);
+        }
+      }
+      return this.enqueue(approved.action, context, true, taskLease);
     } catch (error) {
       const result = { status: "failed" as const, reason: String(error) };
       this.publishResult(result);
@@ -126,6 +164,7 @@ export class ActionExecutor {
     action: GameAction,
     context: SafetyContext,
     confirmed: boolean,
+    taskLease?: TaskLease,
   ): Promise<ActionResult> {
     const job: ActionJob = {
       action,
@@ -136,6 +175,7 @@ export class ActionExecutor {
       pending: true,
       timeout: undefined,
       timedOut: false,
+      ...(taskLease === undefined ? {} : { taskLease: { ...taskLease } }),
     };
     this.pending += 1;
     this.jobs.add(job);
@@ -149,6 +189,10 @@ export class ActionExecutor {
   private async run(job: ActionJob): Promise<void> {
     try {
       if (job.result.settled || job.generation !== this.generation) {
+        this.finishUser(job, { status: "cancelled" });
+        return;
+      }
+      if (job.taskLease && !this.confirmedActionAuthority.isLeaseLive(job.taskLease)) {
         this.finishUser(job, { status: "cancelled" });
         return;
       }

@@ -155,6 +155,43 @@ export class TaskControllerBudget {
     return { ok: true, snapshot: this.snapshot() };
   }
 
+  consumeAdditionalTravel(
+    lease: TaskLease,
+    now: number,
+    horizontalTravel: number,
+  ): TaskBudgetDecision {
+    if (!this.isLeaseActive(lease)) return { ok: false, reason: "task lease is invalid" };
+    const activeLease = this.activeLease!;
+    if (!Number.isFinite(now) || now < activeLease.startedAt) {
+      this.invalidate("timeout");
+      return { ok: false, reason: "task duration exhausted" };
+    }
+    if (now - activeLease.startedAt >= this.limits.maxDurationMs) {
+      this.invalidate("timeout");
+      return { ok: false, reason: "task duration exhausted" };
+    }
+    const additionalTravel = consumptionValue(horizontalTravel);
+    if (
+      additionalTravel === undefined ||
+      this.horizontalTravel + additionalTravel > this.limits.maxHorizontalTravel
+    ) {
+      this.invalidate("budget_exhausted");
+      return { ok: false, reason: "task budget exhausted" };
+    }
+    this.horizontalTravel += additionalTravel;
+    return { ok: true, snapshot: this.snapshot() };
+  }
+
+  isLeaseActive(lease: TaskLease): boolean {
+    const activeLease = this.activeLease;
+    return (
+      this.active &&
+      activeLease !== undefined &&
+      lease.id === activeLease.id &&
+      lease.startedAt === activeLease.startedAt
+    );
+  }
+
   invalidate(reason: TaskStopReason): void {
     if (!this.active) return;
     this.active = false;

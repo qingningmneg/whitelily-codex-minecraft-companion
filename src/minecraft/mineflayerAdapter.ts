@@ -633,8 +633,14 @@ export class MineflayerAdapter implements MinecraftPort {
           started = true;
           return operation();
         })
-        .then(() => finish(aborted ? abortError() : undefined))
-        .catch((error: unknown) => finish(aborted ? abortError() : asError(error)));
+        .then(() => {
+          if (!aborted) finish();
+          else if (cancellation === "motion") finish(abortError());
+        })
+        .catch((error: unknown) => {
+          if (!aborted) finish(asError(error));
+          else if (cancellation === "motion") finish(abortError());
+        });
     });
   }
 

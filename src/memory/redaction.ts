@@ -1,5 +1,8 @@
 const textPatterns: Array<[RegExp, string]> = [
-  [/\b(authorization\s*:\s*)?bearer\s+[A-Za-z0-9._~-]{16,}\b/gi, "$1Bearer [REDACTED_TOKEN]"],
+  [
+    /\b(authorization\s*:\s*)?bearer\s+[A-Za-z0-9._~+/-]{16,}={0,}(?![A-Za-z0-9._~+/=-])/gi,
+    "$1Bearer [REDACTED_TOKEN]",
+  ],
   [/\bsk-[A-Za-z0-9_-]{20,}\b/gi, "[REDACTED_OPENAI_KEY]"],
   [/\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g, "[REDACTED_EMAIL]"],
   [/\b\+?\d[\d -]{7,}\d\b/g, "[REDACTED_PHONE]"],
@@ -121,23 +124,18 @@ function redactUriCredentials(input: string): string {
 
     const authorityStart = schemeEnd + 3;
     let authorityEnd = authorityStart;
-    let firstAt = -1;
-    let colonBeforeAt = false;
+    let lastAt = -1;
     while (authorityEnd < input.length && !isUriAuthorityBoundary(input[authorityEnd]!)) {
       const character = input[authorityEnd]!;
-      if (character === "@" && firstAt < 0) {
-        firstAt = authorityEnd;
-      } else if (character === ":" && firstAt < 0) {
-        colonBeforeAt = true;
-      }
+      if (character === "@") lastAt = authorityEnd;
       authorityEnd += 1;
     }
 
-    if (firstAt >= 0 && colonBeforeAt) {
+    if (lastAt >= 0) {
       output += input.slice(cursor, authorityStart);
       output += "[REDACTED_URI_CREDENTIALS]@";
-      cursor = firstAt + 1;
-      index = firstAt + 1;
+      cursor = lastAt + 1;
+      index = authorityEnd;
       continue;
     }
     index = authorityEnd;
@@ -207,7 +205,10 @@ function isLocalPathStart(input: string, index: number): boolean {
     }
   }
   if (input[index] === "~" && isPathSeparator(input[index + 1])) return true;
+  const previous = index === 0 ? undefined : input[index - 1];
+  const atBoundary = previous === undefined || !/[A-Za-z0-9:/\\]/.test(previous);
   if (
+    atBoundary &&
     isAsciiLetter(input[index]) &&
     input[index + 1] === ":" &&
     isPathSeparator(input[index + 2])
@@ -215,8 +216,6 @@ function isLocalPathStart(input: string, index: number): boolean {
     return true;
   }
 
-  const previous = index === 0 ? undefined : input[index - 1];
-  const atBoundary = previous === undefined || !/[A-Za-z0-9:/\\]/.test(previous);
   if (atBoundary) {
     for (const prefix of bareProfilePrefixes) {
       if (

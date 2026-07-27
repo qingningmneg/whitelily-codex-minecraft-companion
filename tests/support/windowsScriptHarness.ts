@@ -620,8 +620,7 @@ export async function runWindowsScriptFixture(
       PATH: systemFixturePath(shimDirectory),
       WHITELILY_TEST_APP_ROOT: fixtureRoot,
       WHITELILY_TEST_INVOCATION_LOG: invocationLog,
-      WHITELILY_TEST_CODEX_STATUS:
-        options.codexStatus ?? "Logged in with ChatGPT as private-user@example.net",
+      WHITELILY_TEST_CODEX_STATUS: options.codexStatus ?? "Logged in using ChatGPT",
       WHITELILY_TEST_CODEX_EXIT: String(options.codexExitCode ?? 0),
       WHITELILY_TEST_CONFIG_VALID: options.configValid === false ? "0" : "1",
       WHITELILY_TEST_DROP_OWNERSHIP_AFTER_MARKER: options.dropOwnershipAfterMarker ? "1" : "0",

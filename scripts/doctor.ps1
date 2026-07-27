@@ -151,7 +151,7 @@ else {
     $loginLines = & $codex.Source login status 2>$null
     $commandSucceeded = $?
     $loginStatus = $loginLines -join "`n"
-    if ($commandSucceeded -and $loginStatus -match '(?i)ChatGPT') {
+    if ($commandSucceeded -and $loginStatus -match '(?im)^Logged in using ChatGPT\s*$') {
       Write-Check -Status PASS -Label 'Codex login' -Message 'ChatGPT authentication is active.'
     }
     else {

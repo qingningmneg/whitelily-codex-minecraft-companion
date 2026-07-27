@@ -70,6 +70,30 @@ describe("TaskController", () => {
     },
   );
 
+  it("matches only the complete currently live task capability", () => {
+    const controller = fixedController();
+    const task = controller.start(disclosure);
+
+    expect(controller.isLeaseLive(task.lease)).toBe(true);
+    expect(controller.isLeaseLive({ ...task.lease, startedAt: task.lease.startedAt + 1 })).toBe(
+      false,
+    );
+    controller.stop("completed");
+    expect(controller.isLeaseLive(task.lease)).toBe(false);
+  });
+
+  it("reserves additional confirmed travel against the same live task", () => {
+    const controller = fixedController();
+    const task = controller.start(disclosure, { maxHorizontalTravel: 5 });
+
+    expect(controller.reserveAdditionalTravel(task.lease, 5).ok).toBe(true);
+    expect(controller.reserveAdditionalTravel(task.lease, 1)).toEqual({
+      ok: false,
+      reason: "task budget exhausted",
+    });
+    expect(controller.current()).toBeNull();
+  });
+
   it.each([
     [{ ...disclosure, goal: "" }, "task goal cannot be empty"],
     [{ ...disclosure, goal: " \t\n " }, "task goal cannot be empty"],
