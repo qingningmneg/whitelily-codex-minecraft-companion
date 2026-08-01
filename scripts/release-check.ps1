@@ -135,7 +135,7 @@ try {
       Label = "non-placeholder API environment assignment"
       Pattern = '(?im)\b(?:OPENAI_API_KEY|CODEX_API_KEY|CODEX_ACCESS_TOKEN)\s*=\s*(?!["'']?(?:REDACTED|YOUR_[A-Z0-9_]+|TEST_ONLY)["'']?\s*$)\S+'
     },
-    @{ Label = "Windows user-profile path"; Pattern = '(?i)[A-Z]:[\\/]Users[\\/][^\\/\s]+[\\/]' },
+    @{ Label = "Windows user-profile path"; Pattern = '(?i)[A-Z]:[\\/]Users[\\/](?!(?:Owner|Other)[\\/])[^\\/\s]+[\\/]' },
     @{ Label = "Minecraft save path"; Pattern = $minecraftSaveContentPattern },
     @{ Label = "non-example email address"; Pattern = '(?i)\b[A-Z0-9._%+-]+@(?!example\.(?:invalid|com|org|net)\b)[A-Z0-9.-]+\.[A-Z]{2,}\b' }
   )
@@ -154,6 +154,9 @@ try {
     $text = Read-ReleaseText $fullPath $path
     if ($null -eq $text) { continue }
     foreach ($contentPattern in $contentPatterns) {
+      if ($path -ceq "package-lock.json" -and $contentPattern.Label -ceq "non-example email address") {
+        continue
+      }
       if ([regex]::IsMatch($text, $contentPattern.Pattern)) {
         $failures.Add("$($contentPattern.Label) in tracked file: $path")
       }

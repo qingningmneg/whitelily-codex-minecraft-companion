@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "id": "whitelily_avatar",
+  "version": "${version}",
+  "name": "WhiteLily Avatar",
+  "environment": "client",
+  "entrypoints": {
+    "client": ["io.github.whitelily.avatar.WhiteLilyAvatarClient"]
+  },
+  "mixins": ["whitelily_avatar.mixins.json"],
+  "depends": {
+    "minecraft": "=1.21.5",
+    "fabricloader": ">=0.16.14",
+    "fabric-api": ">=0.128.2+1.21.5",
+    "geckolib": "=5.1.0"
+  }
+}

@@ -3,6 +3,31 @@ import { TurnToolBudget } from "../../src/mcp/toolBudget.js";
 import { TaskControllerBudget } from "../../src/safety/taskBudget.js";
 
 describe("TurnToolBudget", () => {
+  it("locally rejects actions outside a turn allowlist before spending task authority", () => {
+    const taskBudget = new TaskControllerBudget();
+    const taskLease = taskBudget.begin();
+    const budget = new TurnToolBudget(taskBudget);
+    const turnLease = budget.begin(taskLease, {
+      allowedActions: ["get_state", "say", "look_at", "jump", "wait"],
+    });
+
+    expect(budget.consume("dig_block", turnLease)).toEqual({
+      ok: false,
+      reason: "tool action is not allowed",
+    });
+    expect(budget.consume("attack_hostile", turnLease)).toEqual({
+      ok: false,
+      reason: "tool action is not allowed",
+    });
+    expect(budget.snapshot().totalCalls).toBe(0);
+    expect(taskBudget.snapshot()).toMatchObject({
+      toolCalls: 0,
+      blockChanges: 0,
+      dangerousOperations: 0,
+    });
+    expect(budget.consume("say", turnLease).ok).toBe(true);
+  });
+
   it("rejects every attempted call after the sixty-fourth with the legacy budget error", () => {
     const budget = new TurnToolBudget();
     const lease = budget.begin();

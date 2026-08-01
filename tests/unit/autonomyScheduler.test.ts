@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { AutonomyReason } from "../../src/autonomy/autonomyScheduler.js";
+import { AutonomyScheduler, type AutonomyReason } from "../../src/autonomy/autonomyScheduler.js";
+import { ModeManager } from "../../src/mode/modeManager.js";
 import { createAutonomySchedulerHarness } from "../support/autonomySchedulerHarness.js";
 
 interface Deferred {
@@ -38,6 +39,33 @@ describe("AutonomyScheduler", () => {
     vi.useRealTimers();
   });
 
+  it("checks presence for the current owner when work drains", async () => {
+    const mode = new ModeManager();
+    mode.setMode("autonomous");
+    let owner = "OldOwner";
+    const checkedOwners: string[] = [];
+    const scheduler = new AutonomyScheduler({
+      mode,
+      minecraft: {
+        isOwnerOnline: async (ownerUsername) => {
+          checkedOwners.push(ownerUsername);
+          return false;
+        },
+      },
+      ownerUsername: () => owner,
+      requestTurn: async () => undefined,
+      isBusy: () => false,
+    });
+    scheduler.start();
+    owner = "NewOwner";
+
+    scheduler.notifyThreat();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(checkedOwners).toEqual(["NewOwner"]);
+    scheduler.stop();
+  });
+
   it("never performs idle planning in friend mode across ten minutes", async () => {
     const value = createAutonomySchedulerHarness({ mode: "friend" });
 
@@ -48,9 +76,54 @@ describe("AutonomyScheduler", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
+  it("reschedules from the live profile idle minutes and proactive-chat restriction", async () => {
+    const value = createAutonomySchedulerHarness({ mode: "balanced" });
+    const profile = value.mode.getProfile();
+    value.mode.applyProfile({
+      ...profile,
+      mode: "balanced",
+      modeSettings: {
+        ...profile.modeSettings,
+        balanced: {
+          ...profile.modeSettings.balanced,
+          idleMinutes: 3,
+          allowProactiveChat: false,
+        },
+      },
+    });
+
+    value.scheduler.start();
+    await vi.advanceTimersByTimeAsync(179_999);
+    expect(value.reasons).toEqual([]);
+    await vi.advanceTimersByTimeAsync(1);
+
+    expect(value.reasons).toEqual(["balanced_idle"]);
+    expect(value.scheduler.canChatProactively()).toBe(false);
+  });
+
+  it("distinguishes suggestion-only authority from proactive chat authority", () => {
+    const value = createAutonomySchedulerHarness({ mode: "balanced" });
+    const profile = value.mode.getProfile();
+    value.mode.applyProfile({
+      ...profile,
+      mode: "balanced",
+      modeSettings: {
+        ...profile.modeSettings,
+        balanced: {
+          ...profile.modeSettings.balanced,
+          allowProactiveChat: false,
+          allowSuggestions: true,
+        },
+      },
+    });
+
+    expect(value.scheduler.canSendProactively("chat")).toBe(false);
+    expect(value.scheduler.canSendProactively("suggestion")).toBe(true);
+  });
+
   it.each([
     ["balanced", 120_000, "balanced_idle"],
-    ["autonomous", 45_000, "autonomous_idle"],
+    ["autonomous", 60_000, "autonomous_idle"],
   ] as const)("fires %s idle planning exactly at %d ms", async (mode, interval, reason) => {
     const value = createAutonomySchedulerHarness({ mode });
     value.scheduler.start();
@@ -70,7 +143,7 @@ describe("AutonomyScheduler", () => {
     const value = createAutonomySchedulerHarness({ mode: "autonomous", ...options });
     value.scheduler.start();
 
-    await vi.advanceTimersByTimeAsync(45_000);
+    await vi.advanceTimersByTimeAsync(60_000);
 
     expect(value.reasons).toEqual([]);
   });
@@ -97,7 +170,7 @@ describe("AutonomyScheduler", () => {
     await vi.advanceTimersByTimeAsync(0);
 
     value.setOwnerOnline(true);
-    await vi.advanceTimersByTimeAsync(44_999);
+    await vi.advanceTimersByTimeAsync(59_999);
     expect(value.reasons).toEqual([]);
     await vi.advanceTimersByTimeAsync(1);
 
@@ -179,7 +252,7 @@ describe("AutonomyScheduler", () => {
     value.scheduler.notifyModeChanged();
 
     expect(value.mode.snapshot().paused).toBe(true);
-    await vi.advanceTimersByTimeAsync(44_999);
+    await vi.advanceTimersByTimeAsync(59_999);
     expect(value.reasons).toEqual([]);
     value.mode.resume();
     await vi.advanceTimersByTimeAsync(1);
@@ -212,7 +285,7 @@ describe("AutonomyScheduler", () => {
       isOwnerOnline: () => online.promise,
     });
     value.scheduler.start();
-    await vi.advanceTimersByTimeAsync(45_000);
+    await vi.advanceTimersByTimeAsync(60_000);
 
     value.mode.setMode("balanced");
     value.scheduler.notifyModeChanged();

@@ -6,25 +6,41 @@ import { selectModel } from "../codex/modelSelector.js";
 import type { CompanionMode } from "../domain/types.js";
 import { SafeLogger } from "../logging/safeLogger.js";
 import { MemoryStore, type MemoryValidationSource } from "../memory/memoryStore.js";
+import { ScopedMemoryStore } from "../memory/scopedMemoryStore.js";
+import { MemoryMigration } from "../memory/memoryMigration.js";
 import { StateStore } from "../memory/stateStore.js";
 import { ModeManager } from "../mode/modeManager.js";
-import { TurnToolBudget } from "../mcp/toolBudget.js";
+import { TOOL_ACTION_KINDS, TurnToolBudget, type ToolActionKind } from "../mcp/toolBudget.js";
 import type { MinecraftEvent, MinecraftPort } from "../minecraft/minecraftPort.js";
+import type { OwnerIdentityAccess, OwnerIdentitySnapshot } from "../identity/ownerIdentity.js";
 import { ConfirmationStore } from "../safety/confirmationStore.js";
 import type { SafetyContext } from "../safety/safetyEngine.js";
 import {
+  effectiveTaskLimits,
   HARD_TASK_LIMITS,
   type TaskLease,
   type TaskLimits,
   type TaskStopReason,
 } from "../safety/taskBudget.js";
+import type { RuntimeAuthorityLoss } from "../runtime/runtimeEvents.js";
+import { isUnsolicitedActivityAllowed } from "../profile/behaviorPolicy.js";
+import type { CompanionProfile } from "../profile/profileSchema.js";
 import {
   buildCompanionAutonomousTurn,
   buildCompanionRecoveryTurn,
-  buildCompanionTurn,
+  buildCompanionTaskExecutionTurn,
+  companionTaskExecutionOutcomeSchema,
   companionTurnOutcomeSchema,
   type CompanionTurnOutcome,
+  type ProactiveKind,
 } from "./promptBuilder.js";
+import {
+  buildOwnerIntentTurn,
+  ownerIntentRepairPrompt,
+  parseOwnerIntentDecision,
+  type IntentMemoryCandidate,
+  type OwnerIntentDecision,
+} from "./intentRouter.js";
 import { ChatRouter } from "./chatRouter.js";
 import { TaskController, type ActiveTask, type TaskDisclosure } from "./taskController.js";
 
@@ -34,13 +50,148 @@ const recoveryRepairPrompt = [
   "Recovery turns do not authorize Minecraft tools.",
   "Do not call any minecraft_ tool during recovery.",
 ].join("\n");
+const autonomousRepairPrompt = [
+  repairPrompt,
+  "Unsolicited autonomous turns must return task as null.",
+  "Do not propose or persist a task, project, world mutation, or high-risk action.",
+].join("\n");
+function balancedRepairPrompt(allowedKinds: readonly ProactiveKind[]): string {
+  const allowed =
+    allowedKinds.length === 1
+      ? JSON.stringify(allowedKinds[0])
+      : allowedKinds.map((kind) => JSON.stringify(kind)).join(" or ");
+  return [
+    repairPrompt,
+    `proactiveKind must be ${allowed}.`,
+    "Balanced unsolicited turns must return task as null and must not use Minecraft tools.",
+  ].join("\n");
+}
 const unavailableMessage =
   "Codex 暂时不可用，我已安全暂停。你仍可以使用 !status、!stop 和记忆命令。";
 
-function attachToolLease(text: string, lease: string, taskLeaseId?: string): string {
+const intentClarificationMessage = "你希望我陪你聊聊天，还是要我在游戏里做一件事？";
+const taskFailureMessage = "这次没能完成，请再试一次。";
+const filteredModelReply = "好，我知道了。";
+const ambiguousNaturalToolNames = new Set<ToolActionKind>(["say", "jump", "wait"]);
+const ambiguousNaturalToolNamePattern = [...ambiguousNaturalToolNames].join("|");
+const bareInternalToolNamePattern = new RegExp(
+  `\\b(?:${TOOL_ACTION_KINDS.filter((name) => !ambiguousNaturalToolNames.has(name)).join("|")})\\b`,
+  "iu",
+);
+const ambiguousToolInvocationPattern = new RegExp(
+  `(?:\`\\s*(?:${ambiguousNaturalToolNamePattern})\\s*\`)|(?:(?:\\b(?:call|invoke|execute|tool|action)\\b|(?:准备|将要|正在)?\\s*(?:调用|执行)|工具)[^\\r\\n.!?。！？]{0,32}\\b(?:${ambiguousNaturalToolNamePattern})\\b)`,
+  "iu",
+);
+const internalModelMetadataPattern =
+  /任务披露|minecraft_[a-z0-9_]+|工具调用|预算|租约|停止条件|expectedActions|allowedActions|maxToolCalls|maxBlockChanges|maxHorizontalTravel|maxDurationMs|maxDangerousOperations|leaseId|stopCondition/iu;
+const transportFailureThreshold = 3;
+
+function containsInternalModelDisclosure(reply: string): boolean {
+  return (
+    internalModelMetadataPattern.test(reply) ||
+    bareInternalToolNamePattern.test(reply) ||
+    ambiguousToolInvocationPattern.test(reply)
+  );
+}
+
+export type CodexFailureScope = "turn" | "service";
+
+const authenticationErrorNames = new Set([
+  "AuthenticationError",
+  "CodexAuthenticationError",
+  "UnauthorizedError",
+]);
+const authenticationErrorCodes = new Set([
+  "AUTHENTICATION_REQUIRED",
+  "AUTH_REQUIRED",
+  "UNAUTHORIZED",
+]);
+const serviceTerminationErrorNames = new Set([
+  "CodexProcessExitError",
+  "CodexServiceTerminatedError",
+]);
+const serviceTerminationErrorCodes = new Set(["CODEX_PROCESS_EXITED", "CODEX_SERVICE_TERMINATED"]);
+const transportErrorNames = new Set(["CodexTransportError"]);
+const transportErrorCodes = new Set(["ECONNREFUSED", "ECONNRESET", "EPIPE", "ETIMEDOUT"]);
+
+function errorName(error: unknown): string {
+  return error instanceof Error && error.name.length > 0 ? error.name : "unknown";
+}
+
+function errorCode(error: unknown): string | undefined {
+  if (typeof error !== "object" || error === null || !("code" in error)) return undefined;
+  const code = (error as { code?: unknown }).code;
+  return typeof code === "string" ? code : undefined;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : "";
+}
+
+function isAuthenticationFailure(error: unknown): boolean {
+  const message = errorMessage(error).toLowerCase();
+  return (
+    authenticationErrorNames.has(errorName(error)) ||
+    authenticationErrorCodes.has(errorCode(error) ?? "") ||
+    message === "chatgpt authentication is required" ||
+    message === "authentication required" ||
+    message === "unauthorized"
+  );
+}
+
+function isServiceTermination(error: unknown): boolean {
+  const message = errorMessage(error).toLowerCase();
+  return (
+    serviceTerminationErrorNames.has(errorName(error)) ||
+    serviceTerminationErrorCodes.has(errorCode(error) ?? "") ||
+    message === "process exited" ||
+    message === "codex app server exited" ||
+    message.startsWith("codex app server exited (") ||
+    message === "codex app server stopped" ||
+    message === "codex app server is stopped" ||
+    message === "codex app-server stdout line exceeded the byte limit"
+  );
+}
+
+function isTransportFailure(error: unknown): boolean {
+  const message = errorMessage(error).toLowerCase();
+  return (
+    transportErrorNames.has(errorName(error)) ||
+    transportErrorCodes.has(errorCode(error) ?? "") ||
+    message === "transport failed" ||
+    message === "model transport rejected" ||
+    message.startsWith("codex transport ") ||
+    message === "codex app-server request failed" ||
+    message.startsWith("codex app-server request timed out:") ||
+    message === "codex turn timed out"
+  );
+}
+
+export function codexFailureScope(
+  error: unknown,
+  consecutiveTransportFailures: number,
+): CodexFailureScope {
+  if (isAuthenticationFailure(error) || isServiceTermination(error)) return "service";
+  if (isTransportFailure(error) && consecutiveTransportFailures >= transportFailureThreshold) {
+    return "service";
+  }
+  return "turn";
+}
+
+function attachToolLease(
+  text: string,
+  lease: string,
+  taskLeaseId?: string,
+  allowedToolActions?: readonly ToolActionKind[],
+): string {
   return [
     text,
     "本回合工具租约",
+    ...(allowedToolActions === undefined
+      ? []
+      : [
+          `本回合只授权这些低风险 minecraft_ 动作：${allowedToolActions.join("、")}。其他动作会被本地拒绝。`,
+        ]),
     ...(taskLeaseId === undefined
       ? []
       : [`本次有界任务租约 ID 为 ${JSON.stringify(taskLeaseId)}。`]),
@@ -49,63 +200,55 @@ function attachToolLease(text: string, lease: string, taskLeaseId?: string): str
   ].join("\n");
 }
 
-const expectedTaskActions = [
+const autonomousMicroToolActions = [
   "get_state",
   "find_block",
   "say",
-  "move_to",
-  "follow_owner",
   "look_at",
   "jump",
-  "dig_block",
-  "place_block",
-  "craft_item",
-  "smelt_item",
-  "collect_dropped",
-  "equip_item",
-  "attack_hostile",
   "wait",
-] as const;
+] as const satisfies readonly ToolActionKind[];
 
-function turnDisclosure(goal: string): TaskDisclosure {
+function autonomousMicroTaskDisclosure(reason: AutonomyReason): TaskDisclosure {
   return {
-    goal,
-    expectedActions: [...expectedTaskActions],
-    limits: { ...HARD_TASK_LIMITS },
-    stopCondition: "完成、失败、中断、达到安全边界或预算耗尽时立即停止",
+    goal: `自主微任务：${reason}`,
+    expectedActions: [...autonomousMicroToolActions],
+    limits: {
+      maxToolCalls: 8,
+      maxBlockChanges: 0,
+      maxHorizontalTravel: 0,
+      maxDurationMs: 60_000,
+      maxDangerousOperations: 0,
+    },
+    stopCondition: "完成一次低风险观察、交流、转向、跳跃或等待后立即停止。",
   };
 }
 
-function conciseGoal(goal: string): string {
-  const normalized = goal.replace(/\s+/gu, " ").trim();
-  const characters = Array.from(normalized);
-  return characters.length <= 80 ? normalized : `${characters.slice(0, 79).join("")}…`;
-}
+type CompanionTaskExecutionOutcome = ReturnType<typeof companionTaskExecutionOutcomeSchema.parse>;
+type ValidatedTaskDecision = Extract<
+  OwnerIntentDecision,
+  { kind: "start_task" | "continue_task" | "replace_task" }
+>;
 
-function disclosureMessage(disclosure: TaskDisclosure): string {
-  return [
-    `任务披露：目标“${conciseGoal(disclosure.goal)}”`,
-    `预计动作类别：${disclosure.expectedActions.join("、")}`,
-    `有效上限：工具调用 ${disclosure.limits.maxToolCalls} 次`,
-    `方块修改 ${disclosure.limits.maxBlockChanges} 次`,
-    `水平移动 ${disclosure.limits.maxHorizontalTravel} 格`,
-    `持续时间 ${disclosure.limits.maxDurationMs} 毫秒`,
-    `危险操作 ${disclosure.limits.maxDangerousOperations} 次`,
-    `停止条件：${disclosure.stopCondition}`,
-  ].join("；");
-}
+const taskLimitKeys = [
+  "maxToolCalls",
+  "maxBlockChanges",
+  "maxHorizontalTravel",
+  "maxDurationMs",
+  "maxDangerousOperations",
+] as const satisfies readonly (keyof TaskLimits)[];
 
-export function formatTaskDisclosureForMinecraft(disclosure: TaskDisclosure): string[] {
-  const firstPrefix = "任务披露：";
-  const continuationPrefix = "任务披露（续）：";
-  const body = disclosureMessage(disclosure).slice(firstPrefix.length);
-  return splitForMinecraft(body, 240 - continuationPrefix.length).map(
-    (chunk, index) => `${index === 0 ? firstPrefix : continuationPrefix}${chunk}`,
-  );
+function canReuseTaskAuthority(decision: ValidatedTaskDecision, task: ActiveTask): boolean {
+  const currentActions = new Set(task.disclosure.expectedActions);
+  if (!decision.task.allowedActions.every((action) => currentActions.has(action))) return false;
+  const requestedLimits = effectiveTaskLimits(decision.task.requestedLimits);
+  return taskLimitKeys.every((key) => requestedLimits[key] <= task.disclosure.limits[key]);
 }
 
 function memoryValidationSource(
-  outcome: CompanionTurnOutcome,
+  outcome: Pick<CompanionTurnOutcome, "reply" | "memoryCandidates"> & {
+    task?: CompanionTurnOutcome["task"];
+  },
   ownerText?: string,
 ): MemoryValidationSource {
   const task = outcome.task;
@@ -128,7 +271,8 @@ export interface CompanionServiceDependencies {
   minecraft: MinecraftPort;
   codex: CodexPort;
   mode: ModeManager;
-  memories: MemoryStore;
+  memories: MemoryStore | ScopedMemoryStore;
+  memoryMigration?: MemoryMigration;
   state: StateStore;
   confirmations: ConfirmationStore;
   executor: ActionExecutor;
@@ -136,11 +280,13 @@ export interface CompanionServiceDependencies {
   taskController: TaskController;
   autonomy: CompanionAutonomyScheduler;
   safetyContextProvider: () => Promise<SafetyContext>;
-  ownerUsername: string;
+  ownerUsername: () => string;
+  ownerIdentity?: Pick<OwnerIdentityAccess, "snapshot" | "setPresence">;
   chatRouter: ChatRouter;
   cwd: string;
   preferredModel: string;
-  reasoningEffort: "low" | "medium";
+  reasoningEffort: string;
+  onAuthorityLost?: (event: RuntimeAuthorityLoss) => void;
   requestedTaskLimits?: Partial<TaskLimits>;
   logger?: Pick<SafeLogger, "error">;
   setTimer?: (callback: () => void, milliseconds: number) => ReturnType<typeof setTimeout>;
@@ -151,6 +297,8 @@ export interface CompanionServiceDependencies {
     milliseconds: number,
   ) => ReturnType<typeof setTimeout>;
   clearConfirmationTimer?: (timer: ReturnType<typeof setTimeout>) => void;
+  compatibilityVerified?: () => boolean | Promise<boolean>;
+  safetyPresetAllows?: () => boolean | Promise<boolean>;
 }
 
 export interface CompanionAutonomyScheduler {
@@ -161,6 +309,7 @@ export interface CompanionAutonomyScheduler {
   notifyActionFailed(): void;
   notifyThreat(): void;
   canChatProactively(): boolean;
+  canSendProactively(kind: ProactiveKind): boolean;
   markProactiveChat(): void;
 }
 
@@ -169,6 +318,14 @@ interface ActiveTurn {
   threadId: string;
   turnId?: string;
   cancel(): void;
+}
+
+interface IntentStamp {
+  readonly generation: number;
+  readonly messageSequence: number;
+  readonly ownerRevision: number;
+  readonly worldGeneration: number;
+  readonly taskLeaseAtDispatch: Readonly<TaskLease> | null;
 }
 
 const noOpLogger: Pick<SafeLogger, "error"> = { error: async () => undefined };
@@ -223,13 +380,20 @@ export class CompanionService {
   private confirmationExpiryTimer: ReturnType<typeof setTimeout> | undefined;
   private mergedMessages: string[] = [];
   private generation = 0;
+  private messageSequence = 0;
+  private worldGeneration = 0;
   private running = false;
   private starting = false;
-  private threadId: string | undefined;
+  private ownerChangedDuringStartup = false;
+  private intentThreadId: string | undefined;
+  private executionThreadId: string | undefined;
   private selectedModel: string | undefined;
   private codexHealthy = true;
-  private activeTurn: ActiveTurn | undefined;
-  private turnTail: Promise<void> = Promise.resolve();
+  private consecutiveTransportFailures = 0;
+  private readonly activeIntentTurns = new Set<ActiveTurn>();
+  private activeExecutionTurn: ActiveTurn | undefined;
+  private intentTurnTail: Promise<void> = Promise.resolve();
+  private executionTurnTail: Promise<void> = Promise.resolve();
   private confirmationTail: Promise<void> = Promise.resolve();
   private recoveryFlight: Promise<void> | undefined;
   private unfinishedTaskSummary: string | null = null;
@@ -237,7 +401,12 @@ export class CompanionService {
   private turnWorkCount = 0;
   private autonomousRequestCount = 0;
   private externallyManagedCodex = false;
+  private reportedModelAuthorityLossGeneration: number | undefined;
   private worldInvalidated = false;
+  private memoryScope: { mode: "global" | "world" | "layered"; worldId?: string } = {
+    mode: "global",
+  };
+  private locallyContainedTaskLeaseKey: string | undefined;
   private readonly pendingConfirmationTerminalReasons = new Map<string, "failed" | "owner_stop">();
 
   constructor(private readonly dependencies: CompanionServiceDependencies) {
@@ -256,9 +425,68 @@ export class CompanionService {
     );
   }
 
+  /** Memory scope only changes future prompts; it never changes the Minecraft connection. */
+  setMemoryScope(scope: { mode: "global" | "world" | "layered"; worldId?: string }): void {
+    if (
+      (scope.mode === "world" || scope.mode === "layered") &&
+      (typeof scope.worldId !== "string" || scope.worldId.length === 0)
+    ) {
+      throw new Error("world id is required");
+    }
+    if (scope.mode === "global" && scope.worldId !== undefined) {
+      throw new Error("global memory scope cannot include a world id");
+    }
+    this.memoryScope = { ...scope };
+    this.invalidateCurrentTurn();
+  }
+
+  getMemoryScope(): { mode: "global" | "world" | "layered"; worldId?: string } {
+    return { ...this.memoryScope };
+  }
+
+  private searchMemories(query: string) {
+    const memories = this.dependencies.memories;
+    return memories instanceof ScopedMemoryStore
+      ? memories.search(query, this.memoryScope)
+      : memories.search(query);
+  }
+
+  private async createThreadPair(generation: number, selectedModel: string): Promise<boolean> {
+    this.intentThreadId = undefined;
+    this.executionThreadId = undefined;
+    try {
+      const intentThreadId = await this.dependencies.codex.startThread({
+        cwd: this.dependencies.cwd,
+        model: selectedModel,
+        reasoningEffort: this.dependencies.reasoningEffort,
+      });
+      if (generation !== this.generation) {
+        await this.closeStaleCodex(generation);
+        return false;
+      }
+      const executionThreadId = await this.dependencies.codex.startThread({
+        cwd: this.dependencies.cwd,
+        model: selectedModel,
+        reasoningEffort: this.dependencies.reasoningEffort,
+      });
+      if (generation !== this.generation) {
+        await this.closeStaleCodex(generation);
+        return false;
+      }
+      this.intentThreadId = intentThreadId;
+      this.executionThreadId = executionThreadId;
+      return true;
+    } catch (error) {
+      this.intentThreadId = undefined;
+      this.executionThreadId = undefined;
+      throw error;
+    }
+  }
+
   async start(preselectedModel?: string): Promise<void> {
     if (this.running || this.starting) throw new Error("CompanionService is already started");
     this.starting = true;
+    this.ownerChangedDuringStartup = false;
     this.externallyManagedCodex = preselectedModel !== undefined;
     const generation = ++this.generation;
     try {
@@ -271,16 +499,18 @@ export class CompanionService {
           void this.logger.error("companion_event_failed", { code: String(error) });
         });
       });
+      await this.dependencies.memoryMigration?.migrateLegacyOnce();
       const persisted = await this.dependencies.state.load();
       if (generation !== this.generation) return;
       this.dependencies.confirmations.clear();
       this.dependencies.executor.stopAll();
-      this.dependencies.mode.setMode("friend");
+      this.dependencies.mode.resetModeFromProfile();
       this.dependencies.mode.completeTask();
       this.unfinishedTaskSummary = persisted.unfinishedTaskSummary;
       this.worldInvalidated = persisted.worldInvalidated;
-      if (this.worldInvalidated || this.unfinishedTaskSummary) this.dependencies.mode.pause();
-      else this.dependencies.mode.resume();
+      if (this.ownerChangedDuringStartup || this.worldInvalidated || this.unfinishedTaskSummary) {
+        this.dependencies.mode.pause();
+      } else this.dependencies.mode.resume();
 
       if (preselectedModel === undefined) {
         await this.dependencies.codex.start();
@@ -289,14 +519,11 @@ export class CompanionService {
       } else {
         this.selectedModel = preselectedModel;
       }
-      this.threadId = await this.dependencies.codex.startThread({
-        cwd: this.dependencies.cwd,
-        model: this.selectedModel,
-        reasoningEffort: this.dependencies.reasoningEffort,
-      });
-      if (generation !== this.generation) return;
+      if (!(await this.createThreadPair(generation, this.selectedModel))) return;
+      this.consecutiveTransportFailures = 0;
       this.codexHealthy = this.unfinishedTaskSummary === null;
       this.running = true;
+      void this.refreshOwnerPresence();
       this.scheduleConfirmationExpiry();
       this.unsubscribeActionResult = this.dependencies.executor.onResult((result) => {
         if (!this.running || result.status !== "failed") return;
@@ -305,6 +532,15 @@ export class CompanionService {
         } catch {
           // Scheduler observation must never affect the action result.
         }
+        if (this.dependencies.taskController.current() === null) return;
+        const error = new Error();
+        error.name = "MinecraftToolError";
+        void this.failTaskOnly(this.generation, error, taskFailureMessage).catch(
+          (failure: unknown) =>
+            this.logger.error("task_failure_containment_failed", {
+              code: errorName(failure),
+            }),
+        );
       });
       this.dependencies.autonomy.start();
       while (this.startupEvents.length > 0) {
@@ -315,6 +551,8 @@ export class CompanionService {
       this.starting = false;
     } catch (error) {
       this.running = false;
+      this.intentThreadId = undefined;
+      this.executionThreadId = undefined;
       this.startupEvents.splice(0);
       this.dependencies.autonomy.stop();
       this.unsubscribeActionResult?.();
@@ -327,6 +565,7 @@ export class CompanionService {
       throw error;
     } finally {
       this.starting = false;
+      this.ownerChangedDuringStartup = false;
     }
   }
 
@@ -345,9 +584,15 @@ export class CompanionService {
     this.dependencies.taskController.stop("process_exit");
     this.dependencies.executor.stopAll();
     this.dependencies.confirmations.clear();
+    const hasActiveRecoveryTurn =
+      this.recoveryFlight !== undefined &&
+      (this.activeIntentTurns.size > 0 || this.activeExecutionTurn !== undefined);
     this.interruptActive();
-    this.activeTurn = undefined;
-    const tail = this.turnTail;
+    this.activeExecutionTurn = undefined;
+    this.intentThreadId = undefined;
+    this.executionThreadId = undefined;
+    const intentTail = this.intentTurnTail;
+    const executionTail = this.executionTurnTail;
     const recovery = this.recoveryFlight;
     const confirmation = this.confirmationTail.catch(() => undefined);
     const stoppingCodex = this.externallyManagedCodex
@@ -358,14 +603,79 @@ export class CompanionService {
             this.logger.error("codex_stop_failed", { code: String(error) }),
           );
     const pendingWork =
-      this.externallyManagedCodex && recovery
+      this.externallyManagedCodex && recovery && !hasActiveRecoveryTurn
         ? [confirmation]
-        : [tail.catch(() => undefined), recovery?.catch(() => undefined), confirmation];
+        : [
+            intentTail.catch(() => undefined),
+            executionTail.catch(() => undefined),
+            recovery?.catch(() => undefined),
+            confirmation,
+          ];
     await Promise.all([...pendingWork, stoppingCodex]);
+  }
+
+  applyProfile(profile: CompanionProfile): void {
+    const previousMode = this.dependencies.mode.getMode();
+    const previousSettings = this.dependencies.mode.getModeSettings();
+    this.dependencies.mode.applyProfile(profile);
+    const nextMode = this.dependencies.mode.getMode();
+    const nextSettings = this.dependencies.mode.getModeSettings();
+    const modeAuthority = { friend: 0, balanced: 1, autonomous: 2 } as const;
+    const restrictionsTightened =
+      modeAuthority[nextMode] < modeAuthority[previousMode] ||
+      (previousMode === "balanced" &&
+        nextMode === "balanced" &&
+        ((previousSettings.allowProactiveChat && !nextSettings.allowProactiveChat) ||
+          (previousSettings.allowSuggestions && !nextSettings.allowSuggestions))) ||
+      (previousMode === "autonomous" &&
+        nextMode === "autonomous" &&
+        previousSettings.allowLowRiskMicroActions &&
+        !nextSettings.allowLowRiskMicroActions);
+    const hasLiveAutonomousAuthority =
+      this.autonomousRequestCount > 0 || this.dependencies.taskController.current() !== null;
+    if (restrictionsTightened && hasLiveAutonomousAuthority) {
+      try {
+        this.dependencies.taskController.stop("owner_stop");
+      } finally {
+        this.dependencies.budget.end();
+        try {
+          this.dependencies.executor.stopAll();
+        } finally {
+          this.invalidateCurrentTurn();
+          this.dependencies.mode.completeTask();
+          this.unfinishedTaskSummary = null;
+        }
+      }
+      void this.persist().catch((error: unknown) =>
+        this.logger.error("profile_restriction_state_save_failed", { code: String(error) }),
+      );
+    }
+    try {
+      this.dependencies.autonomy.notifyModeChanged();
+    } catch {
+      // Profile authority has already been applied and cannot be weakened by observers.
+    }
+  }
+
+  ownerIdentityChanged(_snapshot: OwnerIdentitySnapshot): void {
+    this.dependencies.taskController.stop("owner_changed");
+    this.dependencies.confirmations.clear();
+    this.dependencies.executor.stopAll();
+    if (this.starting && !this.running) this.invalidateStartupOwnerWork();
+    else this.invalidateCurrentTurn();
+    this.dependencies.mode.pause();
+    void this.refreshOwnerPresence();
   }
 
   private async handleEvent(event: MinecraftEvent): Promise<void> {
     if (!this.running) return;
+    if (
+      event.kind === "connected" ||
+      event.kind === "disconnected" ||
+      event.kind === "world_changed"
+    ) {
+      this.worldGeneration += 1;
+    }
     if (event.kind === "chat") {
       const route = this.dependencies.chatRouter.route(event);
       if (route.kind === "ignore") return;
@@ -376,8 +686,10 @@ export class CompanionService {
       this.onOwnerMessage(route.text);
       return;
     }
-    if (event.kind === "owner_offline") {
-      if (event.username !== this.dependencies.ownerUsername) return;
+    if (event.kind === "owner_online" || event.kind === "owner_offline") {
+      if (event.username !== this.dependencies.ownerUsername()) return;
+      this.setOwnerPresence(event.kind === "owner_online" ? "online" : "offline");
+      if (event.kind === "owner_online") return;
       this.dependencies.taskController.stop("disconnect");
       this.invalidateCurrentTurn();
       this.dependencies.confirmations.clear();
@@ -412,9 +724,11 @@ export class CompanionService {
       return;
     }
     if (event.kind === "connected") {
+      void this.refreshOwnerPresence();
       this.dependencies.confirmations.clear();
+      this.dependencies.taskController.stop("disconnect");
       this.dependencies.executor.stopAll();
-      this.dependencies.mode.setMode("friend");
+      this.dependencies.mode.resetModeFromProfile();
       this.dependencies.autonomy.notifyModeChanged();
       this.dependencies.mode.completeTask();
       if (this.worldInvalidated || this.unfinishedTaskSummary) this.dependencies.mode.pause();
@@ -424,64 +738,368 @@ export class CompanionService {
   }
 
   private onOwnerMessage(message: string): void {
-    if (
-      this.dependencies.mode.getMode() === "autonomous" ||
-      this.autonomousRequestCount > 0 ||
-      this.dependencies.taskController.current() !== null
-    ) {
-      this.dependencies.mode.completeTask();
-      this.dependencies.taskController.stop("owner_stop");
-      this.dependencies.executor.stopAll();
-      this.invalidateCurrentTurn();
-      this.dependencies.mode.resume();
-      this.unfinishedTaskSummary = null;
-      void this.persist().catch((error: unknown) =>
-        this.logger.error("state_save_failed", { code: String(error) }),
-      );
-    }
     this.mergedMessages.push(message);
     if (this.mergeTimer !== undefined) return;
     const expectedGeneration = this.generation;
     this.mergeTimer = this.setTimer(() => {
       this.mergeTimer = undefined;
       const combined = this.mergedMessages.splice(0).join("\n");
-      if (combined) this.enqueueTurn(combined, expectedGeneration);
+      if (combined) {
+        this.messageSequence += 1;
+        this.enqueueTurn(combined, expectedGeneration, this.captureIntentStamp());
+      }
     }, 750);
   }
 
-  private enqueueTurn(text: string, generation: number): void {
-    this.turnTail = this.turnTail
+  private enqueueTurn(text: string, generation: number, capturedStamp: Promise<IntentStamp>): void {
+    this.interruptIntentTurns();
+    this.intentTurnTail = this.intentTurnTail
       .catch(() => undefined)
-      .then(() => this.performTurn(text, generation))
+      .then(() => this.performTurn(text, generation, capturedStamp))
       .catch((error: unknown) =>
         this.logger.error("companion_turn_failed", { code: String(error) }),
       );
   }
 
-  private async performTurn(text: string, generation: number): Promise<void> {
+  private async performTurn(
+    text: string,
+    generation: number,
+    capturedStamp: Promise<IntentStamp>,
+  ): Promise<void> {
     try {
       this.turnWorkCount += 1;
-      if (!this.isCurrent(generation) || !this.threadId || this.dependencies.mode.snapshot().paused)
+      if (
+        !this.isCurrent(generation) ||
+        !this.intentThreadId ||
+        !this.executionThreadId ||
+        this.dependencies.mode.snapshot().paused
+      )
         return;
-      const disclosure = turnDisclosure(text);
-      let prompt: string;
+      const stamp = await capturedStamp;
+      if (stamp.generation !== generation || !this.isIntentCurrent(stamp)) return;
+      await this.routeOwnerMessage(text, stamp);
+    } finally {
+      this.turnWorkCount -= 1;
+    }
+  }
+
+  private async routeOwnerMessage(text: string, stamp: IntentStamp): Promise<void> {
+    const decision = await this.resolveOwnerIntent(text, stamp);
+    if (!decision || !this.isIntentCurrent(stamp)) return;
+    switch (decision.kind) {
+      case "chat":
+        await this.persistIntentMemories(decision.memoryCandidates, text, stamp);
+        if (this.isIntentCurrent(stamp))
+          await this.sendOutcomeReply(decision.reply, stamp.generation, false);
+        return;
+      case "clarify":
+        if (this.isIntentCurrent(stamp)) {
+          await this.sendOutcomeReply(decision.question, stamp.generation, false);
+        }
+        return;
+      default:
+        await this.applyTaskDecision(decision, text, stamp);
+    }
+  }
+
+  private async resolveOwnerIntent(
+    text: string,
+    stamp: IntentStamp,
+  ): Promise<OwnerIntentDecision | undefined> {
+    let prompt: string;
+    try {
+      const activeTask = this.dependencies.taskController.current();
+      prompt = buildOwnerIntentTurn({
+        ownerMessage: text,
+        mode: this.dependencies.mode.getMode(),
+        profile: this.dependencies.mode.getProfile(),
+        world: await this.dependencies.minecraft.snapshot(this.dependencies.ownerUsername()),
+        memories: (await this.searchMemories(text)).slice(0, 8),
+        activeTask: activeTask
+          ? {
+              goal: activeTask.disclosure.goal,
+              allowedActions: activeTask.disclosure.expectedActions,
+              limits: activeTask.disclosure.limits,
+            }
+          : null,
+      });
+    } catch (error) {
+      if (this.isIntentCurrent(stamp)) {
+        await this.failTaskOnly(stamp.generation, error, taskFailureMessage);
+      }
+      return undefined;
+    }
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const result = await this.sendAttempt(
+        "intent",
+        attempt === 0 ? prompt : ownerIntentRepairPrompt,
+        stamp.generation,
+        true,
+        undefined,
+        false,
+        undefined,
+        () => this.isIntentCurrent(stamp),
+      );
+      if (!result || !this.isIntentCurrent(stamp)) return undefined;
       try {
-        const input = {
-          mode: this.dependencies.mode.getMode(),
-          world: await this.dependencies.minecraft.snapshot(this.dependencies.ownerUsername),
-          memories: (await this.dependencies.memories.search(text)).slice(0, 8),
-        };
-        prompt = buildCompanionTurn({ ...input, ownerMessage: text });
-      } catch (error) {
-        await this.failClosed(generation, error);
+        return parseOwnerIntentDecision(this.parseJson(result.text));
+      } catch {
+        // One context-free schema-repair turn is allowed before natural clarification.
+      }
+    }
+    if (!this.isIntentCurrent(stamp)) return undefined;
+    try {
+      await this.logger.error("intent_invalid_structure", { code: "invalid_structure" });
+    } catch {
+      // Diagnostic observers cannot suppress the fixed clarification.
+    }
+    if (this.isIntentCurrent(stamp)) await this.say(intentClarificationMessage);
+    return undefined;
+  }
+
+  private async persistIntentMemories(
+    memoryCandidates: readonly IntentMemoryCandidate[],
+    ownerText: string,
+    stamp: IntentStamp,
+  ): Promise<void> {
+    const candidates = memoryCandidates
+      .filter((candidate) => candidate.importance >= 3)
+      .map((candidate) => ({ ...candidate }));
+    if (candidates.length === 0) return;
+    await this.dependencies.memories.addBatch(candidates, () => this.isIntentCurrent(stamp), {
+      ownerText,
+    });
+  }
+
+  private isIntentCurrent(stamp: IntentStamp): boolean {
+    if (
+      !this.isCurrent(stamp.generation) ||
+      stamp.messageSequence !== this.messageSequence ||
+      stamp.worldGeneration !== this.worldGeneration
+    ) {
+      return false;
+    }
+    try {
+      return stamp.ownerRevision === (this.dependencies.ownerIdentity?.snapshot().revision ?? 0);
+    } catch {
+      return false;
+    }
+  }
+
+  private async captureIntentStamp(): Promise<IntentStamp> {
+    const taskLease = this.dependencies.taskController.current()?.lease ?? null;
+    return Object.freeze({
+      generation: this.generation,
+      messageSequence: this.messageSequence,
+      ownerRevision: this.dependencies.ownerIdentity?.snapshot().revision ?? 0,
+      worldGeneration: this.worldGeneration,
+      taskLeaseAtDispatch:
+        taskLease === null
+          ? null
+          : Object.freeze({ id: taskLease.id, startedAt: taskLease.startedAt }),
+    });
+  }
+
+  private isTaskDecisionCurrent(
+    decision: Exclude<OwnerIntentDecision, { kind: "chat" | "clarify" }>,
+    stamp: IntentStamp,
+  ): boolean {
+    if (!this.isIntentCurrent(stamp)) return false;
+    if (decision.kind === "start_task") return true;
+    const currentLease = this.dependencies.taskController.current()?.lease ?? null;
+    if (stamp.taskLeaseAtDispatch === null || currentLease === null) {
+      return stamp.taskLeaseAtDispatch === null && currentLease === null;
+    }
+    return sameTaskLease(stamp.taskLeaseAtDispatch, currentLease);
+  }
+
+  private async applyTaskDecision(
+    decision: Exclude<OwnerIntentDecision, { kind: "chat" | "clarify" }>,
+    text: string,
+    stamp: IntentStamp,
+  ): Promise<void> {
+    if (!this.isTaskDecisionCurrent(decision, stamp)) return;
+    if (decision.kind === "stop_task") {
+      this.revokeCurrentTask("owner_stop");
+      this.unfinishedTaskSummary = null;
+      if (this.isIntentCurrent(stamp)) await this.persist();
+      if (decision.reply && this.isIntentCurrent(stamp)) {
+        await this.sendOutcomeReply(decision.reply, stamp.generation, false);
+      }
+      return;
+    }
+
+    if (
+      (decision.kind === "start_task" || decision.kind === "replace_task") &&
+      (this.dependencies.taskController.current() !== null || this.autonomousRequestCount > 0)
+    ) {
+      this.revokeCurrentTask("owner_stop");
+      this.unfinishedTaskSummary = null;
+      if (this.isIntentCurrent(stamp)) await this.persist();
+      if (!this.isIntentCurrent(stamp)) return;
+    }
+    if (decision.kind === "continue_task") {
+      const currentTask = this.dependencies.taskController.current();
+      if (!currentTask) {
+        await this.sendOutcomeReply(
+          "当前没有可继续的任务，请说明要开始的新任务。",
+          stamp.generation,
+          false,
+        );
         return;
       }
-      const outcome = await this.resolveOutcome(prompt, generation, text, disclosure);
-      if (!outcome || !this.isCurrent(generation)) return;
-      await this.persistOutcome(outcome, generation, text);
-      if (!this.isCurrent(generation)) return;
-      await this.sendOutcomeReply(outcome.reply, generation, false);
+      if (!canReuseTaskAuthority(decision, currentTask)) {
+        await this.sendOutcomeReply(
+          "继续请求超出当前任务权限，请明确替换任务。",
+          stamp.generation,
+          false,
+        );
+        return;
+      }
+      this.interruptExecutionTurn();
+    }
+
+    const queued = this.executionTurnTail
+      .catch(() => undefined)
+      .then(() => this.startValidatedTask(decision, text, stamp))
+      .catch((error: unknown) =>
+        this.logger.error("companion_task_turn_failed", { code: String(error) }),
+      );
+    this.executionTurnTail = queued;
+  }
+
+  private async startValidatedTask(
+    decision: ValidatedTaskDecision,
+    ownerText: string,
+    stamp: IntentStamp,
+  ): Promise<void> {
+    this.turnWorkCount += 1;
+    let task: ActiveTask | undefined;
+    let prepared: TaskDisclosure | undefined;
+    let taskStopReason: TaskStopReason = "failed";
+    try {
+      if (!this.isIntentCurrent(stamp)) return;
+      if (decision.kind === "continue_task") {
+        const currentTask = this.dependencies.taskController.current();
+        if (
+          !currentTask ||
+          stamp.taskLeaseAtDispatch === null ||
+          !sameTaskLease(currentTask.lease, stamp.taskLeaseAtDispatch)
+        )
+          return;
+        task = currentTask;
+      } else {
+        const disclosure: TaskDisclosure = {
+          goal: decision.task.goal,
+          expectedActions: [...decision.task.allowedActions],
+          limits: effectiveTaskLimits(decision.task.requestedLimits),
+          stopCondition: "完成、失败、安全边界或预算耗尽时停止",
+        };
+        prepared = this.dependencies.taskController.prepare(
+          disclosure,
+          decision.task.requestedLimits,
+        );
+      }
+      await this.persistIntentMemories(decision.memoryCandidates, ownerText, stamp);
+      if (!this.isIntentCurrent(stamp)) return;
+      let prompt: string;
+      try {
+        const currentDisclosure = task?.disclosure;
+        const plan =
+          decision.kind === "continue_task" && currentDisclosure
+            ? {
+                goal: currentDisclosure.goal,
+                allowedActions: decision.task.allowedActions.filter((action) =>
+                  currentDisclosure.expectedActions.includes(action),
+                ),
+                requestedLimits: decision.task.requestedLimits,
+              }
+            : decision.task;
+        const input = {
+          mode: this.dependencies.mode.getMode(),
+          profile: this.dependencies.mode.getProfile(),
+          world: await this.dependencies.minecraft.snapshot(this.dependencies.ownerUsername()),
+          memories: (await this.searchMemories(ownerText)).slice(0, 8),
+          ownerMessage: ownerText,
+          plan,
+        };
+        prompt = buildCompanionTaskExecutionTurn(input);
+      } catch (error) {
+        if (this.isIntentCurrent(stamp)) {
+          await this.failTaskOnly(stamp.generation, error, taskFailureMessage);
+        }
+        return;
+      }
+
+      if (!this.isIntentCurrent(stamp)) return;
+      if (task) {
+        if (this.dependencies.taskController.current()?.id !== task.id) return;
+      } else {
+        if (!prepared) throw new Error("validated task disclosure is missing");
+        if (this.dependencies.taskController.current() !== null) return;
+        this.locallyContainedTaskLeaseKey = undefined;
+        task = this.dependencies.taskController.start(prepared, prepared.limits);
+      }
+      if (decision.naturalReply && this.isIntentCurrent(stamp)) {
+        await this.sendOutcomeReply(decision.naturalReply, stamp.generation, false);
+      }
+      if (!this.isIntentCurrent(stamp)) return;
+
+      let outcome: CompanionTaskExecutionOutcome | undefined;
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const result = await this.sendAttempt(
+          "execution",
+          attempt === 0 ? prompt : repairPrompt,
+          stamp.generation,
+          true,
+          task,
+          true,
+          decision.task.allowedActions,
+          () => this.isIntentCurrent(stamp),
+        );
+        if (!result || !this.isIntentCurrent(stamp)) return;
+        const parsed = companionTaskExecutionOutcomeSchema.safeParse(this.parseJson(result.text));
+        if (!parsed.success || !this.memoryCandidatesValid(parsed.data, ownerText)) continue;
+        outcome = parsed.data;
+        break;
+      }
+      if (!outcome) {
+        const error = new Error();
+        error.name = "CodexInvalidStructureError";
+        await this.failTaskOnly(stamp.generation, error, taskFailureMessage);
+        task = undefined;
+        return;
+      }
+
+      taskStopReason = "completed";
+      await this.persistTaskExecutionOutcome(task.disclosure.goal, outcome, stamp, ownerText);
+      if (!this.isIntentCurrent(stamp)) return;
+      await this.sendOutcomeReply(outcome.reply, stamp.generation, false);
+    } catch (error) {
+      if (
+        task &&
+        this.isIntentCurrent(stamp) &&
+        this.dependencies.taskController.current()?.id === task.id
+      ) {
+        this.dependencies.taskController.stop("failed");
+        task = undefined;
+      }
+      if (this.isIntentCurrent(stamp)) {
+        await this.failTaskOnly(stamp.generation, error, taskFailureMessage);
+      }
     } finally {
+      if (
+        task &&
+        this.isIntentCurrent(stamp) &&
+        this.dependencies.taskController.current()?.id === task.id
+      ) {
+        if (
+          taskStopReason !== "completed" ||
+          !this.dependencies.confirmations.hasGameActions(task.lease)
+        ) {
+          this.dependencies.taskController.stop(taskStopReason);
+        }
+      }
       this.turnWorkCount -= 1;
     }
   }
@@ -490,16 +1108,16 @@ export class CompanionService {
     if (!this.running) return;
     const state = this.dependencies.mode.snapshot();
     if (state.mode === "friend" || state.paused) return;
-    if (this.dependencies.taskController.current() !== null) return;
+    if (this.autonomousRequestCount > 0 || this.hasActiveTask()) return;
     const generation = this.generation;
     this.autonomousRequestCount += 1;
-    const queued = this.turnTail
+    const queued = this.executionTurnTail
       .catch(() => undefined)
       .then(() => this.performAutonomousTurn(reason, generation))
       .catch((error: unknown) =>
         this.logger.error("companion_autonomous_turn_failed", { code: String(error) }),
       );
-    this.turnTail = queued;
+    this.executionTurnTail = queued;
     try {
       await queued;
     } finally {
@@ -510,9 +1128,11 @@ export class CompanionService {
   isBusyForAutonomy(): boolean {
     return (
       this.turnWorkCount > 0 ||
-      this.activeTurn !== undefined ||
+      this.activeIntentTurns.size > 0 ||
+      this.activeExecutionTurn !== undefined ||
       this.recoveryFlight !== undefined ||
-      this.dependencies.taskController.current() !== null ||
+      this.autonomousRequestCount > 0 ||
+      this.hasActiveTask() ||
       this.dependencies.executor.isBusy() ||
       this.mergeTimer !== undefined ||
       this.mergedMessages.length > 0
@@ -522,31 +1142,86 @@ export class CompanionService {
   private async performAutonomousTurn(reason: AutonomyReason, generation: number): Promise<void> {
     this.turnWorkCount += 1;
     try {
-      if (!this.isCurrent(generation) || !this.threadId) return;
+      if (!this.isCurrent(generation) || !this.executionThreadId) return;
       const state = this.dependencies.mode.snapshot();
       if (state.mode === "friend" || state.paused) return;
-      if (this.dependencies.taskController.current() !== null) return;
-      if (!(await this.dependencies.minecraft.isOwnerOnline(this.dependencies.ownerUsername)))
+      if (this.hasActiveTask()) return;
+      const ownerOnline = await this.dependencies.minecraft.isOwnerOnline(
+        this.dependencies.ownerUsername(),
+      );
+      const compatibilityVerified =
+        state.mode === "autonomous"
+          ? await (this.dependencies.compatibilityVerified?.() ?? false)
+          : false;
+      const safetyPresetAllows =
+        state.mode === "autonomous"
+          ? await (this.dependencies.safetyPresetAllows?.() ?? false)
+          : false;
+      const settings = this.dependencies.mode.getModeSettings();
+      const policyInput = {
+        mode: state.mode,
+        settings,
+        ownerOnline,
+        hasActiveTask: this.hasActiveTask(),
+        compatibilityVerified,
+        safetyPresetAllows,
+      } as const;
+      const allowedProactiveKinds: ProactiveKind[] =
+        state.mode === "balanced"
+          ? [
+              ...(isUnsolicitedActivityAllowed({
+                ...policyInput,
+                activity: "proactive_chat",
+              })
+                ? (["chat"] as const)
+                : []),
+              ...(isUnsolicitedActivityAllowed({
+                ...policyInput,
+                activity: "suggestion",
+              })
+                ? (["suggestion"] as const)
+                : []),
+            ]
+          : [];
+      if (
+        state.mode === "balanced"
+          ? allowedProactiveKinds.length === 0
+          : !isUnsolicitedActivityAllowed({
+              ...policyInput,
+              activity: "low_risk_micro_action",
+            })
+      )
         return;
       if (!this.isCurrent(generation)) return;
-      const disclosure = turnDisclosure(`自主微任务：${reason}`);
+      const permitsTools = state.mode === "autonomous";
+      const disclosure = permitsTools ? autonomousMicroTaskDisclosure(reason) : undefined;
       let prompt: string;
       try {
         prompt = buildCompanionAutonomousTurn({
           mode: this.dependencies.mode.getMode(),
+          profile: this.dependencies.mode.getProfile(),
           reason,
-          world: await this.dependencies.minecraft.snapshot(this.dependencies.ownerUsername),
-          memories: (await this.dependencies.memories.search(reason)).slice(0, 8),
+          world: await this.dependencies.minecraft.snapshot(this.dependencies.ownerUsername()),
+          memories: (await this.searchMemories(reason)).slice(0, 8),
         });
       } catch (error) {
-        await this.failClosed(generation, error);
+        await this.failTaskOnly(generation, error, taskFailureMessage);
         return;
       }
-      const outcome = await this.resolveOutcome(prompt, generation, undefined, disclosure);
+      const outcome = await this.resolveOutcome(prompt, generation, undefined, disclosure, {
+        toolsEnabled: permitsTools,
+        taskForbidden: true,
+        repairPrompt:
+          state.mode === "balanced"
+            ? balancedRepairPrompt(allowedProactiveKinds)
+            : autonomousRepairPrompt,
+        ...(state.mode === "balanced" ? { allowedProactiveKinds } : {}),
+        ...(permitsTools ? { allowedToolActions: autonomousMicroToolActions } : {}),
+      });
       if (!outcome || !this.isCurrent(generation)) return;
       await this.persistOutcome(outcome, generation);
       if (!this.isCurrent(generation)) return;
-      await this.sendOutcomeReply(outcome.reply, generation, true);
+      await this.sendOutcomeReply(outcome.reply, generation, true, outcome.proactiveKind ?? "chat");
     } finally {
       this.turnWorkCount -= 1;
     }
@@ -557,6 +1232,13 @@ export class CompanionService {
     generation: number,
     ownerText?: string,
     disclosure?: TaskDisclosure,
+    options: {
+      readonly toolsEnabled?: boolean;
+      readonly taskForbidden?: boolean;
+      readonly allowedToolActions?: readonly ToolActionKind[];
+      readonly repairPrompt?: string;
+      readonly allowedProactiveKinds?: readonly ProactiveKind[];
+    } = {},
   ): Promise<CompanionTurnOutcome | undefined> {
     let outcome: CompanionTurnOutcome | undefined;
     let task: ActiveTask | undefined;
@@ -567,32 +1249,40 @@ export class CompanionService {
           disclosure,
           this.dependencies.requestedTaskLimits,
         );
-        for (const chunk of formatTaskDisclosureForMinecraft(prepared)) {
-          if (!this.isCurrent(generation)) return undefined;
-          await this.dependencies.minecraft.say(chunk);
-        }
         if (!this.isCurrent(generation)) return undefined;
+        this.locallyContainedTaskLeaseKey = undefined;
         task = this.dependencies.taskController.start(prepared, prepared.limits);
       }
       for (let attempt = 0; attempt < 2; attempt += 1) {
         const result = await this.sendAttempt(
-          attempt === 0 ? prompt : repairPrompt,
+          "execution",
+          attempt === 0 ? prompt : (options.repairPrompt ?? repairPrompt),
           generation,
           true,
           task,
+          options.toolsEnabled ?? true,
+          options.allowedToolActions,
         );
         if (!result) return undefined;
         const parsed = companionTurnOutcomeSchema.safeParse(this.parseJson(result.text));
-        if (!parsed.success || !this.memoryCandidatesValid(parsed.data, ownerText)) continue;
+        if (
+          !parsed.success ||
+          (options.taskForbidden === true && parsed.data.task !== null) ||
+          (options.allowedProactiveKinds !== undefined &&
+            (parsed.data.proactiveKind === null ||
+              parsed.data.proactiveKind === undefined ||
+              !options.allowedProactiveKinds.includes(parsed.data.proactiveKind))) ||
+          !this.memoryCandidatesValid(parsed.data, ownerText)
+        )
+          continue;
         outcome = parsed.data;
         break;
       }
       if (!outcome) {
-        if (task) {
-          this.dependencies.taskController.stop("failed");
-          task = undefined;
-        }
-        await this.failClosed(generation, new Error("invalid structured Codex output"));
+        const error = new Error();
+        error.name = "CodexInvalidStructureError";
+        await this.failTaskOnly(generation, error, taskFailureMessage);
+        task = undefined;
         return undefined;
       }
       taskStopReason = "completed";
@@ -602,7 +1292,7 @@ export class CompanionService {
         this.dependencies.taskController.stop("failed");
         task = undefined;
       }
-      await this.failClosed(generation, error);
+      await this.failTaskOnly(generation, error, taskFailureMessage);
       return undefined;
     } finally {
       if (task && this.dependencies.taskController.current()?.id === task.id) {
@@ -620,18 +1310,20 @@ export class CompanionService {
     reply: string,
     generation: number,
     proactive: boolean,
+    proactiveKind: ProactiveKind = "chat",
   ): Promise<void> {
     if (!reply || !this.isCurrent(generation)) return;
+    const publicReply = containsInternalModelDisclosure(reply) ? filteredModelReply : reply;
     if (proactive) {
       if (
         this.dependencies.mode.getMode() === "friend" ||
-        !this.dependencies.autonomy.canChatProactively()
+        !this.dependencies.autonomy.canSendProactively(proactiveKind)
       ) {
         return;
       }
     }
     let marked = false;
-    for (const chunk of splitForMinecraft(reply)) {
+    for (const chunk of splitForMinecraft(publicReply)) {
       if (!this.isCurrent(generation)) return;
       await this.dependencies.minecraft.say(chunk);
       if (proactive && !marked) {
@@ -642,33 +1334,50 @@ export class CompanionService {
   }
 
   private async sendAttempt(
-    text: string,
+    role: "intent" | "execution",
+    prompt: string,
     generation: number,
-    failClosedOnError = true,
-    task?: ActiveTask,
-    toolsEnabled = true,
+    trackAsActive: boolean,
+    task: ActiveTask | undefined,
+    toolsEnabled: boolean,
+    allowedToolActions?: readonly ToolActionKind[],
+    isApplicable: () => boolean = () => true,
   ): Promise<CodexTurnResult | undefined> {
-    if (!this.threadId || !this.isCurrent(generation)) return undefined;
+    if (role === "intent" && toolsEnabled) {
+      throw new Error("intent turns cannot enable tools");
+    }
+    const threadId = role === "intent" ? this.intentThreadId : this.executionThreadId;
+    const isAttemptCurrent = () => this.isCurrent(generation) && isApplicable();
+    if (!threadId || !isAttemptCurrent()) return undefined;
     let cancel!: () => void;
     const cancelled = new Promise<undefined>((resolve) => {
       cancel = () => resolve(undefined);
     });
-    const attemptThreadId = this.threadId;
+    const attemptThreadId = threadId;
     const active: ActiveTurn = { generation, threadId: attemptThreadId, cancel };
-    this.activeTurn = active;
+    if (trackAsActive) {
+      if (role === "intent") this.activeIntentTurns.add(active);
+      else this.activeExecutionTurn = active;
+    }
     let budgetStarted = false;
     try {
       if (task && this.dependencies.taskController.current()?.id !== task.id) {
         return undefined;
       }
-      let turnText = text;
+      let turnText = prompt;
       if (toolsEnabled) {
-        const toolLease = this.dependencies.budget.begin(task?.lease);
+        const toolLease = this.dependencies.budget.begin(task?.lease, {
+          ...(allowedToolActions === undefined ? {} : { allowedActions: allowedToolActions }),
+        });
         budgetStarted = true;
-        turnText = attachToolLease(text, toolLease, task?.lease.id);
+        turnText = attachToolLease(prompt, toolLease, task?.lease.id, allowedToolActions);
       }
       const original = this.dependencies.codex.sendTurn(attemptThreadId, turnText, (turnId) => {
-        if (!this.isCurrent(generation) || this.activeTurn !== active) {
+        const trackedActive =
+          role === "intent"
+            ? this.activeIntentTurns.has(active)
+            : this.activeExecutionTurn === active;
+        if (!isAttemptCurrent() || (trackAsActive && !trackedActive)) {
           void this.dependencies.codex
             .interrupt(attemptThreadId, turnId)
             .catch((error: unknown) =>
@@ -680,24 +1389,31 @@ export class CompanionService {
       });
       const result = await Promise.race([original, cancelled]);
       if (!result) return undefined;
-      if (!this.isCurrent(generation)) return undefined;
+      if (!isAttemptCurrent()) return undefined;
+      this.consecutiveTransportFailures = 0;
       if (result.status !== "completed") {
-        if (task) this.dependencies.taskController.stop("failed");
-        if (failClosedOnError) {
-          await this.failClosed(generation, new Error(`Codex turn ${result.status}`));
+        if (trackAsActive && this.codexHealthy) {
+          const error = new Error();
+          error.name =
+            result.status === "interrupted" ? "CodexTurnInterruptedError" : "CodexTurnFailedError";
+          await this.handleCodexFailure(generation, error);
         }
         return undefined;
       }
       return result;
     } catch (error) {
-      if (failClosedOnError) await this.failClosed(generation, error);
-      else if (task) this.dependencies.taskController.stop("failed");
+      if (isAttemptCurrent() && trackAsActive && this.codexHealthy) {
+        await this.handleCodexFailure(generation, error);
+      }
       return undefined;
     } finally {
       try {
         if (budgetStarted) this.dependencies.budget.end();
       } finally {
-        if (this.activeTurn === active) this.activeTurn = undefined;
+        if (role === "intent") this.activeIntentTurns.delete(active);
+        if (role === "execution" && this.activeExecutionTurn === active) {
+          this.activeExecutionTurn = undefined;
+        }
       }
     }
   }
@@ -710,7 +1426,19 @@ export class CompanionService {
     }
   }
 
-  private memoryCandidatesValid(outcome: CompanionTurnOutcome, ownerText?: string): boolean {
+  private hasActiveTask(): boolean {
+    return (
+      this.dependencies.taskController.current() !== null ||
+      this.dependencies.mode.snapshot().taskId !== null
+    );
+  }
+
+  private memoryCandidatesValid(
+    outcome: Pick<CompanionTurnOutcome, "reply" | "memoryCandidates"> & {
+      task?: CompanionTurnOutcome["task"];
+    },
+    ownerText?: string,
+  ): boolean {
     try {
       const source = memoryValidationSource(outcome, ownerText);
       for (const candidate of outcome.memoryCandidates)
@@ -718,6 +1446,35 @@ export class CompanionService {
       return true;
     } catch {
       return false;
+    }
+  }
+
+  private async persistTaskExecutionOutcome(
+    taskGoal: string,
+    outcome: CompanionTaskExecutionOutcome,
+    stamp: IntentStamp,
+    ownerText: string,
+  ): Promise<void> {
+    const candidates = outcome.memoryCandidates.filter((candidate) => candidate.importance >= 3);
+    if (candidates.length > 0) {
+      await this.dependencies.memories.addBatch(
+        candidates,
+        () => this.isIntentCurrent(stamp),
+        memoryValidationSource(outcome, ownerText),
+      );
+    }
+    if (!this.isIntentCurrent(stamp)) return;
+    this.unfinishedTaskSummary =
+      outcome.status === "active" ? JSON.stringify({ goal: taskGoal }) : null;
+    if (outcome.status === "active") this.dependencies.mode.startTask(taskGoal);
+    else this.dependencies.mode.completeTask();
+    await this.persist();
+    if (this.isIntentCurrent(stamp) && outcome.status === "completed") {
+      try {
+        this.dependencies.autonomy.notifyGoalCompleted();
+      } catch (error) {
+        await this.logger.error("autonomy_goal_notification_failed", { code: String(error) });
+      }
     }
   }
 
@@ -752,15 +1509,20 @@ export class CompanionService {
   private recoverSingleFlight(): Promise<void> {
     if (this.recoveryFlight) return this.recoveryFlight;
     const generation = this.generation;
-    const queued = this.turnTail.catch(() => undefined).then(() => this.recover(generation));
+    const queued = Promise.all([
+      this.intentTurnTail.catch(() => undefined),
+      this.executionTurnTail.catch(() => undefined),
+    ]).then(() => this.recover(generation));
     let tracked!: Promise<void>;
     tracked = queued.finally(() => {
       if (this.recoveryFlight === tracked) this.recoveryFlight = undefined;
     });
     this.recoveryFlight = tracked;
-    this.turnTail = tracked.catch((error: unknown) =>
+    const observed = tracked.catch((error: unknown) =>
       this.logger.error("companion_recovery_failed", { code: String(error) }),
     );
+    this.intentTurnTail = observed;
+    this.executionTurnTail = observed;
     return tracked;
   }
 
@@ -771,6 +1533,8 @@ export class CompanionService {
     try {
       await this.persist();
       if (!this.isCurrent(generation)) return;
+      this.intentThreadId = undefined;
+      this.executionThreadId = undefined;
       await this.dependencies.codex.stop().catch(() => undefined);
       if (!this.isCurrent(generation)) return;
       await this.dependencies.codex.start();
@@ -778,35 +1542,41 @@ export class CompanionService {
         await this.closeStaleCodex(generation);
         return;
       }
-      const models = await this.dependencies.codex.listModels();
-      if (!this.isCurrent(generation)) {
-        await this.closeStaleCodex(generation);
-        return;
+      if (this.externallyManagedCodex) {
+        const selectedModel = this.selectedModel;
+        const available =
+          selectedModel !== undefined &&
+          (await this.dependencies.codex.validateModelSelection({
+            modelId: selectedModel,
+            reasoningEffort: this.dependencies.reasoningEffort,
+          }));
+        if (!available) {
+          this.reportModelAuthorityLoss(generation);
+          throw new Error("Selected live model is unavailable");
+        }
+      } else {
+        const models = await this.dependencies.codex.listModels();
+        this.selectedModel = selectModel(models, this.dependencies.preferredModel);
       }
-      this.selectedModel = selectModel(models, this.dependencies.preferredModel);
       if (!this.isCurrent(generation)) return;
-      this.threadId = await this.dependencies.codex.startThread({
-        cwd: this.dependencies.cwd,
-        model: this.selectedModel,
-        reasoningEffort: this.dependencies.reasoningEffort,
-      });
-      if (!this.isCurrent(generation)) {
-        await this.closeStaleCodex(generation);
-        return;
-      }
+      const selectedModel = this.selectedModel;
+      if (!selectedModel) throw new Error("Selected live model is unavailable");
+      if (!(await this.createThreadPair(generation, selectedModel))) return;
       const summary = this.unfinishedTaskSummary ?? "Codex session recovery handshake";
       const prompt = buildCompanionRecoveryTurn({
         mode: this.dependencies.mode.getMode(),
-        world: await this.dependencies.minecraft.snapshot(this.dependencies.ownerUsername),
-        memories: (await this.dependencies.memories.search(summary)).slice(0, 8),
+        profile: this.dependencies.mode.getProfile(),
+        world: await this.dependencies.minecraft.snapshot(this.dependencies.ownerUsername()),
+        memories: (await this.searchMemories(summary)).slice(0, 8),
         summary,
       });
       let recovered: CompanionTurnOutcome | undefined;
       for (let attempt = 0; attempt < 2; attempt += 1) {
         const result = await this.sendAttempt(
+          "execution",
           attempt === 0 ? prompt : recoveryRepairPrompt,
           generation,
-          false,
+          true,
           undefined,
           false,
         );
@@ -841,6 +1611,8 @@ export class CompanionService {
       if (this.isCurrent(generation)) await this.say("已恢复。");
     } catch (error) {
       if (!this.isCurrent(generation)) return;
+      this.intentThreadId = undefined;
+      this.executionThreadId = undefined;
       this.codexHealthy = false;
       this.dependencies.mode.pause();
       await this.persist();
@@ -858,6 +1630,18 @@ export class CompanionService {
       .catch((error: unknown) =>
         this.logger.error("codex_stale_session_stop_failed", { code: String(error) }),
       );
+  }
+
+  private reportModelAuthorityLoss(generation: number): void {
+    if (!this.isCurrent(generation) || this.reportedModelAuthorityLossGeneration === generation) {
+      return;
+    }
+    this.reportedModelAuthorityLossGeneration = generation;
+    try {
+      this.dependencies.onAuthorityLost?.({ reason: "model_unavailable" });
+    } catch {
+      // The recovery failure remains contained if an internal observer misbehaves.
+    }
   }
 
   private async handleCommand(command: LocalCommand): Promise<void> {
@@ -1047,7 +1831,7 @@ export class CompanionService {
       if (inspected.action.kind === "move_to") {
         let snapshot;
         try {
-          snapshot = await this.dependencies.minecraft.snapshot(this.dependencies.ownerUsername);
+          snapshot = await this.dependencies.minecraft.snapshot(this.dependencies.ownerUsername());
         } catch {
           await this.say("无法取得安全上下文，确认未被使用。");
           return;
@@ -1071,6 +1855,11 @@ export class CompanionService {
         task.lease,
         additionalHorizontalTravel,
       );
+      const leaseKey = taskLeaseKey(task.lease);
+      if (this.locallyContainedTaskLeaseKey === leaseKey) {
+        this.locallyContainedTaskLeaseKey = undefined;
+        return;
+      }
       await this.settleConfirmationTask(
         task.lease,
         result.status === "completed" ? "completed" : "failed",
@@ -1160,8 +1949,23 @@ export class CompanionService {
   }
 
   private interruptActive(): void {
-    const active = this.activeTurn;
-    if (!active) return;
+    this.interruptIntentTurns();
+    this.interruptExecutionTurn();
+  }
+
+  private interruptIntentTurns(): void {
+    const intentTurns = [...this.activeIntentTurns];
+    this.activeIntentTurns.clear();
+    for (const active of intentTurns) this.interruptTurn(active);
+  }
+
+  private interruptExecutionTurn(): void {
+    const active = this.activeExecutionTurn;
+    this.activeExecutionTurn = undefined;
+    if (active) this.interruptTurn(active);
+  }
+
+  private interruptTurn(active: ActiveTurn): void {
     active.cancel();
     if (!active.turnId) return;
     void this.dependencies.codex
@@ -1171,6 +1975,15 @@ export class CompanionService {
       );
   }
 
+  private revokeCurrentTask(reason: TaskStopReason): void {
+    this.interruptExecutionTurn();
+    this.dependencies.confirmations.clear();
+    this.dependencies.executor.stopAll();
+    this.dependencies.taskController.stop(reason);
+    this.dependencies.budget.end();
+    this.dependencies.mode.completeTask();
+  }
+
   private handleTaskTerminal(reason: TaskStopReason, forceCleanup = false): void {
     this.pendingConfirmationTerminalReasons.clear();
     try {
@@ -1178,15 +1991,20 @@ export class CompanionService {
     } catch (error) {
       void this.logger.error("task_terminal_confirmation_clear_failed", { code: String(error) });
     }
-    if (!forceCleanup && reason !== "timeout" && reason !== "budget_exhausted") return;
-    this.invalidateCurrentTurn();
+    const taskOnlyStop = reason === "owner_stop";
+    if (!taskOnlyStop && !forceCleanup && reason !== "timeout" && reason !== "budget_exhausted") {
+      return;
+    }
+    if (taskOnlyStop) this.interruptExecutionTurn();
+    else this.invalidateCurrentTurn();
     try {
       this.dependencies.executor.stopAll();
     } catch (error) {
       void this.logger.error("task_terminal_executor_stop_failed", { code: String(error) });
     }
     try {
-      this.dependencies.mode.stop();
+      if (taskOnlyStop) this.dependencies.mode.completeTask();
+      else this.dependencies.mode.stop();
     } catch (error) {
       void this.logger.error("task_terminal_mode_stop_failed", { code: String(error) });
     }
@@ -1198,9 +2016,87 @@ export class CompanionService {
 
   private invalidateCurrentTurn(): void {
     this.interruptActive();
-    this.activeTurn = undefined;
+    this.activeExecutionTurn = undefined;
     this.generation += 1;
     this.clearMergedMessages();
+  }
+
+  private invalidateStartupOwnerWork(): void {
+    this.interruptActive();
+    this.activeExecutionTurn = undefined;
+    this.clearMergedMessages();
+    const retainedEvents = this.startupEvents.filter((event) => event.kind !== "chat");
+    this.startupEvents.splice(0, this.startupEvents.length, ...retainedEvents);
+    this.ownerChangedDuringStartup = true;
+  }
+
+  private async refreshOwnerPresence(): Promise<void> {
+    const identity = this.dependencies.ownerIdentity;
+    if (!identity) return;
+    const snapshot = identity.snapshot();
+    if (!snapshot.configured || snapshot.ownerUsername === null) return;
+    const revision = snapshot.revision;
+    const ownerUsername = snapshot.ownerUsername;
+    try {
+      const online = await this.dependencies.minecraft.isOwnerOnline(ownerUsername);
+      identity.setPresence({
+        revision,
+        ownerUsername,
+        presence: online ? "online" : "offline",
+      });
+    } catch {
+      // Presence is advisory; authority remains with the configured owner.
+    }
+  }
+
+  private setOwnerPresence(presence: "online" | "offline"): void {
+    const identity = this.dependencies.ownerIdentity;
+    if (!identity) return;
+    const snapshot = identity.snapshot();
+    if (!snapshot.configured || snapshot.ownerUsername === null) return;
+    identity.setPresence({
+      revision: snapshot.revision,
+      ownerUsername: snapshot.ownerUsername,
+      presence,
+    });
+  }
+
+  private async handleCodexFailure(generation: number, error: unknown): Promise<void> {
+    if (isTransportFailure(error)) {
+      this.consecutiveTransportFailures = Math.min(
+        transportFailureThreshold,
+        this.consecutiveTransportFailures + 1,
+      );
+    } else {
+      this.consecutiveTransportFailures = 0;
+    }
+    if (codexFailureScope(error, this.consecutiveTransportFailures) === "service") {
+      await this.failClosed(generation, error);
+      return;
+    }
+    await this.failTaskOnly(generation, error, taskFailureMessage);
+  }
+
+  private async failTaskOnly(generation: number, error: unknown, message: string): Promise<void> {
+    if (!this.isCurrent(generation)) return;
+    const failedTask = this.dependencies.taskController.current();
+    if (failedTask) this.locallyContainedTaskLeaseKey = taskLeaseKey(failedTask.lease);
+    // ActionExecutor.stopAll invokes its owner-stop hook, so establish the failure reason first.
+    this.dependencies.taskController.stop("failed");
+    this.interruptExecutionTurn();
+    this.dependencies.confirmations.clear();
+    this.dependencies.executor.stopAll();
+    this.dependencies.taskController.stop("failed");
+    this.dependencies.budget.end();
+    this.dependencies.mode.completeTask();
+    this.unfinishedTaskSummary = null;
+    await this.persist();
+    if (this.isCurrent(generation)) await this.say(message);
+    try {
+      await this.logger.error("codex_task_failed", { code: errorName(error) });
+    } catch {
+      // Diagnostic observers cannot weaken local failure containment.
+    }
   }
 
   private async failClosed(generation: number, error: unknown): Promise<void> {

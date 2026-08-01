@@ -1,8 +1,16 @@
 import { mkdir, writeFile } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { dirname } from "node:path";
 import { ActionExecutor } from "./actions/actionExecutor.js";
 import { AutonomyScheduler } from "./autonomy/autonomyScheduler.js";
 import { CodexAppServerClient } from "./codex/appServerClient.js";
+import {
+  createBundledCodexLaunchConfig,
+  resolveDefaultCodexLaunchConfig,
+  runCodexLoginStatus,
+  spawnCodexAppServerTransport,
+  type CodexLaunchConfig,
+} from "./codex/jsonRpcProcess.js";
+import type { ResolvedModelSelection } from "./codex/modelCatalog.js";
 import { selectModel } from "./codex/modelSelector.js";
 import { ChatRouter } from "./companion/chatRouter.js";
 import { CompanionService } from "./companion/companionService.js";
@@ -12,8 +20,10 @@ import {
   type TaskAuditData,
   type TaskAuditEvent,
 } from "./companion/taskController.js";
-import { loadConfig } from "./config/loadConfig.js";
-import type { AppConfig } from "./config/schema.js";
+import { loadConfig, resolveCoreAppPaths } from "./config/loadConfig.js";
+import type { AppConfig, AppPaths, ConfirmedRuntimeConnection } from "./config/schema.js";
+export type { AppPaths } from "./config/schema.js";
+import { AuditLogger, type AuditEvent } from "./logging/auditLogger.js";
 import { SafeLogger } from "./logging/safeLogger.js";
 import { startMcpServer, type RunningMcpServer } from "./mcp/mcpServer.js";
 import { TurnToolBudget } from "./mcp/toolBudget.js";
@@ -23,14 +33,22 @@ import {
   type TrustedSnapshotStore,
 } from "./mcp/toolRegistry.js";
 import { MemoryStore } from "./memory/memoryStore.js";
+import { MemoryMigration } from "./memory/memoryMigration.js";
+import { ScopedMemoryStore } from "./memory/scopedMemoryStore.js";
 import { StateStore } from "./memory/stateStore.js";
 import type { MinecraftEvent, MinecraftPort } from "./minecraft/minecraftPort.js";
 import { MineflayerAdapter } from "./minecraft/mineflayerAdapter.js";
 import { ModeManager } from "./mode/modeManager.js";
-import { RuntimeFacade } from "./runtime/runtimeFacade.js";
+import { ProfileStore } from "./profile/profileStore.js";
+import type { CompanionProfile } from "./profile/profileSchema.js";
+import { OwnerIdentityError, type OwnerIdentitySnapshot } from "./identity/ownerIdentity.js";
+import { OwnerIdentityService } from "./identity/ownerIdentityService.js";
+import { RuntimeFacade, type RuntimeTaskProjection } from "./runtime/runtimeFacade.js";
+import type { RuntimeAuthorityLoss } from "./runtime/runtimeEvents.js";
 import { ConfirmationStore } from "./safety/confirmationStore.js";
 import { SafetyEngine, type SafetyContext } from "./safety/safetyEngine.js";
 import { TaskControllerBudget } from "./safety/taskBudget.js";
+import { effectiveSafetyProfile, type RuntimeSafetyConfiguration } from "./safety/safetyProfile.js";
 
 const MCP_HOST = "127.0.0.1" as const;
 const MCP_PORT = 32123;
@@ -61,6 +79,9 @@ interface ManagedMinecraft {
 interface ManagedCompanion {
   start(preselectedModel: string): Promise<void>;
   stop(): Promise<void>;
+  ownerIdentityChanged?(snapshot: OwnerIdentitySnapshot): void;
+  applyProfile?(profile: CompanionProfile): void;
+  setMemoryScope?(scope: import("./memory/scopedMemoryStore.js").MemoryContextScope): void;
 }
 
 interface ManagedExecutor {
@@ -75,27 +96,43 @@ export interface AppRuntime {
   minecraft: ManagedMinecraft;
   companion: ManagedCompanion;
   executor: ManagedExecutor;
-}
-
-export interface AppPaths {
-  cwd: string;
-  memories: string;
-  state: string;
-  log: string;
-  codexWorkspace: string;
+  taskProjection?: Pick<RuntimeTaskProjection, "status" | "subscribe">;
 }
 
 export interface AppCompositionContext {
   config: AppConfig;
+  codexLaunchConfig: CodexLaunchConfig;
+  runtimeModelSelection?: ResolvedModelSelection;
   paths: AppPaths;
   mode: ModeManager;
   budget: TurnToolBudget;
   taskController: TaskController;
+  ownerIdentity: OwnerIdentityProvider;
   logger: Pick<SafeLogger, "info" | "error">;
+  reportAuthorityLoss(event: RuntimeAuthorityLoss): void;
+  worldSafety: RuntimeSafetyConfiguration;
+}
+
+export interface OwnerIdentityProvider {
+  snapshot(): OwnerIdentitySnapshot;
+  setPresence(input: {
+    revision: number;
+    ownerUsername: string;
+    presence: "online" | "offline";
+  }): void;
+  subscribe(listener: (snapshot: OwnerIdentitySnapshot) => void): () => void;
 }
 
 export interface CreateAppOptions {
   cwd?: string;
+  dataRoot?: string;
+  codexResourceDirectory?: string;
+  codexClient?: CodexAppServerClient;
+  confirmedMinecraftConnection?: ConfirmedRuntimeConnection;
+  runtimeInitialRevision?: number;
+  runtimeModelSelection?: ResolvedModelSelection;
+  worldSafety?: RuntimeSafetyConfiguration;
+  ownerIdentity?: OwnerIdentityProvider;
   runtimeFactory?: (context: AppCompositionContext) => AppRuntime | Promise<AppRuntime>;
 }
 
@@ -103,6 +140,7 @@ interface RuntimeCompositionObservers {
   taskChanged?(): void;
   modelSelected?(model: string): void;
   invalidateTaskBeforeStartupCleanup?: boolean;
+  authorityLost?(event: RuntimeAuthorityLoss): void;
 }
 
 interface ComposedApp {
@@ -110,6 +148,7 @@ interface ComposedApp {
   runtime: AppRuntime;
   taskBudget: TaskControllerBudget;
   taskController: TaskController;
+  mode: ModeManager;
 }
 
 interface AttemptedComponents {
@@ -136,14 +175,29 @@ class PersistentTaskAudit {
 
   constructor(
     private readonly logger: Pick<SafeLogger, "info" | "error">,
+    private readonly audit: Pick<AuditLogger, "append">,
     private readonly budget: TaskControllerBudget,
   ) {}
 
   readonly record: TaskAuditCallback = (event, data) => {
     const fields = taskAuditFields(event, data, this.budget);
+    const auditEvent = taskAuditEvent(event, data, this.budget);
     this.tail = this.tail
       .catch(() => undefined)
-      .then(() => this.logger.info(event, fields))
+      .then(async () => {
+        let failed = false;
+        try {
+          await this.audit.append(auditEvent);
+        } catch {
+          failed = true;
+        }
+        try {
+          await this.logger.info(event, fields);
+        } catch {
+          failed = true;
+        }
+        if (failed) throw new Error("task audit write failed");
+      })
       .catch(() =>
         Promise.resolve()
           .then(() =>
@@ -164,6 +218,33 @@ class PersistentTaskAudit {
   }
 }
 
+function taskAuditEvent(
+  event: TaskAuditEvent,
+  data: TaskAuditData,
+  budget: TaskControllerBudget,
+): AuditEvent {
+  const snapshot = budget.snapshot();
+  return {
+    schemaVersion: 1,
+    timestamp: event === "task_started" ? data.startedAt : new Date().toISOString(),
+    kind: event,
+    detail: {
+      startedAt: data.startedAt,
+      expectedActionCategoryCount: data.expectedActionCategoryCount,
+      maxToolCalls: data.limits.maxToolCalls,
+      maxBlockChanges: data.limits.maxBlockChanges,
+      maxHorizontalTravel: data.limits.maxHorizontalTravel,
+      maxDurationMs: data.limits.maxDurationMs,
+      maxDangerousOperations: data.limits.maxDangerousOperations,
+      toolCalls: snapshot.toolCalls,
+      blockChanges: snapshot.blockChanges,
+      horizontalTravel: snapshot.horizontalTravel,
+      dangerousOperations: snapshot.dangerousOperations,
+      ...(event === "task_stopped" && "reason" in data ? { reason: data.reason } : {}),
+    },
+  };
+}
+
 function taskAuditFields(
   event: TaskAuditEvent,
   data: TaskAuditData,
@@ -171,14 +252,14 @@ function taskAuditFields(
 ): Record<string, unknown> {
   const snapshot = budget.snapshot();
   return {
-    startedAt: data.task.startedAt,
-    expectedActionCategoryCount: data.task.disclosure.expectedActions.length,
+    startedAt: data.startedAt,
+    expectedActionCategoryCount: data.expectedActionCategoryCount,
     limits: {
-      maxToolCalls: snapshot.limits.maxToolCalls,
-      maxBlockChanges: snapshot.limits.maxBlockChanges,
-      maxHorizontalTravel: snapshot.limits.maxHorizontalTravel,
-      maxDurationMs: snapshot.limits.maxDurationMs,
-      maxDangerousOperations: snapshot.limits.maxDangerousOperations,
+      maxToolCalls: data.limits.maxToolCalls,
+      maxBlockChanges: data.limits.maxBlockChanges,
+      maxHorizontalTravel: data.limits.maxHorizontalTravel,
+      maxDurationMs: data.limits.maxDurationMs,
+      maxDangerousOperations: data.limits.maxDangerousOperations,
     },
     counters: {
       toolCalls: snapshot.toolCalls,
@@ -203,11 +284,17 @@ async function writeWhenMissing(path: string, contents: string): Promise<void> {
 }
 
 async function initializeStorage(paths: AppPaths): Promise<void> {
-  await mkdir(join(paths.cwd, "data"), { recursive: true });
-  await mkdir(join(paths.cwd, "logs"), { recursive: true });
+  await Promise.all([
+    mkdir(dirname(paths.memories), { recursive: true }),
+    mkdir(paths.profiles, { recursive: true }),
+    mkdir(paths.worlds, { recursive: true }),
+    mkdir(paths.logs, { recursive: true }),
+    mkdir(paths.diagnostics, { recursive: true }),
+    mkdir(paths.migrationSnapshots, { recursive: true }),
+  ]);
   await writeWhenMissing(paths.memories, "[]\n");
   await writeWhenMissing(
-    paths.state,
+    paths.runtimeState,
     `${JSON.stringify(
       {
         lastMode: "friend",
@@ -224,11 +311,11 @@ async function initializeStorage(paths: AppPaths): Promise<void> {
 
 export function createTrustedSafetyContextProvider(
   minecraft: Pick<MinecraftPort, "snapshot">,
-  ownerUsername: string,
+  ownerUsername: () => string,
   trustedSnapshots: TrustedSnapshotStore,
 ): () => Promise<SafetyContext> {
   return async (): Promise<SafetyContext> => {
-    const snapshot = await minecraft.snapshot(ownerUsername);
+    const snapshot = await minecraft.snapshot(ownerUsername());
     trustedSnapshots.publish(snapshot);
     const owner = structuredClone(snapshot.ownerPosition ?? snapshot.botPosition);
     if (snapshot.worldSpawn === undefined) return { owner };
@@ -281,8 +368,25 @@ class McpLifecycle implements ManagedMcp {
   }
 }
 
-function createProductionRuntime(context: AppCompositionContext): AppRuntime {
+export function createProductionRuntime(
+  context: AppCompositionContext,
+  sharedCodexClient?: CodexAppServerClient,
+): AppRuntime {
   const { config, paths, mode, budget, taskController, logger } = context;
+  const effectiveWorldSafety = effectiveSafetyProfile(
+    context.worldSafety.requestedPreset,
+    context.worldSafety.compatibilityVerified,
+  );
+  const runtimeModelSelection = context.runtimeModelSelection;
+  const preferredModel = runtimeModelSelection?.modelId ?? config.codex.preferredModel;
+  const reasoningEffort = runtimeModelSelection?.reasoningEffort ?? config.codex.reasoningEffort;
+  const ownerUsername = (): string => {
+    const snapshot = context.ownerIdentity.snapshot();
+    if (!snapshot.configured || snapshot.ownerUsername === null) {
+      throw new OwnerIdentityError("OWNER_IDENTITY_REQUIRED");
+    }
+    return snapshot.ownerUsername;
+  };
   const confirmations = new ConfirmationStore();
   const safety = new SafetyEngine(confirmations, config.safety, (lease) =>
     taskController.isLeaseLive(lease),
@@ -292,7 +396,7 @@ function createProductionRuntime(context: AppCompositionContext): AppRuntime {
     minecraft,
     safety,
     confirmations,
-    config.minecraft.ownerUsername,
+    ownerUsername,
     () => taskController.stop("owner_stop"),
     {
       isLeaseLive: (lease) => taskController.isLeaseLive(lease),
@@ -300,15 +404,26 @@ function createProductionRuntime(context: AppCompositionContext): AppRuntime {
         taskController.reserveAdditionalTravel(lease, horizontalTravel),
     },
   );
-  const memories = new MemoryStore(paths.memories);
+  const legacyMemories = new MemoryStore(paths.memories);
+  const memories = new ScopedMemoryStore(`${paths.memories}.scoped.json`);
+  const memoryMigration = new MemoryMigration(undefined, memories, { legacy: legacyMemories });
   const state = new StateStore(paths.state);
-  const codex = new CodexAppServerClient(config, {
+  const codex =
+    sharedCodexClient ??
+    new CodexAppServerClient(config, {
+      runLoginStatus: (signal) =>
+        runCodexLoginStatus(context.codexLaunchConfig, 10_000, undefined, signal),
+      createTransport: async () => spawnCodexAppServerTransport(context.codexLaunchConfig),
+      workspacePath: paths.codexWorkspace,
+    });
+  codex.configureRuntime({
     workspacePath: paths.codexWorkspace,
+    reasoningEffort,
   });
   const trustedSnapshots = createTrustedSnapshotStore();
   const safetyContextProvider = createTrustedSafetyContextProvider(
     minecraft,
-    config.minecraft.ownerUsername,
+    ownerUsername,
     trustedSnapshots,
   );
 
@@ -316,7 +431,7 @@ function createProductionRuntime(context: AppCompositionContext): AppRuntime {
   const autonomy = new AutonomyScheduler({
     mode,
     minecraft,
-    ownerUsername: config.minecraft.ownerUsername,
+    ownerUsername,
     requestTurn: async (reason) => {
       if (!companion) throw new Error("companion composition is incomplete");
       await companion.requestAutonomousTurn(reason);
@@ -328,6 +443,7 @@ function createProductionRuntime(context: AppCompositionContext): AppRuntime {
     codex,
     mode,
     memories,
+    memoryMigration,
     state,
     confirmations,
     executor,
@@ -335,14 +451,20 @@ function createProductionRuntime(context: AppCompositionContext): AppRuntime {
     taskController,
     autonomy,
     safetyContextProvider,
-    ownerUsername: config.minecraft.ownerUsername,
+    ownerUsername,
+    ownerIdentity: context.ownerIdentity,
     chatRouter: new ChatRouter({
-      ownerUsername: config.minecraft.ownerUsername,
+      ownerUsername,
       maxMessageLength: 4_000,
     }),
     cwd: paths.cwd,
-    preferredModel: config.codex.preferredModel,
-    reasoningEffort: config.codex.reasoningEffort,
+    preferredModel,
+    reasoningEffort,
+    onAuthorityLost: context.reportAuthorityLoss,
+    requestedTaskLimits: effectiveWorldSafety.taskLimits,
+    compatibilityVerified: () => context.worldSafety.compatibilityVerified,
+    safetyPresetAllows: () =>
+      effectiveWorldSafety.preset === "standard" && context.worldSafety.compatibilityVerified,
     logger,
   });
   const toolDependencies: ToolRegistryDependencies = {
@@ -350,19 +472,27 @@ function createProductionRuntime(context: AppCompositionContext): AppRuntime {
     executor,
     budget,
     safetyContextProvider,
-    ownerUsername: config.minecraft.ownerUsername,
+    ownerUsername,
     latestSnapshot: trustedSnapshots.latest,
     observeSnapshot: trustedSnapshots.publish,
   };
 
   return {
-    preferredModel: config.codex.preferredModel,
+    preferredModel,
     mcp: new McpLifecycle(toolDependencies),
     codex,
     selectModel,
     minecraft,
     companion,
     executor,
+    taskProjection: {
+      status: () => {
+        const active = taskController.current();
+        if (active === null) return "running";
+        return confirmations.hasGameActions(active.lease) ? "waiting_confirmation" : "running";
+      },
+      subscribe: (listener) => confirmations.onGameActionsChanged(listener),
+    },
   };
 }
 
@@ -556,6 +686,7 @@ export async function createRuntimeFacade(
   options: CreateAppOptions = {},
 ): Promise<RuntimeFacade> {
   const taskListeners = new Set<() => void>();
+  const authorityLossListeners = new Set<(event: RuntimeAuthorityLoss) => void>();
   let selectedModel: string | null = null;
   const composition = await composeApp(configPath, options, {
     taskChanged: () => {
@@ -570,6 +701,15 @@ export async function createRuntimeFacade(
     modelSelected: (model) => {
       selectedModel = model;
     },
+    authorityLost: (event) => {
+      for (const listener of [...authorityLossListeners]) {
+        try {
+          listener(event);
+        } catch {
+          // Runtime authority observers cannot block production recovery containment.
+        }
+      }
+    },
     invalidateTaskBeforeStartupCleanup: true,
   });
   const minecraft = composition.runtime.minecraft.onEvent
@@ -579,19 +719,46 @@ export async function createRuntimeFacade(
       }
     : undefined;
   return new RuntimeFacade({
+    ...(options.runtimeInitialRevision === undefined
+      ? {}
+      : { initialRevision: options.runtimeInitialRevision }),
     lifecycle: composition.lifecycle,
     task: {
       current: () => composition.taskController.current(),
       budget: () => composition.taskBudget.snapshot(),
+      status: () => composition.runtime.taskProjection?.status() ?? "running",
       stop: (reason) => composition.taskController.stop(reason),
       failClosed: () => composition.taskController.failClosed(),
       subscribe: (listener) => {
         taskListeners.add(listener);
-        return () => taskListeners.delete(listener);
+        const unsubscribeProjection = composition.runtime.taskProjection?.subscribe(listener);
+        return () => {
+          taskListeners.delete(listener);
+          unsubscribeProjection?.();
+        };
       },
     },
     ...(minecraft ? { minecraft } : {}),
     codex: { model: () => selectedModel },
+    authority: {
+      subscribe: (listener) => {
+        authorityLossListeners.add(listener);
+        return () => authorityLossListeners.delete(listener);
+      },
+    },
+    profile: {
+      apply: (profile) => {
+        const applyProfile = composition.runtime.companion.applyProfile;
+        if (applyProfile) {
+          applyProfile.call(composition.runtime.companion, profile);
+          return;
+        }
+        composition.mode.applyProfile(profile);
+      },
+    },
+    memory: {
+      setScope: (scope) => composition.runtime.companion.setMemoryScope?.(scope),
+    },
   });
 }
 
@@ -600,50 +767,101 @@ async function composeApp(
   options: CreateAppOptions,
   observers: RuntimeCompositionObservers = {},
 ): Promise<ComposedApp> {
-  const config = await loadConfig(configPath);
-  const cwd = resolve(options.cwd ?? process.cwd());
-  const paths: AppPaths = {
-    cwd,
-    memories: join(cwd, "data", "memories.json"),
-    state: join(cwd, "data", "state.json"),
-    log: join(cwd, "logs", "companion.log"),
-    codexWorkspace: join(cwd, "codex-workspace"),
-  };
+  const paths = resolveCoreAppPaths(configPath, {
+    cwd: options.cwd ?? process.cwd(),
+    ...(options.dataRoot === undefined ? {} : { dataRoot: options.dataRoot }),
+  });
+  const ownerIdentity = options.ownerIdentity ?? (await OwnerIdentityService.open(paths.config));
+  const initialOwner = ownerIdentity.snapshot();
+  if (!initialOwner.configured || initialOwner.ownerUsername === null) {
+    throw new OwnerIdentityError("OWNER_IDENTITY_REQUIRED");
+  }
+  const config = await loadConfig(paths.config, options.confirmedMinecraftConnection);
   await initializeStorage(paths);
+  const activeProfile = await new ProfileStore({ rootDirectory: paths.profiles }).read();
   const taskBudget = new TaskControllerBudget();
   const logger = new SafeLogger(paths.log);
-  const taskAudit = new PersistentTaskAudit(logger, taskBudget);
-  const taskController = new TaskController(taskBudget, (event, data) => {
-    try {
-      observers.taskChanged?.();
-    } finally {
-      taskAudit.record(event, data);
-    }
-  });
+  const audit = new AuditLogger(paths.audit);
+  const taskAudit = new PersistentTaskAudit(logger, audit, taskBudget);
+  const taskController = new TaskController(
+    taskBudget,
+    (event, data) => {
+      try {
+        observers.taskChanged?.();
+      } finally {
+        taskAudit.record(event, data);
+      }
+    },
+    {
+      ownerIdentityRevision: () => ownerIdentity.snapshot().revision,
+    },
+  );
   const context: AppCompositionContext = {
     config,
+    codexLaunchConfig:
+      options.codexResourceDirectory === undefined
+        ? resolveDefaultCodexLaunchConfig(paths.dataRoot)
+        : createBundledCodexLaunchConfig(
+            options.codexResourceDirectory,
+            paths.dataRoot,
+            process.platform,
+          ),
+    ...(options.runtimeModelSelection
+      ? { runtimeModelSelection: options.runtimeModelSelection }
+      : {}),
     paths,
-    mode: new ModeManager(),
+    mode: new ModeManager(activeProfile.value),
     budget: new TurnToolBudget(taskBudget),
     taskController,
+    ownerIdentity,
     logger,
+    reportAuthorityLoss: (event) => observers.authorityLost?.(event),
+    worldSafety: options.worldSafety ?? { compatibilityVerified: false },
   };
-  const runtime = await (options.runtimeFactory ?? createProductionRuntime)(context);
-  const lifecycleRuntime: AppRuntime = observers.modelSelected
+  const runtime = await (
+    options.runtimeFactory ??
+    ((productionContext: AppCompositionContext) =>
+      createProductionRuntime(productionContext, options.codexClient))
+  )(context);
+  let observedOwnerRevision = ownerIdentity.snapshot().revision;
+  const unsubscribeOwner = ownerIdentity.subscribe((snapshot) => {
+    if (snapshot.revision === observedOwnerRevision) return;
+    observedOwnerRevision = snapshot.revision;
+    taskController.stop("owner_changed");
+    runtime.companion.ownerIdentityChanged?.(snapshot);
+  });
+  const selectedRuntimeModel = options.runtimeModelSelection;
+  const runtimeForSelection: AppRuntime = selectedRuntimeModel
     ? {
-        preferredModel: runtime.preferredModel,
+        preferredModel: selectedRuntimeModel.modelId,
         mcp: runtime.mcp,
         codex: runtime.codex,
-        selectModel: async (available, preferred) => {
-          const model = await runtime.selectModel(available, preferred);
-          observers.modelSelected?.(model);
-          return model;
+        selectModel: (available) => {
+          if (!available.includes(selectedRuntimeModel.modelId)) {
+            throw new Error("Selected live model is unavailable");
+          }
+          return selectedRuntimeModel.modelId;
         },
         minecraft: runtime.minecraft,
         companion: runtime.companion,
         executor: runtime.executor,
       }
     : runtime;
+  const lifecycleRuntime: AppRuntime = observers.modelSelected
+    ? {
+        preferredModel: runtimeForSelection.preferredModel,
+        mcp: runtimeForSelection.mcp,
+        codex: runtimeForSelection.codex,
+        selectModel: async (available, preferred) => {
+          const model = await runtimeForSelection.selectModel(available, preferred);
+          observers.modelSelected?.(model);
+          return model;
+        },
+        minecraft: runtimeForSelection.minecraft,
+        companion: runtimeForSelection.companion,
+        executor: runtimeForSelection.executor,
+      }
+    : runtimeForSelection;
   return {
     lifecycle: new WhiteLilyAppLifecycle(lifecycleRuntime, {
       ...(observers.invalidateTaskBeforeStartupCleanup
@@ -652,10 +870,14 @@ async function composeApp(
           }
         : {}),
       beforeStopCleanup: () => taskController.stop("process_exit"),
-      afterCleanup: () => taskAudit.flush(),
+      afterCleanup: async () => {
+        unsubscribeOwner();
+        await taskAudit.flush();
+      },
     }),
     runtime,
     taskBudget,
     taskController,
+    mode: context.mode,
   };
 }

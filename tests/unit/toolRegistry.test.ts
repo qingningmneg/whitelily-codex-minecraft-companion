@@ -16,6 +16,26 @@ function leased<T extends Record<string, unknown> = Record<never, never>>(
 }
 
 describe("Minecraft MCP tools", () => {
+  it("takes each world snapshot for the current owner", async () => {
+    const harness = createToolRegistryHarness();
+    let owner = "OldOwner";
+    const snapshotOwners: string[] = [];
+    harness.dependencies.minecraft.snapshot = async (ownerUsername) => {
+      snapshotOwners.push(ownerUsername);
+      return structuredClone(harness.minecraft.world);
+    };
+    const tools = createToolRegistry({
+      ...harness.dependencies,
+      ownerUsername: () => owner,
+    });
+    owner = "NewOwner";
+
+    await expect(
+      tools.minecraft_get_state.execute({ turnLease: harness.turnLease }),
+    ).resolves.toHaveProperty("text");
+    expect(snapshotOwners).toEqual(["NewOwner"]);
+  });
+
   it("exports only the reviewed allowlist", () => {
     const harness = createToolRegistryHarness();
     expect(Object.keys(createToolRegistry(harness.dependencies)).sort()).toEqual([

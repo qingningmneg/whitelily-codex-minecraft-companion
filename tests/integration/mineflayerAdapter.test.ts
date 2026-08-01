@@ -252,6 +252,19 @@ describe("MineflayerAdapter", () => {
     await expect(secondConnect).resolves.toBeUndefined();
   });
 
+  it("reports a tab-list owner online even when their entity is outside tracking range", async () => {
+    const bot = new FakeBot();
+    bot.players.TestOwner = {};
+    createBot.mockReturnValue(bot);
+    const adapter = new MineflayerAdapter(config());
+    const connecting = adapter.connect();
+    bot.emit("spawn");
+    await connecting;
+
+    await expect(adapter.isOwnerOnline("TestOwner")).resolves.toBe(true);
+    await expect(adapter.isOwnerOnline("OtherOwner")).resolves.toBe(false);
+  });
+
   it("maps only trusted active-bot dimension transitions to the public world event", async () => {
     const bot = new FakeBot();
     createBot.mockReturnValue(bot);
@@ -1215,7 +1228,7 @@ describe("MineflayerAdapter", () => {
         evaluatePermanent: () => ({ kind: "allow" }),
       },
       confirmations,
-      "TestOwner",
+      () => "TestOwner",
     );
     const context = {
       spawn: { x: 0, y: 64, z: 0 },
@@ -1286,7 +1299,7 @@ describe("MineflayerAdapter", () => {
         evaluatePermanent: () => ({ kind: "allow" }),
       },
       confirmations,
-      "TestOwner",
+      () => "TestOwner",
     );
     const context = {
       spawn: { x: 0, y: 64, z: 0 },
@@ -1350,7 +1363,7 @@ describe("MineflayerAdapter", () => {
         evaluatePermanent: () => ({ kind: "allow" }),
       },
       confirmations,
-      "TestOwner",
+      () => "TestOwner",
     );
     const context = {
       spawn: { x: 0, y: 64, z: 0 },

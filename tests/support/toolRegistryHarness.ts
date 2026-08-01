@@ -24,7 +24,7 @@ export function createToolRegistryHarness(
     minecraft,
     options.safety ?? defaultSafety,
     new ConfirmationStore(),
-    "TestOwner",
+    () => "TestOwner",
   );
   const safetyContextProvider = async (): Promise<SafetyContext> => ({
     spawn: { x: -100, y: 64, z: -100 },
@@ -35,7 +35,7 @@ export function createToolRegistryHarness(
     executor,
     budget,
     safetyContextProvider,
-    ownerUsername: "TestOwner",
+    ownerUsername: () => "TestOwner",
     latestSnapshot: () => minecraft.world,
   };
   return {

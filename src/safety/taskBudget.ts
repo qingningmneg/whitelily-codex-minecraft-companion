@@ -25,6 +25,7 @@ export type TaskStopReason =
   | "emergency_stop"
   | "disconnect"
   | "world_changed"
+  | "owner_changed"
   | "model_unavailable"
   | "process_exit";
 

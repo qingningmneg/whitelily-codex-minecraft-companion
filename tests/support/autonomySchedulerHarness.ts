@@ -28,7 +28,7 @@ export function createAutonomySchedulerHarness(options: AutonomySchedulerHarness
     minecraft: {
       isOwnerOnline: options.isOwnerOnline ?? (async () => ownerOnline),
     },
-    ownerUsername: "TestOwner",
+    ownerUsername: () => "TestOwner",
     requestTurn,
     isBusy: () => busy,
     now: () => Date.now(),

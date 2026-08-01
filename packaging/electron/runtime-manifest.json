@@ -1,0 +1,178 @@
+{
+  "schemaVersion": 1,
+  "productVersion": "0.2.0-beta.1",
+  "target": {
+    "platform": "win32",
+    "arch": "x64"
+  },
+  "versions": {
+    "electron": "43.2.0",
+    "electronBuilder": "26.15.3",
+    "codex": "0.145.0",
+    "codexNative": "0.145.0-win32-x64"
+  },
+  "paths": {
+    "childEntry": "core/childMain.js",
+    "codexPackage": "codex/package",
+    "codexNativePackage": "codex/native",
+    "codexExecutable": "codex/native/vendor/x86_64-pc-windows-msvc/bin/codex.exe",
+    "licenses": "licenses"
+  },
+  "allowlist": {
+    "generatedRoots": [
+      {
+        "source": "dist/src",
+        "target": "core",
+        "extensions": [".js", ".json"]
+      },
+      {
+        "source": "apps/desktop/dist/main",
+        "target": "desktop/main",
+        "extensions": [".js", ".json"]
+      },
+      {
+        "source": "apps/desktop/dist/preload",
+        "target": "desktop/preload",
+        "extensions": [".cjs", ".json"]
+      },
+      {
+        "source": "apps/desktop/dist-renderer",
+        "target": "desktop/renderer",
+        "extensions": [".css", ".html", ".js", ".json", ".svg"]
+      }
+    ],
+    "productionDependencies": {
+      "sourceRoot": "node_modules",
+      "targetRoot": "core/node_modules",
+      "graph": "package-lock.json",
+      "excludedPackages": ["@openai/codex", "@openai/codex-win32-x64", "@whitelily/desktop"],
+      "forbiddenExtensions": [".bat", ".cmd", ".com", ".exe", ".msi", ".ps1", ".psm1", ".vbs"]
+    },
+    "exactFiles": [
+      {
+        "source": "package-lock.json",
+        "target": null,
+        "bytes": 327566,
+        "sha256": "7827816daef5b6bc2553a83ab9a7c1a033f54b58f9ac899a5ae5431e97d3c776"
+      },
+      {
+        "source": "node_modules/electron/package.json",
+        "target": null,
+        "bytes": 744,
+        "sha256": "02d60dd9473e05f9e5c3d23d3397e24c77cf283f086bb20be283e4536aaf1923"
+      },
+      {
+        "source": "node_modules/electron-builder/package.json",
+        "target": null,
+        "bytes": 1653,
+        "sha256": "181429cbec2bbf9286b8e421034dde4386ddefc5fe938b6e15711d63126fd51f"
+      },
+      {
+        "source": "node_modules/@openai/codex/package.json",
+        "target": "codex/package/package.json",
+        "bytes": 1082,
+        "sha256": "ff896fd5e5444cfc645890b21273ad1c6b3e26e4e4ab0934de597a0f8db5aafb"
+      },
+      {
+        "source": "node_modules/@openai/codex/README.md",
+        "target": "codex/package/README.md",
+        "bytes": 2814,
+        "sha256": "8ef3dd9dd00c7dd39d1f0b77de69d25cff4dd3fe7768ec3a3cd1fc9c0aa5b76c"
+      },
+      {
+        "source": "node_modules/@openai/codex/bin/codex.js",
+        "target": "codex/package/bin/codex.js",
+        "bytes": 7236,
+        "sha256": "134063e133f0b4244fa3b251acf973d4fe4b4aeeacbdc135211bf480f59f1477"
+      },
+      {
+        "source": "node_modules/@openai/codex-win32-x64/package.json",
+        "target": "codex/native/package.json",
+        "bytes": 511,
+        "sha256": "74c94696f460ad5dd07371a813a49ac2604121569e075a7e938d2f60b6de76a2"
+      },
+      {
+        "source": "node_modules/@openai/codex-win32-x64/README.md",
+        "target": "codex/native/README.md",
+        "bytes": 2814,
+        "sha256": "8ef3dd9dd00c7dd39d1f0b77de69d25cff4dd3fe7768ec3a3cd1fc9c0aa5b76c"
+      },
+      {
+        "source": "node_modules/@openai/codex-win32-x64/vendor/x86_64-pc-windows-msvc/codex-package.json",
+        "target": "codex/native/vendor/x86_64-pc-windows-msvc/codex-package.json",
+        "bytes": 215,
+        "sha256": "d15dd152401ec63697fb4888d3dec75a849ac85c11aa69256bccc0355e0b7ddd"
+      },
+      {
+        "source": "node_modules/@openai/codex-win32-x64/vendor/x86_64-pc-windows-msvc/bin/codex.exe",
+        "target": "codex/native/vendor/x86_64-pc-windows-msvc/bin/codex.exe",
+        "bytes": 359245096,
+        "sha256": "83751f15cb6a0a7b97df67752c001e3fe1c20e18ffbfec3ff63567296205eb6c"
+      },
+      {
+        "source": "node_modules/@openai/codex-win32-x64/vendor/x86_64-pc-windows-msvc/bin/codex-code-mode-host.exe",
+        "target": "codex/native/vendor/x86_64-pc-windows-msvc/bin/codex-code-mode-host.exe",
+        "bytes": 53605168,
+        "sha256": "de58d3bd9fb88c44555de1104d06fba78e207bce7115d92691b42f6b0f87f3b7"
+      },
+      {
+        "source": "node_modules/@openai/codex-win32-x64/vendor/x86_64-pc-windows-msvc/codex-path/rg.exe",
+        "target": "codex/native/vendor/x86_64-pc-windows-msvc/codex-path/rg.exe",
+        "bytes": 4218880,
+        "sha256": "14231169855ec5205cf5a1b6f1db358ff4aed4247c86b69ce8aae647c77f6680"
+      },
+      {
+        "source": "node_modules/@openai/codex-win32-x64/vendor/x86_64-pc-windows-msvc/codex-resources/codex-command-runner.exe",
+        "target": "codex/native/vendor/x86_64-pc-windows-msvc/codex-resources/codex-command-runner.exe",
+        "bytes": 1271088,
+        "sha256": "09531442d178aefb4c849745e95a000f52d5910a13944638269d9991cb08319b"
+      },
+      {
+        "source": "node_modules/@openai/codex-win32-x64/vendor/x86_64-pc-windows-msvc/codex-resources/codex-windows-sandbox-setup.exe",
+        "target": "codex/native/vendor/x86_64-pc-windows-msvc/codex-resources/codex-windows-sandbox-setup.exe",
+        "bytes": 8807728,
+        "sha256": "c981b438d0959e33f90f6b8b1a9656c4f803a1b82ebdd97e2150d2b8543a0c31"
+      },
+      {
+        "source": "LICENSE",
+        "target": "licenses/WhiteLily-LICENSE.txt",
+        "bytes": 11123,
+        "sha256": "226d0e41f61309952c27fcc11a5140c4e735115f702ff0484ff0c25cfbbeee16"
+      },
+      {
+        "source": "NOTICE",
+        "target": "licenses/WhiteLily-NOTICE.txt",
+        "bytes": 459,
+        "sha256": "d14e84981ee7c7c43cb8ae0e3b22eea184c1f23cc05d68d73659dd8bf616a05c"
+      }
+    ],
+    "generatedFiles": [
+      "core/childMain.js",
+      "core/package.json",
+      "licenses/OpenAI-Codex-NOTICE.txt"
+    ],
+    "requiredFiles": [
+      "core/childMain.js",
+      "desktop/main/main.js",
+      "desktop/preload/preload.cjs",
+      "desktop/renderer/index.html",
+      "codex/native/vendor/x86_64-pc-windows-msvc/bin/codex.exe",
+      "codex/native/vendor/x86_64-pc-windows-msvc/bin/codex-code-mode-host.exe",
+      "codex/native/vendor/x86_64-pc-windows-msvc/codex-path/rg.exe",
+      "codex/native/vendor/x86_64-pc-windows-msvc/codex-resources/codex-command-runner.exe",
+      "codex/native/vendor/x86_64-pc-windows-msvc/codex-resources/codex-windows-sandbox-setup.exe",
+      "licenses/WhiteLily-LICENSE.txt",
+      "licenses/WhiteLily-NOTICE.txt",
+      "licenses/OpenAI-Codex-NOTICE.txt"
+    ],
+    "executableFiles": [
+      "codex/native/vendor/x86_64-pc-windows-msvc/bin/codex.exe",
+      "codex/native/vendor/x86_64-pc-windows-msvc/bin/codex-code-mode-host.exe",
+      "codex/native/vendor/x86_64-pc-windows-msvc/codex-path/rg.exe",
+      "codex/native/vendor/x86_64-pc-windows-msvc/codex-resources/codex-command-runner.exe",
+      "codex/native/vendor/x86_64-pc-windows-msvc/codex-resources/codex-windows-sandbox-setup.exe"
+    ],
+    "scriptFiles": [],
+    "afterPackFiles": ["app.asar"]
+  }
+}

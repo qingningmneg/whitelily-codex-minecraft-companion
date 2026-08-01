@@ -1,5 +1,4 @@
-import type { TaskDisclosure } from "../companion/taskController.js";
-import type { TaskBudgetSnapshot, TaskStopReason } from "../safety/taskBudget.js";
+import type { TaskBudgetSnapshot, TaskLimits, TaskStopReason } from "../safety/taskBudget.js";
 
 export type RuntimeCommand =
   | { readonly kind: "start" }
@@ -8,12 +7,16 @@ export type RuntimeCommand =
 
 export interface PublicTaskSnapshot {
   readonly id: string;
-  readonly disclosure: TaskDisclosure;
+  readonly goal: string;
+  readonly status: "running" | "waiting_confirmation";
+  readonly allowedActions: readonly string[];
+  readonly effectiveLimits: TaskLimits;
   readonly startedAt: string;
   readonly budget: TaskBudgetSnapshot;
 }
 
 export interface RuntimeSnapshot {
+  readonly revision: number;
   readonly lifecycle: "idle" | "starting" | "running" | "stopping" | "stopped" | "failed";
   readonly minecraft: {
     readonly state: "disconnected" | "connecting" | "connected" | "reconnecting";
@@ -27,9 +30,19 @@ export interface RuntimeSnapshot {
   readonly lastError: { readonly code: string; readonly message: string } | null;
 }
 
-export type RuntimeEvent =
+export type RuntimeEventPayload =
   | { readonly kind: "lifecycle"; readonly state: RuntimeSnapshot["lifecycle"] }
   | { readonly kind: "minecraft"; readonly state: RuntimeSnapshot["minecraft"] }
   | { readonly kind: "codex"; readonly state: RuntimeSnapshot["codex"] }
   | { readonly kind: "task"; readonly task: PublicTaskSnapshot | null }
   | { readonly kind: "error"; readonly error: { readonly code: string; readonly message: string } };
+
+export type RuntimeEvent = RuntimeEventPayload extends infer Event
+  ? Event extends RuntimeEventPayload
+    ? Event & { readonly revision: number }
+    : never
+  : never;
+
+export interface RuntimeAuthorityLoss {
+  readonly reason: "model_unavailable";
+}

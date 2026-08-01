@@ -175,6 +175,7 @@ export async function createAppHarness(options: AppHarnessOptions = {}) {
       state: await readFile(join(directory, "data", "state.json"), "utf8"),
       log: await readFile(join(directory, "logs", "companion.log"), "utf8"),
     }),
+    readAudit: () => readFile(join(directory, "logs", "audit.jsonl"), "utf8"),
     cleanup: () => rm(directory, { recursive: true, force: true }),
   };
 }

@@ -11,7 +11,7 @@ export const appConfigSchema = z
         bot_username: z.literal("WhiteLily"),
         owner_username: z
           .string()
-          .regex(/^[A-Za-z0-9_]{3,16}$/, "owner username must match Minecraft Java rules"),
+          .regex(/^[A-Za-z0-9_]{3,16}$/u, "owner username must match Minecraft Java rules"),
       })
       .strict(),
     codex: z
@@ -40,6 +40,11 @@ export const appConfigSchema = z
 
 export type RawAppConfig = z.infer<typeof appConfigSchema>;
 
+export interface ConfirmedRuntimeConnection {
+  readonly host: "127.0.0.1";
+  readonly port: number;
+}
+
 export interface AppConfig {
   minecraft: {
     host: "127.0.0.1";
@@ -62,4 +67,23 @@ export interface AppConfig {
     placeConfirmationThreshold: 128;
     travelConfirmationDistance: 256;
   };
+}
+
+export interface AppPaths {
+  cwd: string;
+  dataRoot: string;
+  config: string;
+  profiles: string;
+  memories: string;
+  worlds: string;
+  logs: string;
+  audit: string;
+  diagnostics: string;
+  migrationSnapshots: string;
+  runtimeState: string;
+  codexWorkspace: string;
+  /** Compatibility alias for the legacy runtime state path. */
+  state: string;
+  /** Compatibility alias for the legacy companion log path. */
+  log: string;
 }

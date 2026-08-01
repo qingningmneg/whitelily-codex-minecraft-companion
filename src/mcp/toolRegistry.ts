@@ -22,7 +22,7 @@ export interface ToolRegistryDependencies {
   executor: ActionExecutor;
   budget: TurnToolBudget;
   safetyContextProvider: () => Promise<SafetyContext>;
-  ownerUsername: string;
+  ownerUsername: () => string;
   latestSnapshot?: () => WorldSnapshot | undefined;
   observeSnapshot?: (snapshot: WorldSnapshot) => void;
 }
@@ -212,7 +212,7 @@ export function createToolRegistry(dependencies: ToolRegistryDependencies) {
     return trusted;
   };
   const takeSnapshot = async (): Promise<WorldSnapshot> => {
-    const snapshot: unknown = await dependencies.minecraft.snapshot(dependencies.ownerUsername);
+    const snapshot: unknown = await dependencies.minecraft.snapshot(dependencies.ownerUsername());
     if (!isTrustedWorldSnapshot(snapshot)) throw new Error("trusted snapshot is unavailable");
     return observeSnapshot(snapshot);
   };

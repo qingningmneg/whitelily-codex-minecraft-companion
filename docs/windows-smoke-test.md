@@ -5,11 +5,57 @@
 ## 准备
 
 - [ ] 备份所有重要存档，并实际确认备份可恢复。
+- [ ] 完成 WhiteLily 安装并打开桌面应用。
+- [ ] 在 WhiteLily 中使用 ChatGPT 登录，并从实时列表选择模型。
 - [ ] 在 PCL2 中使用 Minecraft Java 1.21.5 创建一个全新、可丢弃的测试世界。
-- [ ] 将测试世界“对局域网开放”，端口设为 `25565`；确认 `config.toml` 中 WhiteLily 只连接本机回环地址 `127.0.0.1`。
-- [ ] 在项目目录运行 `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\doctor.ps1`，逐项处理所有 `FAIL`。
-- [ ] 运行 `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\start.ps1`。
+- [ ] 将测试世界“对局域网开放”；核对并确认 WhiteLily 检测到的候选会话只使用本机回环地址 `127.0.0.1`。
 - [ ] 确认名为 `WhiteLily` 的机器人进入测试世界。
+
+## 自然聊天、任务路由与游戏内零披露
+
+以下检查只能在全新、可丢弃的测试世界中执行，绝不能使用无法替代或尚未验证备份可恢复的存档。
+
+1. [ ] 启动 WhiteLily 和 PCL2，用 PCL2 启动 Minecraft Java 1.21.5，进入可丢弃世界并“对局域网开放”；确认 WhiteLily 保持连接。
+2. [ ] 在 Minecraft 聊天中发送 `你好呀`；预期只收到一句自然回复，桌面没有任务卡片，WhiteLily 不移动，聊天中没有内部披露。
+3. [ ] 发送 `走到我身边来`；预期在动作前看到桌面任务卡片与自然确认，两者先后顺序不固定（任务卡片可能先出现，不能因此判失败）；随后 WhiteLily 直接移动到主人身边，聊天中没有内部披露。
+4. [ ] WhiteLily 移动时发送 `今天天气不错`；预期收到聊天回复，原移动任务仍保持活动，不被普通聊天取消。
+5. [ ] 发送 `去那棵树下面`；预期旧任务和旧动作权限先结束，再显示并执行替换任务；旧任务不得继续移动。
+6. [ ] 触发现有危险动作确认（例如请求移动到超过当前安全范围的远处）；预期出现现有确认流程，批准前不执行动作。
+7. [ ] 在桌面任务卡片点击 `停止当前任务`；预期当前任务和动作立即停止，但 WhiteLily 桌面应用、Codex 与 Minecraft 仍保持连接。
+8. [ ] 再开始一个任务并在 Minecraft 聊天中发送 `!stop`；预期无需等待意图模型回合便立即停止任务和动作，随后 `!status` 显示没有活动任务。
+9. [ ] 检查本次 Minecraft 聊天以及该测试世界对应的 `latest.log`；以下内部词语均不得出现：`任务披露`、`expectedActions`、`allowedActions`、`maxToolCalls`、`maxBlockChanges`、`maxHorizontalTravel`、`maxDurationMs`、`maxDangerousOperations`、`leaseId`、`stopCondition`。
+
+## 主人身份首次设置与在线切换
+
+实测时只记录时间戳、通过/失败、Minecraft 版本和构建提交。不得记录真实主人用户名、进程 PID、用户目录、原始日志行或诊断内容；进程与监听端口只记录“连续”或“不连续”。
+
+- [ ] 首次启动时不手工编辑 `config.toml`，完成主人身份设置。
+- [ ] 主人用户名不会出现在 `whitelily.onboarding.v1`、普通日志或诊断包中。
+- [ ] 运行中将主人改为一个合法但离线的测试用户名，界面显示“正在等待新主人上线”。
+- [ ] 旧主人下一条 `!status` 被忽略，旧任务停止且不再产生动作。
+- [ ] 切回实际主人后，新命令被接受。
+- [ ] Minecraft `latest.log` 中没有 WhiteLily 退出或重新加入记录。
+- [ ] Codex 服务进程 PID 与 `127.0.0.1:32123` 监听在切换前后保持连续。
+
+执行切换前后应在本机分别核对 WhiteLily、Mineflayer/Codex 子进程、`127.0.0.1:32123` 监听所有者，以及 `latest.log` 中最近的 WhiteLily 加入/退出事件。不得把实际 PID 或日志原文复制到测试记录。测试结束前必须切回实际主人，并确认本机 `config.toml` 不再保留测试用户名。
+
+### 脱敏实测记录
+
+- 时间：`2026-07-30T15:08:24+08:00` 至 `2026-07-30T15:12:24+08:00`
+- Minecraft：Java 版 1.21.5
+- 构建提交：`1d19cd8`
+- 总体结果：PASS
+
+| 检查项                                      | 结果 |
+| ------------------------------------------- | ---- |
+| 首次设置无需手工编辑配置                    | PASS |
+| 首次设置存储、普通日志与诊断包隐私          | PASS |
+| 离线新主人等待状态                          | PASS |
+| 旧主人命令忽略与旧任务停止                  | PASS |
+| 实际主人恢复与新命令接受                    | PASS |
+| 切换期间无 WhiteLily 退出或重新加入         | PASS |
+| WhiteLily、Mineflayer、Codex 与本机监听连续 | PASS |
+| 测试结束时主人配置已恢复                    | PASS |
 
 ## 聊天、模式与普通动作
 

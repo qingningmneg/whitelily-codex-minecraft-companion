@@ -87,7 +87,7 @@ export class ActionExecutor {
     private readonly minecraft: MinecraftPort,
     private readonly safety: ActionSafety,
     private readonly confirmations: ConfirmationStore,
-    private readonly ownerUsername: string,
+    private readonly ownerUsername: () => string,
     private readonly beforeStopAll: () => void = () => undefined,
     private readonly confirmedActionAuthority: ConfirmedActionAuthority = noConfirmedActionAuthority,
   ) {}
@@ -308,7 +308,7 @@ export class ActionExecutor {
         await this.minecraft.moveTo(action.position, signal);
         return;
       case "follow_owner":
-        await this.minecraft.followOwner(this.ownerUsername, action.distance, signal);
+        await this.minecraft.followOwner(this.ownerUsername(), action.distance, signal);
         return;
       case "look_at":
         await this.minecraft.lookAt(action.position, signal);

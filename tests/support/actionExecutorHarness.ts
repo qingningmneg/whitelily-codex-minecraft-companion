@@ -12,5 +12,5 @@ export function createActionExecutorHarness(
     evaluate: () => decision,
     evaluatePermanent: () => decision,
   };
-  return new ActionExecutor(minecraft, safety, confirmations, "TestOwner");
+  return new ActionExecutor(minecraft, safety, confirmations, () => "TestOwner");
 }

@@ -1,0 +1,50 @@
+[
+  {
+    "localAddress": "127.0.0.1",
+    "localPort": 51321,
+    "pid": 4200,
+    "processName": "javaw.exe",
+    "processStartedAt": 1785196800123,
+    "version": "1.21.5"
+  },
+  {
+    "localAddress": "::1",
+    "localPort": 51322,
+    "pid": 4200,
+    "processName": "javaw.exe",
+    "processStartedAt": 1785196800123,
+    "version": null
+  },
+  {
+    "localAddress": "0.0.0.0",
+    "localPort": 51323,
+    "pid": 4200,
+    "processName": "javaw.exe",
+    "processStartedAt": 1785196800123,
+    "version": "1.21.5"
+  },
+  {
+    "localAddress": "192.168.1.25",
+    "localPort": 51324,
+    "pid": 4200,
+    "processName": "javaw.exe",
+    "processStartedAt": 1785196800123,
+    "version": "1.21.5"
+  },
+  {
+    "localAddress": "::ffff:127.0.0.1",
+    "localPort": 51325,
+    "pid": 4200,
+    "processName": "javaw.exe",
+    "processStartedAt": 1785196800123,
+    "version": "1.21.5"
+  },
+  {
+    "localAddress": "127.0.0.1",
+    "localPort": 51326,
+    "pid": 4300,
+    "processName": "not-java.exe",
+    "processStartedAt": 1785196800456,
+    "version": "1.21.5"
+  }
+]

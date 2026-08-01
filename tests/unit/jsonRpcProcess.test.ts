@@ -1,9 +1,15 @@
+import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { PassThrough } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
 import {
   createCodexAppServerSpawnSpec,
+  createBundledCodexLaunchConfig,
   JsonRpcProcess,
+  resolveDefaultCodexExecutable,
   runCodexLoginStatus,
   spawnCodexAppServerTransport,
   terminateCodexProcessTree,
@@ -18,6 +24,67 @@ function processDouble(options: { pid?: number; exitCode?: number | null } = {})
     kill: vi.fn(() => true),
   });
   return child;
+}
+
+const reviewedExecutables = [
+  "vendor/x86_64-pc-windows-msvc/bin/codex.exe",
+  "vendor/x86_64-pc-windows-msvc/bin/codex-code-mode-host.exe",
+  "vendor/x86_64-pc-windows-msvc/codex-path/rg.exe",
+  "vendor/x86_64-pc-windows-msvc/codex-resources/codex-command-runner.exe",
+  "vendor/x86_64-pc-windows-msvc/codex-resources/codex-windows-sandbox-setup.exe",
+] as const;
+
+function createPackagedCodexFixture(): {
+  root: string;
+  resources: string;
+  dataRoot: string;
+  manifestPath: string;
+  cleanup(): void;
+} {
+  const root = mkdtempSync(join(tmpdir(), "whitelily-codex-launch-"));
+  const resources = join(root, "resources");
+  const native = join(resources, "codex", "native");
+  const dataRoot = join(root, "data");
+  const exactFiles = reviewedExecutables.map((path, index) => {
+    const bytes = Buffer.from(`reviewed-${index}`);
+    const target = `codex/native/${path}`;
+    const absolute = join(native, ...path.split("/"));
+    mkdirSync(dirname(absolute), { recursive: true });
+    writeFileSync(absolute, bytes);
+    return {
+      source: `node_modules/@openai/codex-win32-x64/${path}`,
+      target,
+      bytes: bytes.length,
+      sha256: createHash("sha256").update(bytes).digest("hex"),
+    };
+  });
+  const manifestPath = join(resources, "runtime-manifest.json");
+  writeFileSync(
+    manifestPath,
+    JSON.stringify({
+      schemaVersion: 1,
+      paths: {
+        codexExecutable: "codex/native/vendor/x86_64-pc-windows-msvc/bin/codex.exe",
+      },
+      allowlist: {
+        exactFiles,
+        executableFiles: reviewedExecutables.map((path) => `codex/native/${path}`),
+      },
+      policySha256: "a".repeat(64),
+      resources: exactFiles.map(({ target: path, bytes, sha256 }) => ({
+        path,
+        bytes,
+        sha256,
+      })),
+    }),
+  );
+  return {
+    root,
+    resources,
+    dataRoot,
+    manifestPath,
+    cleanup: () => rmSync(root, { recursive: true, force: true }),
+  };
 }
 
 describe("JsonRpcProcess", () => {
@@ -148,6 +215,151 @@ describe("JsonRpcProcess", () => {
       env: { PATH: "C:\\Windows" },
       windowsHide: true,
     });
+  });
+
+  it("spawns only the trusted bundled executable with a controlled PATH and local Codex home", () => {
+    const fixture = createPackagedCodexFixture();
+    try {
+      const launch = createBundledCodexLaunchConfig(fixture.resources, fixture.dataRoot, "win32", {
+        layout: "packaged",
+        manifestPath: fixture.manifestPath,
+      });
+      const spec = createCodexAppServerSpawnSpec("win32", launch, {
+        PATH: "C:\\system-node;C:\\system-git;C:\\system-codex",
+        Path: "C:\\second-system-path",
+        CODEX_HOME: "C:\\Users\\Owner\\.codex",
+        OPENAI_API_KEY: "platform-key",
+      });
+
+      expect(spec).toMatchObject({
+        command: launch.executablePath,
+        args: ["app-server", "--listen", "stdio://"],
+        env: {
+          CODEX_HOME: launch.codexHome,
+          PATH: [
+            dirname(launch.executablePath),
+            resolve(dirname(launch.executablePath), "..", "codex-path"),
+            resolve(dirname(launch.executablePath), "..", "codex-resources"),
+          ].join(";"),
+        },
+        windowsHide: true,
+      });
+      expect(Object.keys(spec.env)).toEqual(["PATH", "CODEX_HOME"]);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("rejects an arbitrary absolute Codex launch object that was not manifest-verified", () => {
+    expect(() =>
+      createCodexAppServerSpawnSpec(
+        "win32",
+        {
+          executablePath: String.raw`C:\unreviewed\codex.exe`,
+          codexHome: String.raw`C:\unreviewed\home`,
+        },
+        {},
+      ),
+    ).toThrow("not verified");
+  });
+
+  it("rejects a missing reviewed native helper and an extra executable", () => {
+    const fixture = createPackagedCodexFixture();
+    try {
+      rmSync(join(fixture.resources, "codex", "native", ...reviewedExecutables[1].split("/")));
+      expect(() =>
+        createBundledCodexLaunchConfig(fixture.resources, fixture.dataRoot, "win32", {
+          layout: "packaged",
+          manifestPath: fixture.manifestPath,
+        }),
+      ).toThrow();
+
+      const repaired = createPackagedCodexFixture();
+      try {
+        const rogue = join(repaired.resources, "codex", "native", "vendor", "rogue.exe");
+        writeFileSync(rogue, "rogue");
+        expect(() =>
+          createBundledCodexLaunchConfig(repaired.resources, repaired.dataRoot, "win32", {
+            layout: "packaged",
+            manifestPath: repaired.manifestPath,
+          }),
+        ).toThrow("allowlist");
+      } finally {
+        repaired.cleanup();
+      }
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("rejects a Codex home junction that escapes the WhiteLily data root", () => {
+    const fixture = createPackagedCodexFixture();
+    try {
+      const outside = join(fixture.root, "outside-home");
+      mkdirSync(fixture.dataRoot, { recursive: true });
+      mkdirSync(outside);
+      symlinkSync(outside, join(fixture.dataRoot, "codex"), "junction");
+
+      expect(() =>
+        createBundledCodexLaunchConfig(fixture.resources, fixture.dataRoot, "win32", {
+          layout: "packaged",
+          manifestPath: fixture.manifestPath,
+        }),
+      ).toThrow("escaped");
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("rejects a native resource junction that escapes its reviewed root", () => {
+    const fixture = createPackagedCodexFixture();
+    try {
+      const native = join(fixture.resources, "codex", "native");
+      const vendor = join(native, "vendor");
+      const outside = join(fixture.root, "outside-vendor");
+      mkdirSync(outside);
+      for (const path of reviewedExecutables) {
+        const source = join(vendor, ...path.replace("vendor/", "").split("/"));
+        const target = join(outside, ...path.replace("vendor/", "").split("/"));
+        mkdirSync(dirname(target), { recursive: true });
+        writeFileSync(target, readFileSync(source));
+      }
+      rmSync(vendor, { recursive: true, force: true });
+      symlinkSync(outside, vendor, "junction");
+
+      expect(() =>
+        createBundledCodexLaunchConfig(fixture.resources, fixture.dataRoot, "win32", {
+          layout: "packaged",
+          manifestPath: fixture.manifestPath,
+        }),
+      ).toThrow("escaped");
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("resolves the exact bundled Windows Codex binary instead of consulting the working directory", () => {
+    const cwd = vi
+      .spyOn(process, "cwd")
+      .mockReturnValue("C:\\Users\\Owner\\AppData\\Local\\WhiteLily\\data");
+    try {
+      expect(resolveDefaultCodexExecutable("win32", "x64")).toBe(
+        resolve(
+          import.meta.dirname,
+          "..",
+          "..",
+          "node_modules",
+          "@openai",
+          "codex-win32-x64",
+          "vendor",
+          "x86_64-pc-windows-msvc",
+          "bin",
+          "codex.exe",
+        ),
+      );
+    } finally {
+      cwd.mockRestore();
+    }
   });
 
   it("rejects Windows executable paths that can expand command variables", () => {

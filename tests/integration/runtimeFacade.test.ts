@@ -139,6 +139,120 @@ function createRuntimeFacadeHarness() {
 }
 
 describe("RuntimeFacade", () => {
+  it("forwards a memory-scope change without changing the Minecraft lifecycle", () => {
+    const scopes: unknown[] = [];
+    const runtime = new RuntimeFacade({
+      lifecycle: { start: async () => undefined, stop: async () => undefined },
+      memory: { setScope: (scope) => scopes.push(scope) },
+    });
+
+    runtime.setMemoryScope({ mode: "layered", worldId: "world-a" });
+
+    expect(scopes).toEqual([{ mode: "layered", worldId: "world-a" }]);
+    expect(runtime.snapshot().minecraft).toEqual({ state: "disconnected", sessionId: null });
+  });
+  it("publishes strictly increasing revisions and snapshots the latest public revision", async () => {
+    const harness = createRuntimeFacadeHarness();
+    const revisions: Array<number | undefined> = [];
+    harness.runtime.subscribe((event) => {
+      revisions.push((event as RuntimeEvent & { revision?: number }).revision);
+    });
+
+    await harness.runtime.start();
+
+    expect(revisions).toEqual([1, 2, 3, 4, 5]);
+    expect((harness.runtime.snapshot() as { revision?: number }).revision).toBe(5);
+  });
+
+  it("fails closed instead of publishing an unsafe revision after exhaustion", async () => {
+    const runtime = new RuntimeFacade({
+      lifecycle: {
+        start: async () => undefined,
+        stop: async () => undefined,
+      },
+      initialRevision: Number.MAX_SAFE_INTEGER,
+    } as ConstructorParameters<typeof RuntimeFacade>[0]);
+    const events: RuntimeEvent[] = [];
+    runtime.subscribe((event) => events.push(event));
+
+    await expect(runtime.start()).rejects.toThrow(/revision/iu);
+
+    expect(events).toEqual([]);
+    expect(runtime.snapshot()).toMatchObject({
+      revision: Number.MAX_SAFE_INTEGER,
+      lifecycle: "failed",
+      lastError: {
+        code: "RUNTIME_REVISION_EXHAUSTED",
+        message: "Runtime revision is exhausted",
+      },
+    });
+  });
+
+  it.each([
+    {
+      operation: "start",
+      initialRevision: Number.MAX_SAFE_INTEGER - 1,
+      expectedEventRevisions: [Number.MAX_SAFE_INTEGER],
+    },
+    {
+      operation: "start",
+      initialRevision: Number.MAX_SAFE_INTEGER,
+      expectedEventRevisions: [],
+    },
+    {
+      operation: "stop",
+      initialRevision: Number.MAX_SAFE_INTEGER - 1,
+      expectedEventRevisions: [Number.MAX_SAFE_INTEGER],
+    },
+    {
+      operation: "stop",
+      initialRevision: Number.MAX_SAFE_INTEGER,
+      expectedEventRevisions: [],
+    },
+  ] as const)(
+    "$operation fails closed without an unhandled rejection from revision $initialRevision",
+    async ({ operation, initialRevision, expectedEventRevisions }) => {
+      const unhandled: unknown[] = [];
+      const onUnhandled = (reason: unknown): void => {
+        unhandled.push(reason);
+      };
+      process.on("unhandledRejection", onUnhandled);
+      let cleanupCalls = 0;
+      const runtime = new RuntimeFacade({
+        initialRevision,
+        lifecycle: {
+          start: async () => undefined,
+          stop: async () => {
+            cleanupCalls += 1;
+          },
+        },
+      });
+      const events: RuntimeEvent[] = [];
+      runtime.subscribe((event) => events.push(event));
+
+      try {
+        const operationPromise =
+          operation === "start" ? runtime.start() : runtime.stop("process_exit");
+        await expect(operationPromise).rejects.toThrow(/revision/iu);
+        await new Promise<void>((resolve) => setImmediate(resolve));
+
+        expect(unhandled).toEqual([]);
+        expect(cleanupCalls).toBe(1);
+        expect(events.map((event) => event.revision)).toEqual(expectedEventRevisions);
+        expect(events.every((event) => Number.isSafeInteger(event.revision))).toBe(true);
+        expect(runtime.snapshot()).toMatchObject({
+          revision: Number.MAX_SAFE_INTEGER,
+          lifecycle: "failed",
+          lastError: {
+            code: "RUNTIME_REVISION_EXHAUSTED",
+          },
+        });
+      } finally {
+        process.off("unhandledRejection", onUnhandled);
+      }
+    },
+  );
+
   it("publishes ordered startup and stop state", async () => {
     const harness = createRuntimeFacadeHarness();
     const states: string[] = [];
@@ -160,6 +274,19 @@ describe("RuntimeFacade", () => {
 
     expect(harness.cleanupOrder()).toEqual(["task", "executor", "minecraft", "codex", "mcp"]);
     expect(harness.stopReasons).toEqual(["emergency_stop"]);
+  });
+
+  it("accepts owner_changed as a terminal task-budget reason", () => {
+    const runtime = new RuntimeFacade({
+      lifecycle: { start: async () => undefined, stop: async () => undefined },
+      task: {
+        current: () => null,
+        budget: () => ({ ...inactiveBudget(), stopReason: "owner_changed" }),
+        stop: () => undefined,
+      },
+    });
+
+    expect(runtime.snapshot()).toMatchObject({ task: null, lastError: null });
   });
 
   it("shares a concurrent start and emits one startup transition", async () => {
@@ -337,6 +464,7 @@ describe("RuntimeFacade", () => {
     expect(stops).toBe(1);
     expect(events).toContainEqual({
       kind: "error",
+      revision: 6,
       error: {
         code: "RUNTIME_START_FAILED",
         message: "Runtime failed to start",
@@ -412,7 +540,7 @@ describe("RuntimeFacade", () => {
           throw new Error(`failed to invalidate ${leaseId} at C:\\private`);
         },
       },
-      createPublicTaskId: () => "public-stop-failure-task",
+      createPublicTaskId: () => "task_public_stop_failure_task",
     });
     await runtime.start();
 
@@ -464,7 +592,7 @@ describe("RuntimeFacade", () => {
           reasons.push(reason);
         },
       },
-      createPublicTaskId: () => "public-noop-stop-task",
+      createPublicTaskId: () => "task_public_noop_stop_task",
     });
     await runtime.start();
 
@@ -519,7 +647,7 @@ describe("RuntimeFacade", () => {
           invalidated = true;
         },
       },
-      createPublicTaskId: () => "public-accessor-throw-task",
+      createPublicTaskId: () => "task_public_accessor_throw_task",
     });
     await runtime.start();
 
@@ -579,7 +707,7 @@ describe("RuntimeFacade", () => {
           };
         },
       },
-      createPublicTaskId: () => "public-late-cleanup-task",
+      createPublicTaskId: () => "task_public_late_cleanup_task",
     });
     runtime.subscribe((event) => {
       if (event.kind === "task") publishedTasks.push(event);
@@ -631,10 +759,12 @@ describe("RuntimeFacade", () => {
     await runtime.start();
     expect(events).toContainEqual({
       kind: "minecraft",
+      revision: 2,
       state: { state: "connecting", sessionId: null },
     });
     expect(events).toContainEqual({
       kind: "codex",
+      revision: 3,
       state: { state: "starting", model: null },
     });
     expect(runtime.snapshot().codex).toEqual({
@@ -649,7 +779,7 @@ describe("RuntimeFacade", () => {
     });
     minecraftListener?.({ kind: "world_changed" });
     expect(runtime.snapshot()).toMatchObject({
-      minecraft: { state: "connected", sessionId: null },
+      minecraft: { state: "disconnected", sessionId: null },
       lastError: null,
     });
     minecraftListener?.({
@@ -702,6 +832,7 @@ describe("RuntimeFacade", () => {
 
   it("maps tasks to a stable public ID without serializing the lease", () => {
     let taskListener: (() => void) | undefined;
+    let status: "running" | "waiting_confirmation" = "running";
     let budget: TaskBudgetSnapshot = {
       ...inactiveBudget(),
       active: true,
@@ -727,6 +858,7 @@ describe("RuntimeFacade", () => {
       task: {
         current: () => active,
         budget: () => budget,
+        status: () => status,
         stop: () => undefined,
         subscribe: (listener) => {
           taskListener = listener;
@@ -737,32 +869,32 @@ describe("RuntimeFacade", () => {
       },
       createPublicTaskId: () => {
         publicIds += 1;
-        return "public-task-1";
+        return "task_public_1";
       },
     });
 
     const first = runtime.snapshot();
     const second = runtime.snapshot();
-    expect(first.task).toMatchObject({
-      id: "public-task-1",
-      disclosure: {
-        goal: "Build a safe house",
-        expectedActions: ["move", "place"],
-      },
+    expect(first.task).toEqual({
+      id: "task_public_1",
+      goal: "Build a safe house",
+      status: "running",
+      allowedActions: ["move", "place"],
+      effectiveLimits: budget.limits,
       startedAt: "2023-11-14T22:13:20.000Z",
-      budget: {
-        active: true,
-        startedAt: 1_700_000_000_000,
-      },
+      budget,
     });
-    expect(second.task?.id).toBe("public-task-1");
+    expect(second.task?.id).toBe("task_public_1");
+    expect(second.task?.id).not.toBe(active.lease.id);
     expect(publicIds).toBe(1);
     expect(JSON.stringify({ first, second })).not.toContain("lease-super-secret");
+    expect(JSON.stringify({ first, second })).not.toContain("ownerUsername");
+    expect(JSON.stringify({ first, second })).not.toContain("prompt");
 
     const observed: RuntimeEvent[] = [];
     runtime.subscribe((event) => {
       if (event.kind === "task" && event.task) {
-        (event.task.disclosure.expectedActions as string[]).push("mutated");
+        (event.task.allowedActions as string[]).push("mutated");
       }
     });
     runtime.subscribe((event) => observed.push(event));
@@ -772,14 +904,66 @@ describe("RuntimeFacade", () => {
     expect(observed.at(-1)).toMatchObject({
       kind: "task",
       task: {
-        disclosure: { expectedActions: ["move", "place"] },
+        id: "task_public_1",
+        goal: "Build a safe house",
+        status: "running",
+        allowedActions: ["move", "place"],
+        effectiveLimits: budget.limits,
         budget: { toolCalls: 1 },
       },
+    });
+    status = "waiting_confirmation";
+    taskListener?.();
+    expect(observed.at(-1)).toMatchObject({
+      kind: "task",
+      task: { id: "task_public_1", status: "waiting_confirmation" },
     });
     active = null;
     budget = { ...budget, active: false, stopReason: "completed", startedAt: null };
     taskListener?.();
-    expect(observed.at(-1)).toEqual({ kind: "task", task: null });
+    expect(observed.at(-1)).toEqual({ kind: "task", revision: 3, task: null });
+  });
+
+  it("stops only the current task idempotently while preserving runtime authority", async () => {
+    let active: ActiveTask | null = activeTaskFixture();
+    let budget = activeBudgetFixture();
+    const stopReasons: TaskStopReason[] = [];
+    let lifecycleStops = 0;
+    const runtime = new RuntimeFacade({
+      lifecycle: {
+        start: async () => undefined,
+        stop: async () => {
+          lifecycleStops += 1;
+        },
+      },
+      codex: { model: () => "gpt-5.6" },
+      task: {
+        current: () => active,
+        budget: () => budget,
+        status: () => "running",
+        stop: (reason) => {
+          stopReasons.push(reason);
+          active = null;
+          budget = { ...budget, active: false, stopReason: reason, startedAt: null };
+        },
+      },
+      createPublicTaskId: () => "task_stop_only",
+    });
+    await runtime.start();
+    const authorityBefore = runtime.snapshot();
+
+    await expect(runtime.stopTask()).resolves.toBeUndefined();
+    await expect(runtime.stopTask()).resolves.toBeUndefined();
+
+    expect(stopReasons).toEqual(["owner_stop"]);
+    expect(lifecycleStops).toBe(0);
+    expect(runtime.snapshot()).toMatchObject({
+      lifecycle: authorityBefore.lifecycle,
+      minecraft: authorityBefore.minecraft,
+      codex: authorityBefore.codex,
+      task: null,
+      lastError: null,
+    });
   });
 
   it("redacts credentials and local paths from every public disclosure string", () => {
@@ -818,7 +1002,7 @@ describe("RuntimeFacade", () => {
           };
         },
       },
-      createPublicTaskId: () => "public-redacted-task",
+      createPublicTaskId: () => "task_public_redacted_task",
     });
     const taskEvents: RuntimeEvent[] = [];
     runtime.subscribe((event) => {
@@ -829,12 +1013,12 @@ describe("RuntimeFacade", () => {
 
     const snapshot = runtime.snapshot();
     const cliJson = JSON.stringify({ snapshot, events: taskEvents });
-    expect(snapshot.task?.disclosure.goal).toContain("Collect spruce safely");
+    expect(snapshot.task?.goal).toContain("Collect spruce safely");
     expect(task.disclosure.goal).toContain("hunter2");
     expect(task.disclosure.goal).toContain(task.lease.id);
-    expect(snapshot.task?.disclosure.stopCondition).toContain("Stop safely");
-    expect(snapshot.task?.disclosure.expectedActions).toHaveLength(8);
+    expect(snapshot.task?.allowedActions).toHaveLength(8);
     expect(cliJson).toContain("craft safely");
+    expect(cliJson).not.toContain("Stop safely");
     for (const sensitive of [
       "hunter2",
       "abc+def==",
@@ -859,8 +1043,8 @@ describe("RuntimeFacade", () => {
     ]) {
       expect(cliJson).not.toContain(sensitive);
     }
-    expect(Object.isFrozen(snapshot.task?.disclosure)).toBe(true);
-    expect(Object.isFrozen(snapshot.task?.disclosure.expectedActions)).toBe(true);
+    expect(Object.isFrozen(snapshot.task)).toBe(true);
+    expect(Object.isFrozen(snapshot.task?.allowedActions)).toBe(true);
     expect(Object.isFrozen(taskEvents.at(-1))).toBe(true);
   });
 
@@ -897,7 +1081,7 @@ describe("RuntimeFacade", () => {
           return () => undefined;
         },
       },
-      createPublicTaskId: () => "public-spaced-redaction-task",
+      createPublicTaskId: () => "task_public_spaced_redaction_task",
     });
     const taskEvents: RuntimeEvent[] = [];
     runtime.subscribe((event) => {
@@ -980,7 +1164,7 @@ describe("RuntimeFacade", () => {
           return () => undefined;
         },
       },
-      createPublicTaskId: () => "public-punctuated-path-task",
+      createPublicTaskId: () => "task_public_punctuated_path_task",
     });
     const events: RuntimeEvent[] = [];
     runtime.subscribe((event) => {
@@ -1023,7 +1207,7 @@ describe("RuntimeFacade", () => {
     }
   });
 
-  it("bounds public disclosure text by Unicode code points without splitting safe text", () => {
+  it("bounds public task text by Unicode code points without splitting safe text", () => {
     const task = activeTaskFixture();
     task.disclosure = {
       ...task.disclosure,
@@ -1041,18 +1225,16 @@ describe("RuntimeFacade", () => {
         budget: activeBudgetFixture,
         stop: () => undefined,
       },
-      createPublicTaskId: () => "public-unicode-task",
+      createPublicTaskId: () => "task_public_unicode_task",
     });
 
-    const disclosure = runtime.snapshot().task?.disclosure;
-    expect(disclosure?.goal.startsWith("Keep safe ")).toBe(true);
-    expect(Array.from(disclosure?.goal ?? "")).toHaveLength(4_000);
-    expect(Array.from(disclosure?.expectedActions[0] ?? "")).toHaveLength(256);
-    expect(disclosure?.stopCondition.startsWith("Stop safely ")).toBe(true);
-    expect(Array.from(disclosure?.stopCondition ?? "")).toHaveLength(4_000);
-    expect(disclosure?.goal.endsWith("🌸")).toBe(true);
-    expect(disclosure?.expectedActions[0]?.endsWith("🌿")).toBe(true);
-    expect(disclosure?.stopCondition.endsWith("🛑")).toBe(true);
+    const publicTask = runtime.snapshot().task;
+    expect(publicTask?.goal.startsWith("Keep safe ")).toBe(true);
+    expect(Array.from(publicTask?.goal ?? "")).toHaveLength(4_000);
+    expect(Array.from(publicTask?.allowedActions[0] ?? "")).toHaveLength(256);
+    expect(publicTask?.goal.endsWith("🌸")).toBe(true);
+    expect(publicTask?.allowedActions[0]?.endsWith("🌿")).toBe(true);
+    expect(JSON.stringify(publicTask)).not.toContain("Stop safely");
   });
 
   it("fails closed before scanning a disclosure string above the raw work bound", () => {
@@ -1099,13 +1281,13 @@ describe("RuntimeFacade", () => {
         budget: activeBudgetFixture,
         stop: () => undefined,
       },
-      createPublicTaskId: () => "public-linear-scan-task",
+      createPublicTaskId: () => "task_public_linear_scan_task",
     });
     const snapshot = runtime.snapshot();
     const elapsed = performance.now() - started;
 
     expect(snapshot.lifecycle).toBe("idle");
-    expect(Array.from(snapshot.task?.disclosure.goal ?? "")).toHaveLength(4_000);
+    expect(Array.from(snapshot.task?.goal ?? "")).toHaveLength(4_000);
     expect(elapsed).toBeLessThan(500);
   });
 
@@ -1122,10 +1304,10 @@ describe("RuntimeFacade", () => {
         budget: activeBudgetFixture,
         stop: () => undefined,
       },
-      createPublicTaskId: () => "public-marker-boundary-task",
+      createPublicTaskId: () => "task_public_marker_boundary_task",
     });
 
-    const goal = runtime.snapshot().task?.disclosure.goal ?? "";
+    const goal = runtime.snapshot().task?.goal ?? "";
     expect(Array.from(goal).length).toBeLessThanOrEqual(4_000);
     expect(goal).not.toMatch(/\[REDACTED(?:_[A-Z]*)?$/u);
     expect(goal).not.toContain("C:\\Users\\Owner");
@@ -1216,7 +1398,7 @@ describe("RuntimeFacade", () => {
         budget,
         stop: () => undefined,
       },
-      createPublicTaskId: () => "public-exact-shape-task",
+      createPublicTaskId: () => "task_public_exact_shape_task",
     });
 
     const snapshot = runtime.snapshot();
@@ -1370,7 +1552,7 @@ describe("RuntimeFacade", () => {
           return () => undefined;
         },
       },
-      createPublicTaskId: () => "public-terminal-task",
+      createPublicTaskId: () => "task_public_terminal_task",
     });
     const events: RuntimeEvent[] = [];
     runtime.subscribe((event) => events.push(event));
@@ -1716,6 +1898,35 @@ describe("RuntimeFacade", () => {
     expect(lifecycleStops).toBe(1);
   });
 
+  it.each([
+    ["uppercase characters", "task_Public_1"],
+    ["a missing task prefix", "public_task_1"],
+    ["an empty task suffix", "task_"],
+  ])("terminally rejects a generated public ID with %s", async (_label, generatedId) => {
+    let taskStops = 0;
+    const runtime = new RuntimeFacade({
+      lifecycle: {
+        start: async () => undefined,
+        stop: async () => undefined,
+      },
+      task: {
+        current: activeTaskFixture,
+        budget: activeBudgetFixture,
+        stop: () => {
+          taskStops += 1;
+        },
+      },
+      createPublicTaskId: () => generatedId,
+    });
+
+    expect(runtime.snapshot()).toMatchObject({
+      lifecycle: "failed",
+      task: null,
+      lastError: { code: "TASK_STATE_UNKNOWN" },
+    });
+    expect(taskStops).toBe(1);
+  });
+
   it("terminally fails closed without publishing a task when public ID generation throws", async () => {
     let taskSubscriptions = 0;
     let taskStops = 0;
@@ -1783,7 +1994,7 @@ describe("RuntimeFacade", () => {
             return () => undefined;
           },
         },
-        createPublicTaskId: () => "public-malformed-minecraft-task",
+        createPublicTaskId: () => "task_public_malformed_minecraft_task",
       });
       await runtime.start();
 
@@ -1863,7 +2074,7 @@ describe("RuntimeFacade", () => {
 
     expect(runtime.snapshot()).toMatchObject({
       lifecycle: "running",
-      minecraft: { state: "reconnecting", sessionId: null },
+      minecraft: { state: "disconnected", sessionId: null },
       lastError: null,
     });
   });
@@ -1940,7 +2151,7 @@ describe("RuntimeFacade", () => {
           return () => undefined;
         },
       },
-      createPublicTaskId: () => "public-reentrant-task",
+      createPublicTaskId: () => "task_public_reentrant_task",
     });
     let injectedUnknown = false;
     runtime.subscribe((event) => {

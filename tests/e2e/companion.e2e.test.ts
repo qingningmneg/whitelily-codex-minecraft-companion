@@ -1,8 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import {
-  companionTurnOutcomeSchema,
-  type CompanionTurnOutcome,
-} from "../../src/companion/promptBuilder.js";
+import { companionTurnOutcomeSchema } from "../../src/companion/promptBuilder.js";
 import { RuntimeFacade } from "../../src/runtime/runtimeFacade.js";
 import type { TaskBudgetSnapshot } from "../../src/safety/taskBudget.js";
 import {
@@ -149,7 +146,7 @@ describe("simulated WhiteLily lifecycle", () => {
       codex: {
         model: () => "gpt-5.6-terra",
       },
-      createPublicTaskId: () => "public-e2e-task",
+      createPublicTaskId: () => "task_public_e2e",
     });
     const lifecycle: string[] = [];
     runtime.subscribe((event) => {
@@ -173,7 +170,7 @@ describe("simulated WhiteLily lifecycle", () => {
       lifecycle: "running",
       minecraft: { state: "connected", sessionId: null },
       codex: { state: "ready", model: "gpt-5.6-terra" },
-      task: { id: "public-e2e-task" },
+      task: { id: "task_public_e2e" },
     });
     expect(JSON.stringify(runtime.snapshot())).not.toContain(active.lease.id);
 
@@ -206,10 +203,9 @@ describe("simulated WhiteLily lifecycle", () => {
   });
 
   it("completes the approved first-stage lifecycle through the public ports", async () => {
-    const value = await harness();
     const rememberedTurn = {
+      kind: "chat",
       reply: "好呀，我记住啦。",
-      task: null,
       memoryCandidates: [
         {
           category: "preference",
@@ -217,10 +213,15 @@ describe("simulated WhiteLily lifecycle", () => {
           importance: 4,
         },
       ],
-    } satisfies CompanionTurnOutcome;
+    } as const;
+    const value = await harness({
+      intentResponses: [
+        JSON.stringify(rememberedTurn),
+        new Error("ChatGPT authentication is required"),
+      ],
+    });
 
     await value.start();
-    value.codex.queueResponse(JSON.stringify(rememberedTurn));
     await value.ownerSays("你好，记住我喜欢在山顶建家");
 
     expect(value.minecraft.chatLog).toContain("好呀，我记住啦。");
@@ -257,7 +258,6 @@ describe("simulated WhiteLily lifecycle", () => {
     expect(value.mode.snapshot().mode).toBe("friend");
     await expect(value.memories.search("山顶")).resolves.toHaveLength(1);
 
-    value.codex.failNextTurn("quota_exhausted");
     await value.ownerSays("我们继续吧");
     expect(value.mode.snapshot().paused).toBe(true);
     expect(value.minecraft.chatLog.at(-1)).toContain("我已安全暂停");

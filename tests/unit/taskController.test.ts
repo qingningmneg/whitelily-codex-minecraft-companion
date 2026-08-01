@@ -51,6 +51,29 @@ describe("TaskController", () => {
     expect(() => controller.start(disclosure)).toThrow("a task is already active");
   });
 
+  it("invalidates the active task when owner revision changes", () => {
+    let identityRevision = 4;
+    const audit = vi.fn<TaskAuditCallback>();
+    const controller = new TaskController(
+      new TaskControllerBudget({
+        now: () => Date.parse("2026-07-27T08:00:00.000Z"),
+        randomId: () => "task-lease-1",
+      }),
+      audit,
+      { ownerIdentityRevision: () => identityRevision },
+    );
+    const active = controller.start(disclosure);
+
+    identityRevision = 5;
+
+    expect(controller.isLeaseLive(active.lease)).toBe(false);
+    expect(controller.current()).toBeNull();
+    expect(audit).toHaveBeenLastCalledWith(
+      "task_stopped",
+      expect.objectContaining({ reason: "owner_changed" }),
+    );
+  });
+
   it.each(["emergency_stop", "disconnect", "world_changed", "model_unavailable"] as const)(
     "invalidates tool work on %s",
     (reason) => {
@@ -212,16 +235,13 @@ describe("TaskController", () => {
     });
   });
 
-  it("audits actual transitions once with stable identity, reason, and defensive data", () => {
+  it("audits actual transitions once with reason and defensive data", () => {
     const events: Array<{ event: string; data: unknown }> = [];
-    const observedGoals: string[] = [];
+    const observedLimits: number[] = [];
     const controller = fixedController((event, data) => {
       events.push({ event, data });
-      if ("task" in data) {
-        observedGoals.push(data.task.disclosure.goal);
-        data.task.disclosure.goal = "mutated audit";
-        data.task.lease.id = "mutated audit lease";
-      }
+      observedLimits.push(data.limits.maxToolCalls);
+      data.limits.maxToolCalls = 0;
     });
 
     const started = controller.start(disclosure);
@@ -233,19 +253,17 @@ describe("TaskController", () => {
     expect(events[0]).toMatchObject({
       event: "task_started",
       data: {
-        task: {
-          id: "task-lease-1",
-          disclosure: { goal: "mutated audit" },
-        },
+        startedAt: "2026-07-27T08:00:00.000Z",
+        expectedActionCategoryCount: 4,
+        limits: { maxToolCalls: 0 },
       },
     });
     expect(events[1]).toMatchObject({
       event: "task_stopped",
       data: {
-        task: {
-          id: "task-lease-1",
-          disclosure: { goal: "mutated audit" },
-        },
+        startedAt: "2026-07-27T08:00:00.000Z",
+        expectedActionCategoryCount: 4,
+        limits: { maxToolCalls: 0 },
         reason: "owner_stop",
       },
     });
@@ -254,7 +272,40 @@ describe("TaskController", () => {
       lease: { id: "task-lease-1" },
       disclosure: { goal: disclosure.goal },
     });
-    expect(observedGoals).toEqual([disclosure.goal, disclosure.goal]);
+    expect(observedLimits).toEqual([64, 64]);
+  });
+
+  it("keeps audit callback payloads free of task authority and private task text", () => {
+    const records: Array<{ event: string; data: unknown }> = [];
+    const controller = fixedController((event, data) => {
+      records.push({ event, data: structuredClone(data) });
+    });
+
+    controller.start(disclosure, { maxToolCalls: 3 });
+    controller.stop("owner_stop");
+
+    expect(records).toEqual([
+      {
+        event: "task_started",
+        data: {
+          startedAt: "2026-07-27T08:00:00.000Z",
+          expectedActionCategoryCount: 4,
+          limits: { ...HARD_TASK_LIMITS, maxToolCalls: 3 },
+        },
+      },
+      {
+        event: "task_stopped",
+        data: {
+          startedAt: "2026-07-27T08:00:00.000Z",
+          expectedActionCategoryCount: 4,
+          limits: { ...HARD_TASK_LIMITS, maxToolCalls: 3 },
+          reason: "owner_stop",
+        },
+      },
+    ]);
+    expect(JSON.stringify(records)).not.toMatch(
+      /task-lease-1|collect four oak logs|stopCondition|expectedActions|"(?:task|lease|id)"\s*:/iu,
+    );
   });
 
   it("fails closed on an invalid stop reason without letting audit errors escape", () => {

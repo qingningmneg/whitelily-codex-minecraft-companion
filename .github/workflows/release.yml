@@ -3,7 +3,7 @@ name: release
 on:
   push:
     tags:
-      - "v*"
+      - "v*-beta.*"
 
 permissions:
   contents: write
@@ -13,6 +13,11 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Use stable runner temp
+        shell: pwsh
+        run: |
+          "TEMP=$env:RUNNER_TEMP" >> $env:GITHUB_ENV
+          "TMP=$env:RUNNER_TEMP" >> $env:GITHUB_ENV
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
@@ -20,19 +25,39 @@ jobs:
       - run: npm ci
       - run: npm run format:check
       - run: npm run typecheck
-      - run: npm test
+      - run: npm run desktop:prepare
+      - run: npm test -- --no-file-parallelism
       - run: npm run build
       - shell: pwsh
         run: ./scripts/release-check.ps1 -SkipInstall
+      - shell: pwsh
+        run: ./scripts/package-installer.ps1 -Version ($env:GITHUB_REF_NAME.Substring(1))
       - shell: pwsh
         run: ./scripts/package-release.ps1 -Version ($env:GITHUB_REF_NAME.Substring(1))
       - uses: actions/upload-artifact@v4
         with:
           name: whitelily-windows-x64
           path: |
+            release/WhiteLily-*-windows-x64-setup.exe
+            release/WhiteLily-*-windows-x64-setup.exe.sha256
+            release/WhiteLily-*-windows-x64-setup.exe.signing-status.txt
             release/whitelily-*-windows-x64.zip
             release/whitelily-*-windows-x64.zip.sha256
       - shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create $env:GITHUB_REF_NAME release/whitelily-*-windows-x64.zip release/whitelily-*-windows-x64.zip.sha256 --title $env:GITHUB_REF_NAME --generate-notes
+        run: |
+          $version = $env:GITHUB_REF_NAME.Substring(1)
+          $assets = @(
+            "release/WhiteLily-$version-windows-x64-setup.exe"
+            "release/WhiteLily-$version-windows-x64-setup.exe.sha256"
+            "release/WhiteLily-$version-windows-x64-setup.exe.signing-status.txt"
+            "release/whitelily-$version-windows-x64.zip"
+            "release/whitelily-$version-windows-x64.zip.sha256"
+          )
+          foreach ($asset in $assets) {
+            if (-not (Test-Path -LiteralPath $asset -PathType Leaf)) {
+              throw "Required release asset is missing: $asset"
+            }
+          }
+          gh release create $env:GITHUB_REF_NAME @assets --title $env:GITHUB_REF_NAME --generate-notes --prerelease

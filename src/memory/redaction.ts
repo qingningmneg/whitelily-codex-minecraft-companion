@@ -5,6 +5,10 @@ const textPatterns: Array<[RegExp, string]> = [
   ],
   [/\bsk-[A-Za-z0-9_-]{20,}\b/gi, "[REDACTED_OPENAI_KEY]"],
   [/\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g, "[REDACTED_EMAIL]"],
+  [
+    /(?<![A-Za-z0-9])(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)(?::\d{1,5})?(?![A-Za-z0-9])/g,
+    "[REDACTED_IP]",
+  ],
   [/\b\+?\d[\d -]{7,}\d\b/g, "[REDACTED_PHONE]"],
   [
     /\b\d{1,6}[A-Za-z]?\s+[A-Za-z][A-Za-z .'-]{2,}\s+(?:Street|St\.?|Road|Rd\.?|Avenue|Ave\.?|Lane|Ln\.?|Drive|Dr\.?|Boulevard|Blvd\.?|Parkway|Pkwy\.?)\b/gi,
@@ -31,9 +35,11 @@ const bareProfilePrefixes = ["users", "home"] as const;
 function redactText(input: string): string {
   const assignmentsRedacted = redactSensitiveAssignments(input);
   const uriCredentialsRedacted = redactUriCredentials(assignmentsRedacted);
+  const uriQueriesRedacted = redactUriQueries(uriCredentialsRedacted);
+  const ipAddressesRedacted = redactIpAddresses(uriQueriesRedacted);
   return textPatterns.reduce(
     (value, [pattern, replacement]) => value.replace(pattern, replacement),
-    uriCredentialsRedacted,
+    ipAddressesRedacted,
   );
 }
 
@@ -141,6 +147,53 @@ function redactUriCredentials(input: string): string {
     index = authorityEnd;
   }
   return output + input.slice(cursor);
+}
+
+function redactUriQueries(input: string): string {
+  return input.replace(/\bhttps?:\/\/[^\s"'<>?#]+[?#][^ \t\r\n"'<>]*/giu, (value) => {
+    const query = value.indexOf("?");
+    const fragment = value.indexOf("#");
+    const boundary = query < 0 ? fragment : fragment < 0 ? query : Math.min(query, fragment);
+    return `${value.slice(0, boundary)}${value[boundary]}[REDACTED_QUERY]`;
+  });
+}
+
+function redactIpAddresses(input: string): string {
+  const bracketsRedacted = input.replace(
+    /\[([A-Fa-f0-9:.]+)\](?::\d{1,5})?/gu,
+    (value, address: string) => (isIpv6Address(address) ? "[REDACTED_IP]" : value),
+  );
+  return bracketsRedacted.replace(
+    /(?<![A-Fa-f0-9:[])(?:[A-Fa-f0-9]{0,4}:){2,}[A-Fa-f0-9:.]{0,15}(?![A-Fa-f0-9:\]])/gu,
+    (value) => (isIpv6Address(value) ? "[REDACTED_IP]" : value),
+  );
+}
+
+function isIpv6Address(value: string): boolean {
+  if (!value.includes(":") || value.indexOf("::") !== value.lastIndexOf("::")) return false;
+  const compressed = value.includes("::");
+  const groups = value.split("::").flatMap((half) => (half === "" ? [] : half.split(":")));
+  let units = 0;
+  for (const [index, group] of groups.entries()) {
+    if (group.includes(".")) {
+      if (index !== groups.length - 1 || !isIpv4Address(group)) return false;
+      units += 2;
+      continue;
+    }
+    if (!/^[A-Fa-f0-9]{1,4}$/u.test(group)) return false;
+    units += 1;
+  }
+  return compressed ? units < 8 : units === 8;
+}
+
+function isIpv4Address(value: string): boolean {
+  const octets = value.split(".");
+  return (
+    octets.length === 4 &&
+    octets.every(
+      (octet) => /^(?:0|[1-9]\d{0,2})$/u.test(octet) && Number.parseInt(octet, 10) <= 255,
+    )
+  );
 }
 
 function isUriSchemeCharacter(value: string | undefined): boolean {
@@ -272,6 +325,32 @@ function isEscaped(input: string, index: number): boolean {
 
 function sensitiveKeyReplacement(key: string): string | undefined {
   const normalized = key.replace(/[^a-z0-9]/gi, "").toLocaleLowerCase();
+  if (
+    /^(?:memory|memories|memorydata|memoryrecord|memoryrecords|profile|profiles|companionprofile|persona|auth|authentication|authdata|account|accounts|accountdata|pcl2account|pcl2accounts)$/.test(
+      normalized,
+    )
+  ) {
+    return "[REDACTED_PROTECTED]";
+  }
+  if (/^(?:chat|chats|message|messages)$/.test(normalized)) {
+    return "[REDACTED_CHAT]";
+  }
+  if (/(?:rawchat|chatlog|chattranscript|conversation|messagehistory)/.test(normalized)) {
+    return "[REDACTED_CHAT]";
+  }
+  if (/(?:memorysummary|completememory|memorycontent)/.test(normalized)) {
+    return "[REDACTED_MEMORY]";
+  }
+  if (
+    /^(?:owner|username)$/.test(normalized) ||
+    /(?:ownerusername|botusername|playerusername|playername|minecraftusername|accountusername)/.test(
+      normalized,
+    )
+  ) {
+    return "[REDACTED_USERNAME]";
+  }
+  if (/^(?:ip|ipaddress|addressip|hostip)$/.test(normalized)) return "[REDACTED_IP]";
+  if (/(?:authurl|loginurl|callbackurl|authcallback)/.test(normalized)) return "[REDACTED_URL]";
   if (/(?:password|passwd|pwd)/.test(normalized)) return "[REDACTED_PASSWORD]";
   if (/(?:email|mail)/.test(normalized)) return "[REDACTED_EMAIL]";
   if (/(?:phone|mobile|telephone|tel)/.test(normalized)) return "[REDACTED_PHONE]";
@@ -325,6 +404,24 @@ export function redactSecrets(input: string): string {
 
 export function redactPublicText(input: string): string {
   return redactLocalPaths(redactSecrets(input));
+}
+
+export interface RedactedText {
+  value: string;
+  redactions: number;
+}
+
+export function redactPublicTextWithCount(input: string): RedactedText {
+  const before = countRedactionMarkers(input);
+  const value = redactPublicText(input);
+  return {
+    value,
+    redactions: Math.max(0, countRedactionMarkers(value) - before),
+  };
+}
+
+function countRedactionMarkers(input: string): number {
+  return input.match(/\[REDACTED(?:_[A-Z]+)*\]/gu)?.length ?? 0;
 }
 
 export function containsSensitiveData(input: string): boolean {
