@@ -18,9 +18,22 @@ if (-not [StringComparer]::OrdinalIgnoreCase.Equals($resolvedBundle, $expectedBu
     throw 'Electron bundle target must be the exact repository build/electron-bundle directory'
 }
 
+function Get-Sha256Hex {
+    param([Parameter(Mandatory = $true)][string]$LiteralPath)
+
+    $stream = [System.IO.File]::OpenRead($LiteralPath)
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        return [System.BitConverter]::ToString($sha256.ComputeHash($stream)).Replace('-', '').ToLowerInvariant()
+    } finally {
+        $sha256.Dispose()
+        $stream.Dispose()
+    }
+}
+
 $sourceManifestPath = Join-Path $repositoryRoot 'packaging/electron/runtime-manifest.json'
 $sourceManifest = Get-Content -LiteralPath $sourceManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
-$policySha256 = (Get-FileHash -LiteralPath $sourceManifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+$policySha256 = Get-Sha256Hex $sourceManifestPath
 $rootPackage = Get-Content -LiteralPath (Join-Path $repositoryRoot 'package.json') -Raw -Encoding UTF8 | ConvertFrom-Json
 $desktopPackage = Get-Content -LiteralPath (Join-Path $repositoryRoot 'apps/desktop/package.json') -Raw -Encoding UTF8 | ConvertFrom-Json
 $lockVersionsJson = & node -e @'
@@ -88,7 +101,7 @@ function Assert-ReviewedFile {
         throw "reviewed source dependency is missing: $($Entry.source)"
     }
     $file = Get-Item -LiteralPath $path
-    $hash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+    $hash = Get-Sha256Hex $path
     if ($file.Length -ne [long]$Entry.bytes -or -not [StringComparer]::Ordinal.Equals($hash, [string]$Entry.sha256)) {
         throw "reviewed source dependency hash mismatch: $($Entry.source)"
     }
@@ -226,7 +239,7 @@ Package metadata and upstream notices are preserved under codex/package and code
                 [ordered]@{
                     path = (Get-RelativePath $staging $resource.FullName).Replace('\', '/')
                     bytes = $resource.Length
-                    sha256 = (Get-FileHash -LiteralPath $resource.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+                    sha256 = Get-Sha256Hex $resource.FullName
                 }
             }
     )

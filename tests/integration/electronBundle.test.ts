@@ -42,6 +42,7 @@ const repositoryRoot = resolve(import.meta.dirname, "..", "..");
 const sourceManifestPath = join(repositoryRoot, "packaging", "electron", "runtime-manifest.json");
 const bundleRoot = join(repositoryRoot, "build", "electron-bundle");
 const bundleManifestPath = join(bundleRoot, "runtime-manifest.json");
+const prepareScriptPath = join(repositoryRoot, "scripts", "prepare-electron-bundle.ps1");
 const require = createRequire(import.meta.url);
 const asar = require("@electron/asar") as {
   createPackage: (source: string, destination: string) => Promise<void>;
@@ -221,6 +222,13 @@ async function createMaterializationFixture(options?: {
 }
 
 describe("deterministic Electron resources", () => {
+  it("computes SHA-256 without depending on the optional Get-FileHash cmdlet", async () => {
+    const script = await readFile(prepareScriptPath, "utf8");
+
+    expect(script).not.toMatch(/\bGet-FileHash\b/u);
+    expect(script).toMatch(/System\.Security\.Cryptography\.SHA256/u);
+  });
+
   it("binds after-pack verification to required helpers even if the generated list omits one", async () => {
     const root = await mkdtemp(join(tmpdir(), "whitelily-after-pack-"));
     try {
