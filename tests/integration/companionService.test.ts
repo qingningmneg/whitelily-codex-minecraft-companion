@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { MinecraftEvent } from "../../src/minecraft/minecraftPort.js";
-import type { TaskDisclosure } from "../../src/companion/taskController.js";
+import type { OwnerIdentitySnapshot } from "../../src/identity/ownerIdentity.js";
+import { TOOL_ACTION_KINDS } from "../../src/mcp/toolBudget.js";
 import {
   createCompanionHarness,
   outcome,
@@ -8,18 +9,145 @@ import {
 } from "../support/companionHarness.js";
 
 const unavailable = "Codex 暂时不可用，我已安全暂停。你仍可以使用 !status、!stop 和记忆命令。";
+const naturalTaskFailure = "这次没能完成，请再试一次。";
 const harnesses: Array<Awaited<ReturnType<typeof createCompanionHarness>>> = [];
+const legacyOwnerTaskActions = [
+  "get_state",
+  "find_block",
+  "say",
+  "move_to",
+  "look_at",
+  "jump",
+  "dig_block",
+  "place_block",
+  "craft_item",
+  "smelt_item",
+  "collect_dropped",
+  "equip_item",
+  "attack_hostile",
+  "wait",
+] as const;
 
-function withoutTaskDisclosures(messages: readonly string[]): string[] {
-  return messages.filter((message) => !message.startsWith("任务披露"));
+function deferredValue<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
 }
 
-function reconstructTaskDisclosure(messages: readonly string[]): string {
-  return messages.map((message) => message.replace(/^任务披露(?:（续）)?：/u, "")).join("");
+function taskExecutionOutcome(
+  reply: string,
+  status: "completed" | "active" | "stopped" = "completed",
+  memoryCandidates: ReadonlyArray<{
+    category: "preference" | "place" | "project" | "promise" | "experience";
+    summary: string;
+    importance: 1 | 2 | 3 | 4 | 5;
+  }> = [],
+): string {
+  return JSON.stringify({ reply, status, memoryCandidates });
+}
+
+function migrateLegacyTaskExecutionOutcome(response: string): string {
+  const parsed = JSON.parse(response) as {
+    reply: string;
+    task: null | { status: "completed" | "active" | "stopped" };
+    memoryCandidates: Array<{
+      category: "preference" | "place" | "project" | "promise" | "experience";
+      summary: string;
+      importance: 1 | 2 | 3 | 4 | 5;
+    }>;
+  };
+  return taskExecutionOutcome(
+    parsed.reply,
+    parsed.task?.status ?? "completed",
+    parsed.memoryCandidates,
+  );
+}
+
+function taskDecision(input: {
+  kind?: "start_task" | "continue_task" | "replace_task";
+  naturalReply: string | null;
+  goal: string;
+  allowedActions: readonly string[];
+  requestedLimits?: NonNullable<CompanionHarnessOptions["requestedTaskLimits"]>;
+}): string {
+  return JSON.stringify({
+    kind: input.kind ?? "start_task",
+    naturalReply: input.naturalReply,
+    task: {
+      goal: input.goal,
+      allowedActions: input.allowedActions,
+      requestedLimits: input.requestedLimits ?? {},
+    },
+    memoryCandidates: [],
+  });
+}
+
+function taskPlanFromPrompt(prompt: string): unknown {
+  const match = /\nTASK_PLAN\n([^\n]+)\nEND_TASK_PLAN\n/u.exec(prompt);
+  if (!match?.[1]) throw new Error("expected one TASK_PLAN JSON section");
+  return JSON.parse(match[1]) as unknown;
+}
+
+const internalDisclosurePattern =
+  /任务披露|minecraft_[a-z0-9_]+|get_state|find_block|move_to|follow_owner|look_at|dig_block|place_block|craft_item|smelt_item|collect_dropped|equip_item|attack_hostile|工具调用|预算|租约|停止条件|expectedActions|allowedActions|maxToolCalls|maxBlockChanges|maxHorizontalTravel|maxDurationMs|maxDangerousOperations|leaseId|stopCondition/iu;
+const leakingInternalModelReply =
+  "我会先调用 minecraft_move_to 和 get_state，并显示工具调用、预算、租约、停止条件、allowedActions、maxToolCalls、leaseId、stopCondition。";
+const naturalFilteredReply = "好，我知道了。";
+const ambiguousNaturalToolNames = new Set(["say", "jump", "wait"]);
+const uncommonBareToolNames = TOOL_ACTION_KINDS.filter(
+  (toolName) => !ambiguousNaturalToolNames.has(toolName),
+);
+
+function expectZeroInternalDisclosure(
+  value: Awaited<ReturnType<typeof createCompanionHarness>>,
+  diagnostics: ReadonlyArray<unknown> = [],
+  privateInputs: ReadonlyArray<string> = [],
+) {
+  const visibleText = value.minecraft.chatLog.join("\n");
+  const diagnosticsJson = JSON.stringify(diagnostics);
+  expect(visibleText).not.toMatch(internalDisclosurePattern);
+  expect(value.taskAuditEvents).not.toContainEqual(
+    expect.objectContaining({ ownerMessage: expect.anything() }),
+  );
+  for (const privateInput of privateInputs) {
+    expect(diagnosticsJson).not.toContain(privateInput);
+  }
+}
+
+function expectAuditAndPersistencePrivacy(
+  value: Awaited<ReturnType<typeof createCompanionHarness>>,
+  privateInputs: ReadonlyArray<string>,
+) {
+  const persistedJson = JSON.stringify({
+    audit: value.taskAuditPayloads,
+    state: value.savedStates,
+  });
+  expect(persistedJson).not.toMatch(
+    /"(?:lease|leaseId|turnLease|ownerUsername|credential|credentials|token|password|prompt)"\s*:/iu,
+  );
+  for (const privateInput of privateInputs) {
+    expect(persistedJson).not.toContain(privateInput);
+  }
 }
 
 async function harness(options: CompanionHarnessOptions = {}) {
-  const created = await createCompanionHarness(options);
+  const created = await createCompanionHarness({
+    ...options,
+    intentResponses:
+      options.intentResponses ??
+      Array.from({ length: 32 }, () =>
+        taskDecision({
+          naturalReply: null,
+          goal: "finish confirmed travel",
+          allowedActions: legacyOwnerTaskActions,
+          ...(options.requestedTaskLimits === undefined
+            ? {}
+            : { requestedLimits: options.requestedTaskLimits }),
+        }),
+      ),
+  });
   harnesses.push(created);
   return created;
 }
@@ -67,17 +195,8 @@ async function startPendingMoveConfirmation(
 }
 
 function activeConfirmationOutcome(reply = "ready", goal = "finish confirmed travel") {
-  return outcome({
-    reply,
-    task: {
-      goal,
-      allowedActions: ["move_to"],
-      actionBudget: 2,
-      successCondition: "arrive safely",
-      stopCondition: "owner stops",
-      status: "active",
-    },
-  });
+  void goal;
+  return taskExecutionOutcome(reply, "active");
 }
 
 afterEach(async () => {
@@ -91,80 +210,1323 @@ afterEach(async () => {
 });
 
 describe("CompanionService lifecycle", () => {
-  it("splits long Unicode disclosure labels into bounded command-safe chunks", async () => {
-    const companionModule =
-      (await import("../../src/companion/companionService.js")) as typeof import("../../src/companion/companionService.js") & {
-        formatTaskDisclosureForMinecraft?: (disclosure: TaskDisclosure) => string[];
-      };
-    expect(companionModule.formatTaskDisclosureForMinecraft).toBeTypeOf("function");
-    const firstAction = `观察${"😀".repeat(300)}`;
-    const secondAction = `/${"移动🌍".repeat(200)}`;
-    const chunks = companionModule.formatTaskDisclosureForMinecraft!({
-      goal: `整理${"🌸".repeat(300)}`,
-      expectedActions: [firstAction, secondAction],
-      limits: {
-        maxToolCalls: 5,
-        maxBlockChanges: 6,
-        maxHorizontalTravel: 7,
-        maxDurationMs: 8_000,
-        maxDangerousOperations: 1,
-      },
-      stopCondition: `主人停止或${"完成✅".repeat(100)}`,
-    });
+  it("starts two independent threads for normal service ownership", async () => {
+    const value = await harness();
 
-    const reconstructed = reconstructTaskDisclosure(chunks);
-    expect(reconstructed).toContain(firstAction);
-    expect(reconstructed).toContain(secondAction);
-    expect(chunks.every((chunk) => chunk.startsWith("任务披露"))).toBe(true);
-    expect(
-      chunks.every(
-        (chunk) =>
-          chunk.length <= 240 &&
-          Array.from(chunk).length <= 240 &&
-          !/[\uD800-\uDBFF]$/u.test(chunk) &&
-          !/^[\uDC00-\uDFFF]/u.test(chunk) &&
-          !chunk.startsWith("/"),
-      ),
-    ).toBe(true);
-  });
-
-  it("sends the complete goal, action categories, five effective limits, and stop condition before task authority or Codex", async () => {
-    const value = await harness({ deferredTurns: [0] });
     await value.start();
 
-    await startPlayerTurn(value, "collect four oak logs");
-
-    const disclosure = reconstructTaskDisclosure(value.disclosureChatAtTaskStart[0] ?? []);
-    expect(disclosure).toContain("collect four oak logs");
-    for (const category of [
-      "get_state",
-      "find_block",
-      "say",
-      "move_to",
-      "follow_owner",
-      "look_at",
-      "jump",
-      "dig_block",
-      "place_block",
-      "craft_item",
-      "smelt_item",
-      "collect_dropped",
-      "equip_item",
-      "attack_hostile",
-      "wait",
-    ]) {
-      expect(disclosure).toContain(category);
-    }
-    expect(disclosure).toContain("工具调用 64");
-    expect(disclosure).toContain("方块修改 256");
-    expect(disclosure).toContain("水平移动 1024");
-    expect(disclosure).toContain("持续时间 600000");
-    expect(disclosure).toContain("危险操作 8");
-    expect(disclosure).toContain("完成、失败、中断、达到安全边界或预算耗尽时立即停止");
-    expect(value.codex.turns).toHaveLength(1);
+    expect(value.codex.startedThreads).toHaveLength(2);
+    expect(value.codex.startedThreads[0]).toMatchObject({ model: "gpt-5.6-terra" });
+    expect(value.codex.startedThreads[1]).toMatchObject({ model: "gpt-5.6-terra" });
+    expect(value.codex.startedThreadIds.intent).not.toBe(value.codex.startedThreadIds.execution);
   });
 
-  it("discloses and acquires every requested lower limit", async () => {
+  it("starts two independent threads for externally managed Codex ownership", async () => {
+    const value = await harness();
+
+    await value.service.start("gpt-5.6-terra");
+
+    expect(value.codex.startCalls).toBe(0);
+    expect(value.codex.startedThreads).toHaveLength(2);
+    expect(value.codex.startedThreads[0]).toMatchObject({ model: "gpt-5.6-terra" });
+    expect(value.codex.startedThreads[1]).toMatchObject({ model: "gpt-5.6-terra" });
+    expect(value.codex.startedThreadIds.intent).not.toBe(value.codex.startedThreadIds.execution);
+  });
+
+  it("recovery recreates two independent threads before its execution handshake", async () => {
+    const value = await harness({
+      persistedState: {
+        lastMode: "friend",
+        paused: true,
+        unfinishedTaskSummary: '{"goal":"resume safely"}',
+      },
+      intentThreadIds: ["intent-initial", "intent-recovery"],
+      threadIds: ["execution-initial", "execution-recovery"],
+      executionResponses: [outcome()],
+    });
+    await value.start();
+
+    await emitCommand(value, "!resume");
+
+    expect(value.codex.startedThreads).toHaveLength(4);
+    expect(value.codex.startedThreadIds).toEqual({
+      intent: "intent-recovery",
+      execution: "execution-recovery",
+    });
+    expect(value.codex.turnsFor("execution")).toEqual([
+      expect.objectContaining({ threadId: "execution-recovery" }),
+    ]);
+    expect(value.codex.turnsFor("intent")).toEqual([]);
+  });
+
+  it("recovery invalidates two independent threads when model selection disappears", async () => {
+    const value = await harness({
+      persistedState: {
+        lastMode: "friend",
+        paused: true,
+        unfinishedTaskSummary: '{"goal":"resume safely"}',
+      },
+      selectionAvailability: [false],
+    });
+    await value.service.start("gpt-5.6-terra");
+
+    await emitCommand(value, "!resume");
+    await value.untilChat(unavailable);
+
+    const state = value.service as unknown as {
+      intentThreadId: string | undefined;
+      executionThreadId: string | undefined;
+    };
+    expect(state.intentThreadId).toBeUndefined();
+    expect(state.executionThreadId).toBeUndefined();
+  });
+
+  it("recovery handshake failure revokes two independent threads before they can be reused", async () => {
+    const value = await harness({
+      persistedState: {
+        lastMode: "friend",
+        paused: true,
+        unfinishedTaskSummary: '{"goal":"resume safely"}',
+      },
+      intentThreadIds: ["intent-initial", "intent-failed-recovery"],
+      threadIds: ["execution-initial", "execution-failed-recovery"],
+      executionResponses: ["not json", "still not json"],
+    });
+    await value.start();
+
+    await emitCommand(value, "!resume");
+    await value.untilChat(unavailable);
+
+    const internal = value.service as unknown as {
+      generation: number;
+      intentThreadId: string | undefined;
+      executionThreadId: string | undefined;
+      sendAttempt(
+        role: "execution",
+        prompt: string,
+        generation: number,
+        trackAsActive: boolean,
+        task: undefined,
+        toolsEnabled: boolean,
+      ): Promise<unknown>;
+    };
+    expect(internal.intentThreadId).toBeUndefined();
+    expect(internal.executionThreadId).toBeUndefined();
+    const turnsAfterFailure = value.codex.turnsFor("execution").length;
+
+    await expect(
+      internal.sendAttempt(
+        "execution",
+        "must not reuse failed recovery",
+        internal.generation,
+        true,
+        undefined,
+        false,
+      ),
+    ).resolves.toBeUndefined();
+    expect(value.codex.turnsFor("execution")).toHaveLength(turnsAfterFailure);
+  });
+
+  it("stop during creation leaves two independent threads detached from the service", async () => {
+    const value = await harness({ gatedThreadStarts: [1] });
+    const starting = value.start();
+    await value.untilThreadStart(1);
+
+    const stopping = value.stop();
+    value.releaseThreadStart(1);
+    await Promise.all([starting, stopping]);
+
+    const state = value.service as unknown as {
+      intentThreadId: string | undefined;
+      executionThreadId: string | undefined;
+    };
+    expect(state.intentThreadId).toBeUndefined();
+    expect(state.executionThreadId).toBeUndefined();
+    expect(value.codex.startedThreads).toHaveLength(1);
+  });
+
+  it("generation invalidation discards stale creation of two independent threads", async () => {
+    const value = await harness({ gatedThreadStarts: [1] });
+    const starting = value.start();
+    await value.untilThreadStart(1);
+
+    value.service.setMemoryScope({ mode: "global" });
+    value.releaseThreadStart(1);
+    await starting;
+
+    const state = value.service as unknown as {
+      intentThreadId: string | undefined;
+      executionThreadId: string | undefined;
+    };
+    expect(state.intentThreadId).toBeUndefined();
+    expect(state.executionThreadId).toBeUndefined();
+    expect(value.codex.startedThreads).toHaveLength(2);
+  });
+
+  it("a failed second creation invalidates two independent threads", async () => {
+    const value = await harness({
+      codexThreadStartErrors: [undefined, new Error("execution thread failed")],
+    });
+
+    await expect(value.start()).rejects.toThrow("execution thread failed");
+
+    const state = value.service as unknown as {
+      intentThreadId: string | undefined;
+      executionThreadId: string | undefined;
+    };
+    expect(state.intentThreadId).toBeUndefined();
+    expect(state.executionThreadId).toBeUndefined();
+  });
+
+  it("retries from the intent phase after the first thread creation fails", async () => {
+    const value = await harness({
+      codexThreadStartErrors: [new Error("intent creation failed")],
+      intentThreadIds: ["failed-intent", "retry-intent"],
+      threadIds: ["retry-execution"],
+    });
+
+    await expect(value.start()).rejects.toThrow("intent creation failed");
+    expect(value.codex.startedThreads).toEqual([]);
+    expect(value.codex.startedThreadIds).toEqual({
+      intent: undefined,
+      execution: undefined,
+    });
+
+    await value.start();
+    expect(value.codex.startedThreadIds).toEqual({
+      intent: "retry-intent",
+      execution: "retry-execution",
+    });
+  });
+
+  it("does not publish a failed execution thread and retries from the intent phase", async () => {
+    const value = await harness({
+      codexThreadStartErrors: [undefined, new Error("execution creation failed")],
+      intentThreadIds: ["orphaned-intent", "retry-intent"],
+      threadIds: ["failed-execution", "retry-execution"],
+    });
+
+    await expect(value.start()).rejects.toThrow("execution creation failed");
+    expect(value.codex.startedThreadIds).toEqual({
+      intent: undefined,
+      execution: undefined,
+    });
+
+    await value.start();
+    expect(value.codex.startedThreadIds).toEqual({
+      intent: "retry-intent",
+      execution: "retry-execution",
+    });
+  });
+
+  it.each(["你好呀", "现在是几点?", "你在干什么呢", "我觉得走路这个动作很可爱"])(
+    "routes tool-free chat: %s",
+    async (ownerMessage) => {
+      const value = await harness({
+        intentResponses: [
+          JSON.stringify({ kind: "chat", reply: "自然回复", memoryCandidates: [] }),
+        ],
+      });
+      await value.start();
+
+      await value.emitOwnerText(ownerMessage);
+      await value.untilChat("自然回复");
+
+      expect(value.taskAuditEvents).toEqual([]);
+      expect(value.budgetEvents).toEqual([]);
+      expect(value.minecraft.calls).toEqual([]);
+      expect(value.codex.turnsFor("execution")).toEqual([]);
+      expect(value.minecraft.chatLog).toEqual(["自然回复"]);
+    },
+  );
+
+  describe("intent repair", () => {
+    it("uses one context-free repair turn after an invalid first intent output", async () => {
+      const ownerMessage = "OWNER_PRIVATE_INTENT";
+      const invalidOutput = "MODEL_PRIVATE_INVALID_OUTPUT";
+      const value = await harness({
+        intentResponses: [
+          invalidOutput,
+          JSON.stringify({ kind: "chat", reply: "正常聊天回复", memoryCandidates: [] }),
+        ],
+      });
+      await value.start();
+
+      await value.emitOwnerText(ownerMessage);
+      await value.untilChat("正常聊天回复");
+
+      expect(value.codex.turnsFor("intent")).toHaveLength(2);
+      const repairPrompt = value.codex.turnsFor("intent")[1]?.text ?? "";
+      expect(repairPrompt).not.toContain(ownerMessage);
+      expect(repairPrompt).not.toContain(invalidOutput);
+      expect(value.codex.turnsFor("execution")).toHaveLength(0);
+      expect(value.mode.snapshot().paused).toBe(false);
+    });
+
+    it("keeps two invalid intent structures local and asks a fixed natural clarification", async () => {
+      const ownerMessage = "OWNER_PRIVATE_AMBIGUOUS_REQUEST";
+      const firstInvalidOutput = "MODEL_PRIVATE_FIRST_INVALID_OUTPUT";
+      const secondInvalidOutput = "MODEL_PRIVATE_SECOND_INVALID_OUTPUT";
+      const auditEntries: Array<{ event: string; fields: Record<string, unknown> }> = [];
+      const value = await harness({
+        intentResponses: [firstInvalidOutput, secondInvalidOutput],
+      });
+      const internal = value.service as unknown as {
+        logger: {
+          error(event: string, fields: Record<string, unknown>): Promise<void>;
+        };
+      };
+      internal.logger.error = async (event, fields) => {
+        auditEntries.push({ event, fields });
+        value.errors.push(String(fields.code));
+      };
+      await value.start();
+
+      await value.emitOwnerText(ownerMessage);
+      await value.untilIntentSettled();
+
+      expect(value.codex.turnsFor("intent")).toHaveLength(2);
+      expect(value.codex.turnsFor("execution")).toHaveLength(0);
+      expect(value.taskAuditEvents).toEqual([]);
+      expect(value.budgetEvents).toEqual([]);
+      expect(value.mode.snapshot().paused).toBe(false);
+      expect(value.minecraft.chatLog).toEqual(["你希望我陪你聊聊天，还是要我在游戏里做一件事？"]);
+      expect(value.errors).toContain("invalid_structure");
+      const repairPrompt = value.codex.turnsFor("intent")[1]?.text ?? "";
+      expect(repairPrompt).not.toContain(ownerMessage);
+      expect(repairPrompt).not.toContain(firstInvalidOutput);
+      expect(JSON.stringify(auditEntries)).not.toContain(ownerMessage);
+      expect(JSON.stringify(auditEntries)).not.toContain(firstInvalidOutput);
+      expect(JSON.stringify(auditEntries)).not.toContain(secondInvalidOutput);
+    });
+  });
+
+  it("routes chat during an active task without pre-cancelling its deferred execution", async () => {
+    const value = await harness({
+      deferredTurns: [0],
+      intentResponses: [
+        JSON.stringify({
+          kind: "start_task",
+          naturalReply: null,
+          task: {
+            goal: "keep waiting",
+            allowedActions: ["wait"],
+            requestedLimits: {},
+          },
+          memoryCandidates: [],
+        }),
+        JSON.stringify({ kind: "chat", reply: "今天天气确实不错。", memoryCandidates: [] }),
+      ],
+      executionResponses: [taskExecutionOutcome("execution completed", "active")],
+    });
+    await value.start();
+    await value.emitOwnerText("start waiting");
+    await value.untilCodexTurns(1);
+    const activeTask = value.taskController.current();
+    if (!activeTask) throw new Error("expected an active task");
+    const auditBeforeChat = [...value.taskAuditEvents];
+    const budgetBeforeChat = [...value.budgetEvents];
+
+    await value.emitOwnerText("tell me something while you wait");
+    await value.untilChat("今天天气确实不错。");
+
+    expect(value.taskController.current()?.id).toBe(activeTask.id);
+    expect(value.taskAuditEvents).toEqual(auditBeforeChat);
+    expect(value.budgetEvents).toEqual(budgetBeforeChat);
+    expect(value.codex.interruptions).not.toContainEqual({
+      threadId: value.codex.startedThreadIds.execution,
+      turnId: "turn-1",
+    });
+    expect(value.codex.turnsFor("execution")).toHaveLength(1);
+    expect(value.minecraft.chatLog.at(-1)).toBe("今天天气确实不错。");
+  });
+
+  describe("active task intent semantics and fences", () => {
+    const initialDecision = taskDecision({
+      naturalReply: null,
+      goal: "keep watching the path",
+      allowedActions: ["get_state", "wait"],
+      requestedLimits: { maxToolCalls: 8, maxDurationMs: 120_000 },
+    });
+
+    function replacementDecision(kind: "continue_task" | "replace_task" = "replace_task") {
+      return taskDecision({
+        kind,
+        naturalReply: null,
+        goal: kind === "continue_task" ? "keep watching narrowly" : "inspect the new path",
+        allowedActions: ["get_state"],
+        requestedLimits: { maxToolCalls: 4, maxDurationMs: 60_000 },
+      });
+    }
+
+    function rotateTaskLease(value: Awaited<ReturnType<typeof createCompanionHarness>>) {
+      const oldTask = value.taskController.current();
+      if (!oldTask) throw new Error("expected an old task");
+      value.taskController.stop("owner_stop");
+      const disclosure = value.taskController.prepare(
+        {
+          goal: "independent replacement lease",
+          expectedActions: ["get_state"],
+          limits: {
+            maxToolCalls: 4,
+            maxBlockChanges: 0,
+            maxHorizontalTravel: 0,
+            maxDurationMs: 60_000,
+            maxDangerousOperations: 0,
+          },
+          stopCondition: "manual test boundary",
+        },
+        {
+          maxToolCalls: 4,
+          maxBlockChanges: 0,
+          maxHorizontalTravel: 0,
+          maxDurationMs: 60_000,
+          maxDangerousOperations: 0,
+        },
+      );
+      return {
+        oldTask,
+        replacementTask: value.taskController.start(disclosure, disclosure.limits),
+      };
+    }
+
+    it("atomically revokes execution, confirmations, actions, and lease before replace task starts", async () => {
+      const value = await harness({
+        deferredTurns: [0, 1],
+        activeMinecraftWait: true,
+        intentResponses: [initialDecision, replacementDecision()],
+      });
+      await value.start();
+      await startPlayerTurn(value, "watch the path");
+      const oldTask = value.taskController.current();
+      if (!oldTask) throw new Error("expected an active task");
+      const oldTurnId = "turn-1";
+      const genericConfirmation = value.confirmations.create("pending memory clear", {
+        kind: "memory_clear",
+      });
+      const runningAction = value.executor.execute(
+        { kind: "wait", milliseconds: 5_000 },
+        { spawn: { x: 0, y: 64, z: 0 }, owner: { x: 0, y: 64, z: 0 } },
+      );
+      await value.untilActiveWaitStarted();
+
+      await value.emitOwnerText("replace that with a new inspection");
+      await vi.waitFor(() => expect(value.codex.turnsFor("execution")).toHaveLength(2));
+
+      await expect(runningAction).resolves.toEqual({ status: "cancelled" });
+      const replacement = value.taskController.current();
+      expect(replacement?.id).not.toBe(oldTask.id);
+      expect(value.codex.interruptions).toContainEqual({
+        threadId: value.codex.startedThreadIds.execution,
+        turnId: oldTurnId,
+      });
+      expect(value.confirmations.get(genericConfirmation.id)).toBeUndefined();
+      expect(value.taskController.isLeaseLive(oldTask.lease)).toBe(false);
+      expect(value.taskAuditEvents).toEqual([
+        "task_started",
+        "task_stopped:owner_stop",
+        "task_started",
+      ]);
+
+      value.codex.releaseTurnResult(
+        0,
+        taskExecutionOutcome("stale old execution", "completed", [
+          {
+            category: "experience",
+            summary: "stale old execution memory",
+            importance: 3,
+          },
+        ]),
+      );
+      await Promise.resolve();
+      expect(value.minecraft.chatLog).not.toContain("stale old execution");
+      await expect(value.memories.list()).resolves.not.toContainEqual(
+        expect.objectContaining({ summary: "stale old execution memory" }),
+      );
+    });
+
+    it("stop task revokes active execution and all local authority without starting a replacement", async () => {
+      const value = await harness({
+        deferredTurns: [0],
+        activeMinecraftWait: true,
+        intentResponses: [
+          initialDecision,
+          JSON.stringify({ kind: "stop_task", reply: "Stopped as requested." }),
+        ],
+      });
+      await value.start();
+      await startPlayerTurn(value, "watch the path");
+      const oldTask = value.taskController.current();
+      if (!oldTask) throw new Error("expected an active task");
+      const genericConfirmation = value.confirmations.create("pending memory clear", {
+        kind: "memory_clear",
+      });
+      const runningAction = value.executor.execute(
+        { kind: "wait", milliseconds: 5_000 },
+        { spawn: { x: 0, y: 64, z: 0 }, owner: { x: 0, y: 64, z: 0 } },
+      );
+      await value.untilActiveWaitStarted();
+
+      await value.emitOwnerText("stop the task");
+      await value.untilChat("Stopped as requested.");
+
+      await expect(runningAction).resolves.toEqual({ status: "cancelled" });
+      expect(value.taskController.current()).toBeNull();
+      expect(value.codex.interruptions).toContainEqual({
+        threadId: value.codex.startedThreadIds.execution,
+        turnId: "turn-1",
+      });
+      expect(value.confirmations.get(genericConfirmation.id)).toBeUndefined();
+      expect(value.taskController.isLeaseLive(oldTask.lease)).toBe(false);
+      expect(value.codex.turnsFor("execution")).toHaveLength(1);
+      expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:owner_stop"]);
+    });
+
+    it("clarify leaves the active task, confirmation, execution, and lease unchanged", async () => {
+      const value = await harness({
+        deferredTurns: [0],
+        intentResponses: [
+          initialDecision,
+          JSON.stringify({ kind: "clarify", question: "Which direction?" }),
+        ],
+      });
+      await value.start();
+      await startPlayerTurn(value, "watch the path");
+      const task = value.taskController.current();
+      if (!task) throw new Error("expected an active task");
+      const confirmation = value.confirmations.createGameAction(
+        "pending look",
+        { kind: "look_at", position: { x: 1, y: 64, z: 1 } },
+        task.lease,
+      );
+
+      await value.emitOwnerText("change it somehow");
+      await value.untilChat("Which direction?");
+
+      expect(value.taskController.current()).toMatchObject({ id: task.id, lease: task.lease });
+      expect(value.confirmations.get(confirmation.id)).toBeDefined();
+      expect(value.codex.interruptions).toEqual([]);
+      expect(value.taskAuditEvents).toEqual(["task_started"]);
+    });
+
+    it("continues under the same lease after interrupting only the active execution turn", async () => {
+      const value = await harness({
+        deferredTurns: [0, 1],
+        intentResponses: [initialDecision, replacementDecision("continue_task")],
+        executionResponses: [
+          taskExecutionOutcome("stale first execution", "active"),
+          taskExecutionOutcome("narrow continuation", "active"),
+        ],
+      });
+      await value.start();
+      await startPlayerTurn(value, "watch the path");
+      const task = value.taskController.current();
+      if (!task) throw new Error("expected an active task");
+
+      await value.emitOwnerText("continue with only a state check");
+      await vi.waitFor(() => expect(value.codex.turnsFor("execution")).toHaveLength(2), {
+        timeout: 300,
+      });
+
+      expect(value.codex.interruptions).toContainEqual({
+        threadId: value.codex.startedThreadIds.execution,
+        turnId: "turn-1",
+      });
+      expect(value.taskController.current()).toMatchObject({ id: task.id, lease: task.lease });
+      expect(value.budgetTaskLeaseIds).toEqual([task.lease.id, task.lease.id]);
+      expect(value.taskAuditEvents).toEqual(["task_started"]);
+
+      value.codex.releaseTurnResult(1, taskExecutionOutcome("narrow continuation", "active"));
+      await value.untilChat("narrow continuation");
+      expect(value.taskAuditEvents.filter((event) => event === "task_started")).toHaveLength(1);
+    });
+
+    it("!stop creates no intent turn and stops the active task immediately", async () => {
+      const value = await harness({
+        deferredTurns: [0],
+        intentResponses: [initialDecision],
+      });
+      await value.start();
+      await startPlayerTurn(value, "watch the path");
+      const intentTurnsBeforeStop = value.codex.turnsFor("intent").length;
+
+      await emitCommand(value, "!stop");
+
+      expect(value.codex.turnsFor("intent")).toHaveLength(intentTurnsBeforeStop);
+      expect(value.taskController.current()).toBeNull();
+      expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:owner_stop"]);
+    });
+
+    it.each([
+      {
+        label: "continue",
+        decision: replacementDecision("continue_task"),
+      },
+      {
+        label: "replace",
+        decision: replacementDecision("replace_task"),
+      },
+      {
+        label: "stop",
+        decision: JSON.stringify({ kind: "stop_task", reply: "must stay stale" }),
+      },
+    ])("rejects a stale $label decision after the task lease changes", async ({ decision }) => {
+      const value = await harness({
+        deferredTurns: [0],
+        deferredIntentTurns: [1],
+        intentResponses: [initialDecision],
+      });
+      await value.start();
+      await startPlayerTurn(value, "watch the path");
+      await value.emitOwnerText("pending task decision");
+      const { replacementTask } = rotateTaskLease(value);
+      const auditAfterRotation = [...value.taskAuditEvents];
+
+      value.codex.releaseTurnResultFor("intent", 1, decision);
+      await value.untilIntentSettled();
+
+      expect(value.taskController.current()).toMatchObject({
+        id: replacementTask.id,
+        lease: replacementTask.lease,
+      });
+      expect(value.taskAuditEvents).toEqual(auditAfterRotation);
+      expect(value.codex.turnsFor("execution")).toHaveLength(1);
+      expect(value.minecraft.chatLog).not.toContain("must stay stale");
+    });
+
+    it("accepts chat after only the task lease changes", async () => {
+      const value = await harness({
+        deferredTurns: [0],
+        deferredIntentTurns: [1],
+        intentResponses: [initialDecision],
+      });
+      await value.start();
+      await startPlayerTurn(value, "watch the path");
+      await value.emitOwnerText("chat while the lease changes");
+      const { replacementTask } = rotateTaskLease(value);
+
+      value.codex.releaseTurnResultFor(
+        "intent",
+        1,
+        JSON.stringify({ kind: "chat", reply: "Lease-independent chat.", memoryCandidates: [] }),
+      );
+      await value.untilChat("Lease-independent chat.");
+
+      expect(value.taskController.current()?.id).toBe(replacementTask.id);
+    });
+
+    it("applies only the second decision when it arrives before the first", async () => {
+      const value = await harness({
+        deferredIntentTurns: [0, 1],
+        intentResponses: [],
+      });
+      await value.start();
+      await value.emitOwnerText("first pending message");
+      await value.emitOwnerText("second latest message");
+
+      expect(value.codex.interruptions).toContainEqual({
+        threadId: value.codex.startedThreadIds.intent,
+        turnId: "turn-1",
+      });
+      value.codex.releaseTurnResultFor(
+        "intent",
+        1,
+        JSON.stringify({ kind: "chat", reply: "latest only", memoryCandidates: [] }),
+      );
+      await value.untilChat("latest only");
+      value.codex.releaseTurnResultFor("intent", 0, initialDecision);
+      await value.untilTurnSettled();
+
+      expect(value.minecraft.chatLog).toEqual(["latest only"]);
+      expect(value.taskAuditEvents).toEqual([]);
+      expect(value.codex.turnsFor("execution")).toEqual([]);
+      expect(value.budgetEvents).toEqual([]);
+      expect(value.minecraft.calls).toEqual([]);
+      await expect(value.memories.list()).resolves.toEqual([]);
+    });
+
+    it("captures a queued intent stamp before older persistence releases", async () => {
+      const value = await harness({
+        gateMemoryFileRename: true,
+        intentResponses: [
+          JSON.stringify({
+            kind: "chat",
+            reply: "stale gated reply",
+            memoryCandidates: [
+              {
+                category: "preference",
+                summary: "玩家偏好寻找独特高大橡树",
+                importance: 4,
+              },
+            ],
+          }),
+          JSON.stringify({ kind: "chat", reply: "latest queued reply", memoryCandidates: [] }),
+        ],
+        executionResponses: [taskExecutionOutcome("stale queued execution")],
+      });
+      await value.start();
+      await value.emitOwnerText("今晚请陪我去西边森林寻找那棵最高的橡树");
+      await value.untilMemoryRename();
+
+      value.minecraft.emit({
+        kind: "chat",
+        username: "TestOwner",
+        message: "queued stale A",
+      });
+      await value.untilMergeTimer();
+      value.fireMergeTimers();
+      value.minecraft.emit({
+        kind: "chat",
+        username: "TestOwner",
+        message: "queued latest B",
+      });
+      await value.untilMergeTimer();
+      value.fireMergeTimers();
+      value.releaseMemoryRename();
+
+      await value.untilChat("latest queued reply");
+      await value.untilTurnSettled();
+
+      expect(value.codex.turnsFor("intent")).toHaveLength(2);
+      expect(
+        value.codex
+          .turnsFor("intent")
+          .some((turn) => turn.text.includes('"ownerMessage":"queued stale A"')),
+      ).toBe(false);
+      expect(value.minecraft.chatLog).toEqual(["latest queued reply"]);
+      expect(value.taskAuditEvents).toEqual([]);
+      expect(value.codex.turnsFor("execution")).toEqual([]);
+      expect(value.budgetEvents).toEqual([]);
+      expect(value.minecraft.calls).toEqual([]);
+      await expect(value.memories.list()).resolves.toEqual([]);
+    });
+
+    it("drops stale intent output when the owner identity revision changes", async () => {
+      const value = await harness({
+        deferredIntentTurns: [0],
+        intentResponses: [],
+        ownerIdentitySnapshot: {
+          revision: 4,
+          ownerUsername: "TestOwner",
+          configured: true,
+          presence: "online",
+        },
+      });
+      await value.start();
+      await value.emitOwnerText("remember that I like oak");
+      value.setOwnerIdentitySnapshot({
+        revision: 5,
+        ownerUsername: "TestOwner",
+        configured: true,
+        presence: "online",
+      });
+
+      value.codex.releaseTurnResultFor(
+        "intent",
+        0,
+        JSON.stringify({
+          kind: "chat",
+          reply: "stale owner reply",
+          memoryCandidates: [
+            {
+              category: "preference",
+              summary: "Owner likes oak",
+              importance: 3,
+            },
+          ],
+        }),
+      );
+      await value.untilTurnSettled();
+
+      expect(value.minecraft.chatLog).not.toContain("stale owner reply");
+      expect(value.taskAuditEvents).toEqual([]);
+      expect(value.minecraft.calls).toEqual([]);
+      await expect(value.memories.list()).resolves.toEqual([]);
+    });
+
+    it("drops stale intent output when the world changes through reconnect", async () => {
+      const value = await harness({
+        deferredIntentTurns: [0],
+        intentResponses: [],
+      });
+      await value.start();
+      await value.emitOwnerText("remember this world view");
+      const savesBeforeConnect = value.savedStates.length;
+      value.minecraft.emit({ kind: "connected" });
+      await vi.waitFor(() => expect(value.savedStates.length).toBeGreaterThan(savesBeforeConnect));
+
+      value.codex.releaseTurnResultFor(
+        "intent",
+        0,
+        JSON.stringify({
+          kind: "chat",
+          reply: "stale world reply",
+          memoryCandidates: [
+            {
+              category: "experience",
+              summary: "Owner remembers this world view",
+              importance: 3,
+            },
+          ],
+        }),
+      );
+      await value.untilTurnSettled();
+
+      expect(value.minecraft.chatLog).not.toContain("stale world reply");
+      expect(value.taskAuditEvents).toEqual([]);
+      expect(value.minecraft.calls).toEqual([]);
+      await expect(value.memories.list()).resolves.toEqual([]);
+    });
+
+    it("does not stop a live task when stale execution persistence fails after newer chat", async () => {
+      const memoryWriteEntered = deferredValue<void>();
+      let rejectMemoryWrite!: (error: Error) => void;
+      const memoryWrite = new Promise<never>((_resolve, reject) => {
+        rejectMemoryWrite = reject;
+      });
+      const value = await harness({
+        intentResponses: [
+          initialDecision,
+          JSON.stringify({ kind: "chat", reply: "newer chat", memoryCandidates: [] }),
+        ],
+        executionResponses: [
+          taskExecutionOutcome("已整理成简短摘要。", "active", [
+            {
+              category: "preference",
+              summary: "玩家偏好寻找独特高大橡树",
+              importance: 4,
+            },
+          ]),
+        ],
+      });
+      vi.spyOn(value.memories, "addBatch").mockImplementation(() => {
+        memoryWriteEntered.resolve();
+        return memoryWrite;
+      });
+      await value.start();
+      await startPlayerTurn(value, "今晚请陪我去西边森林寻找那棵最高的橡树");
+      await memoryWriteEntered.promise;
+      const task = value.taskController.current();
+      if (!task) throw new Error("expected an active task");
+
+      await value.emitOwnerText("chat before storage finishes");
+      await value.untilChat("newer chat");
+      rejectMemoryWrite(new Error("stale storage failure"));
+      for (let index = 0; index < 8; index += 1) await Promise.resolve();
+
+      expect(value.taskController.current()).toMatchObject({ id: task.id, lease: task.lease });
+      expect(value.taskAuditEvents).toEqual(["task_started"]);
+      expect(value.minecraft.chatLog).toEqual(["newer chat"]);
+      await expect(value.memories.list()).resolves.toEqual([]);
+    });
+
+    it("lets stop task win while an older intent repair is pending", async () => {
+      const value = await harness({
+        deferredTurns: [0],
+        deferredIntentTurns: [1, 2],
+        intentResponses: [
+          initialDecision,
+          JSON.stringify({ kind: "stop_task", reply: "new stop won" }),
+        ],
+      });
+      await value.start();
+      await startPlayerTurn(value, "watch the path");
+      await value.emitOwnerText("ambiguous older request");
+      value.codex.releaseTurnResultFor("intent", 1, "{invalid");
+      await vi.waitFor(() => expect(value.codex.turnsFor("intent")).toHaveLength(3));
+
+      await value.emitOwnerText("stop now");
+      await value.untilChat("new stop won");
+      expect(value.taskController.current()).toBeNull();
+
+      value.codex.releaseTurnResultFor(
+        "intent",
+        2,
+        JSON.stringify({
+          kind: "chat",
+          reply: "stale repaired reply",
+          memoryCandidates: [
+            {
+              category: "experience",
+              summary: "stale repair memory",
+              importance: 3,
+            },
+          ],
+        }),
+      );
+      await value.untilTurnSettled();
+
+      expect(value.minecraft.chatLog).toEqual(["new stop won"]);
+      expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:owner_stop"]);
+      await expect(value.memories.list()).resolves.toEqual([]);
+    });
+
+    it("rapid owner messages start only the latest task once", async () => {
+      const value = await harness({
+        deferredIntentTurns: [0, 1, 2],
+        deferredTurns: [0],
+        intentResponses: [],
+      });
+      await value.start();
+      await value.emitOwnerText("rapid first");
+      await value.emitOwnerText("rapid second");
+      await value.emitOwnerText("rapid latest");
+
+      value.codex.releaseTurnResultFor(
+        "intent",
+        2,
+        taskDecision({
+          naturalReply: "latest task accepted",
+          goal: "latest rapid task",
+          allowedActions: ["get_state"],
+        }),
+      );
+      await value.untilChat("latest task accepted");
+      await value.untilCodexTurns(1);
+      value.codex.releaseTurnResultFor("intent", 1, initialDecision);
+      value.codex.releaseTurnResultFor("intent", 0, initialDecision);
+      await Promise.resolve();
+
+      expect(value.taskController.current()?.disclosure.goal).toBe("latest rapid task");
+      expect(value.taskAuditEvents).toEqual(["task_started"]);
+      expect(value.minecraft.chatLog).toEqual(["latest task accepted"]);
+      expect(value.codex.turnsFor("execution")).toHaveLength(1);
+    });
+  });
+
+  it("routes legacy codexResponses to execution after a strict automatic intent decision", async () => {
+    const value = await harness({
+      codexResponses: [taskExecutionOutcome("legacy execution response")],
+    });
+    await value.start();
+
+    await value.ownerSays("legacy task request");
+
+    expect(value.codex.turnsFor("intent")).toHaveLength(1);
+    expect(value.codex.turnsFor("execution")).toHaveLength(1);
+    expect(value.minecraft.chatLog.at(-1)).toBe("legacy execution response");
+  });
+
+  it("rejects tool authority on the intent thread before opening a Codex turn", async () => {
+    const value = await harness();
+    await value.start();
+    const internal = value.service as unknown as {
+      generation: number;
+      sendAttempt(
+        role: "intent",
+        prompt: string,
+        generation: number,
+        trackAsActive: boolean,
+        task: undefined,
+        toolsEnabled: boolean,
+      ): Promise<unknown>;
+    };
+
+    await expect(
+      internal.sendAttempt(
+        "intent",
+        "must stay tool-free",
+        internal.generation,
+        true,
+        undefined,
+        true,
+      ),
+    ).rejects.toThrow("intent turns cannot enable tools");
+
+    expect(value.codex.turnsFor("intent")).toEqual([]);
+    expect(value.budgetEvents).toEqual([]);
+  });
+
+  describe("minimal task authorization", () => {
+    it.each([
+      {
+        ownerText: "走到我身边来",
+        goal: "走到主人身边",
+        allowedActions: ["get_state", "move_to"],
+        executorReply: "我到你身边了。",
+      },
+      {
+        ownerText: "看向那棵树",
+        goal: "看向主人指示的树",
+        allowedActions: ["get_state", "look_at"],
+        executorReply: "我正看着那棵树。",
+      },
+      {
+        ownerText: "挖掉这块石头",
+        goal: "挖掉主人指定的石头",
+        allowedActions: ["get_state", "dig_block"],
+        executorReply: "那块石头已处理。",
+      },
+    ])(
+      "starts $ownerText with only its validated actions and zero Minecraft disclosure",
+      async ({ ownerText, goal, allowedActions, executorReply }) => {
+        const naturalReply = `收到：${ownerText}`;
+        const value = await harness({
+          deferredTurns: [0],
+          intentResponses: [
+            taskDecision({
+              naturalReply,
+              goal,
+              allowedActions,
+              requestedLimits: { maxToolCalls: 4 },
+            }),
+          ],
+          executionResponses: [taskExecutionOutcome(executorReply)],
+        });
+        const beginCalls: Array<{
+          taskLeaseId: string | undefined;
+          allowedActions: readonly string[] | undefined;
+        }> = [];
+        const begin = value.budget.begin.bind(value.budget);
+        value.budget.begin = (taskLease, authorization = {}) => {
+          beginCalls.push({
+            taskLeaseId: taskLease?.id,
+            allowedActions: authorization.allowedActions,
+          });
+          return begin(taskLease, authorization);
+        };
+        await value.start();
+
+        await startPlayerTurn(value, ownerText);
+
+        const activeTask = value.taskController.current();
+        expect(activeTask).not.toBeNull();
+        expect(value.taskAuditEvents).toEqual(["task_started"]);
+        expect(value.codex.turnsFor("execution")).toHaveLength(1);
+        expect(taskPlanFromPrompt(value.codex.turnsFor("execution")[0]?.text ?? "")).toEqual({
+          allowedActions,
+          goal,
+          requestedLimits: { maxToolCalls: 4 },
+        });
+        expect(beginCalls).toEqual([
+          {
+            taskLeaseId: activeTask?.lease.id,
+            allowedActions,
+          },
+        ]);
+
+        const denied = await value.executeRawTool("minecraft_wait", {
+          milliseconds: 10,
+          turnLease: value.budgetLeases[0],
+        });
+        expect(denied).toEqual({
+          text: '{"error":"tool action is not allowed"}',
+          isError: true,
+        });
+        expect(value.minecraft.calls).toEqual([]);
+
+        value.codex.releaseTurnResult(0);
+        await value.untilTurnSettled();
+
+        expect(value.minecraft.chatLog).toEqual([naturalReply, executorReply]);
+        expect(value.minecraft.chatLog.join("\n")).not.toContain("任务披露");
+      },
+    );
+  });
+
+  it.each(["friend", "balanced", "autonomous"] as const)(
+    "executes a safe owner task in %s mode without an extra confirmation",
+    async (mode) => {
+      const value = await harness({
+        deferredTurns: [0],
+        compatibilityVerified: true,
+        safetyPresetAllows: true,
+        intentResponses: [
+          taskDecision({
+            naturalReply: null,
+            goal: `inspect safely in ${mode}`,
+            allowedActions: ["get_state"],
+          }),
+        ],
+        executionResponses: [taskExecutionOutcome(`safe ${mode}`)],
+      });
+      await value.start();
+      await emitCommand(value, `!mode ${mode}`);
+      value.minecraft.chatLog.splice(0);
+
+      await startPlayerTurn(value, `inspect safely in ${mode}`);
+
+      const task = value.taskController.current();
+      if (!task) throw new Error("expected active safe task");
+      const result = await value.executeRawTool("minecraft_get_state", {
+        turnLease: value.budgetLeases[0],
+      });
+      expect(result.isError).not.toBe(true);
+      expect(JSON.parse(result.text)).not.toHaveProperty("status", "confirmation_required");
+      expect(value.confirmations.hasGameActions(task.lease)).toBe(false);
+
+      value.codex.releaseTurnResult(0);
+      await value.untilTurnSettled();
+
+      expect(value.minecraft.chatLog).toEqual([`safe ${mode}`]);
+      expect(value.minecraft.chatLog.join("\n")).not.toContain("任务披露");
+    },
+  );
+
+  it("keeps dangerous confirmation and permanent denial ahead of Minecraft execution", async () => {
+    const value = await harness({
+      deferredTurns: [0],
+      intentResponses: [
+        taskDecision({
+          naturalReply: null,
+          goal: "perform bounded dangerous checks",
+          allowedActions: ["get_state", "move_to", "place_block"],
+          requestedLimits: {
+            maxHorizontalTravel: 1_024,
+            maxDangerousOperations: 8,
+          },
+        }),
+      ],
+      executionResponses: [taskExecutionOutcome("dangerous checks complete", "active")],
+    });
+    await value.start();
+    await startPlayerTurn(value, "perform bounded dangerous checks");
+    const task = value.taskController.current();
+    if (!task) throw new Error("expected active dangerous task");
+
+    const confirmation = await value.executeRawTool("minecraft_move_to", {
+      x: 300,
+      y: 64,
+      z: 0,
+      turnLease: value.budgetLeases[0],
+    });
+    const confirmationResult = JSON.parse(confirmation.text) as {
+      status?: string;
+      confirmationId?: number;
+    };
+    expect(confirmationResult).toMatchObject({
+      status: "confirmation_required",
+      confirmationId: expect.any(Number),
+    });
+    expect(value.minecraft.calls.filter((call) => call.method === "moveTo")).toHaveLength(0);
+    expect(value.confirmations.hasGameActions(task.lease)).toBe(true);
+
+    const permanentlyDenied = await value.executeRawTool("minecraft_place_block", {
+      blockName: "tnt",
+      x: 20,
+      y: 64,
+      z: 0,
+      turnLease: value.budgetLeases[0],
+    });
+    expect(JSON.parse(permanentlyDenied.text)).toMatchObject({ status: "denied" });
+    expect(value.minecraft.calls.filter((call) => call.method === "placeBlock")).toHaveLength(0);
+    expect(value.confirmations.get((confirmationResult.confirmationId ?? 0) + 1)).toBeUndefined();
+
+    await emitCommand(value, `!allow ${confirmationResult.confirmationId}`);
+
+    expect(value.minecraft.calls.filter((call) => call.method === "moveTo")).toHaveLength(1);
+    expect(value.confirmations.get(confirmationResult.confirmationId ?? 0)).toBeUndefined();
+  });
+
+  describe("continue_task authorization", () => {
+    const activeLimits = {
+      maxToolCalls: 8,
+      maxBlockChanges: 4,
+      maxHorizontalTravel: 512,
+      maxDurationMs: 120_000,
+      maxDangerousOperations: 2,
+    };
+    const continuedLimits = {
+      maxToolCalls: 4,
+      maxBlockChanges: 2,
+      maxHorizontalTravel: 256,
+      maxDurationMs: 60_000,
+      maxDangerousOperations: 1,
+    };
+
+    it("reuses the pending-confirmation task lease for a validated action and limit subset", async () => {
+      const value = await harness({
+        deferredTurns: [0, 1],
+        intentResponses: [
+          taskDecision({
+            naturalReply: null,
+            goal: "finish confirmed travel",
+            allowedActions: ["get_state", "move_to", "look_at"],
+            requestedLimits: activeLimits,
+          }),
+          taskDecision({
+            kind: "continue_task",
+            naturalReply: null,
+            goal: "look around while travel waits",
+            allowedActions: ["get_state", "look_at"],
+            requestedLimits: continuedLimits,
+          }),
+        ],
+        executionResponses: [
+          taskExecutionOutcome("ready", "active"),
+          taskExecutionOutcome("continued", "active"),
+        ],
+      });
+      const pending = await startPendingMoveConfirmation(value);
+      const activeTask = value.taskController.current();
+      if (!activeTask) throw new Error("expected pending-confirmation task");
+      expect(value.confirmations.get(pending.confirmationId)).toBeDefined();
+
+      await value.emitOwnerText("continue by looking around");
+      await vi.waitFor(() => expect(value.codex.turnsFor("execution")).toHaveLength(2), {
+        timeout: 1_000,
+      });
+
+      expect(value.taskController.current()).toMatchObject({
+        id: activeTask.id,
+        lease: activeTask.lease,
+        disclosure: { goal: "finish confirmed travel" },
+      });
+      expect(value.taskAuditEvents).toEqual(["task_started"]);
+      expect(value.confirmations.get(pending.confirmationId)).toBeDefined();
+      expect(value.budgetTaskLeaseIds).toEqual([activeTask.lease.id, activeTask.lease.id]);
+      expect(taskPlanFromPrompt(value.codex.turnsFor("execution")[1]?.text ?? "")).toEqual({
+        allowedActions: ["get_state", "look_at"],
+        goal: "finish confirmed travel",
+        requestedLimits: continuedLimits,
+      });
+
+      const deniedExpansion = await value.executeRawTool("minecraft_move_to", {
+        x: 20,
+        y: 64,
+        z: 0,
+        turnLease: value.budgetLeases[1],
+      });
+      expect(deniedExpansion).toEqual({
+        text: '{"error":"tool action is not allowed"}',
+        isError: true,
+      });
+
+      value.codex.releaseTurnResult(1);
+      await value.untilChat("continued");
+
+      expect(value.taskController.current()).toMatchObject({
+        id: activeTask.id,
+        lease: activeTask.lease,
+        disclosure: { goal: "finish confirmed travel" },
+      });
+      expect(value.confirmations.get(pending.confirmationId)).toBeDefined();
+      expect(value.taskAuditEvents).toEqual(["task_started"]);
+      expect(value.minecraft.chatLog.join("\n")).not.toContain("任务披露");
+    });
+
+    it.each([
+      {
+        label: "action",
+        allowedActions: ["get_state", "look_at", "place_block"],
+        requestedLimits: continuedLimits,
+      },
+      {
+        label: "limit",
+        allowedActions: ["get_state", "look_at"],
+        requestedLimits: { ...activeLimits, maxToolCalls: 9 },
+      },
+    ])(
+      "rejects a continue_task $label expansion without changing the task or confirmation",
+      async ({ allowedActions, requestedLimits }) => {
+        const value = await harness({
+          deferredTurns: [0],
+          intentResponses: [
+            taskDecision({
+              naturalReply: null,
+              goal: "finish confirmed travel",
+              allowedActions: ["get_state", "move_to", "look_at"],
+              requestedLimits: activeLimits,
+            }),
+            taskDecision({
+              kind: "continue_task",
+              naturalReply: "must not authorize",
+              goal: "expand pending travel",
+              allowedActions,
+              requestedLimits,
+            }),
+          ],
+          executionResponses: [taskExecutionOutcome("ready", "active")],
+        });
+        const pending = await startPendingMoveConfirmation(value);
+        const activeTask = value.taskController.current();
+        if (!activeTask) throw new Error("expected pending-confirmation task");
+
+        await value.emitOwnerText("continue with more authority");
+        await vi.waitFor(() =>
+          expect(value.minecraft.chatLog).toContain("继续请求超出当前任务权限，请明确替换任务。"),
+        );
+
+        expect(value.codex.turnsFor("execution")).toHaveLength(1);
+        expect(value.taskController.current()).toMatchObject({
+          id: activeTask.id,
+          lease: activeTask.lease,
+        });
+        expect(value.confirmations.get(pending.confirmationId)).toBeDefined();
+        expect(value.taskAuditEvents).toEqual(["task_started"]);
+        expect(value.budgetTaskLeaseIds).toEqual([activeTask.lease.id]);
+        expect(value.minecraft.chatLog).not.toContain("must not authorize");
+        expect(value.minecraft.chatLog.join("\n")).not.toContain("任务披露");
+      },
+    );
+
+    it("clarifies continue_task when no task is active without creating authority", async () => {
+      const value = await harness({
+        intentResponses: [
+          taskDecision({
+            kind: "continue_task",
+            naturalReply: "must not start",
+            goal: "missing task",
+            allowedActions: ["get_state"],
+            requestedLimits: continuedLimits,
+          }),
+        ],
+      });
+      await value.start();
+
+      await value.emitOwnerText("continue the missing task");
+      await vi.waitFor(() =>
+        expect(value.minecraft.chatLog).toContain("当前没有可继续的任务，请说明要开始的新任务。"),
+      );
+
+      expect(value.taskController.current()).toBeNull();
+      expect(value.taskAuditEvents).toEqual([]);
+      expect(value.codex.turnsFor("execution")).toEqual([]);
+      expect(value.budgetEvents).toEqual([]);
+      expect(value.minecraft.chatLog).not.toContain("must not start");
+      expect(value.minecraft.chatLog.join("\n")).not.toContain("任务披露");
+    });
+  });
+
+  it.each(["friend", "balanced", "autonomous"] as const)(
+    "keeps the production task ceiling and permanent action denials in %s mode",
+    async (mode) => {
+      const value = await harness({
+        deferredTurns: [0],
+        compatibilityVerified: true,
+        safetyPresetAllows: true,
+        requestedTaskLimits: {
+          maxToolCalls: 64,
+          maxBlockChanges: 256,
+          maxHorizontalTravel: 1_024,
+          maxDurationMs: 600_000,
+          maxDangerousOperations: 0,
+        },
+        codexResponses: [taskExecutionOutcome(`mode ${mode}`, "active")],
+      });
+      await value.start();
+      await emitCommand(value, `!mode ${mode}`);
+      await startPlayerTurn(value, `player task in ${mode} mode`);
+
+      expect(value.taskController.current()?.disclosure.limits).toEqual({
+        maxToolCalls: 64,
+        maxBlockChanges: 256,
+        maxHorizontalTravel: 1_024,
+        maxDurationMs: 600_000,
+        maxDangerousOperations: 0,
+      });
+      value.codex.releaseTurnResult(0);
+      await value.untilChat(`mode ${mode}`);
+      const denied = await value.codexCalls("minecraft_place_block", {
+        blockName: "tnt",
+        x: 20,
+        y: 64,
+        z: 0,
+      });
+      expect(JSON.parse(denied.text)).toMatchObject({ status: "denied" });
+    },
+  );
+  it("keeps validated lower limits in the internal task disclosure without game disclosure", async () => {
     const limits = {
       maxToolCalls: 5,
       maxBlockChanges: 6,
@@ -172,47 +1534,31 @@ describe("CompanionService lifecycle", () => {
       maxDurationMs: 8_000,
       maxDangerousOperations: 1,
     };
-    const value = await harness({ deferredTurns: [0], requestedTaskLimits: limits });
+    const value = await harness({
+      deferredTurns: [0],
+      intentResponses: [
+        taskDecision({
+          naturalReply: null,
+          goal: "bounded task",
+          allowedActions: ["get_state", "move_to"],
+          requestedLimits: limits,
+        }),
+      ],
+    });
     await value.start();
 
     await startPlayerTurn(value, "bounded task");
 
-    const disclosure = reconstructTaskDisclosure(value.disclosureChatAtTaskStart[0] ?? []);
-    expect(disclosure).toContain("工具调用 5");
-    expect(disclosure).toContain("方块修改 6");
-    expect(disclosure).toContain("水平移动 7");
-    expect(disclosure).toContain("持续时间 8000");
-    expect(disclosure).toContain("危险操作 1");
-    expect(value.taskController.current()?.disclosure.limits).toEqual(limits);
-  });
-
-  it("opens no task, Codex turn, or Minecraft action when disclosure delivery fails", async () => {
-    const value = await harness();
-    await value.start();
-    let disclosureAttempts = 0;
-    value.minecraft.say = async () => {
-      disclosureAttempts += 1;
-      throw new Error("disclosure transport failed");
-    };
-
-    value.minecraft.emit({
-      kind: "chat",
-      username: "TestOwner",
-      message: "must not gain authority",
+    expect(value.taskController.current()?.disclosure).toMatchObject({
+      goal: "bounded task",
+      expectedActions: ["get_state", "move_to"],
+      limits,
+      stopCondition: "完成、失败、安全边界或预算耗尽时停止",
     });
-    await value.untilMergeTimer();
-    value.fireMergeTimers();
-    await vi.waitFor(() => expect(disclosureAttempts).toBeGreaterThan(0));
-    await value.untilTurnSettled();
-
-    expect(value.taskController.current()).toBeNull();
-    expect(value.taskAuditEvents).toEqual([]);
-    expect(value.codex.turns).toEqual([]);
-    expect(value.budgetEvents).toEqual([]);
-    expect(value.minecraft.calls).toEqual([]);
+    expect(value.minecraft.chatLog).toEqual([]);
   });
 
-  it("discloses an owner task before Codex receives the same task lease as the tool budget", async () => {
+  it("starts an owner task before Codex receives the same task lease without game disclosure", async () => {
     const value = await harness({ deferredTurns: [0] });
     await value.start();
 
@@ -220,22 +1566,25 @@ describe("CompanionService lifecycle", () => {
 
     const task = value.taskController.current();
     expect(task).not.toBeNull();
-    expect(value.minecraft.chatLog[0]).toContain("任务披露");
-    expect(value.minecraft.chatLog[0]).toContain("collect four oak logs");
+    expect(value.minecraft.chatLog).toEqual([]);
     expect(value.codex.turns[0]?.text).toContain(task?.lease.id);
     expect(value.budgetTaskLeaseIds).toEqual([task?.lease.id]);
     expect(value.taskAuditEvents).toEqual(["task_started"]);
 
-    value.codex.releaseTurnResult(0, outcome());
+    value.codex.releaseTurnResult(0, taskExecutionOutcome(""));
     await value.untilTurnSettled();
     expect(value.taskController.current()).toBeNull();
     expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:completed"]);
   });
 
-  it("discloses an autonomous microtask before opening its leased Codex turn", async () => {
-    const value = await harness({ deferredTurns: [0] });
+  it("keeps an autonomous microtask internal before opening its leased Codex turn", async () => {
+    const value = await harness({
+      deferredTurns: [0],
+      compatibilityVerified: true,
+      safetyPresetAllows: true,
+    });
     await value.start();
-    await emitCommand(value, "!mode balanced");
+    await emitCommand(value, "!mode autonomous");
     value.minecraft.chatLog.splice(0);
 
     const turn = value.service.requestAutonomousTurn("nearby_threat");
@@ -243,7 +1592,7 @@ describe("CompanionService lifecycle", () => {
 
     const task = value.taskController.current();
     expect(task?.disclosure.goal).toContain("nearby_threat");
-    expect(value.minecraft.chatLog[0]).toContain("任务披露");
+    expect(value.minecraft.chatLog).toEqual([]);
     expect(value.codex.turns[0]?.text).toContain(task?.lease.id);
     expect(value.budgetTaskLeaseIds).toEqual([task?.lease.id]);
 
@@ -522,7 +1871,7 @@ describe("CompanionService lifecycle", () => {
   });
 
   it.each([
-    ["completed", { text: outcome(), status: "completed" }],
+    ["completed", { text: taskExecutionOutcome(""), status: "completed" }],
     ["failed", { text: "", status: "failed" }],
     ["interrupted", { text: "", status: "interrupted" }],
   ] as const)("stops the task after a %s Codex terminal result", async (label, response) => {
@@ -537,7 +1886,7 @@ describe("CompanionService lifecycle", () => {
     ]);
   });
 
-  it("stops rejected model transport once as model_unavailable and cancels active action work", async () => {
+  it("keeps one rejected model transport local and cancels active action work", async () => {
     const value = await harness({
       activeMinecraftWait: true,
       codexResponses: [new Error("model transport rejected")],
@@ -554,9 +1903,9 @@ describe("CompanionService lifecycle", () => {
     await expect(action).resolves.toEqual({ status: "cancelled" });
     expect(value.activeWaitWasAborted()).toBe(true);
     expect(value.taskController.current()).toBeNull();
-    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:model_unavailable"]);
-    expect(value.mode.snapshot().paused).toBe(true);
-    expect(withoutTaskDisclosures(value.minecraft.chatLog)).toEqual([unavailable]);
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:failed"]);
+    expect(value.mode.snapshot().paused).toBe(false);
+    expect(value.minecraft.chatLog).toEqual([naturalTaskFailure]);
   });
 
   it("starts and stops its autonomy scheduler without duplicate lifecycle subscriptions", async () => {
@@ -625,11 +1974,264 @@ describe("CompanionService lifecycle", () => {
     await expect(value.state.load()).resolves.toMatchObject({ paused: true });
   });
 
+  it("cancels old-owner work without stopping Minecraft or Codex", async () => {
+    vi.useFakeTimers();
+    const value = await harness({
+      deferredTurns: [0],
+      activeMinecraftWait: true,
+    });
+    await value.start();
+    await startPlayerTurn(value, "keep working");
+    expect(value.taskController.current()).not.toBeNull();
+    const action = value.executor.execute(
+      { kind: "wait", milliseconds: 5_000 },
+      { spawn: { x: 0, y: 64, z: 0 }, owner: { x: 0, y: 64, z: 0 } },
+    );
+    const pending = value.confirmations.create("pending", { kind: "memory_clear" });
+    await value.untilActiveWaitStarted();
+    const stopAll = vi.spyOn(value.executor, "stopAll");
+    const disconnect = vi.spyOn(value.minecraft, "disconnect");
+    const stopCodex = vi.spyOn(value.codex, "stop");
+
+    value.service.ownerIdentityChanged({
+      revision: 1,
+      ownerUsername: "NewOwner",
+      configured: true,
+      presence: "unknown",
+    });
+
+    await expect(action).resolves.toEqual({ status: "cancelled" });
+    expect(value.taskController.current()).toBeNull();
+    expect(value.taskAuditEvents).toContain("task_stopped:owner_changed");
+    expect(stopAll).toHaveBeenCalled();
+    expect(value.codex.interruptions).toEqual([{ threadId: "thread-1", turnId: "turn-1" }]);
+    expect(value.confirmations.get(pending.id)).toBeUndefined();
+    expect(value.mode.snapshot().paused).toBe(true);
+    expect(disconnect).not.toHaveBeenCalled();
+    expect(stopCodex).not.toHaveBeenCalled();
+  });
+
+  it("owner_stop terminal cleanup revokes the active turn, actions, and task confirmation only", async () => {
+    const value = await harness({
+      deferredTurns: [0],
+      activeMinecraftWait: true,
+    });
+    await value.start();
+    await startPlayerTurn(value, "keep working");
+    const taskLease = value.taskController.current()?.lease;
+    if (!taskLease) throw new Error("expected an active task lease");
+    const active = value.executor.execute(
+      { kind: "wait", milliseconds: 5_000 },
+      { spawn: { x: 0, y: 64, z: 0 }, owner: { x: 0, y: 64, z: 0 } },
+    );
+    const queued = value.executor.execute(
+      { kind: "jump" },
+      { spawn: { x: 0, y: 64, z: 0 }, owner: { x: 0, y: 64, z: 0 } },
+    );
+    const pending = value.confirmations.createGameAction(
+      "pending task-only stop action",
+      { kind: "say", message: "must not run" },
+      taskLease,
+    );
+    await value.untilActiveWaitStarted();
+    const disconnect = vi.spyOn(value.minecraft, "disconnect");
+    const codexStopCalls = value.codex.stopCalls;
+
+    value.taskController.stop("owner_stop");
+
+    await expect(active).resolves.toEqual({ status: "cancelled" });
+    await expect(queued).resolves.toEqual({ status: "cancelled" });
+    expect(value.activeWaitWasAborted()).toBe(true);
+    expect(value.codex.interruptions).toContainEqual({
+      threadId: "thread-1",
+      turnId: "turn-1",
+    });
+    expect(value.confirmations.get(pending.id)).toBeUndefined();
+    expect(value.executor.pendingCount()).toBe(0);
+    expect(value.taskController.current()).toBeNull();
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:owner_stop"]);
+    expect(value.mode.snapshot()).toMatchObject({ paused: false, taskId: null });
+    expect(disconnect).not.toHaveBeenCalled();
+    expect(value.codex.stopCalls).toBe(codexStopCalls);
+  });
+
+  it("finishes startup for the new owner, stays paused, and tears down normally", async () => {
+    const value = await harness();
+    let ownerUsername = "OldOwner";
+    const dependencies = (
+      value.service as unknown as {
+        dependencies: {
+          ownerUsername: () => string;
+          chatRouter: { options: { ownerUsername: () => string } };
+        };
+      }
+    ).dependencies;
+    dependencies.ownerUsername = () => ownerUsername;
+    dependencies.chatRouter.options.ownerUsername = () => ownerUsername;
+    const originalLoad = value.state.load.bind(value.state);
+    const loadEntered = deferredValue<void>();
+    const releaseLoad = deferredValue<void>();
+    value.state.load = async () => {
+      loadEntered.resolve();
+      await releaseLoad.promise;
+      return originalLoad();
+    };
+    const originalOnEvent = value.minecraft.onEvent.bind(value.minecraft);
+    const unsubscribed = vi.fn();
+    vi.spyOn(value.minecraft, "onEvent").mockImplementation((listener) => {
+      const unsubscribe = originalOnEvent(listener);
+      return () => {
+        unsubscribed();
+        unsubscribe();
+      };
+    });
+
+    const starting = value.start();
+    await loadEntered.promise;
+    ownerUsername = "NewOwner";
+    value.service.ownerIdentityChanged({
+      revision: 1,
+      ownerUsername,
+      configured: true,
+      presence: "unknown",
+    });
+    releaseLoad.resolve();
+    await starting;
+
+    expect(value.mode.snapshot().paused).toBe(true);
+    value.minecraft.emit({ kind: "chat", username: "OldOwner", message: "!resume" });
+    await Promise.resolve();
+    expect(value.mode.snapshot().paused).toBe(true);
+
+    value.minecraft.emit({ kind: "chat", username: "NewOwner", message: "!resume" });
+    await vi.waitFor(() => expect(value.mode.snapshot().paused).toBe(false));
+    value.minecraft.emit({ kind: "chat", username: "NewOwner", message: "hello from new owner" });
+    await value.untilMergeTimer();
+    value.fireMergeTimers();
+    await value.untilCodexTurns(1);
+    expect(value.codex.turns[0]?.text).toContain('"ownerMessage":"hello from new owner"');
+
+    await value.stop();
+    expect(unsubscribed).toHaveBeenCalledOnce();
+    value.minecraft.emit({ kind: "chat", username: "NewOwner", message: "after stop" });
+    expect(value.pendingMergeTimers()).toBe(0);
+  });
+
+  it("preserves queued world invalidation while discarding old-owner startup chat", async () => {
+    const value = await harness();
+    let ownerUsername = "OldOwner";
+    const dependencies = (
+      value.service as unknown as {
+        dependencies: {
+          ownerUsername: () => string;
+          chatRouter: { options: { ownerUsername: () => string } };
+        };
+      }
+    ).dependencies;
+    dependencies.ownerUsername = () => ownerUsername;
+    dependencies.chatRouter.options.ownerUsername = () => ownerUsername;
+    const originalLoad = value.state.load.bind(value.state);
+    const loadEntered = deferredValue<void>();
+    const releaseLoad = deferredValue<void>();
+    value.state.load = async () => {
+      loadEntered.resolve();
+      await releaseLoad.promise;
+      return originalLoad();
+    };
+
+    const starting = value.start();
+    await loadEntered.promise;
+    value.minecraft.emit({ kind: "world_changed" });
+    value.minecraft.emit({ kind: "chat", username: "OldOwner", message: "!resume" });
+    ownerUsername = "NewOwner";
+    value.service.ownerIdentityChanged({
+      revision: 1,
+      ownerUsername,
+      configured: true,
+      presence: "unknown",
+    });
+    releaseLoad.resolve();
+    await starting;
+
+    expect(value.mode.snapshot()).toMatchObject({ paused: true, taskId: null });
+    await expect(value.state.load()).resolves.toMatchObject({
+      paused: true,
+      worldInvalidated: true,
+    });
+    expect(value.minecraft.chatLog).not.toContain("已恢复。");
+  });
+
+  it("publishes offline for the new owner and ignores a late old-owner presence result", async () => {
+    const value = await harness();
+    const oldPresence = deferredValue<boolean>();
+    const newPresence = deferredValue<boolean>();
+    let snapshot: OwnerIdentitySnapshot = {
+      revision: 0,
+      ownerUsername: "OldOwner",
+      configured: true,
+      presence: "unknown",
+    };
+    const identity = {
+      snapshot: () => snapshot,
+      setPresence(input: {
+        revision: number;
+        ownerUsername: string;
+        presence: "online" | "offline";
+      }) {
+        if (
+          input.revision !== snapshot.revision ||
+          input.ownerUsername !== snapshot.ownerUsername
+        ) {
+          return;
+        }
+        snapshot = { ...snapshot, presence: input.presence };
+      },
+    };
+    const dependencies = (
+      value.service as unknown as {
+        dependencies: {
+          ownerIdentity?: typeof identity;
+          ownerUsername: () => string;
+        };
+      }
+    ).dependencies;
+    dependencies.ownerIdentity = identity;
+    dependencies.ownerUsername = () => snapshot.ownerUsername ?? "unconfigured";
+    const checkedOwners: string[] = [];
+    value.minecraft.isOwnerOnline = (ownerUsername) => {
+      checkedOwners.push(ownerUsername);
+      return ownerUsername === "OldOwner" ? oldPresence.promise : newPresence.promise;
+    };
+    await value.start();
+
+    value.minecraft.emit({ kind: "connected" });
+    await vi.waitFor(() => expect(checkedOwners).toContain("OldOwner"));
+    snapshot = {
+      revision: 1,
+      ownerUsername: "NewOwner",
+      configured: true,
+      presence: "unknown",
+    };
+    value.service.ownerIdentityChanged(snapshot);
+    await vi.waitFor(() => expect(checkedOwners).toContain("NewOwner"));
+    newPresence.resolve(false);
+
+    await vi.waitFor(() => expect(snapshot).toMatchObject({ revision: 1, presence: "offline" }));
+    oldPresence.resolve(true);
+    await Promise.resolve();
+
+    expect(snapshot).toMatchObject({
+      revision: 1,
+      ownerUsername: "NewOwner",
+      presence: "offline",
+    });
+  });
+
   it("pause settles the first turn budget before resume starts a second non-overlapping attempt", async () => {
     vi.useFakeTimers();
     const value = await harness({
       deferredTurns: [0],
-      codexResponses: [outcome({ reply: "第二次完成" })],
+      codexResponses: [taskExecutionOutcome("第二次完成")],
     });
     await value.start();
     await startPlayerTurn(value, "first");
@@ -696,18 +2298,9 @@ describe("CompanionService lifecycle", () => {
       value.codex.releaseTurnStart(0);
       value.codex.releaseTurnResult(
         0,
-        outcome({
-          reply: "LATE_REPLY",
-          task: {
-            goal: "late task",
-            allowedActions: ["wait"],
-            actionBudget: 1,
-            successCondition: "late success",
-            stopCondition: "late stop",
-            status: "active",
-          },
-          memoryCandidates: [{ category: "project", summary: "late memory", importance: 4 }],
-        }),
+        taskExecutionOutcome("LATE_REPLY", "active", [
+          { category: "project", summary: "late memory", importance: 4 },
+        ]),
       );
 
       expect(value.codex.interruptions).toEqual([{ threadId: "thread-1", turnId: "turn-1" }]);
@@ -732,14 +2325,14 @@ describe("CompanionService lifecycle", () => {
     expect(value.budget.snapshot().active).toBe(false);
     expect(value.codex.stopCalls).toBe(1);
     value.codex.releaseTurnStart(0);
-    value.codex.releaseTurnResult(0, outcome({ reply: "too late" }));
+    value.codex.releaseTurnResult(0, taskExecutionOutcome("too late"));
     expect(value.minecraft.chatLog).not.toContain("too late");
   });
 
   it("drains an in-flight confirmation resolution before stop resolves", async () => {
     const value = await harness({
       deferredTurns: [0],
-      codexResponses: [outcome({ reply: "ready" })],
+      codexResponses: [taskExecutionOutcome("ready")],
     });
     const { confirmationId } = await startPendingMoveConfirmation(value);
     let releaseAction!: () => void;
@@ -869,18 +2462,9 @@ describe("CompanionService lifecycle", () => {
     const value = await harness({
       gateMemoryFileRename: true,
       codexResponses: [
-        outcome({
-          reply: "should stay hidden",
-          task: {
-            goal: "hidden task",
-            allowedActions: ["wait"],
-            actionBudget: 1,
-            successCondition: "hidden success",
-            stopCondition: "hidden stop",
-            status: "active",
-          },
-          memoryCandidates: [{ category: "project", summary: "hidden memory", importance: 4 }],
-        }),
+        taskExecutionOutcome("should stay hidden", "active", [
+          { category: "project", summary: "hidden memory", importance: 4 },
+        ]),
       ],
     });
     await value.start();
@@ -897,7 +2481,7 @@ describe("CompanionService lifecycle", () => {
       paused: true,
       unfinishedTaskSummary: null,
     });
-    expect(withoutTaskDisclosures(value.minecraft.chatLog)).toEqual(["已停止当前任务和所有动作。"]);
+    expect(value.minecraft.chatLog).toEqual(["已停止当前任务和所有动作。"]);
   });
 
   it("owner input interrupts an autonomous action and turn before the new player turn starts", async () => {
@@ -905,7 +2489,7 @@ describe("CompanionService lifecycle", () => {
     const value = await harness({
       deferredTurns: [0],
       activeMinecraftWait: true,
-      codexResponses: [outcome({ reply: "owner turn completed" })],
+      codexResponses: [taskExecutionOutcome("owner turn completed")],
     });
     await value.start();
     await emitCommand(value, "!mode autonomous");
@@ -917,14 +2501,15 @@ describe("CompanionService lifecycle", () => {
     await value.untilActiveWaitStarted();
 
     value.minecraft.emit({ kind: "chat", username: "TestOwner", message: "come back" });
+    await value.untilMergeTimer();
+    value.fireMergeTimers();
+    await value.untilCodexTurns(2);
     expect(await action).toEqual({ status: "cancelled" });
     expect(value.activeWaitWasAborted()).toBe(true);
     expect(value.codex.interruptions).toContainEqual({
       threadId: "thread-1",
       turnId: "turn-1",
     });
-    value.fireMergeTimers();
-    await value.untilCodexTurns(2);
     await value.untilChat("owner turn completed");
 
     expect(value.codex.turns[1]?.text).toContain('"ownerMessage":"come back"');
@@ -935,7 +2520,7 @@ describe("CompanionService lifecycle", () => {
     vi.useFakeTimers();
     const value = await harness({
       deferredTurns: [0],
-      codexResponses: [outcome({ reply: "owner turn completed" })],
+      codexResponses: [taskExecutionOutcome("owner turn completed")],
     });
     await value.start();
     await emitCommand(value, "!mode balanced");
@@ -943,9 +2528,10 @@ describe("CompanionService lifecycle", () => {
     await value.untilCodexTurns(1);
 
     value.minecraft.emit({ kind: "chat", username: "TestOwner", message: "help me now" });
-    expect(value.codex.interruptions).toEqual([{ threadId: "thread-1", turnId: "turn-1" }]);
+    await value.untilMergeTimer();
     value.fireMergeTimers();
     await value.untilCodexTurns(2);
+    expect(value.codex.interruptions).toEqual([{ threadId: "thread-1", turnId: "turn-1" }]);
     await autonomous;
     await value.untilChat("owner turn completed");
 
@@ -957,6 +2543,8 @@ describe("CompanionService lifecycle", () => {
     const value = await harness({
       deferredTurns: [0],
       codexResponses: [outcome({ reply: "late mode reply" })],
+      compatibilityVerified: true,
+      safetyPresetAllows: true,
     });
     await value.start();
     await emitCommand(value, "!mode autonomous");
@@ -975,26 +2563,24 @@ describe("CompanionService lifecycle", () => {
   it("reconnect clears taskId but retains a compact unfinished summary and remains paused", async () => {
     vi.useFakeTimers();
     const value = await harness({
-      codexResponses: [
-        outcome({
-          task: {
-            goal: "retained goal",
-            allowedActions: ["wait"],
-            actionBudget: 1,
-            successCondition: "retained success",
-            stopCondition: "retained stop",
-            status: "active",
-          },
+      intentResponses: [
+        taskDecision({
+          naturalReply: null,
+          goal: "retained goal",
+          allowedActions: ["wait"],
         }),
       ],
+      codexResponses: [taskExecutionOutcome("", "active")],
     });
     await value.start();
     await startPlayerTurn(value, "start task");
-    await value.untilTurnSettled();
-    expect(value.mode.snapshot().taskId).toBe("retained goal");
+    await vi.waitFor(() => expect(value.mode.snapshot().taskId).toBe("retained goal"));
 
     value.minecraft.emit({ kind: "connected" });
 
+    expect(value.taskTerminalReasons).toHaveLength(1);
+    expect(["completed", "disconnect"]).toContain(value.taskTerminalReasons[0]);
+    expect(value.taskTerminalReasons).not.toContain("owner_stop");
     expect(value.mode.snapshot()).toMatchObject({ mode: "friend", paused: true, taskId: null });
     await value.untilState(
       (state) =>
@@ -1002,22 +2588,93 @@ describe("CompanionService lifecycle", () => {
         state.unfinishedTaskSummary ===
           JSON.stringify({
             goal: "retained goal",
-            success: "retained success",
-            stop: "retained stop",
           }),
     );
     expect(await value.state.load()).toMatchObject({
       paused: true,
       unfinishedTaskSummary: JSON.stringify({
         goal: "retained goal",
-        success: "retained success",
-        stop: "retained stop",
       }),
     });
   });
 });
 
 describe("CompanionService recovery", () => {
+  it("recovers an externally managed session with the exact live model and reasoning effort", async () => {
+    const value = await harness({
+      runtimeReasoningEffort: "xhigh",
+      modelResults: [["service-live-model", "gpt-5.6-terra"]],
+      threadIds: ["thread-service-start", "thread-service-recovery"],
+      codexResponses: [new Error("Codex app server exited"), outcome()],
+    });
+    await value.service.start("service-live-model");
+    await startPlayerTurn(value, "trigger exact-pair recovery");
+    await value.untilChat(unavailable);
+
+    await emitCommand(value, "!resume");
+    await vi.waitFor(() => expect(value.codex.startedThreads).toHaveLength(4));
+
+    expect(value.codex.startedThreads).toHaveLength(4);
+    expect(
+      value.codex.startedThreads.every(
+        (thread) =>
+          thread.cwd === value.directory &&
+          thread.model === "service-live-model" &&
+          thread.reasoningEffort === "xhigh",
+      ),
+    ).toBe(true);
+  });
+
+  it("does not open a recovery thread when the externally managed model-effort pair disappeared", async () => {
+    const value = await harness({
+      runtimeReasoningEffort: "xhigh",
+      selectionAvailability: [false],
+      modelResults: [["service-live-model"]],
+      threadIds: ["thread-service-start", "thread-must-not-start"],
+      codexResponses: [new Error("Codex app server exited"), outcome()],
+    });
+    await value.service.start("service-live-model");
+    await startPlayerTurn(value, "trigger unavailable-pair recovery");
+    await value.untilChat(unavailable);
+    value.minecraft.chatLog.splice(0);
+
+    await emitCommand(value, "!resume");
+    await vi.waitFor(() => expect(value.codex.validateSelectionCalls).toBe(1));
+
+    expect(value.codex.startedThreads).toHaveLength(2);
+    expect(
+      value.codex.startedThreads.every(
+        (thread) =>
+          thread.cwd === value.directory &&
+          thread.model === "service-live-model" &&
+          thread.reasoningEffort === "xhigh",
+      ),
+    ).toBe(true);
+    expect(value.codex.turns).toHaveLength(1);
+  });
+
+  it("reports definitive externally managed model loss before recovery can retain authority", async () => {
+    const authorityLosses: string[] = [];
+    const value = await harness({
+      runtimeReasoningEffort: "xhigh",
+      selectionAvailability: [false],
+      modelResults: [["service-live-model"]],
+      threadIds: ["thread-service-start", "thread-must-not-start"],
+      codexResponses: [new Error("Codex app server exited"), outcome()],
+      onModelAuthorityLost: () => authorityLosses.push("model_unavailable"),
+    });
+    await value.service.start("service-live-model");
+    await startPlayerTurn(value, "trigger immediate authority loss");
+    await value.untilChat(unavailable);
+
+    await emitCommand(value, "!resume");
+    await vi.waitFor(() => expect(value.codex.validateSelectionCalls).toBe(1));
+
+    expect(authorityLosses).toEqual(["model_unavailable"]);
+    expect(value.codex.startedThreads).toHaveLength(2);
+    expect(value.codex.turns).toHaveLength(1);
+  });
+
   it("keeps Minecraft tools disabled across recovery schema-repair attempts", async () => {
     const value = await harness({
       persistedState: {
@@ -1072,12 +2729,12 @@ describe("CompanionService recovery", () => {
     const value = await harness({
       gatedCodexStarts: [1],
       threadIds: ["thread-old", "thread-recovery"],
-      codexResponses: [new Error("quota"), outcome()],
+      codexResponses: [new Error("Codex app server exited"), outcome()],
     });
     await value.start();
     await startPlayerTurn(value, "trigger quota");
     await value.untilChat(unavailable);
-    expect(withoutTaskDisclosures(value.minecraft.chatLog)).toEqual([unavailable]);
+    expect(value.minecraft.chatLog).toEqual([unavailable]);
     value.minecraft.chatLog.splice(0);
     value.budgetEvents.splice(0);
 
@@ -1089,8 +2746,10 @@ describe("CompanionService recovery", () => {
 
     expect(value.codex.startCalls).toBe(2);
     expect(value.codex.listModelCalls).toBe(2);
-    expect(value.codex.startedThreads).toHaveLength(2);
-    expect(value.codex.startedThreads[1]?.model).toBe("gpt-5.6-terra");
+    expect(value.codex.startedThreads).toHaveLength(4);
+    expect(
+      value.codex.startedThreads.slice(2).every((item) => item.model === "gpt-5.6-terra"),
+    ).toBe(true);
     expect(value.codex.turns).toHaveLength(2);
     expect(value.codex.turns[1]).toMatchObject({ threadId: "thread-recovery" });
     expect(value.budgetEvents).toEqual([]);
@@ -1117,7 +2776,7 @@ describe("CompanionService recovery", () => {
     await stopping;
 
     expect(value.codex.startCalls).toBe(2);
-    expect(value.codex.startedThreads).toHaveLength(1);
+    expect(value.codex.startedThreads).toHaveLength(2);
     expect(value.codex.turns).toHaveLength(1);
     expect(value.budgetEvents).toEqual([]);
     expect(value.budget.snapshot().active).toBe(false);
@@ -1178,7 +2837,43 @@ describe("CompanionService recovery", () => {
     }).toEqual(afterOwnerStop);
   });
 
-  it.each(["process exited", "quota exceeded"])(
+  it("external stop settles a gated recovery turn without stopping app-owned Codex", async () => {
+    const value = await harness({
+      persistedState: {
+        lastMode: "friend",
+        paused: true,
+        unfinishedTaskSummary: '{"goal":"recover locally"}',
+      },
+      deferredTurns: [0],
+      intentThreadIds: ["intent-initial", "intent-recovery"],
+      threadIds: ["execution-initial", "execution-recovery"],
+      executionResponses: [outcome({ reply: "late recovery output" })],
+    });
+    await value.service.start("gpt-5.6-terra");
+    value.minecraft.emit({ kind: "chat", username: "TestOwner", message: "!resume" });
+    await value.untilCodexTurns(1);
+    const stopCallsBeforeShutdown = value.codex.stopCalls;
+
+    await expect(value.stop()).resolves.toBeUndefined();
+
+    const internal = value.service as unknown as {
+      recoveryFlight: Promise<void> | undefined;
+    };
+    expect(value.codex.stopCalls).toBe(stopCallsBeforeShutdown);
+    expect(value.codex.interruptions).toEqual([
+      { threadId: "execution-recovery", turnId: "turn-1" },
+    ]);
+    expect(internal.recoveryFlight).toBeUndefined();
+    expect(value.service.isBusyForAutonomy()).toBe(false);
+    const chatAfterStop = [...value.minecraft.chatLog];
+
+    value.codex.releaseTurnResultFor("execution", 0);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(value.minecraft.chatLog).toEqual(chatAfterStop);
+  });
+
+  it.each(["process exited", "Codex app server exited"])(
     "%s uses a fresh allowed model/thread and a parsed recovery turn before success",
     async (failure) => {
       vi.useFakeTimers();
@@ -1189,13 +2884,15 @@ describe("CompanionService recovery", () => {
       await value.start();
       await startPlayerTurn(value, "hello");
       await value.untilChat(unavailable);
-      expect(withoutTaskDisclosures(value.minecraft.chatLog)).toEqual([unavailable]);
+      expect(value.minecraft.chatLog).toEqual([unavailable]);
       expect(value.mode.snapshot().paused).toBe(true);
 
       await emitCommand(value, "!resume");
 
       expect(value.codex.startCalls).toBe(2);
       expect(value.codex.startedThreads.map((item) => item.model)).toEqual([
+        "gpt-5.6-terra",
+        "gpt-5.6-terra",
         "gpt-5.6-terra",
         "gpt-5.6-terra",
       ]);
@@ -1216,7 +2913,7 @@ describe("CompanionService recovery", () => {
       vi.useFakeTimers();
       const value = await harness({
         threadIds: ["thread-old", "thread-recovery"],
-        codexResponses: [new Error("quota"), ...recoveryResponses],
+        codexResponses: [new Error("Codex app server exited"), ...recoveryResponses],
       });
       await value.start();
       await startPlayerTurn(value, "hello");
@@ -1225,7 +2922,7 @@ describe("CompanionService recovery", () => {
       await value.untilChat(unavailable);
 
       expect(value.mode.snapshot().paused).toBe(true);
-      expect(withoutTaskDisclosures(value.minecraft.chatLog)).toEqual([unavailable, unavailable]);
+      expect(value.minecraft.chatLog).toEqual([unavailable, unavailable]);
       await emitCommand(value, "!status");
       expect(value.minecraft.chatLog.at(-1)).toContain("Codex：不可用");
       expect(value.minecraft.chatLog).not.toContain("已恢复。");
@@ -1248,7 +2945,7 @@ describe("CompanionService recovery", () => {
 
     await emitCommand(value, "!resume");
 
-    expect(value.codex.startedThreads).toHaveLength(2);
+    expect(value.codex.startedThreads).toHaveLength(4);
     expect(value.codex.turns[0]).toMatchObject({ threadId: "thread-proof" });
     expect(value.codex.turns[0]?.text).toContain(
       `"systemOwnedRecoveryContext":${JSON.stringify(summary)}`,
@@ -1326,18 +3023,7 @@ describe("CompanionService output and commands", () => {
   it("notifies one completed task and one real failed action result exactly once", async () => {
     vi.useFakeTimers();
     const value = await harness({
-      codexResponses: [
-        outcome({
-          task: {
-            goal: "inspect",
-            allowedActions: ["wait"],
-            actionBudget: 1,
-            successCondition: "done",
-            stopCondition: "stop",
-            status: "completed",
-          },
-        }),
-      ],
+      codexResponses: [taskExecutionOutcome("")],
     });
     await value.start();
     await startPlayerTurn(value, "finish");
@@ -1354,9 +3040,9 @@ describe("CompanionService output and commands", () => {
     expect(value.autonomy.actionsFailed).toBe(1);
   });
 
-  it("uses typed system-owned autonomous context with eight headings and a fresh budget", async () => {
+  it("uses typed system-owned balanced context with eight headings and no tool budget", async () => {
     const value = await harness({
-      codexResponses: [outcome({ reply: "自主消息" })],
+      codexResponses: [outcome({ reply: "自主消息", proactiveKind: "chat" })],
       autonomyCanChat: true,
     });
     await value.start();
@@ -1377,9 +3063,213 @@ describe("CompanionService output and commands", () => {
     expect(prompt).toContain('"reason":"nearby_threat"');
     expect(prompt).toContain("不是玩家发言");
     expect(prompt).not.toContain('"ownerMessage"');
-    expect(value.budgetEvents).toEqual(["begin", "end"]);
+    expect(value.budgetEvents).toEqual([]);
+    expect(value.taskController.current()).toBeNull();
+    expect(value.minecraft.chatLog.some((message) => message.startsWith("任务披露"))).toBe(false);
     expect(value.minecraft.chatLog.at(-1)).toBe("自主消息");
     expect(value.autonomy.proactiveMarks).toBe(1);
+  });
+
+  it("rejects a balanced model-proposed task and repairs without tools or world-task authority", async () => {
+    const value = await harness({
+      codexResponses: [
+        outcome({
+          proactiveKind: "chat",
+          task: {
+            goal: "mutate the world",
+            allowedActions: ["dig_block"],
+            actionBudget: 4,
+            successCondition: "changed",
+            stopCondition: "done",
+            status: "active",
+          },
+        }),
+        outcome({ reply: "只提供建议", proactiveKind: "chat" }),
+      ],
+    });
+    await value.start();
+    await emitCommand(value, "!mode balanced");
+    value.budgetEvents.splice(0);
+    value.minecraft.chatLog.splice(0);
+
+    await value.service.requestAutonomousTurn("balanced_idle");
+
+    expect(value.codex.turns).toHaveLength(2);
+    expect(value.budgetEvents).toEqual([]);
+    expect(value.taskController.current()).toBeNull();
+    expect(value.taskAuditEvents).toEqual([]);
+    expect(value.minecraft.chatLog).toEqual(["只提供建议"]);
+  });
+
+  it.each([
+    ["neither", false, false, "chat", 0],
+    ["chat only", true, false, "chat", 1],
+    ["suggestion only", false, true, "suggestion", 1],
+    ["chat and suggestion", true, true, "suggestion", 1],
+  ] as const)(
+    "enforces the balanced proactive kind matrix for %s",
+    async (_name, allowProactiveChat, allowSuggestions, proactiveKind, expectedTurns) => {
+      const value = await harness({
+        codexResponses: [outcome({ reply: "bounded proactive output", proactiveKind })],
+      });
+      await value.start();
+      const profile = value.mode.getProfile();
+      value.service.applyProfile({
+        ...profile,
+        mode: "balanced",
+        modeSettings: {
+          ...profile.modeSettings,
+          balanced: {
+            ...profile.modeSettings.balanced,
+            allowProactiveChat,
+            allowSuggestions,
+          },
+        },
+      });
+      value.minecraft.chatLog.splice(0);
+
+      await value.service.requestAutonomousTurn("balanced_idle");
+
+      expect(value.codex.turns).toHaveLength(expectedTurns);
+      expect(value.budgetEvents).toEqual([]);
+      expect(value.taskController.current()).toBeNull();
+      expect(value.mode.snapshot().taskId).toBeNull();
+      expect(value.minecraft.chatLog).toEqual(
+        expectedTurns === 0 ? [] : ["bounded proactive output"],
+      );
+    },
+  );
+
+  it.each([
+    ["chat only", true, false, "suggestion", "chat"],
+    ["suggestion only", false, true, "chat", "suggestion"],
+  ] as const)(
+    "repairs an unallowed balanced proactive kind for %s",
+    async (_name, allowProactiveChat, allowSuggestions, rejectedKind, repairedKind) => {
+      const value = await harness({
+        codexResponses: [
+          outcome({ reply: "unallowed output", proactiveKind: rejectedKind }),
+          outcome({ reply: "allowed repaired output", proactiveKind: repairedKind }),
+        ],
+      });
+      await value.start();
+      const profile = value.mode.getProfile();
+      value.service.applyProfile({
+        ...profile,
+        mode: "balanced",
+        modeSettings: {
+          ...profile.modeSettings,
+          balanced: {
+            ...profile.modeSettings.balanced,
+            allowProactiveChat,
+            allowSuggestions,
+          },
+        },
+      });
+      value.minecraft.chatLog.splice(0);
+
+      await value.service.requestAutonomousTurn("balanced_idle");
+
+      expect(value.codex.turns).toHaveLength(2);
+      expect(value.codex.turns[1]?.text).toContain(
+        `proactiveKind must be ${JSON.stringify(repairedKind)}`,
+      );
+      expect(value.minecraft.chatLog).toEqual(["allowed repaired output"]);
+      expect(value.mode.snapshot().taskId).toBeNull();
+    },
+  );
+
+  it("keeps both unallowed balanced proactive-kind attempts local", async () => {
+    const value = await harness({
+      codexResponses: [
+        outcome({ reply: "unallowed first", proactiveKind: "suggestion" }),
+        outcome({ reply: "unallowed second", proactiveKind: "suggestion" }),
+      ],
+    });
+    await value.start();
+    const profile = value.mode.getProfile();
+    value.service.applyProfile({
+      ...profile,
+      mode: "balanced",
+      modeSettings: {
+        ...profile.modeSettings,
+        balanced: {
+          ...profile.modeSettings.balanced,
+          allowProactiveChat: true,
+          allowSuggestions: false,
+        },
+      },
+    });
+    value.minecraft.chatLog.splice(0);
+
+    await value.service.requestAutonomousTurn("balanced_idle");
+
+    expect(value.codex.turns).toHaveLength(2);
+    expect(value.minecraft.chatLog).toEqual([naturalTaskFailure]);
+    expect(value.minecraft.chatLog).not.toContain("unallowed first");
+    expect(value.minecraft.chatLog).not.toContain("unallowed second");
+    expect(value.mode.snapshot().taskId).toBeNull();
+    expect(value.mode.snapshot().paused).toBe(false);
+  });
+
+  it.each([
+    ["missing compatibility proof", false, true],
+    ["missing safety-preset proof", true, false],
+    ["Task4 evidence not wired", undefined, undefined],
+  ] as const)(
+    "denies autonomous work with %s",
+    async (_name, compatibilityVerified, safetyPresetAllows) => {
+      const value = await harness({
+        ...(compatibilityVerified === undefined ? {} : { compatibilityVerified }),
+        ...(safetyPresetAllows === undefined ? {} : { safetyPresetAllows }),
+      });
+      await value.start();
+      await emitCommand(value, "!mode autonomous");
+
+      await value.service.requestAutonomousTurn("autonomous_idle");
+
+      expect(value.codex.turns).toHaveLength(0);
+      expect(value.budgetEvents).toEqual([]);
+      expect(value.taskController.current()).toBeNull();
+    },
+  );
+
+  it("denies otherwise-authorized autonomous work while the owner is offline", async () => {
+    const value = await harness({
+      compatibilityVerified: true,
+      safetyPresetAllows: true,
+    });
+    await value.start();
+    await emitCommand(value, "!mode autonomous");
+    value.minecraft.ownerOnline = false;
+
+    await value.service.requestAutonomousTurn("nearby_threat");
+
+    expect(value.codex.turns).toHaveLength(0);
+    expect(value.budgetEvents).toEqual([]);
+  });
+
+  it("lets profile settings restrict balanced proactive chat below the hard ceiling", async () => {
+    const value = await harness();
+    await value.start();
+    const profile = value.mode.getProfile();
+    value.mode.applyProfile({
+      ...profile,
+      mode: "balanced",
+      modeSettings: {
+        ...profile.modeSettings,
+        balanced: {
+          ...profile.modeSettings.balanced,
+          allowProactiveChat: false,
+          allowSuggestions: false,
+        },
+      },
+    });
+
+    await value.service.requestAutonomousTurn("balanced_idle");
+
+    expect(value.codex.turns).toHaveLength(0);
+    expect(value.budgetEvents).toEqual([]);
   });
 
   it("friend suppresses autonomous chat while other modes send only when cooldown permits", async () => {
@@ -1388,33 +3278,34 @@ describe("CompanionService output and commands", () => {
       codexResponses: [
         outcome({
           reply: "balanced hidden",
+          proactiveKind: "chat",
           memoryCandidates: [
             { category: "experience", summary: "suppressed chat still processed", importance: 4 },
           ],
         }),
-        outcome({ reply: longReply }),
+        outcome({ reply: longReply, proactiveKind: "chat" }),
       ],
       autonomyCanChat: true,
     });
     await value.start();
 
     await value.service.requestAutonomousTurn("nearby_threat");
-    expect(withoutTaskDisclosures(value.minecraft.chatLog)).toEqual([]);
+    expect(value.minecraft.chatLog).toEqual([]);
     expect(value.codex.turns).toHaveLength(0);
 
     await emitCommand(value, "!mode balanced");
     value.minecraft.chatLog.splice(0);
     value.autonomy.canChat = false;
     await value.service.requestAutonomousTurn("balanced_idle");
-    expect(withoutTaskDisclosures(value.minecraft.chatLog)).toEqual([]);
+    expect(value.minecraft.chatLog).toEqual([]);
     expect(value.autonomy.proactiveMarks).toBe(0);
     await expect(value.memories.search("suppressed")).resolves.toHaveLength(1);
 
     value.autonomy.canChat = true;
     await value.service.requestAutonomousTurn("goal_completed");
-    expect(withoutTaskDisclosures(value.minecraft.chatLog).join("")).toBe(longReply);
+    expect(value.minecraft.chatLog.join("")).toBe(longReply);
     expect(
-      withoutTaskDisclosures(value.minecraft.chatLog).every(
+      value.minecraft.chatLog.every(
         (chunk) =>
           chunk.length <= 240 && !/[\uD800-\uDBFF]$/.test(chunk) && !/^[\uDC00-\uDFFF]/.test(chunk),
       ),
@@ -1426,6 +3317,8 @@ describe("CompanionService output and commands", () => {
     const value = await harness({
       codexResponses: [outcome({ reply: "自主模式主动消息" })],
       autonomyCanChat: true,
+      compatibilityVerified: true,
+      safetyPresetAllows: true,
     });
     await value.start();
     await emitCommand(value, "!mode autonomous");
@@ -1433,15 +3326,227 @@ describe("CompanionService output and commands", () => {
 
     await value.service.requestAutonomousTurn("nearby_threat");
 
-    expect(withoutTaskDisclosures(value.minecraft.chatLog)).toEqual(["自主模式主动消息"]);
+    expect(value.minecraft.chatLog).toEqual(["自主模式主动消息"]);
     expect(value.autonomy.proactiveMarks).toBe(1);
   });
+
+  it("repairs every autonomous task outcome to task null before persistence or reply", async () => {
+    const unsafeTask = {
+      goal: "excavate and build a large fortress",
+      allowedActions: ["dig_block", "place_block", "attack_hostile"],
+      actionBudget: 64,
+      successCondition: "fortress complete",
+      stopCondition: "project complete",
+      status: "active" as const,
+    };
+    const value = await harness({
+      codexResponses: [
+        outcome({ reply: "unsafe first reply", task: unsafeTask }),
+        outcome({ reply: "safe repaired reply", task: null }),
+      ],
+      compatibilityVerified: true,
+      safetyPresetAllows: true,
+    });
+    await value.start();
+    await emitCommand(value, "!mode autonomous");
+    value.minecraft.chatLog.splice(0);
+
+    await value.service.requestAutonomousTurn("autonomous_idle");
+
+    expect(value.codex.turns).toHaveLength(2);
+    expect(value.codex.turns[1]?.text).toContain(
+      "Unsolicited autonomous turns must return task as null.",
+    );
+    expect(value.mode.snapshot().taskId).toBeNull();
+    expect(value.taskController.current()).toBeNull();
+    expect(value.minecraft.chatLog).toEqual(["safe repaired reply"]);
+  });
+
+  it("keeps two autonomous outcomes containing a task local", async () => {
+    const unsafeTask = {
+      goal: "large destructive project",
+      allowedActions: ["dig_block", "place_block"],
+      actionBudget: 64,
+      successCondition: "world changed",
+      stopCondition: "project complete",
+      status: "active" as const,
+    };
+    const value = await harness({
+      codexResponses: [
+        outcome({ reply: "unsafe first reply", task: unsafeTask }),
+        outcome({ reply: "unsafe second reply", task: unsafeTask }),
+      ],
+      compatibilityVerified: true,
+      safetyPresetAllows: true,
+    });
+    await value.start();
+    await emitCommand(value, "!mode autonomous");
+    value.minecraft.chatLog.splice(0);
+
+    await value.service.requestAutonomousTurn("autonomous_idle");
+
+    expect(value.codex.turns).toHaveLength(2);
+    expect(value.mode.snapshot().taskId).toBeNull();
+    expect(value.taskController.current()).toBeNull();
+    expect(value.minecraft.chatLog).toEqual([naturalTaskFailure]);
+    expect(value.minecraft.chatLog).not.toContain("unsafe first reply");
+    expect(value.minecraft.chatLog).not.toContain("unsafe second reply");
+    expect(value.autonomy.proactiveMarks).toBe(0);
+    expect(value.mode.snapshot().paused).toBe(false);
+  });
+
+  it("treats a logical ModeManager task as active autonomy authority", async () => {
+    const value = await harness({
+      compatibilityVerified: true,
+      safetyPresetAllows: true,
+    });
+    await value.start();
+    await emitCommand(value, "!mode autonomous");
+    value.mode.startTask("persisted logical task");
+
+    await value.service.requestAutonomousTurn("autonomous_idle");
+
+    expect(value.codex.turns).toHaveLength(0);
+    expect(value.mode.snapshot().taskId).toBe("persisted logical task");
+  });
+
+  it("does not queue a second autonomous turn behind an in-flight request", async () => {
+    const value = await harness({
+      codexResponses: [outcome({ reply: "single reply" }), outcome({ reply: "late reply" })],
+      deferredTurns: [0],
+      compatibilityVerified: true,
+      safetyPresetAllows: true,
+    });
+    await value.start();
+    await emitCommand(value, "!mode autonomous");
+    value.minecraft.chatLog.splice(0);
+
+    const first = value.service.requestAutonomousTurn("autonomous_idle");
+    const second = value.service.requestAutonomousTurn("nearby_threat");
+    await value.untilCodexTurns(1);
+    value.codex.releaseTurnResult(0);
+    await Promise.all([first, second]);
+
+    expect(value.codex.turns).toHaveLength(1);
+    expect(value.minecraft.chatLog).toEqual(["single reply"]);
+    expect(value.mode.snapshot().taskId).toBeNull();
+  });
+
+  it("enforces the autonomous low-risk tool allowlist at the local budget boundary", async () => {
+    const value = await harness({
+      deferredTurns: [0],
+      compatibilityVerified: true,
+      safetyPresetAllows: true,
+    });
+    await value.start();
+    await emitCommand(value, "!mode autonomous");
+    value.minecraft.chatLog.splice(0);
+
+    const turn = value.service.requestAutonomousTurn("nearby_threat");
+    await value.untilCodexTurns(1);
+    const task = value.taskController.current();
+    const lease = value.budgetLeases[0];
+    if (!lease) throw new Error("expected autonomous turn lease");
+
+    const dig = await value.executeRawTool("minecraft_dig_block", {
+      x: 2,
+      y: 64,
+      z: 2,
+      blockName: "stone",
+      turnLease: lease,
+    });
+    const attack = await value.executeRawTool("minecraft_attack_hostile", {
+      entityId: 7,
+      turnLease: lease,
+    });
+
+    expect(dig).toMatchObject({ isError: true, text: expect.stringContaining("not allowed") });
+    expect(attack).toMatchObject({ isError: true, text: expect.stringContaining("not allowed") });
+    expect(value.minecraft.calls).toEqual([]);
+    expect(task?.disclosure).toMatchObject({
+      expectedActions: ["get_state", "find_block", "say", "look_at", "jump", "wait"],
+      limits: {
+        maxToolCalls: 8,
+        maxBlockChanges: 0,
+        maxHorizontalTravel: 0,
+        maxDurationMs: 60_000,
+        maxDangerousOperations: 0,
+      },
+    });
+
+    value.codex.releaseTurnResult(0, outcome());
+    await turn;
+  });
+
+  it.each([
+    [
+      "switches to friend mode",
+      (
+        profile: ReturnType<
+          Awaited<ReturnType<typeof createCompanionHarness>>["mode"]["getProfile"]
+        >,
+      ) => ({ ...profile, mode: "friend" as const }),
+    ],
+    [
+      "disables autonomous micro-actions",
+      (
+        profile: ReturnType<
+          Awaited<ReturnType<typeof createCompanionHarness>>["mode"]["getProfile"]
+        >,
+      ) => ({
+        ...profile,
+        modeSettings: {
+          ...profile.modeSettings,
+          autonomous: {
+            ...profile.modeSettings.autonomous,
+            allowLowRiskMicroActions: false,
+          },
+        },
+      }),
+    ],
+  ])(
+    "revokes the active autonomous turn and tool lease when a live profile %s",
+    async (_name, restrictProfile) => {
+      const value = await harness({
+        deferredTurns: [0],
+        codexResponses: [outcome({ reply: "late profile reply" })],
+        compatibilityVerified: true,
+        safetyPresetAllows: true,
+      });
+      await value.start();
+      await emitCommand(value, "!mode autonomous");
+      value.minecraft.chatLog.splice(0);
+
+      const turn = value.service.requestAutonomousTurn("nearby_threat");
+      await value.untilCodexTurns(1);
+      const lease = value.budgetLeases[0];
+      if (!lease) throw new Error("expected autonomous turn lease");
+
+      value.service.applyProfile(restrictProfile(value.mode.getProfile()));
+
+      const staleWait = await value.executeRawTool("minecraft_wait", {
+        milliseconds: 10,
+        turnLease: lease,
+      });
+      expect(staleWait).toMatchObject({ isError: true });
+      expect(value.minecraft.calls).toEqual([]);
+      expect(value.taskController.current()).toBeNull();
+      expect(value.codex.interruptions).toEqual([{ threadId: "thread-1", turnId: "turn-1" }]);
+
+      value.codex.releaseTurnResult(0);
+      await turn;
+
+      expect(value.minecraft.chatLog).not.toContain("late profile reply");
+    },
+  );
 
   it("shutdown cancels a deferred autonomous turn with no late output and one budget pair", async () => {
     const value = await harness({
       deferredStarts: [0],
       deferredTurns: [0],
       codexResponses: [outcome({ reply: "late autonomous reply" })],
+      compatibilityVerified: true,
+      safetyPresetAllows: true,
     });
     await value.start();
     await emitCommand(value, "!mode autonomous");
@@ -1462,6 +3567,8 @@ describe("CompanionService output and commands", () => {
   it("gives each autonomous schema attempt a fresh non-overlapping shared budget", async () => {
     const value = await harness({
       codexResponses: ["invalid json", outcome()],
+      compatibilityVerified: true,
+      safetyPresetAllows: true,
     });
     await value.start();
     await emitCommand(value, "!mode autonomous");
@@ -1477,9 +3584,7 @@ describe("CompanionService output and commands", () => {
       expect(turn.text).toContain(sharedTaskLeaseId);
     }
     expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:completed"]);
-    expect(
-      value.minecraft.chatLog.filter((message) => message.startsWith("任务披露：")),
-    ).toHaveLength(1);
+    expect(value.minecraft.chatLog).toEqual(["已切换到自主模式。"]);
     expect(value.budget.snapshot().active).toBe(false);
     expect(value.autonomy.proactiveMarks).toBe(0);
   });
@@ -1513,12 +3618,12 @@ describe("CompanionService output and commands", () => {
     ["241 UTF-16 units plus emoji", `${"c".repeat(239)}😀`],
   ])("chunks %s exactly without splitting surrogate pairs", async (_label, reply) => {
     vi.useFakeTimers();
-    const value = await harness({ codexResponses: [outcome({ reply })] });
+    const value = await harness({ codexResponses: [taskExecutionOutcome(reply)] });
     await value.start();
     await startPlayerTurn(value, "chunk");
     await value.untilTurnSettled();
 
-    const replyChunks = withoutTaskDisclosures(value.minecraft.chatLog);
+    const replyChunks = value.minecraft.chatLog;
     expect(replyChunks.join("")).toBe(reply);
     expect(replyChunks.every((chunk) => chunk.length > 0 && chunk.length <= 240)).toBe(true);
     expect(
@@ -1581,7 +3686,7 @@ describe("CompanionService output and commands", () => {
   it("keeps the originating task alive while confirmation waits and closes it once after allow", async () => {
     const value = await harness({
       deferredTurns: [0],
-      codexResponses: [outcome({ reply: "ready" })],
+      codexResponses: [taskExecutionOutcome("ready")],
     });
     const { task, confirmationId } = await startPendingMoveConfirmation(value);
     expect(value.taskController.current()?.lease).toEqual(task.lease);
@@ -1678,7 +3783,7 @@ describe("CompanionService output and commands", () => {
   it("keeps the originating task alive while confirmation waits and closes it once after deny", async () => {
     const value = await harness({
       deferredTurns: [0],
-      codexResponses: [outcome({ reply: "ready" })],
+      codexResponses: [taskExecutionOutcome("ready")],
     });
     const { task, confirmationId } = await startPendingMoveConfirmation(value);
     expect(value.taskController.current()?.lease).toEqual(task.lease);
@@ -1738,15 +3843,16 @@ describe("CompanionService output and commands", () => {
     expect(dispatches).toBeGreaterThan(0);
     expect(value.mode.snapshot()).toEqual({
       mode: "friend",
-      paused: true,
+      paused: false,
       taskId: null,
     });
     expect(await value.state.load()).toMatchObject({
-      paused: true,
+      paused: false,
       unfinishedTaskSummary: null,
     });
     expect(value.autonomy.goalsCompleted).toBe(0);
     expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:failed"]);
+    expect(value.minecraft.chatLog.at(-1)).toBe(naturalTaskFailure);
 
     await value.stop();
     const restarted = await harness({ storageDirectory: value.directory });
@@ -1760,7 +3866,7 @@ describe("CompanionService output and commands", () => {
   it("re-snapshots confirmed movement and exhausts the task on only the extra travel", async () => {
     const value = await harness({
       deferredTurns: [0],
-      codexResponses: [outcome({ reply: "ready" })],
+      codexResponses: [taskExecutionOutcome("ready")],
       requestedTaskLimits: { maxHorizontalTravel: 350 },
     });
     const { confirmationId } = await startPendingMoveConfirmation(value);
@@ -1776,7 +3882,7 @@ describe("CompanionService output and commands", () => {
   it("keeps the task alive until its last game confirmation is resolved", async () => {
     const value = await harness({
       deferredTurns: [0],
-      codexResponses: [outcome({ reply: "ready" })],
+      codexResponses: [taskExecutionOutcome("ready")],
     });
     await value.start();
     await startPlayerTurn(value, "travel twice");
@@ -1831,8 +3937,7 @@ describe("CompanionService output and commands", () => {
     }
     value.codex.releaseTurnResult(0);
     await value.untilChat("ready");
-    const activeSummary =
-      '{"goal":"finish confirmed travel","success":"arrive safely","stop":"owner stops"}';
+    const activeSummary = '{"goal":"finish confirmed travel"}';
 
     await emitCommand(value, `!allow ${ids[0]}`);
 
@@ -1865,7 +3970,7 @@ describe("CompanionService output and commands", () => {
     expect(restarted.codex.turns).toEqual([]);
   });
 
-  it("remembers a confirmed-action failure until the final ticket settles", async () => {
+  it("persists a confirmed-action failure immediately even when another ticket remains", async () => {
     const value = await harness({
       deferredTurns: [0],
       codexResponses: [activeConfirmationOutcome()],
@@ -1892,27 +3997,18 @@ describe("CompanionService output and commands", () => {
 
     await emitCommand(value, `!allow ${ids[0]}`);
 
-    expect(value.taskController.current()).not.toBeNull();
-    expect(value.taskAuditEvents).toEqual(["task_started"]);
+    expect(dispatches).toBeGreaterThan(0);
+    expect(value.taskController.current()).toBeNull();
+    expect(value.confirmations.get(ids[0]!)).toBeUndefined();
+    expect(value.confirmations.get(ids[1]!)).toBeUndefined();
+    expect(value.mode.snapshot()).toEqual({ mode: "friend", paused: false, taskId: null });
     expect(await value.state.load()).toMatchObject({
       paused: false,
-      unfinishedTaskSummary:
-        '{"goal":"finish confirmed travel","success":"arrive safely","stop":"owner stops"}',
-    });
-    value.minecraft.moveTo = async () => {
-      dispatches += 1;
-    };
-
-    await emitCommand(value, `!allow ${ids[1]}`);
-
-    expect(dispatches).toBeGreaterThan(1);
-    expect(value.mode.snapshot()).toEqual({ mode: "friend", paused: true, taskId: null });
-    expect(await value.state.load()).toMatchObject({
-      paused: true,
       unfinishedTaskSummary: null,
     });
     expect(value.autonomy.goalsCompleted).toBe(0);
     expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:failed"]);
+    expect(value.minecraft.chatLog.at(-1)).toBe(naturalTaskFailure);
 
     await value.stop();
     const restarted = await harness({ storageDirectory: value.directory });
@@ -1961,7 +4057,7 @@ describe("CompanionService output and commands", () => {
   it("serializes back-to-back allows so every consumed ticket executes before task closure", async () => {
     const value = await harness({
       deferredTurns: [0],
-      codexResponses: [outcome({ reply: "ready" })],
+      codexResponses: [taskExecutionOutcome("ready")],
     });
     await value.start();
     await startPlayerTurn(value, "travel twice");
@@ -2006,7 +4102,7 @@ describe("CompanionService output and commands", () => {
     vi.setSystemTime(startedAt);
     const value = await harness({
       deferredTurns: [0],
-      codexResponses: [outcome({ reply: "ready" })],
+      codexResponses: [taskExecutionOutcome("ready")],
     });
     const { confirmationId } = await startPendingMoveConfirmation(value);
     vi.setSystemTime(new Date(startedAt.getTime() + 120_000));
@@ -2142,8 +4238,7 @@ describe("CompanionService output and commands", () => {
     expect(value.taskController.current()).not.toBeNull();
     expect(await value.state.load()).toMatchObject({
       paused: false,
-      unfinishedTaskSummary:
-        '{"goal":"finish confirmed travel","success":"arrive safely","stop":"owner stops"}',
+      unfinishedTaskSummary: '{"goal":"finish confirmed travel"}',
     });
     expect(value.taskAuditEvents).toEqual(["task_started"]);
 
@@ -2321,7 +4416,7 @@ describe("CompanionService output and commands", () => {
   it("does not stop in-flight task work for an unrelated missing confirmation id", async () => {
     const value = await harness({
       deferredTurns: [0],
-      codexResponses: [outcome({ reply: "ready" })],
+      codexResponses: [taskExecutionOutcome("ready")],
     });
     await value.start();
     await startPlayerTurn(value, "continue working");
@@ -2341,7 +4436,7 @@ describe("CompanionService output and commands", () => {
   it("treats a new owner request as replacing a task that is waiting for confirmation", async () => {
     const value = await harness({
       deferredTurns: [0],
-      codexResponses: [outcome({ reply: "ready" }), outcome({ reply: "new work ready" })],
+      codexResponses: [taskExecutionOutcome("ready"), taskExecutionOutcome("new work ready")],
     });
     const { confirmationId } = await startPendingMoveConfirmation(value);
 
@@ -2369,7 +4464,9 @@ describe("CompanionService output and commands", () => {
     async (mode) => {
       const value = await harness({
         deferredTurns: [0],
-        codexResponses: [outcome({ reply: "ready" })],
+        codexResponses: [taskExecutionOutcome("ready")],
+        compatibilityVerified: true,
+        safetyPresetAllows: true,
       });
       const { task, confirmationId } = await startPendingMoveConfirmation(value);
       value.mode.setMode(mode);
@@ -2401,7 +4498,7 @@ describe("CompanionService output and commands", () => {
     async (reason) => {
       const value = await harness({
         deferredTurns: [0],
-        codexResponses: [outcome({ reply: "ready" })],
+        codexResponses: [taskExecutionOutcome("ready")],
       });
       const { confirmationId } = await startPendingMoveConfirmation(value);
 
@@ -2416,24 +4513,22 @@ describe("CompanionService output and commands", () => {
 
   it("rejects an entire model memory candidate set containing a real-world address", async () => {
     vi.useFakeTimers();
-    const invalid = outcome({
-      reply: "must fail",
-      memoryCandidates: [
-        { category: "project", summary: "safe project summary", importance: 4 },
-        {
-          category: "place",
-          summary: "上海市浦东新区世纪大道100号",
-          importance: 4,
-        },
-      ],
-    });
+    const invalid = taskExecutionOutcome("must fail", "completed", [
+      { category: "project", summary: "safe project summary", importance: 4 },
+      {
+        category: "place",
+        summary: "上海市浦东新区世纪大道100号",
+        importance: 4,
+      },
+    ]);
     const value = await harness({ codexResponses: [invalid, invalid] });
     await value.start();
     await startPlayerTurn(value, "remember these");
-    await value.untilChat(unavailable);
+    await value.untilChat(naturalTaskFailure);
 
     await expect(value.memories.list()).resolves.toEqual([]);
-    expect(withoutTaskDisclosures(value.minecraft.chatLog)).toEqual([unavailable]);
+    expect(value.minecraft.chatLog).toEqual([naturalTaskFailure]);
+    expect(value.mode.snapshot().paused).toBe(false);
   });
 
   it("repairs an unlabeled verbatim owner-memory proposal before any persistence", async () => {
@@ -2441,16 +4536,12 @@ describe("CompanionService output and commands", () => {
     const ownerText = "今晚请陪我去西边森林寻找那棵最高的橡树";
     const value = await harness({
       codexResponses: [
-        outcome({
-          reply: "first output must not be used",
-          memoryCandidates: [{ category: "experience", summary: ownerText, importance: 4 }],
-        }),
-        outcome({
-          reply: "已整理成简短摘要。",
-          memoryCandidates: [
-            { category: "preference", summary: "玩家偏好寻找独特高大橡树", importance: 4 },
-          ],
-        }),
+        taskExecutionOutcome("first output must not be used", "completed", [
+          { category: "experience", summary: ownerText, importance: 4 },
+        ]),
+        taskExecutionOutcome("已整理成简短摘要。", "completed", [
+          { category: "preference", summary: "玩家偏好寻找独特高大橡树", importance: 4 },
+        ]),
       ],
     });
     await value.start();
@@ -2473,18 +4564,14 @@ describe("CompanionService task state", () => {
   it("persists a compact active task summary and valid mode task id", async () => {
     vi.useFakeTimers();
     const value = await harness({
-      codexResponses: [
-        outcome({
-          task: {
-            goal: "collect oak",
-            allowedActions: ["move_to", "dig_block"],
-            actionBudget: 4,
-            successCondition: "four logs",
-            stopCondition: "owner stops",
-            status: "active",
-          },
+      intentResponses: [
+        taskDecision({
+          naturalReply: null,
+          goal: "collect oak",
+          allowedActions: ["move_to", "dig_block"],
         }),
       ],
+      codexResponses: [taskExecutionOutcome("", "active")],
     });
     await value.start();
     await startPlayerTurn(value, "collect");
@@ -2494,8 +4581,6 @@ describe("CompanionService task state", () => {
         state.unfinishedTaskSummary ===
           JSON.stringify({
             goal: "collect oak",
-            success: "four logs",
-            stop: "owner stops",
           }),
     );
 
@@ -2504,28 +4589,15 @@ describe("CompanionService task state", () => {
       paused: false,
       unfinishedTaskSummary: JSON.stringify({
         goal: "collect oak",
-        success: "four logs",
-        stop: "owner stops",
       }),
     });
   });
 
-  it.each(["completed", "stopped", null] as const)(
+  it.each(["completed", "stopped"] as const)(
     "%s task outcome clears task and compact summary without pausing",
     async (status) => {
       vi.useFakeTimers();
-      const task =
-        status === null
-          ? null
-          : {
-              goal: "done",
-              allowedActions: ["wait"],
-              actionBudget: 1,
-              successCondition: "done",
-              stopCondition: "stop",
-              status,
-            };
-      const value = await harness({ codexResponses: [outcome({ task })] });
+      const value = await harness({ codexResponses: [taskExecutionOutcome("", status)] });
       await value.start();
       value.mode.startTask("old task");
       await startPlayerTurn(value, "update");
@@ -2540,17 +4612,735 @@ describe("CompanionService task state", () => {
   );
 });
 
+describe("CompanionService zero disclosure privacy regressions", () => {
+  it("replaces a model reply containing internal task vocabulary before Minecraft chat", async () => {
+    const rawModelOutput = JSON.stringify({
+      kind: "chat",
+      reply: leakingInternalModelReply,
+      memoryCandidates: [],
+    });
+    const value = await harness({ intentResponses: [rawModelOutput] });
+    await value.start();
+
+    await value.emitOwnerText("你好呀");
+    await value.untilIntentSettled();
+
+    expect(value.minecraft.chatLog).toEqual([naturalFilteredReply]);
+    expect(value.minecraft.chatLog.join("\n")).not.toMatch(internalDisclosurePattern);
+    expect(value.minecraft.chatLog.join("\n")).not.toContain(rawModelOutput);
+  });
+
+  it.each(uncommonBareToolNames)(
+    "replaces the uncommon bare tool name %s before Minecraft chat",
+    async (toolName) => {
+      const value = await harness({
+        intentResponses: [
+          JSON.stringify({
+            kind: "chat",
+            reply: `准备调用 ${toolName}`,
+            memoryCandidates: [],
+          }),
+        ],
+      });
+      await value.start();
+
+      await value.emitOwnerText("继续");
+      await value.untilIntentSettled();
+
+      expect(value.minecraft.chatLog).toEqual([naturalFilteredReply]);
+    },
+  );
+
+  it.each(["say", "jump", "wait"] as const)(
+    "replaces the ambiguous tool name %s in an explicit invocation context",
+    async (toolName) => {
+      const value = await harness({
+        intentResponses: [
+          JSON.stringify({
+            kind: "chat",
+            reply: `准备调用 \`${toolName}\``,
+            memoryCandidates: [],
+          }),
+        ],
+      });
+      await value.start();
+
+      await value.emitOwnerText("继续");
+      await value.untilIntentSettled();
+
+      expect(value.minecraft.chatLog).toEqual([naturalFilteredReply]);
+    },
+  );
+
+  it.each([
+    "I just wanted to say hello.",
+    "Rabbits jump when startled.",
+    "Please wait a moment while I think.",
+    "I use words to say hello.",
+    "Rabbits use their legs to jump.",
+    "She said 'wait' and smiled.",
+  ])("preserves natural English containing an ambiguous word: %s", async (reply) => {
+    const value = await harness({
+      intentResponses: [
+        JSON.stringify({
+          kind: "chat",
+          reply,
+          memoryCandidates: [],
+        }),
+      ],
+    });
+    await value.start();
+
+    await value.emitOwnerText("chat naturally");
+    await value.untilChat(reply);
+
+    expect(value.minecraft.chatLog).toEqual([reply]);
+  });
+
+  it("replaces an internal clarify question with a natural nontechnical response", async () => {
+    const value = await harness({
+      intentResponses: [
+        JSON.stringify({
+          kind: "clarify",
+          question: leakingInternalModelReply,
+        }),
+      ],
+    });
+    await value.start();
+
+    await value.emitOwnerText("你想怎么做");
+    await value.untilIntentSettled();
+
+    expect(value.minecraft.chatLog).toEqual([naturalFilteredReply]);
+    expectZeroInternalDisclosure(value);
+  });
+
+  it.each([
+    {
+      label: "natural task acknowledgement",
+      naturalReply: leakingInternalModelReply,
+      executionReply: "任务完成了。",
+      expectedChat: [naturalFilteredReply, "任务完成了。"],
+    },
+    {
+      label: "task execution result",
+      naturalReply: null,
+      executionReply: leakingInternalModelReply,
+      expectedChat: [naturalFilteredReply],
+    },
+  ])("replaces an internal $label before Minecraft chat", async (testCase) => {
+    const value = await harness({
+      deferredTurns: [0],
+      intentResponses: [
+        taskDecision({
+          naturalReply: testCase.naturalReply,
+          goal: "安全测试任务",
+          allowedActions: ["get_state"],
+        }),
+      ],
+      executionResponses: [taskExecutionOutcome(testCase.executionReply)],
+    });
+    await value.start();
+
+    await value.emitOwnerText("执行测试任务");
+    await vi.waitFor(() => expect(value.codex.turnsFor("execution")).toHaveLength(1));
+    value.codex.releaseTurnResultFor("execution", 0);
+    await value.untilTurnSettled();
+
+    expect(value.minecraft.chatLog).toEqual(testCase.expectedChat);
+    expectZeroInternalDisclosure(value);
+  });
+
+  it("keeps ordinary chat audit-free and excludes private router material from diagnostics", async () => {
+    const ownerMessage = "你好呀";
+    const rawModelOutput = JSON.stringify({
+      kind: "chat",
+      reply: "你好呀，很高兴见到你。",
+      memoryCandidates: [],
+    });
+    const diagnostics: Array<{ event: string; fields: Record<string, unknown> }> = [];
+    const value = await harness({ intentResponses: [rawModelOutput] });
+    const internal = value.service as unknown as {
+      logger: {
+        error(event: string, fields: Record<string, unknown>): Promise<void>;
+      };
+    };
+    internal.logger.error = async (event, fields) => {
+      diagnostics.push({ event, fields });
+    };
+    await value.start();
+
+    await value.emitOwnerText(ownerMessage);
+    await value.untilChat("你好呀，很高兴见到你。");
+
+    const intentPrompt = value.codex.turnsFor("intent")[0]?.text ?? "";
+    expect(value.taskAuditEvents).toEqual([]);
+    expect(value.budgetEvents).toEqual([]);
+    expect(value.codex.turnsFor("execution")).toEqual([]);
+    expect(value.minecraft.calls).toEqual([]);
+    expectZeroInternalDisclosure(value, diagnostics, [ownerMessage, intentPrompt, rawModelOutput]);
+  });
+
+  it("keeps safe task replacement auditable without exposing its authority in game chat", async () => {
+    const firstOwnerMessage = "OWNER_PRIVATE_START_MESSAGE";
+    const replacementOwnerMessage = "OWNER_PRIVATE_REPLACEMENT_MESSAGE";
+    const firstIntentOutput = taskDecision({
+      naturalReply: "我正在过来。",
+      goal: "走到主人身边",
+      allowedActions: ["get_state", "move_to"],
+    });
+    const replacementIntentOutput = taskDecision({
+      kind: "replace_task",
+      naturalReply: "我改去那棵树下面。",
+      goal: "走到那棵树下面",
+      allowedActions: ["get_state", "move_to"],
+    });
+    const value = await harness({
+      deferredTurns: [0, 1],
+      intentResponses: [firstIntentOutput, replacementIntentOutput],
+      executionResponses: [
+        taskExecutionOutcome("第一项任务进行中。", "active"),
+        taskExecutionOutcome("替换任务进行中。", "active"),
+      ],
+    });
+    await value.start();
+
+    await value.emitOwnerText(firstOwnerMessage);
+    await vi.waitFor(() => expect(value.codex.turnsFor("execution")).toHaveLength(1));
+    const safeState = await value.executeRawTool("minecraft_get_state", {
+      turnLease: value.budgetLeases[0],
+    });
+    expect(safeState.isError).not.toBe(true);
+    await value.untilChat("我正在过来。");
+
+    await value.emitOwnerText(replacementOwnerMessage);
+    await vi.waitFor(() => expect(value.codex.turnsFor("execution")).toHaveLength(2));
+    await value.untilChat("我改去那棵树下面。");
+    await emitCommand(value, "!stop");
+
+    expect(value.taskAuditEvents).toEqual([
+      "task_started",
+      "task_stopped:owner_stop",
+      "task_started",
+      "task_stopped:owner_stop",
+    ]);
+    expectZeroInternalDisclosure(value);
+    expectAuditAndPersistencePrivacy(value, [
+      firstOwnerMessage,
+      replacementOwnerMessage,
+      value.codex.turnsFor("intent")[0]?.text ?? "",
+      value.codex.turnsFor("intent")[1]?.text ?? "",
+      firstIntentOutput,
+      replacementIntentOutput,
+    ]);
+  });
+
+  it("keeps dangerous confirmation details out of chat and does not execute before approval", async () => {
+    const value = await harness({
+      deferredTurns: [0],
+      intentResponses: [
+        taskDecision({
+          naturalReply: "我会先确认安全边界。",
+          goal: "移动到远处",
+          allowedActions: ["move_to"],
+          requestedLimits: { maxHorizontalTravel: 1_024, maxDangerousOperations: 2 },
+        }),
+      ],
+      executionResponses: [taskExecutionOutcome("这一步需要你确认后我才能继续。", "active")],
+    });
+    await value.start();
+
+    await value.emitOwnerText("走到远处看看");
+    await vi.waitFor(() => expect(value.codex.turnsFor("execution")).toHaveLength(1));
+    const result = await value.executeRawTool("minecraft_move_to", {
+      x: 300,
+      y: 64,
+      z: 0,
+      turnLease: value.budgetLeases[0],
+    });
+    expect(JSON.parse(result.text)).toMatchObject({
+      status: "confirmation_required",
+      confirmationId: expect.any(Number),
+    });
+    expect(value.minecraft.calls.filter((call) => call.method === "moveTo")).toEqual([]);
+    value.codex.releaseTurnResultFor("execution", 0);
+    await value.untilChat("这一步需要你确认后我才能继续。");
+    await vi.waitFor(() => expect(value.budget.snapshot().active).toBe(false));
+
+    expect(value.taskController.current()).not.toBeNull();
+    expect(value.minecraft.chatLog).toEqual([
+      "我会先确认安全边界。",
+      "这一步需要你确认后我才能继续。",
+    ]);
+    expectZeroInternalDisclosure(value);
+
+    await emitCommand(value, "!stop");
+
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:owner_stop"]);
+  });
+
+  it("keeps an autonomous microtask and its private execution material out of disclosure sinks", async () => {
+    const rawModelOutput = outcome({ reply: "附近有点动静。", proactiveKind: "chat" });
+    const diagnostics: Array<{ event: string; fields: Record<string, unknown> }> = [];
+    const value = await harness({
+      deferredTurns: [0],
+      executionResponses: [rawModelOutput],
+      compatibilityVerified: true,
+      safetyPresetAllows: true,
+    });
+    const internal = value.service as unknown as {
+      logger: {
+        error(event: string, fields: Record<string, unknown>): Promise<void>;
+      };
+    };
+    internal.logger.error = async (event, fields) => {
+      diagnostics.push({ event, fields });
+    };
+    await value.start();
+    await emitCommand(value, "!mode autonomous");
+    value.minecraft.chatLog.splice(0);
+
+    const turn = value.service.requestAutonomousTurn("nearby_threat");
+    await value.untilCodexTurns(1);
+    const executionPrompt = value.codex.turnsFor("execution")[0]?.text ?? "";
+    value.codex.releaseTurnResultFor("execution", 0);
+    await turn;
+
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:completed"]);
+    expectZeroInternalDisclosure(value, diagnostics, [executionPrompt, rawModelOutput]);
+  });
+
+  it("contains task failure without exposing raw model output or task internals", async () => {
+    const ownerMessage = "OWNER_PRIVATE_FAILURE_MESSAGE";
+    const firstRawModelOutput = "MODEL_PRIVATE_INVALID_EXECUTION_ONE";
+    const secondRawModelOutput = "MODEL_PRIVATE_INVALID_EXECUTION_TWO";
+    const diagnostics: Array<{ event: string; fields: Record<string, unknown> }> = [];
+    const value = await harness({
+      intentResponses: [
+        taskDecision({
+          naturalReply: null,
+          goal: "失败隔离测试",
+          allowedActions: ["get_state"],
+        }),
+      ],
+      executionResponses: [firstRawModelOutput, secondRawModelOutput],
+    });
+    const internal = value.service as unknown as {
+      logger: {
+        error(event: string, fields: Record<string, unknown>): Promise<void>;
+      };
+    };
+    internal.logger.error = async (event, fields) => {
+      diagnostics.push({ event, fields });
+    };
+    await value.start();
+
+    await value.emitOwnerText(ownerMessage);
+    await value.untilChat(naturalTaskFailure);
+
+    const intentPrompt = value.codex.turnsFor("intent")[0]?.text ?? "";
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:failed"]);
+    expect(value.mode.snapshot().paused).toBe(false);
+    expectZeroInternalDisclosure(value, diagnostics, [
+      intentPrompt,
+      firstRawModelOutput,
+      secondRawModelOutput,
+    ]);
+    expectAuditAndPersistencePrivacy(value, [
+      ownerMessage,
+      intentPrompt,
+      firstRawModelOutput,
+      secondRawModelOutput,
+    ]);
+  });
+});
+
+describe("CompanionService memory scope", () => {
+  it("invalidates an active turn when memory scope changes without disconnecting Minecraft", async () => {
+    const value = await harness({ deferredTurns: [0] });
+    await value.start();
+    await startPlayerTurn(value, "remember this");
+
+    value.service.setMemoryScope({ mode: "layered", worldId: "world-a" });
+    await Promise.resolve();
+
+    expect(value.codex.interruptions).toEqual([{ threadId: "thread-1", turnId: "turn-1" }]);
+    expect(value.minecraft.calls.filter((call) => call.method === "disconnect")).toEqual([]);
+  });
+});
+
+describe("CompanionService task failure containment", () => {
+  it("keeps two invalid execution JSON results inside the current task failure", async () => {
+    const value = await harness({
+      activeMinecraftWait: true,
+      deferredTurns: [0, 1],
+      intentResponses: [
+        taskDecision({
+          naturalReply: null,
+          goal: "local invalid JSON task",
+          allowedActions: ["wait", "jump"],
+        }),
+        JSON.stringify({
+          kind: "chat",
+          reply: "你好呀，今天也很高兴见到你。",
+          memoryCandidates: [],
+        }),
+      ],
+    });
+    await value.start();
+    await value.emitOwnerText("start local invalid JSON task");
+    await value.untilCodexTurns(1);
+    const taskLease = value.taskController.current()?.lease;
+    if (!taskLease) throw new Error("expected an active task lease");
+    const active = value.executor.execute(
+      { kind: "wait", milliseconds: 5_000 },
+      { spawn: { x: 0, y: 64, z: 0 }, owner: { x: 0, y: 64, z: 0 } },
+    );
+    const queued = value.executor.execute(
+      { kind: "jump" },
+      { spawn: { x: 0, y: 64, z: 0 }, owner: { x: 0, y: 64, z: 0 } },
+    );
+    const pending = value.confirmations.createGameAction(
+      "pending local failure action",
+      { kind: "say", message: "must not run" },
+      taskLease,
+    );
+    await value.untilActiveWaitStarted();
+
+    value.codex.releaseTurnResultFor("execution", 0, "invalid execution JSON one");
+    await value.untilCodexTurns(2);
+    const turnLease = value.budgetLeases.at(-1);
+    value.codex.releaseTurnResultFor("execution", 1, "invalid execution JSON two");
+    await value.untilTurnSettled();
+    await expect(active).resolves.toEqual({ status: "cancelled" });
+    await expect(queued).resolves.toEqual({ status: "cancelled" });
+
+    expect(value.taskController.isLeaseLive(taskLease)).toBe(false);
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:failed"]);
+    expect(value.taskTerminalReasons).toEqual(["failed"]);
+    expect(value.confirmations.get(pending.id)).toBeUndefined();
+    expect(value.executor.pendingCount()).toBe(0);
+    expect(value.budget.snapshot().active).toBe(false);
+    expect(
+      await value.executeRawTool("minecraft_jump", {
+        turnLease,
+      }),
+    ).toMatchObject({ isError: true });
+    expect(value.mode.snapshot().paused).toBe(false);
+    expect(value.minecraft.chatLog).toEqual([naturalTaskFailure]);
+    expect((value.service as unknown as { codexHealthy: boolean }).codexHealthy).toBe(true);
+
+    await value.emitOwnerText("你好呀");
+    await value.untilChat("你好呀，今天也很高兴见到你。");
+    expect(value.minecraft.chatLog).toEqual([naturalTaskFailure, "你好呀，今天也很高兴见到你。"]);
+    expect(value.codex.turnsFor("execution")).toHaveLength(2);
+  });
+
+  it("keeps a rejected execution turn inside the current task failure", async () => {
+    const value = await harness({
+      activeMinecraftWait: true,
+      deferredTurns: [0],
+      intentResponses: [
+        taskDecision({
+          naturalReply: null,
+          goal: "local rejected turn task",
+          allowedActions: ["wait", "jump"],
+        }),
+        JSON.stringify({ kind: "chat", reply: "普通聊天仍然可用。", memoryCandidates: [] }),
+      ],
+    });
+    await value.start();
+    await value.emitOwnerText("start rejected turn task");
+    await value.untilCodexTurns(1);
+    const taskLease = value.taskController.current()?.lease;
+    if (!taskLease) throw new Error("expected an active task lease");
+    const active = value.executor.execute(
+      { kind: "wait", milliseconds: 5_000 },
+      { spawn: { x: 0, y: 64, z: 0 }, owner: { x: 0, y: 64, z: 0 } },
+    );
+    const queued = value.executor.execute(
+      { kind: "jump" },
+      { spawn: { x: 0, y: 64, z: 0 }, owner: { x: 0, y: 64, z: 0 } },
+    );
+    const pending = value.confirmations.createGameAction(
+      "pending rejected-turn action",
+      { kind: "say", message: "must not run" },
+      taskLease,
+    );
+    await value.untilActiveWaitStarted();
+    const turnLease = value.budgetLeases.at(-1);
+
+    value.codex.releaseTurnResultFor("execution", 0, new Error("turn rejected"));
+    await value.untilTurnSettled();
+    await expect(active).resolves.toEqual({ status: "cancelled" });
+    await expect(queued).resolves.toEqual({ status: "cancelled" });
+
+    expect(value.taskController.isLeaseLive(taskLease)).toBe(false);
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:failed"]);
+    expect(value.taskTerminalReasons).toEqual(["failed"]);
+    expect(value.confirmations.get(pending.id)).toBeUndefined();
+    expect(value.executor.pendingCount()).toBe(0);
+    expect(value.budget.snapshot().active).toBe(false);
+    expect(
+      await value.executeRawTool("minecraft_jump", {
+        turnLease,
+      }),
+    ).toMatchObject({ isError: true });
+    expect(value.mode.snapshot().paused).toBe(false);
+    expect(value.minecraft.chatLog).toEqual([naturalTaskFailure]);
+    expect((value.service as unknown as { codexHealthy: boolean }).codexHealthy).toBe(true);
+
+    await value.emitOwnerText("你好呀");
+    await value.untilChat("普通聊天仍然可用。");
+    expect(value.minecraft.chatLog).toEqual([naturalTaskFailure, "普通聊天仍然可用。"]);
+  });
+
+  it("keeps one Minecraft tool failure inside the current task failure", async () => {
+    const toolEntered = deferredValue<void>();
+    const releaseToolFailure = deferredValue<void>();
+    const value = await harness({
+      deferredTurns: [0],
+      intentResponses: [
+        taskDecision({
+          naturalReply: null,
+          goal: "local tool failure task",
+          allowedActions: ["jump", "wait"],
+        }),
+        JSON.stringify({ kind: "chat", reply: "工具失败后也能继续聊天。", memoryCandidates: [] }),
+      ],
+    });
+    value.minecraft.jump = async () => {
+      toolEntered.resolve();
+      await releaseToolFailure.promise;
+      throw new Error("PRIVATE_MINECRAFT_TOOL_FAILURE");
+    };
+    await value.start();
+    await value.emitOwnerText("start tool failure task");
+    await value.untilCodexTurns(1);
+    const taskLease = value.taskController.current()?.lease;
+    if (!taskLease) throw new Error("expected an active task lease");
+    const turnLease = value.budgetLeases.at(-1);
+    const pending = value.confirmations.createGameAction(
+      "pending tool-failure action",
+      { kind: "say", message: "must not run" },
+      taskLease,
+    );
+
+    const failingTool = value.executeRawTool("minecraft_jump", { turnLease });
+    await toolEntered.promise;
+    const queued = value.executor.execute(
+      { kind: "wait", milliseconds: 10 },
+      { spawn: { x: 0, y: 64, z: 0 }, owner: { x: 0, y: 64, z: 0 } },
+    );
+    releaseToolFailure.resolve();
+    await expect(failingTool).resolves.toMatchObject({ isError: true });
+    await value.untilChat(naturalTaskFailure);
+    await expect(queued).resolves.toEqual({ status: "cancelled" });
+
+    expect(value.taskController.isLeaseLive(taskLease)).toBe(false);
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:failed"]);
+    expect(value.taskTerminalReasons).toEqual(["failed"]);
+    expect(value.confirmations.get(pending.id)).toBeUndefined();
+    expect(value.executor.pendingCount()).toBe(0);
+    expect(value.budget.snapshot().active).toBe(false);
+    expect(
+      await value.executeRawTool("minecraft_jump", {
+        turnLease,
+      }),
+    ).toMatchObject({ isError: true });
+    expect(value.mode.snapshot().paused).toBe(false);
+    expect(value.minecraft.chatLog).toEqual([naturalTaskFailure]);
+    expect(value.minecraft.chatLog.join("\n")).not.toContain("PRIVATE_MINECRAFT_TOOL_FAILURE");
+    expect((value.service as unknown as { codexHealthy: boolean }).codexHealthy).toBe(true);
+
+    await value.emitOwnerText("你好呀");
+    await value.untilChat("工具失败后也能继续聊天。");
+    expect(value.minecraft.chatLog).toEqual([naturalTaskFailure, "工具失败后也能继续聊天。"]);
+  });
+
+  it("contains one failed confirmed action immediately despite multiple confirmation tickets", async () => {
+    const value = await harness({
+      deferredTurns: [0],
+      intentResponses: [
+        taskDecision({
+          naturalReply: null,
+          goal: "confirmed multi-ticket failure",
+          allowedActions: ["move_to"],
+        }),
+        JSON.stringify({ kind: "chat", reply: "确认失败后仍能聊天。", memoryCandidates: [] }),
+      ],
+      executionResponses: [activeConfirmationOutcome()],
+    });
+    await value.start();
+    await startPlayerTurn(value, "travel to two distant places");
+    const taskLease = value.taskController.current()?.lease;
+    if (!taskLease) throw new Error("expected an active task lease");
+    const confirmationIds: number[] = [];
+    for (const x of [300, 310]) {
+      const confirmation = await value.executeRawTool("minecraft_move_to", {
+        x,
+        y: 64,
+        z: 0,
+        turnLease: value.budgetLeases[0],
+      });
+      confirmationIds.push(
+        (JSON.parse(confirmation.text) as { confirmationId: number }).confirmationId,
+      );
+    }
+    value.codex.releaseTurnResultFor("execution", 0);
+    await value.untilChat("ready");
+    value.minecraft.chatLog.splice(0);
+    value.minecraft.moveTo = async () => {
+      throw new Error("PRIVATE_CONFIRMED_ACTION_FAILURE");
+    };
+
+    await emitCommand(value, `!allow ${confirmationIds[0]}`);
+
+    expect(value.taskController.isLeaseLive(taskLease)).toBe(false);
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:failed"]);
+    expect(value.taskTerminalReasons).toEqual(["failed"]);
+    expect(value.confirmations.get(confirmationIds[0]!)).toBeUndefined();
+    expect(value.confirmations.get(confirmationIds[1]!)).toBeUndefined();
+    expect(value.executor.pendingCount()).toBe(0);
+    expect(value.budget.snapshot().active).toBe(false);
+    expect(value.mode.snapshot().paused).toBe(false);
+    expect(value.minecraft.chatLog).toEqual([naturalTaskFailure]);
+    expect(value.minecraft.chatLog.join("\n")).not.toContain("PRIVATE_CONFIRMED_ACTION_FAILURE");
+
+    await value.emitOwnerText("你好呀");
+    await value.untilChat("确认失败后仍能聊天。");
+    expect(value.minecraft.chatLog).toEqual([naturalTaskFailure, "确认失败后仍能聊天。"]);
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:failed"]);
+  });
+
+  it("contains an earlier ordinary action failure while a confirmed action is awaiting execution", async () => {
+    const ordinaryActionEntered = deferredValue<void>();
+    const releaseOrdinaryAction = deferredValue<void>();
+    const value = await harness({
+      deferredTurns: [0],
+      intentResponses: [
+        taskDecision({
+          naturalReply: null,
+          goal: "ordinary failure ahead of confirmation",
+          allowedActions: ["move_to", "jump"],
+        }),
+        JSON.stringify({ kind: "chat", reply: "排队失败后仍能聊天。", memoryCandidates: [] }),
+      ],
+      executionResponses: [activeConfirmationOutcome()],
+    });
+    await value.start();
+    await startPlayerTurn(value, "travel after jumping");
+    const taskLease = value.taskController.current()?.lease;
+    if (!taskLease) throw new Error("expected an active task lease");
+    const confirmation = await value.executeRawTool("minecraft_move_to", {
+      x: 300,
+      y: 64,
+      z: 0,
+      turnLease: value.budgetLeases[0],
+    });
+    const confirmationId = (JSON.parse(confirmation.text) as { confirmationId: number })
+      .confirmationId;
+    value.codex.releaseTurnResultFor("execution", 0);
+    await value.untilChat("ready");
+    value.minecraft.chatLog.splice(0);
+    value.minecraft.jump = async () => {
+      ordinaryActionEntered.resolve();
+      await releaseOrdinaryAction.promise;
+      throw new Error("PRIVATE_QUEUED_ORDINARY_FAILURE");
+    };
+    const ordinaryAction = value.executor.execute(
+      { kind: "jump" },
+      { spawn: { x: 0, y: 64, z: 0 }, owner: { x: 0, y: 64, z: 0 } },
+    );
+    await ordinaryActionEntered.promise;
+
+    const allowing = emitCommand(value, `!allow ${confirmationId}`);
+    await vi.waitFor(() => expect(value.executor.pendingCount()).toBe(2));
+    releaseOrdinaryAction.resolve();
+    await expect(ordinaryAction).resolves.toMatchObject({ status: "failed" });
+    await allowing;
+
+    expect(value.taskController.isLeaseLive(taskLease)).toBe(false);
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:failed"]);
+    expect(value.taskTerminalReasons).toEqual(["failed"]);
+    expect(value.confirmations.get(confirmationId)).toBeUndefined();
+    expect(value.executor.pendingCount()).toBe(0);
+    expect(value.budget.snapshot().active).toBe(false);
+    expect(value.mode.snapshot().paused).toBe(false);
+    expect(value.minecraft.calls.filter((call) => call.method === "moveTo")).toEqual([]);
+    expect(value.minecraft.chatLog).toEqual([naturalTaskFailure]);
+    expect(value.minecraft.chatLog.join("\n")).not.toContain("PRIVATE_QUEUED_ORDINARY_FAILURE");
+
+    await value.emitOwnerText("你好呀");
+    await value.untilChat("排队失败后仍能聊天。");
+    expect(value.minecraft.chatLog).toEqual([naturalTaskFailure, "排队失败后仍能聊天。"]);
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:failed"]);
+  });
+});
+
+describe("CompanionService scoped Codex fails closed and recovery", () => {
+  it("fails closed immediately for explicit authentication loss and recovers normally", async () => {
+    const value = await harness({
+      intentResponses: [new Error("ChatGPT authentication is required")],
+      executionResponses: [outcome()],
+    });
+    await value.start();
+
+    await value.emitOwnerText("trigger authentication loss");
+    await value.untilChat(unavailable);
+
+    expect(value.mode.snapshot().paused).toBe(true);
+    expect(value.minecraft.chatLog).toEqual([unavailable]);
+    expect((value.service as unknown as { codexHealthy: boolean }).codexHealthy).toBe(false);
+
+    await emitCommand(value, "!resume");
+    expect(value.mode.snapshot().paused).toBe(false);
+    expect((value.service as unknown as { codexHealthy: boolean }).codexHealthy).toBe(true);
+  });
+
+  it("fails closed only at the bounded consecutive Codex transport threshold and recovers", async () => {
+    const transportFailures = Array.from({ length: 3 }, (_, index) => {
+      const error = new Error(`transport attempt ${index + 1}`);
+      error.name = "CodexTransportError";
+      return error;
+    });
+    const value = await harness({
+      intentResponses: transportFailures,
+      executionResponses: [outcome()],
+    });
+    await value.start();
+
+    await value.emitOwnerText("transport failure one");
+    await value.untilChat(naturalTaskFailure);
+    await value.emitOwnerText("transport failure two");
+    await vi.waitFor(() => expect(value.minecraft.chatLog).toHaveLength(2));
+    expect(value.mode.snapshot().paused).toBe(false);
+    expect(value.minecraft.chatLog).toEqual([naturalTaskFailure, naturalTaskFailure]);
+
+    await value.emitOwnerText("transport failure three");
+    await value.untilChat(unavailable);
+    expect(value.mode.snapshot().paused).toBe(true);
+    expect(value.minecraft.chatLog).toEqual([naturalTaskFailure, naturalTaskFailure, unavailable]);
+    expect((value.service as unknown as { codexHealthy: boolean }).codexHealthy).toBe(false);
+
+    await emitCommand(value, "!resume");
+    expect(value.mode.snapshot().paused).toBe(false);
+    expect((value.service as unknown as { codexHealthy: boolean }).codexHealthy).toBe(true);
+  });
+});
+
 describe("CompanionService failures", () => {
-  it("two invalid JSON outputs fail closed once with a fresh budget for each attempt", async () => {
+  it("two invalid JSON outputs fail only the task with a fresh budget for each attempt", async () => {
     vi.useFakeTimers();
     const value = await harness({ codexResponses: ["bad one", "bad two"] });
     await value.start();
     await startPlayerTurn(value, "bad");
-    await value.untilChat(unavailable);
+    await value.untilChat(naturalTaskFailure);
 
-    expect(value.budgetEvents).toEqual(["begin", "end", "begin", "end"]);
-    expect(withoutTaskDisclosures(value.minecraft.chatLog)).toEqual([unavailable]);
-    expect(value.mode.snapshot().paused).toBe(true);
+    expect(value.budgetEvents.filter((event) => event === "begin")).toHaveLength(2);
+    expect(value.budget.snapshot().active).toBe(false);
+    expect(value.minecraft.chatLog).toEqual([naturalTaskFailure]);
+    expect(value.mode.snapshot().paused).toBe(false);
   });
 
   it.each([
@@ -2558,17 +5348,18 @@ describe("CompanionService failures", () => {
     ["interrupted", { status: "interrupted", text: "" }],
     ["rejected", new Error("turn rejected")],
   ] as const)(
-    "%s Codex turn fails closed with exactly one budget pair",
+    "%s Codex turn fails only the task and revokes its budget",
     async (_label, response) => {
       vi.useFakeTimers();
       const value = await harness({ codexResponses: [response] });
       await value.start();
       await startPlayerTurn(value, "fail");
-      await value.untilChat(unavailable);
+      await value.untilChat(naturalTaskFailure);
 
-      expect(value.budgetEvents).toEqual(["begin", "end"]);
-      expect(withoutTaskDisclosures(value.minecraft.chatLog)).toEqual([unavailable]);
-      expect(value.mode.snapshot().paused).toBe(true);
+      expect(value.budgetEvents.filter((event) => event === "begin")).toHaveLength(1);
+      expect(value.budget.snapshot().active).toBe(false);
+      expect(value.minecraft.chatLog).toEqual([naturalTaskFailure]);
+      expect(value.mode.snapshot().paused).toBe(false);
     },
   );
 });

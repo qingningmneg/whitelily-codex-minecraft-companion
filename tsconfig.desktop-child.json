@@ -1,0 +1,5 @@
+{
+  "extends": "./tsconfig.json",
+  "include": ["src/desktop/childMain.ts"],
+  "exclude": ["tests", "apps"]
+}

@@ -2,8 +2,14 @@ import { access, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { pathToFileURL } from "node:url";
-import { afterEach, describe, expect, it } from "vitest";
-import { createApp, createRuntimeFacade } from "../../src/app.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  createApp,
+  createRuntimeFacade,
+  type AppCompositionContext,
+  type AppPaths,
+  type OwnerIdentityProvider,
+} from "../../src/app.js";
 import { ActionExecutor } from "../../src/actions/actionExecutor.js";
 import { CodexAppServerClient } from "../../src/codex/appServerClient.js";
 import type { AppConfig } from "../../src/config/schema.js";
@@ -14,7 +20,9 @@ import { FakeMinecraftPort } from "../../src/minecraft/fakeMinecraftPort.js";
 import { ConfirmationStore } from "../../src/safety/confirmationStore.js";
 import { SafetyEngine } from "../../src/safety/safetyEngine.js";
 import { createCompanionHarness } from "../support/companionHarness.js";
+import { ProfileStore } from "../../src/profile/profileStore.js";
 import { createJsonRpcLineTransportHarness } from "../support/jsonRpcProcessHarness.js";
+import type { OwnerIdentitySnapshot } from "../../src/identity/ownerIdentity.js";
 import {
   createAppHarness,
   createCliHarness,
@@ -23,6 +31,43 @@ import {
 } from "../support/appHarness.js";
 
 const cleanups: Array<() => Promise<void>> = [];
+
+function controlledOwnerIdentity(ownerUsername: string | null) {
+  let snapshot: OwnerIdentitySnapshot = {
+    revision: 0,
+    ownerUsername,
+    configured: ownerUsername !== null,
+    presence: "unknown",
+  };
+  const listeners = new Set<(value: OwnerIdentitySnapshot) => void>();
+  const ownerIdentity: OwnerIdentityProvider = {
+    snapshot: () => snapshot,
+    setPresence(input) {
+      if (input.revision !== snapshot.revision || input.ownerUsername !== snapshot.ownerUsername) {
+        return;
+      }
+      snapshot = { ...snapshot, presence: input.presence };
+      for (const listener of listeners) listener(snapshot);
+    },
+    subscribe(listener) {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+  };
+  return {
+    ownerIdentity,
+    commit(nextOwner: string) {
+      snapshot = {
+        revision: snapshot.revision + 1,
+        ownerUsername: nextOwner,
+        configured: true,
+        presence: "unknown",
+      };
+      for (const listener of listeners) listener(snapshot);
+    },
+    listenerCount: () => listeners.size,
+  };
+}
 const realCodexConfig: AppConfig = {
   minecraft: {
     host: "127.0.0.1",
@@ -55,7 +100,7 @@ describe("WhiteLilyApp composition", () => {
       appModule as typeof appModule & {
         createTrustedSafetyContextProvider?: (
           minecraft: FakeMinecraftPort,
-          ownerUsername: string,
+          ownerUsername: () => string,
           snapshots: ReturnType<typeof createTrustedSnapshotStore>,
         ) => () => Promise<{
           spawn?: { x: number; y: number; z: number };
@@ -73,13 +118,13 @@ describe("WhiteLilyApp composition", () => {
     world.worldSpawn = { x: 120, y: 70, z: -45 };
     world.botPosition = { x: 140, y: 70, z: -45 };
     const snapshots = createTrustedSnapshotStore();
-    const safetyContextProvider = createProvider(minecraft, "TestOwner", snapshots);
+    const safetyContextProvider = createProvider(minecraft, () => "TestOwner", snapshots);
     const confirmations = new ConfirmationStore();
     const executor = new ActionExecutor(
       minecraft,
       new SafetyEngine(confirmations),
       confirmations,
-      "TestOwner",
+      () => "TestOwner",
     );
     const budget = new TurnToolBudget();
     const firstLease = budget.begin();
@@ -88,7 +133,7 @@ describe("WhiteLilyApp composition", () => {
       executor,
       budget,
       safetyContextProvider,
-      ownerUsername: "TestOwner",
+      ownerUsername: () => "TestOwner",
       latestSnapshot: snapshots.latest,
       observeSnapshot: snapshots.publish,
     });
@@ -449,6 +494,164 @@ describe("WhiteLilyApp composition", () => {
     });
   });
 
+  it("derives the expanded core paths from one injected desktop data root", async () => {
+    const harness = await createCliHarness();
+    cleanups.push(harness.cleanup);
+    const dataRoot = join(harness.directory, "desktop-data");
+    const resourceRoot = resolve(
+      import.meta.dirname,
+      "..",
+      "..",
+      "node_modules",
+      "@openai",
+      "codex-win32-x64",
+    );
+    const configPath = join(dataRoot, "config.toml");
+    await mkdir(dataRoot, { recursive: true });
+    await writeFile(configPath, validConfig, "utf8");
+    let paths: AppPaths;
+    let codexLaunchConfig: { executablePath: string; codexHome: string } | undefined;
+
+    const app = await createApp(configPath, {
+      cwd: join(harness.directory, "untrusted-working-directory"),
+      dataRoot,
+      runtimeFactory: (context) => {
+        paths = context.paths;
+        codexLaunchConfig = (
+          context as typeof context & {
+            codexLaunchConfig: { executablePath: string; codexHome: string };
+          }
+        ).codexLaunchConfig;
+        return {
+          preferredModel: context.config.codex.preferredModel,
+          mcp: { start: async () => undefined, stop: async () => undefined },
+          codex: {
+            assertChatGptLogin: async () => undefined,
+            start: async () => undefined,
+            listModels: async () => ["gpt-5.6-terra"],
+            stop: async () => undefined,
+          },
+          selectModel: (available) => available[0]!,
+          minecraft: { connect: async () => undefined, disconnect: async () => undefined },
+          companion: { start: async () => undefined, stop: async () => undefined },
+          executor: { stopAll: () => undefined },
+        };
+      },
+    });
+    cleanups.push(() => app.stop());
+
+    expect(paths!).toEqual({
+      cwd: dataRoot,
+      dataRoot,
+      config: configPath,
+      profiles: join(dataRoot, "config", "profiles"),
+      memories: join(dataRoot, "data", "memories.json"),
+      worlds: join(dataRoot, "config", "worlds"),
+      logs: join(dataRoot, "logs"),
+      audit: join(dataRoot, "logs", "audit.jsonl"),
+      diagnostics: join(dataRoot, "diagnostics"),
+      migrationSnapshots: join(dataRoot, "data", "migration-snapshots"),
+      runtimeState: join(dataRoot, "data", "state.json"),
+      codexWorkspace: join(dataRoot, "codex-workspace"),
+      state: join(dataRoot, "data", "state.json"),
+      log: join(dataRoot, "logs", "companion.log"),
+    });
+    expect(codexLaunchConfig).toEqual({
+      executablePath: join(resourceRoot, "vendor", "x86_64-pc-windows-msvc", "bin", "codex.exe"),
+      codexHome: join(dataRoot, "codex"),
+    });
+  });
+
+  it("keeps legacy CLI path derivation when no data root is injected", async () => {
+    const harness = await createAppHarness();
+    cleanups.push(harness.cleanup);
+
+    expect(harness.composition.paths).toEqual({
+      cwd: harness.directory,
+      dataRoot: harness.directory,
+      config: harness.configPath,
+      profiles: join(harness.directory, "config", "profiles"),
+      memories: join(harness.directory, "data", "memories.json"),
+      worlds: join(harness.directory, "config", "worlds"),
+      logs: join(harness.directory, "logs"),
+      audit: join(harness.directory, "logs", "audit.jsonl"),
+      diagnostics: join(harness.directory, "diagnostics"),
+      migrationSnapshots: join(harness.directory, "data", "migration-snapshots"),
+      runtimeState: join(harness.directory, "data", "state.json"),
+      codexWorkspace: join(harness.directory, "codex-workspace"),
+      state: join(harness.directory, "data", "state.json"),
+      log: join(harness.directory, "logs", "companion.log"),
+    });
+  });
+
+  it("composes legacy CLI with an external config while keeping runtime data under cwd", async () => {
+    const harness = await createCliHarness();
+    cleanups.push(harness.cleanup);
+    const runtimeDirectory = join(harness.directory, "legacy-runtime");
+    await mkdir(runtimeDirectory, { recursive: true });
+    let paths: AppPaths | undefined;
+    const app = await createApp(harness.configPath, {
+      cwd: runtimeDirectory,
+      runtimeFactory: (context) => {
+        paths = context.paths;
+        return {
+          preferredModel: context.config.codex.preferredModel,
+          mcp: { start: async () => undefined, stop: async () => undefined },
+          codex: {
+            assertChatGptLogin: async () => undefined,
+            start: async () => undefined,
+            listModels: async () => ["gpt-5.6-terra"],
+            stop: async () => undefined,
+          },
+          selectModel: (_available, preferred) => preferred,
+          minecraft: { connect: async () => undefined, disconnect: async () => undefined },
+          companion: { start: async () => undefined, stop: async () => undefined },
+          executor: { stopAll: () => undefined },
+        };
+      },
+    });
+    cleanups.push(() => app.stop());
+
+    expect(paths).toEqual({
+      cwd: runtimeDirectory,
+      dataRoot: runtimeDirectory,
+      config: harness.configPath,
+      profiles: join(runtimeDirectory, "config", "profiles"),
+      memories: join(runtimeDirectory, "data", "memories.json"),
+      worlds: join(runtimeDirectory, "config", "worlds"),
+      logs: join(runtimeDirectory, "logs"),
+      audit: join(runtimeDirectory, "logs", "audit.jsonl"),
+      diagnostics: join(runtimeDirectory, "diagnostics"),
+      migrationSnapshots: join(runtimeDirectory, "data", "migration-snapshots"),
+      runtimeState: join(runtimeDirectory, "data", "state.json"),
+      codexWorkspace: join(runtimeDirectory, "codex-workspace"),
+      state: join(runtimeDirectory, "data", "state.json"),
+      log: join(runtimeDirectory, "logs", "companion.log"),
+    });
+    await expect(readFile(join(runtimeDirectory, "data", "memories.json"), "utf8")).resolves.toBe(
+      "[]\n",
+    );
+    await expect(readFile(join(runtimeDirectory, "data", "state.json"), "utf8")).resolves.toContain(
+      '"lastMode": "friend"',
+    );
+  });
+
+  it("rejects an injected config path that escapes the desktop data root", async () => {
+    const harness = await createCliHarness();
+    cleanups.push(harness.cleanup);
+    const dataRoot = join(harness.directory, "desktop-data");
+
+    await expect(
+      createApp(harness.configPath, {
+        dataRoot,
+        runtimeFactory: () => {
+          throw new Error("must not compose");
+        },
+      }),
+    ).rejects.toThrow("config must stay within the WhiteLily data root");
+    await expect(access(dataRoot)).rejects.toThrow();
+  });
+
   it("rejects invalid configuration before storage or runtime composition", async () => {
     const harness = await createCliHarness();
     cleanups.push(harness.cleanup);
@@ -478,6 +681,86 @@ describe("WhiteLilyApp composition", () => {
     expect(harness.identities.companionMode).toBe(harness.composition.mode);
     expect(harness.identities.mcpBudget).toBe(harness.composition.budget);
     expect(harness.identities.companionBudget).toBe(harness.composition.budget);
+  });
+
+  it("revokes old-owner work through the shared identity and retires its listener on cleanup", async () => {
+    const files = await createCliHarness();
+    cleanups.push(files.cleanup);
+    const identity = controlledOwnerIdentity("OldOwner");
+    const disconnect = vi.fn(async () => undefined);
+    const stopCodex = vi.fn(async () => undefined);
+    const ownerChanges: OwnerIdentitySnapshot[] = [];
+    let composition: AppCompositionContext | undefined;
+    const app = await createApp(files.configPath, {
+      cwd: files.directory,
+      ownerIdentity: identity.ownerIdentity,
+      runtimeFactory: (context) => {
+        composition = context;
+        return {
+          preferredModel: context.config.codex.preferredModel,
+          mcp: { start: async () => undefined, stop: async () => undefined },
+          codex: {
+            assertChatGptLogin: async () => undefined,
+            start: async () => undefined,
+            listModels: async () => ["gpt-5.6-terra"],
+            stop: stopCodex,
+          },
+          selectModel: (_available, preferred) => preferred,
+          minecraft: { connect: async () => undefined, disconnect },
+          companion: {
+            start: async () => undefined,
+            stop: async () => undefined,
+            ownerIdentityChanged: (snapshot: OwnerIdentitySnapshot) => ownerChanges.push(snapshot),
+          },
+          executor: { stopAll: () => undefined },
+        };
+      },
+    });
+    if (!composition) throw new Error("runtime was not composed");
+    await app.start();
+    composition.taskController.start({
+      goal: "old owner task",
+      expectedActions: ["get_state"],
+      limits: {
+        maxToolCalls: 1,
+        maxBlockChanges: 0,
+        maxHorizontalTravel: 0,
+        maxDurationMs: 1_000,
+        maxDangerousOperations: 0,
+      },
+      stopCondition: "the owner changes",
+    });
+
+    identity.commit("NewOwner");
+
+    expect(composition.taskController.current()).toBeNull();
+    expect(ownerChanges).toHaveLength(1);
+    expect(disconnect).not.toHaveBeenCalled();
+    expect(stopCodex).not.toHaveBeenCalled();
+    expect(identity.listenerCount()).toBe(1);
+
+    await app.stop();
+    expect(identity.listenerCount()).toBe(0);
+    identity.commit("LaterOwner");
+    expect(ownerChanges).toHaveLength(1);
+  });
+
+  it("rejects runtime composition when the canonical owner identity is unconfigured", async () => {
+    const files = await createCliHarness();
+    cleanups.push(files.cleanup);
+    let composed = false;
+
+    await expect(
+      createApp(files.configPath, {
+        cwd: files.directory,
+        ownerIdentity: controlledOwnerIdentity(null).ownerIdentity,
+        runtimeFactory: () => {
+          composed = true;
+          throw new Error("must not compose");
+        },
+      }),
+    ).rejects.toMatchObject({ code: "OWNER_IDENTITY_REQUIRED" });
+    expect(composed).toBe(false);
   });
 
   it("persists sanitized task start and completed audit records through legacy createApp", async () => {
@@ -519,12 +802,19 @@ describe("WhiteLilyApp composition", () => {
     await harness.app.stop();
 
     const output = (await harness.readData()).log;
+    const auditOutput = await harness.readAudit();
+    const auditRecords = auditOutput
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
     const records = output
       .trim()
       .split("\n")
       .filter(Boolean)
       .map((line) => JSON.parse(line) as Record<string, unknown>);
     expect(records.map((record) => record.event)).toEqual(["task_started", "task_stopped"]);
+    expect(auditRecords.map((record) => record.kind)).toEqual(["task_started", "task_stopped"]);
     expect(records[0]).toMatchObject({
       limits: {
         maxToolCalls: 5,
@@ -798,7 +1088,7 @@ describe("WhiteLilyApp composition", () => {
       minecraft: { state: "connected", sessionId: null },
       codex: { state: "ready", model: "gpt-5.6-terra" },
       task: {
-        disclosure: { goal: "Build a safe house" },
+        goal: "Build a safe house",
       },
     });
     expect(runtime.snapshot().task?.id).not.toBe(active.lease.id);
@@ -820,6 +1110,261 @@ describe("WhiteLilyApp composition", () => {
       codex: { state: "stopped", model: null },
       task: null,
     });
+  });
+
+  it("loads the latest persisted active profile on composition and accepts live profile replacement", async () => {
+    const files = await createCliHarness();
+    cleanups.push(files.cleanup);
+    const profiles = new ProfileStore({
+      rootDirectory: join(files.directory, "config", "profiles"),
+      createProfileId: () => "be176ae1-a4b4-4fd6-b04c-89634cd74a99",
+    });
+    const initial = await profiles.read();
+    const persisted = await profiles.update(initial.revision, {
+      ...initial.value,
+      displayName: "小百合",
+      mode: "balanced",
+      persona: "persisted builder",
+    });
+    let context: import("../../src/app.js").AppCompositionContext | undefined;
+    const runtime = await createRuntimeFacade(files.configPath, {
+      cwd: files.directory,
+      runtimeFactory: (createdContext) => {
+        context = createdContext;
+        return {
+          preferredModel: createdContext.config.codex.preferredModel,
+          mcp: { start: async () => undefined, stop: async () => undefined },
+          codex: {
+            assertChatGptLogin: async () => undefined,
+            start: async () => undefined,
+            listModels: async () => ["gpt-5.6-terra"],
+            stop: async () => undefined,
+          },
+          selectModel: (_available, preferred) => preferred,
+          minecraft: { connect: async () => undefined, disconnect: async () => undefined },
+          companion: { start: async () => undefined, stop: async () => undefined },
+          executor: { stopAll: () => undefined },
+        };
+      },
+    });
+    if (!context) throw new Error("runtime context was not composed");
+
+    expect(context.mode.getProfile()).toEqual(persisted.value);
+    runtime.applyProfile({
+      ...persisted.value,
+      displayName: "即时百合",
+      mode: "autonomous",
+      persona: "live replacement",
+    });
+
+    expect(context.mode.getProfile()).toMatchObject({
+      displayName: "即时百合",
+      mode: "autonomous",
+      persona: "live replacement",
+    });
+    await runtime.stop("process_exit");
+  });
+
+  it("uses the desktop live model selection instead of legacy config defaults", async () => {
+    const files = await createCliHarness();
+    cleanups.push(files.cleanup);
+    const legacySelector = vi.fn(() => {
+      throw new Error("legacy model selector must not run");
+    });
+    const companionStarts: string[] = [];
+    let context: import("../../src/app.js").AppCompositionContext | undefined;
+    const runtime = await createRuntimeFacade(files.configPath, {
+      cwd: files.directory,
+      runtimeModelSelection: {
+        modelId: "service-live-model",
+        reasoningEffort: "xhigh",
+      },
+      runtimeFactory: (createdContext) => {
+        context = createdContext;
+        return {
+          preferredModel: createdContext.config.codex.preferredModel,
+          mcp: { start: async () => undefined, stop: async () => undefined },
+          codex: {
+            assertChatGptLogin: async () => undefined,
+            start: async () => undefined,
+            listModels: async () => ["service-live-model"],
+            stop: async () => undefined,
+          },
+          selectModel: legacySelector,
+          minecraft: {
+            connect: async () => undefined,
+            disconnect: async () => undefined,
+          },
+          companion: {
+            start: async (model) => {
+              companionStarts.push(model);
+            },
+            stop: async () => undefined,
+          },
+          executor: { stopAll: () => undefined },
+        };
+      },
+    });
+
+    await runtime.start();
+
+    expect(context?.runtimeModelSelection).toEqual({
+      modelId: "service-live-model",
+      reasoningEffort: "xhigh",
+    });
+    expect(legacySelector).not.toHaveBeenCalled();
+    expect(companionStarts).toEqual(["service-live-model"]);
+    expect(runtime.snapshot().codex.model).toBe("service-live-model");
+  });
+
+  it("forwards typed model authority loss only while the exact facade is live", async () => {
+    const files = await createCliHarness();
+    cleanups.push(files.cleanup);
+    let context: import("../../src/app.js").AppCompositionContext | undefined;
+    const runtime = await createRuntimeFacade(files.configPath, {
+      cwd: files.directory,
+      runtimeFactory: (createdContext) => {
+        context = createdContext;
+        return {
+          preferredModel: "service-live-model",
+          mcp: { start: async () => undefined, stop: async () => undefined },
+          codex: {
+            assertChatGptLogin: async () => undefined,
+            start: async () => undefined,
+            listModels: async () => ["service-live-model"],
+            stop: async () => undefined,
+          },
+          selectModel: () => "service-live-model",
+          minecraft: {
+            connect: async () => undefined,
+            disconnect: async () => undefined,
+          },
+          companion: {
+            start: async () => undefined,
+            stop: async () => undefined,
+          },
+          executor: { stopAll: () => undefined },
+        };
+      },
+    });
+    if (!context) throw new Error("runtime context was not composed");
+    const losses: string[] = [];
+    runtime.subscribeAuthorityLoss((event) => losses.push(event.reason));
+
+    context.reportAuthorityLoss({ reason: "model_unavailable" });
+    expect(losses).toEqual(["model_unavailable"]);
+
+    await runtime.stop("owner_stop");
+    context.reportAuthorityLoss({ reason: "model_unavailable" });
+    expect(losses).toEqual(["model_unavailable"]);
+  });
+
+  it("carries a non-legacy model and xhigh effort through production thread and turn transport", async () => {
+    const files = await createCliHarness();
+    cleanups.push(files.cleanup);
+    const transport = createJsonRpcLineTransportHarness();
+    const codex = new CodexAppServerClient(realCodexConfig, {
+      runLoginStatus: async () => ({
+        stdout: "Logged in using ChatGPT\n",
+        stderr: "",
+        exitCode: 0,
+      }),
+      createTransport: async () => transport.transport,
+      workspacePath: "C:/legacy/workspace-must-not-win",
+    });
+    const appModule = await import("../../src/app.js");
+    const createProductionRuntime = (
+      appModule as typeof appModule & {
+        createProductionRuntime?: (
+          context: import("../../src/app.js").AppCompositionContext,
+          client: CodexAppServerClient,
+        ) => import("../../src/app.js").AppRuntime;
+      }
+    ).createProductionRuntime;
+    expect(createProductionRuntime).toBeTypeOf("function");
+    if (!createProductionRuntime) throw new Error("production runtime composition is unavailable");
+    let production: import("../../src/app.js").AppRuntime | undefined;
+    await createRuntimeFacade(files.configPath, {
+      cwd: files.directory,
+      codexClient: codex,
+      runtimeModelSelection: {
+        modelId: "service-live-model",
+        reasoningEffort: "xhigh",
+      },
+      runtimeFactory: (context) => {
+        production = createProductionRuntime(context, codex);
+        return production;
+      },
+    });
+    if (!production) throw new Error("production runtime was not composed");
+
+    const starting = codex.start();
+    await expect(transport.nextSent()).resolves.toMatchObject({ id: 1, method: "initialize" });
+    transport.receive({
+      id: 1,
+      result: {
+        userAgent: "codex/0.145.0",
+        codexHome: "D:/codex-home",
+        platformFamily: "windows",
+        platformOs: "windows",
+      },
+    });
+    await starting;
+    await expect(transport.nextSent()).resolves.toEqual({ method: "initialized", params: {} });
+
+    const companionStarting = production.companion.start("service-live-model");
+    await expect(transport.nextSent()).resolves.toEqual({
+      id: 2,
+      method: "thread/start",
+      params: {
+        model: "service-live-model",
+        cwd: resolve(files.directory, "codex-workspace"),
+        sandbox: "read-only",
+        approvalPolicy: "never",
+      },
+    });
+    transport.receive({ id: 2, result: { thread: { id: "thread-service-live-intent" } } });
+    await expect(transport.nextSent()).resolves.toEqual({
+      id: 3,
+      method: "thread/start",
+      params: {
+        model: "service-live-model",
+        cwd: resolve(files.directory, "codex-workspace"),
+        sandbox: "read-only",
+        approvalPolicy: "never",
+      },
+    });
+    transport.receive({ id: 3, result: { thread: { id: "thread-service-live-execution" } } });
+    await companionStarting;
+
+    const turn = codex.sendTurn("thread-service-live-execution", "transport pair check");
+    await expect(transport.nextSent()).resolves.toEqual({
+      id: 4,
+      method: "turn/start",
+      params: {
+        threadId: "thread-service-live-execution",
+        input: [{ type: "text", text: "transport pair check", text_elements: [] }],
+        effort: "xhigh",
+      },
+    });
+    transport.receive({ id: 4, result: { turn: { id: "turn-service-live" } } });
+    transport.receive({
+      method: "turn/completed",
+      params: {
+        threadId: "thread-service-live-execution",
+        turn: { id: "turn-service-live", status: "completed" },
+      },
+    });
+    await expect(turn).resolves.toMatchObject({
+      threadId: "thread-service-live-execution",
+      turnId: "turn-service-live",
+      status: "completed",
+    });
+    expect(JSON.stringify(transport.sent())).not.toContain("gpt-5.6-terra");
+    expect(JSON.stringify(transport.sent())).not.toContain('"effort":"low"');
+
+    await production.companion.stop();
+    await codex.stop();
   });
 
   it("invalidates a startup-created task before component failure cleanup", async () => {
@@ -919,6 +1464,11 @@ describe("externally composed CompanionService startup", () => {
     expect(harness.codex.startCalls).toBe(0);
     expect(harness.codex.listModelCalls).toBe(0);
     expect(harness.codex.startedThreads).toEqual([
+      {
+        cwd: harness.directory,
+        model: "gpt-5.6-luna",
+        reasoningEffort: "low",
+      },
       {
         cwd: harness.directory,
         model: "gpt-5.6-luna",

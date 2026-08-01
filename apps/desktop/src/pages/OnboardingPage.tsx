@@ -1,0 +1,1106 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+import type { AccountSnapshot } from "../../../../src/codex/accountService";
+import { parseMinecraftJavaUsername } from "../../../../src/identity/ownerIdentity";
+import type { ModelCatalogSnapshot, ModelSelection } from "../../../../src/codex/modelCatalog";
+import type { RuntimeSnapshot } from "../../../../src/runtime/runtimeEvents";
+import type { Pcl2Candidate } from "../../src-main/discovery/pcl2Discovery";
+import type { LanCandidate } from "../../src-main/discovery/lanDetector";
+import { LanCandidateCard } from "../components/LanCandidateCard";
+import { ModelPicker } from "../components/ModelPicker";
+import { OnboardingProgress, type OnboardingStep } from "../components/OnboardingProgress";
+import type { WhiteLilyDesktopApi } from "../desktopApi";
+import type { Locale, MessageKey } from "../i18n/messageKeys";
+import { translate } from "../i18n/translator";
+
+export const ONBOARDING_STORAGE_KEY = "whitelily.onboarding.v1";
+
+const STORAGE_VERSION = 2;
+const MAX_STORAGE_BYTES = 2_048;
+const MAX_LOGIN_POLL_MS = 10 * 60_000;
+const LOGIN_POLL_INTERVAL_MS = 250;
+const MODEL_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
+const EFFORT_PATTERN = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/u;
+
+type SafeProgressHint = "login" | "model" | "owner" | "pcl2" | "lan" | "ready";
+
+interface SafePreferences {
+  version: 2;
+  locale: Locale;
+  progressHint: SafeProgressHint;
+  modelPreference:
+    { mode: "automatic" } | { mode: "explicit"; modelId: string; reasoningEffort: string } | null;
+}
+
+interface OnboardingPageProps {
+  api: WhiteLilyDesktopApi;
+  locale: Locale;
+  active: boolean;
+  onReady(snapshot: RuntimeSnapshot): void;
+}
+
+interface LoginIntent {
+  readonly generation: number;
+  cancelRequested: boolean;
+}
+
+interface LoginPollWait {
+  readonly timer: ReturnType<typeof setTimeout>;
+  readonly wake: () => void;
+}
+
+interface CatalogLoadIntent {
+  readonly requestId: number;
+  readonly generation: number;
+  readonly promise: Promise<void>;
+}
+
+interface OwnerUpdateIntent {
+  readonly requestId: number;
+  readonly generation: number;
+}
+
+const defaultPreferences: SafePreferences = {
+  version: STORAGE_VERSION,
+  locale: "zh-CN",
+  progressHint: "login",
+  modelPreference: null,
+};
+
+export function OnboardingPage({ api, locale, active, onReady }: OnboardingPageProps) {
+  const [step, setStep] = useState<OnboardingStep>("environment");
+  const [catalog, setCatalog] = useState<ModelCatalogSnapshot | null>(null);
+  const [catalogLoading, setCatalogLoading] = useState(false);
+  const [pcl2Candidates, setPcl2Candidates] = useState<readonly Pcl2Candidate[]>([]);
+  const [pcl2Loading, setPcl2Loading] = useState(false);
+  const [lanCandidates, setLanCandidates] = useState<readonly LanCandidate[]>([]);
+  const [lanLoading, setLanLoading] = useState(false);
+  const [loginPending, setLoginPending] = useState(false);
+  const [ownerDraft, setOwnerDraft] = useState("");
+  const [ownerRevision, setOwnerRevision] = useState<number | null>(null);
+  const [ownerPending, setOwnerPending] = useState(false);
+  const [ownerMessageKey, setOwnerMessageKey] = useState<MessageKey | null>(null);
+  const [ownerMessageIsAlert, setOwnerMessageIsAlert] = useState(false);
+  const [connectingCandidate, setConnectingCandidate] = useState<string | null>(null);
+  const [errorKey, setErrorKey] = useState<MessageKey | null>(null);
+  const mounted = useRef(true);
+  const flowGeneration = useRef(0);
+  const activeLoginIntent = useRef<LoginIntent | null>(null);
+  const loginAttempt = useRef<string | null>(null);
+  const loginPollWait = useRef<LoginPollWait | null>(null);
+  const catalogRequestId = useRef(0);
+  const catalogInFlight = useRef<CatalogLoadIntent | null>(null);
+  const catalogSelectionTail = useRef<Promise<void>>(Promise.resolve());
+  const ownerUpdateRequestId = useRef(0);
+  const activeOwnerUpdate = useRef<OwnerUpdateIntent | null>(null);
+  const observedLocale = useRef(locale);
+  const heading = useRef<HTMLHeadingElement>(null);
+  const ownerAlert = useRef<HTMLParagraphElement>(null);
+  const preferences = useRef(readOnboardingPreferences());
+  const resumeHint = useRef(preferences.current.progressHint);
+  const resumedPcl2 = useRef(false);
+
+  const persist = useCallback((patch: Partial<Omit<SafePreferences, "version">>) => {
+    const next: SafePreferences = { ...preferences.current, ...patch, version: STORAGE_VERSION };
+    preferences.current = next;
+    writeOnboardingPreferences(next);
+  }, []);
+
+  const clearLoginWait = useCallback((): void => {
+    const pending = loginPollWait.current;
+    loginPollWait.current = null;
+    if (!pending) return;
+    clearTimeout(pending.timer);
+    pending.wake();
+  }, []);
+
+  const invalidateCatalogLoad = useCallback((): void => {
+    catalogRequestId.current += 1;
+    catalogInFlight.current = null;
+    if (mounted.current) setCatalogLoading(false);
+  }, []);
+
+  const queueCatalogSelection = useCallback(
+    (
+      input: Parameters<WhiteLilyDesktopApi["selectModel"]>[0],
+      isCurrent: () => boolean,
+    ): Promise<ModelSelection | null> => {
+      const operation = catalogSelectionTail.current
+        .catch(() => undefined)
+        .then(async () => {
+          if (!isCurrent()) return null;
+          const selected = await api.selectModel(input);
+          if (!isCurrent()) return null;
+          return selected;
+        });
+      catalogSelectionTail.current = operation.then(
+        () => undefined,
+        () => undefined,
+      );
+      return operation;
+    },
+    [api],
+  );
+
+  const loadOwnerIdentity = useCallback(
+    async (
+      generation: number,
+      continueDownstream = false,
+      authorityIsCurrent: () => boolean = () => true,
+    ): Promise<void> => {
+      const isCurrent = (): boolean =>
+        mounted.current && generation === flowGeneration.current && authorityIsCurrent();
+      if (!isCurrent()) return;
+      activeOwnerUpdate.current = null;
+      setOwnerPending(false);
+      setStep("owner");
+      persist({ progressHint: "owner" });
+      setOwnerRevision(null);
+      setOwnerDraft("");
+      setOwnerMessageKey(null);
+      setOwnerMessageIsAlert(false);
+      try {
+        const identity = await api.readOwnerIdentity();
+        if (!isCurrent()) return;
+        setOwnerRevision(identity.revision);
+        setOwnerDraft(identity.configured && identity.ownerUsername ? identity.ownerUsername : "");
+        if (continueDownstream && identity.configured) setStep("pcl2");
+      } catch (error) {
+        if (!isCurrent()) return;
+        setOwnerMessageKey(safeOwnerErrorKey(error));
+        setOwnerMessageIsAlert(true);
+      }
+    },
+    [api, persist],
+  );
+
+  const loadCatalog = useCallback(
+    async (generation: number): Promise<void> => {
+      if (!mounted.current || generation !== flowGeneration.current) return;
+      const pending = catalogInFlight.current;
+      if (pending?.generation === generation) return pending.promise;
+
+      const requestId = ++catalogRequestId.current;
+      const isCurrent = (): boolean =>
+        mounted.current &&
+        generation === flowGeneration.current &&
+        catalogRequestId.current === requestId &&
+        catalogInFlight.current?.requestId === requestId;
+      setCatalogLoading(true);
+
+      const operation = Promise.resolve().then(async () => {
+        try {
+          if (!isCurrent()) return;
+          let liveCatalog: ModelCatalogSnapshot;
+          try {
+            liveCatalog = await api.listModels();
+          } catch (error) {
+            if (!isCurrent()) return;
+            setStep("model");
+            setErrorKey(safeOnboardingErrorKey(asStableError(error, "MODEL_UNAVAILABLE")));
+            return;
+          }
+          if (!isCurrent()) return;
+
+          const control: CatalogSelectionControl = {
+            isCurrent,
+            select: (input) => queueCatalogSelection(input, isCurrent),
+          };
+          let restored =
+            preferences.current.modelPreference === null && liveCatalog.models.length > 0
+              ? await applyAutomaticFallback(control, liveCatalog)
+              : await restoreLiveModelPreference(control, liveCatalog, preferences.current);
+          if (!isCurrent() || !restored) return;
+          const wantsDownstreamResume =
+            resumeHint.current === "pcl2" ||
+            resumeHint.current === "lan" ||
+            resumeHint.current === "ready";
+          const wantsOwnerResume = resumeHint.current === "owner";
+          if (
+            wantsDownstreamResume &&
+            liveCatalog.models.length > 0 &&
+            !restored.fallbackFailed &&
+            !restored.selectionApplied
+          ) {
+            if (!isCurrent()) return;
+            const automatic = await applyAutomaticFallback(control, restored.catalog);
+            if (!isCurrent() || !automatic) return;
+            restored = automatic;
+          }
+          liveCatalog = restored.catalog;
+          if (!isCurrent()) return;
+          if (restored.preference !== preferences.current.modelPreference) {
+            persist({ modelPreference: restored.preference });
+          }
+          if (!isCurrent()) return;
+          setCatalog(liveCatalog);
+          const liveModelAuthorityReady =
+            liveCatalog.models.length > 0 &&
+            !restored.fallbackFailed &&
+            (!wantsDownstreamResume || restored.selectionApplied);
+          setErrorKey(liveModelAuthorityReady ? null : "onboarding.error.MODEL_UNAVAILABLE");
+
+          if (!isCurrent()) return;
+          if (wantsOwnerResume && liveModelAuthorityReady) {
+            await loadOwnerIdentity(generation, false, isCurrent);
+          } else if (wantsDownstreamResume && liveModelAuthorityReady) {
+            await loadOwnerIdentity(generation, true, isCurrent);
+          } else {
+            setStep("model");
+            persist({ progressHint: "model" });
+          }
+        } finally {
+          if (catalogInFlight.current?.requestId === requestId) {
+            catalogInFlight.current = null;
+            if (mounted.current) setCatalogLoading(false);
+          }
+        }
+      });
+      catalogInFlight.current = { requestId, generation, promise: operation };
+      return operation;
+    },
+    [api, loadOwnerIdentity, persist, queueCatalogSelection],
+  );
+
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      flowGeneration.current += 1;
+      activeOwnerUpdate.current = null;
+      invalidateCatalogLoad();
+      const intent = activeLoginIntent.current;
+      if (intent) intent.cancelRequested = true;
+      activeLoginIntent.current = null;
+      clearLoginWait();
+      const attemptId = loginAttempt.current;
+      loginAttempt.current = null;
+      if (attemptId) void api.cancelChatGptLogin(attemptId).catch(() => undefined);
+    };
+  }, [api, clearLoginWait, invalidateCatalogLoad]);
+
+  useEffect(() => {
+    if (!active) {
+      flowGeneration.current += 1;
+      activeOwnerUpdate.current = null;
+      setOwnerPending(false);
+      invalidateCatalogLoad();
+      setStep("environment");
+      return;
+    }
+    invalidateCatalogLoad();
+    const generation = ++flowGeneration.current;
+    activeOwnerUpdate.current = null;
+    setOwnerPending(false);
+    setStep("environment");
+    setErrorKey(null);
+    void api.getAccount().then(
+      async (account) => {
+        if (!mounted.current || generation !== flowGeneration.current) return;
+        if (isSignedIn(account)) {
+          await loadCatalog(generation);
+          return;
+        }
+        setStep("login");
+        persist({ progressHint: "login" });
+      },
+      (error) => {
+        if (!mounted.current || generation !== flowGeneration.current) return;
+        setStep("login");
+        setErrorKey(safeOnboardingErrorKey(asStableError(error, "CODEX_NOT_LOGGED_IN")));
+      },
+    );
+  }, [active, api, invalidateCatalogLoad, loadCatalog, persist]);
+
+  useEffect(() => {
+    heading.current?.focus();
+  }, [step]);
+
+  useEffect(() => {
+    if (ownerMessageIsAlert) ownerAlert.current?.focus();
+  }, [ownerMessageIsAlert, ownerMessageKey]);
+
+  useEffect(() => {
+    const localeChanged = observedLocale.current !== locale;
+    observedLocale.current = locale;
+    persist({ locale });
+    if (!localeChanged) return;
+    const pendingCatalog = catalogInFlight.current;
+    if (!pendingCatalog) return;
+    invalidateCatalogLoad();
+    if (active) void loadCatalog(flowGeneration.current);
+  }, [active, invalidateCatalogLoad, loadCatalog, locale, persist]);
+
+  const startLogin = async (): Promise<void> => {
+    if (loginPending) return;
+    invalidateCatalogLoad();
+    const generation = ++flowGeneration.current;
+    const intent: LoginIntent = { generation, cancelRequested: false };
+    activeLoginIntent.current = intent;
+    setLoginPending(true);
+    setErrorKey(null);
+    try {
+      const attempt = await api.startChatGptLogin();
+      if (
+        !mounted.current ||
+        intent.cancelRequested ||
+        activeLoginIntent.current !== intent ||
+        generation !== flowGeneration.current
+      ) {
+        await api.cancelChatGptLogin(attempt.attemptId).catch(() => undefined);
+        return;
+      }
+      loginAttempt.current = attempt.attemptId;
+      await pollForSignedInAccount({
+        api,
+        attempt,
+        isCurrent: () =>
+          mounted.current &&
+          !intent.cancelRequested &&
+          activeLoginIntent.current === intent &&
+          generation === flowGeneration.current,
+        schedule: (timer, wake) => {
+          loginPollWait.current = { timer, wake };
+        },
+      });
+      if (
+        !mounted.current ||
+        intent.cancelRequested ||
+        activeLoginIntent.current !== intent ||
+        generation !== flowGeneration.current
+      ) {
+        return;
+      }
+      clearLoginWait();
+      loginAttempt.current = null;
+      activeLoginIntent.current = null;
+      await loadCatalog(generation);
+    } catch (error) {
+      if (
+        !mounted.current ||
+        intent.cancelRequested ||
+        activeLoginIntent.current !== intent ||
+        generation !== flowGeneration.current
+      ) {
+        return;
+      }
+      clearLoginWait();
+      const attemptId = loginAttempt.current;
+      loginAttempt.current = null;
+      activeLoginIntent.current = null;
+      if (attemptId) await api.cancelChatGptLogin(attemptId).catch(() => undefined);
+      if (!mounted.current || generation !== flowGeneration.current) return;
+      setErrorKey(safeOnboardingErrorKey(asStableError(error, "CODEX_NOT_LOGGED_IN")));
+    } finally {
+      if (mounted.current && generation === flowGeneration.current) {
+        activeLoginIntent.current = null;
+        setLoginPending(false);
+      }
+    }
+  };
+
+  const cancelLogin = async (): Promise<void> => {
+    const intent = activeLoginIntent.current;
+    if (!loginPending || !intent) return;
+    intent.cancelRequested = true;
+    if (activeLoginIntent.current === intent) activeLoginIntent.current = null;
+    invalidateCatalogLoad();
+    const generation = ++flowGeneration.current;
+    clearLoginWait();
+    const attemptId = loginAttempt.current;
+    loginAttempt.current = null;
+    setLoginPending(false);
+    setErrorKey(null);
+    if (!attemptId) return;
+    try {
+      await api.cancelChatGptLogin(attemptId);
+      if (mounted.current && generation === flowGeneration.current) setErrorKey(null);
+    } catch {
+      if (mounted.current && generation === flowGeneration.current) {
+        setErrorKey("onboarding.error.CODEX_NOT_LOGGED_IN");
+      }
+    }
+  };
+
+  const submitOwner = async (): Promise<void> => {
+    const validationKey = ownerValidationErrorKey(ownerDraft);
+    if (
+      activeOwnerUpdate.current !== null ||
+      ownerPending ||
+      ownerRevision === null ||
+      validationKey !== null
+    ) {
+      return;
+    }
+    const generation = flowGeneration.current;
+    const intent: OwnerUpdateIntent = {
+      generation,
+      requestId: ++ownerUpdateRequestId.current,
+    };
+    const isCurrent = (): boolean =>
+      mounted.current &&
+      generation === flowGeneration.current &&
+      activeOwnerUpdate.current === intent;
+    activeOwnerUpdate.current = intent;
+    setOwnerPending(true);
+    setOwnerMessageKey(null);
+    setOwnerMessageIsAlert(false);
+    try {
+      await api.updateOwnerIdentity({
+        expectedRevision: ownerRevision,
+        ownerUsername: ownerDraft,
+      });
+      if (!isCurrent()) return;
+      setStep("pcl2");
+      persist({ progressHint: "pcl2" });
+    } catch (error) {
+      if (!isCurrent()) return;
+      setOwnerMessageKey(safeOwnerErrorKey(error));
+      setOwnerMessageIsAlert(true);
+    } finally {
+      if (activeOwnerUpdate.current === intent) {
+        activeOwnerUpdate.current = null;
+        if (mounted.current && generation === flowGeneration.current) setOwnerPending(false);
+      }
+    }
+  };
+
+  const refreshPcl2 = useCallback(async (): Promise<void> => {
+    const generation = flowGeneration.current;
+    setPcl2Loading(true);
+    setErrorKey(null);
+    try {
+      const candidates = await api.discoverPcl2();
+      if (!mounted.current || generation !== flowGeneration.current) return;
+      setPcl2Candidates(candidates);
+      if (candidates.length === 0) setErrorKey("onboarding.error.PCL2_NOT_FOUND");
+      if (
+        candidates.length > 0 &&
+        !resumedPcl2.current &&
+        (resumeHint.current === "lan" || resumeHint.current === "ready")
+      ) {
+        resumedPcl2.current = true;
+        setStep("lan");
+        persist({ progressHint: "lan" });
+      }
+    } catch (error) {
+      if (!mounted.current || generation !== flowGeneration.current) return;
+      setPcl2Candidates([]);
+      setErrorKey(safeOnboardingErrorKey(asStableError(error, "PCL2_NOT_FOUND")));
+    } finally {
+      if (mounted.current && generation === flowGeneration.current) setPcl2Loading(false);
+    }
+  }, [api, persist]);
+
+  useEffect(() => {
+    if (step !== "pcl2") return;
+    persist({ progressHint: "pcl2" });
+    void refreshPcl2();
+  }, [persist, refreshPcl2, step]);
+
+  const refreshLan = useCallback(async (): Promise<void> => {
+    const generation = flowGeneration.current;
+    setLanLoading(true);
+    setErrorKey(null);
+    try {
+      const candidates = await api.detectLanCandidates();
+      if (!mounted.current || generation !== flowGeneration.current) return;
+      setLanCandidates(candidates);
+      if (candidates.length === 0) setErrorKey("onboarding.error.LAN_NOT_FOUND");
+    } catch (error) {
+      if (!mounted.current || generation !== flowGeneration.current) return;
+      setLanCandidates([]);
+      setErrorKey(safeOnboardingErrorKey(asStableError(error, "LAN_NOT_FOUND")));
+    } finally {
+      if (mounted.current && generation === flowGeneration.current) setLanLoading(false);
+    }
+  }, [api]);
+
+  useEffect(() => {
+    if (step !== "lan") return;
+    persist({ progressHint: "lan" });
+    void refreshLan();
+  }, [persist, refreshLan, step]);
+
+  const confirmAndConnect = async (candidateId: string): Promise<void> => {
+    if (connectingCandidate) return;
+    const generation = flowGeneration.current;
+    let candidateConfirmed = false;
+    setConnectingCandidate(candidateId);
+    setErrorKey(null);
+    try {
+      await api.confirmLanCandidate(candidateId);
+      candidateConfirmed = true;
+      if (!mounted.current || generation !== flowGeneration.current) return;
+      const snapshot = await api.start();
+      if (!mounted.current || generation !== flowGeneration.current) return;
+      if (snapshot.lifecycle !== "running") throw new Error("MINECRAFT_CONNECT_FAILED");
+      setStep("ready");
+      persist({ progressHint: "ready" });
+      onReady(snapshot);
+    } catch (error) {
+      if (!mounted.current || generation !== flowGeneration.current) return;
+      const key = safeOnboardingErrorKey(asStableError(error, "MINECRAFT_CONNECT_FAILED"));
+      setErrorKey(key);
+      if (key === "onboarding.error.LAN_CANDIDATE_EXPIRED" || candidateConfirmed) {
+        setLanCandidates([]);
+        await refreshLan();
+        if (mounted.current && generation === flowGeneration.current) {
+          setErrorKey(key);
+        }
+      }
+    } finally {
+      if (mounted.current && generation === flowGeneration.current) {
+        setConnectingCandidate(null);
+      }
+    }
+  };
+
+  const connectionLifecycle =
+    connectingCandidate !== null
+      ? "connecting"
+      : lanLoading
+        ? "detecting"
+        : lanCandidates.length > 0
+          ? "awaiting_confirmation"
+          : "idle";
+  const ownerValidationKey = ownerValidationErrorKey(ownerDraft);
+  const visibleOwnerMessageKey =
+    ownerMessageKey ?? (ownerDraft.length > 0 ? ownerValidationKey : null);
+  const ownerCanSubmit =
+    ownerRevision !== null &&
+    ownerValidationKey === null &&
+    !ownerPending &&
+    activeOwnerUpdate.current === null;
+
+  return (
+    <main className="onboarding" data-connection-lifecycle={connectionLifecycle}>
+      <OnboardingProgress locale={locale} step={step} />
+      <section className="onboarding-panel" aria-labelledby="onboarding-title">
+        {step === "environment" ? (
+          <>
+            <p className="onboarding-eyebrow">{translate(locale, "onboarding.eyebrow")}</p>
+            <h1 id="onboarding-title" ref={heading} tabIndex={-1}>
+              {translate(locale, "onboarding.environment.title")}
+            </h1>
+            <p>{translate(locale, "onboarding.environment.body")}</p>
+            <div className="onboarding-loading" role="status" aria-live="polite">
+              <span className="loading-spinner" aria-hidden="true" />
+              {translate(locale, "onboarding.environment.loading")}
+            </div>
+          </>
+        ) : null}
+
+        {step === "login" ? (
+          <>
+            <p className="onboarding-eyebrow">{translate(locale, "onboarding.eyebrow")}</p>
+            <h1 id="onboarding-title" ref={heading} tabIndex={-1}>
+              {translate(locale, "onboarding.login.title")}
+            </h1>
+            <p>{translate(locale, "onboarding.login.body")}</p>
+            <div className="onboarding-actions">
+              <button
+                className="primary-button"
+                type="button"
+                disabled={loginPending}
+                onClick={() => void startLogin()}
+              >
+                {translate(
+                  locale,
+                  loginPending ? "onboarding.login.waiting" : "onboarding.login.start",
+                )}
+              </button>
+              {loginPending ? (
+                <button
+                  className="secondary-button"
+                  type="button"
+                  onClick={() => void cancelLogin()}
+                >
+                  {translate(locale, "onboarding.login.cancel")}
+                </button>
+              ) : null}
+            </div>
+          </>
+        ) : null}
+
+        {step === "model" ? (
+          <>
+            <p className="onboarding-eyebrow">{translate(locale, "onboarding.eyebrow")}</p>
+            <h1 id="onboarding-title" ref={heading} tabIndex={-1}>
+              {translate(locale, "onboarding.model.title")}
+            </h1>
+            <p>{translate(locale, "onboarding.model.body")}</p>
+            {catalog && catalog.models.length > 0 ? (
+              <ModelPicker
+                locale={locale}
+                catalog={catalog}
+                onSelect={(selection) => api.selectModel(selection)}
+                onApplied={(selection) => {
+                  setErrorKey(null);
+                  setCatalog((current) => (current ? { ...current, selection } : current));
+                  const preference =
+                    selection.mode === "automatic"
+                      ? ({ mode: "automatic" } as const)
+                      : {
+                          mode: "explicit" as const,
+                          modelId: selection.modelId,
+                          reasoningEffort: selection.reasoningEffort,
+                        };
+                  persist({ modelPreference: preference });
+                }}
+                onContinue={() => {
+                  void loadOwnerIdentity(flowGeneration.current);
+                }}
+              />
+            ) : (
+              <button
+                className="secondary-button"
+                type="button"
+                disabled={catalogLoading}
+                onClick={() => void loadCatalog(flowGeneration.current)}
+              >
+                {translate(locale, catalogLoading ? "onboarding.refreshing" : "onboarding.retry")}
+              </button>
+            )}
+          </>
+        ) : null}
+
+        {step === "owner" ? (
+          <>
+            <p className="onboarding-eyebrow">{translate(locale, "onboarding.eyebrow")}</p>
+            <h1 id="onboarding-title" ref={heading} tabIndex={-1}>
+              {translate(locale, "onboarding.owner.title")}
+            </h1>
+            <p>{translate(locale, "onboarding.owner.body")}</p>
+            <form
+              className="owner-form"
+              onSubmit={(event) => {
+                event.preventDefault();
+                void submitOwner();
+              }}
+            >
+              <label htmlFor="owner-username">{translate(locale, "onboarding.owner.label")}</label>
+              <input
+                id="owner-username"
+                autoComplete="off"
+                spellCheck={false}
+                minLength={3}
+                maxLength={16}
+                pattern="[A-Za-z0-9_]{3,16}"
+                value={ownerDraft}
+                disabled={ownerRevision === null}
+                aria-invalid={visibleOwnerMessageKey !== null}
+                aria-describedby="owner-help owner-error"
+                onChange={(event) => {
+                  setOwnerDraft(event.target.value);
+                  if (ownerRevision !== null) {
+                    setOwnerMessageKey(null);
+                    setOwnerMessageIsAlert(false);
+                  }
+                }}
+              />
+              <p id="owner-help" className="owner-form__help">
+                {translate(locale, "onboarding.owner.help")}
+              </p>
+              <p
+                id="owner-error"
+                className="owner-form__error"
+                ref={ownerAlert}
+                role={ownerMessageIsAlert ? "alert" : undefined}
+                aria-live={ownerMessageIsAlert ? "assertive" : undefined}
+                tabIndex={ownerMessageIsAlert ? -1 : undefined}
+              >
+                {visibleOwnerMessageKey ? translate(locale, visibleOwnerMessageKey) : null}
+              </p>
+              <button className="primary-button" type="submit" disabled={!ownerCanSubmit}>
+                {translate(
+                  locale,
+                  ownerPending ? "onboarding.owner.pending" : "onboarding.owner.confirm",
+                )}
+              </button>
+            </form>
+          </>
+        ) : null}
+
+        {step === "pcl2" ? (
+          <>
+            <p className="onboarding-eyebrow">{translate(locale, "onboarding.eyebrow")}</p>
+            <h1 id="onboarding-title" ref={heading} tabIndex={-1}>
+              {translate(locale, "onboarding.pcl2.title")}
+            </h1>
+            <p>{translate(locale, "onboarding.pcl2.body")}</p>
+            {pcl2Candidates.length > 0 ? (
+              <ul className="pcl2-list">
+                {pcl2Candidates.map((candidate) => (
+                  <li key={candidate.id}>
+                    <span>{candidate.displayPath}</span>
+                    <span>
+                      {translate(
+                        locale,
+                        candidate.running ? "onboarding.pcl2.running" : "onboarding.pcl2.installed",
+                      )}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            ) : null}
+            {pcl2Candidates.length === 0 && !pcl2Loading ? (
+              <div className="instruction-card">
+                <strong>{translate(locale, "onboarding.pcl2.notFoundTitle")}</strong>
+                <p>{translate(locale, "onboarding.pcl2.notFoundBody")}</p>
+              </div>
+            ) : null}
+            <div className="onboarding-actions">
+              <button
+                className="secondary-button"
+                type="button"
+                disabled={pcl2Loading}
+                onClick={() => void refreshPcl2()}
+              >
+                {translate(locale, pcl2Loading ? "onboarding.refreshing" : "onboarding.refresh")}
+              </button>
+              {pcl2Candidates.length > 0 ? (
+                <button
+                  className="primary-button"
+                  type="button"
+                  onClick={() => {
+                    setStep("lan");
+                    persist({ progressHint: "lan" });
+                  }}
+                >
+                  {translate(locale, "onboarding.pcl2.continue")}
+                </button>
+              ) : null}
+            </div>
+          </>
+        ) : null}
+
+        {step === "lan" ? (
+          <>
+            <p className="onboarding-eyebrow">{translate(locale, "onboarding.eyebrow")}</p>
+            <h1 id="onboarding-title" ref={heading} tabIndex={-1}>
+              {translate(locale, "onboarding.lan.title")}
+            </h1>
+            <p>{translate(locale, "onboarding.lan.body")}</p>
+            <div className="instruction-card">
+              <strong>{translate(locale, "onboarding.lan.instructionsTitle")}</strong>
+              <p>{translate(locale, "onboarding.lan.instructionsBody")}</p>
+            </div>
+            {lanCandidates.length > 0 ? (
+              <div className="lan-candidate-list">
+                {lanCandidates.map((candidate) => (
+                  <LanCandidateCard
+                    candidate={candidate}
+                    locale={locale}
+                    pending={connectingCandidate === candidate.id}
+                    disabled={connectingCandidate !== null}
+                    onConfirm={(id) => void confirmAndConnect(id)}
+                    key={candidate.id}
+                  />
+                ))}
+              </div>
+            ) : null}
+            <button
+              className="secondary-button"
+              type="button"
+              disabled={lanLoading || connectingCandidate !== null}
+              onClick={() => void refreshLan()}
+            >
+              {translate(locale, lanLoading ? "onboarding.refreshing" : "onboarding.refresh")}
+            </button>
+          </>
+        ) : null}
+
+        {step === "ready" ? (
+          <>
+            <h1 id="onboarding-title" ref={heading} tabIndex={-1}>
+              {translate(locale, "onboarding.ready.title")}
+            </h1>
+            <p>{translate(locale, "onboarding.ready.body")}</p>
+          </>
+        ) : null}
+
+        {errorKey ? (
+          <p className="onboarding-error" role="alert" aria-live="assertive">
+            {translate(locale, errorKey)}
+          </p>
+        ) : null}
+      </section>
+    </main>
+  );
+}
+
+export function readOnboardingLocale(): Locale {
+  return readOnboardingPreferences().locale;
+}
+
+export function persistOnboardingLocale(locale: Locale): void {
+  const current = readOnboardingPreferences();
+  writeOnboardingPreferences({ ...current, locale });
+}
+
+export function safeOnboardingErrorKey(error: unknown): MessageKey {
+  const message = error instanceof Error ? error.message : "";
+  const mappings: readonly [string, MessageKey][] = [
+    ["CODEX_NOT_LOGGED_IN", "onboarding.error.CODEX_NOT_LOGGED_IN"],
+    ["MODEL_UNAVAILABLE", "onboarding.error.MODEL_UNAVAILABLE"],
+    ["PCL2_NOT_FOUND", "onboarding.error.PCL2_NOT_FOUND"],
+    ["LAN_NOT_FOUND", "onboarding.error.LAN_NOT_FOUND"],
+    ["LAN_CANDIDATE_EXPIRED", "onboarding.error.LAN_CANDIDATE_EXPIRED"],
+    ["LAN_CANDIDATE_CHANGED", "onboarding.error.LAN_CANDIDATE_EXPIRED"],
+    ["MINECRAFT_VERSION_UNVERIFIED", "onboarding.error.MINECRAFT_VERSION_UNVERIFIED"],
+    ["MINECRAFT_CONNECT_FAILED", "onboarding.error.MINECRAFT_CONNECT_FAILED"],
+  ];
+  return mappings.find(([code]) => message.includes(code))?.[1] ?? "onboarding.error.UNKNOWN";
+}
+
+function ownerValidationErrorKey(value: string): MessageKey | null {
+  try {
+    parseMinecraftJavaUsername(value);
+    return null;
+  } catch {
+    return value.trim().toLowerCase() === "whitelily"
+      ? "onboarding.owner.error.collision"
+      : "onboarding.owner.error.invalid";
+  }
+}
+
+function safeOwnerErrorKey(error: unknown): MessageKey {
+  const message = error instanceof Error ? error.message : "";
+  const mappings: readonly [string, MessageKey][] = [
+    ["OWNER_IDENTITY_INVALID", "onboarding.owner.error.invalid"],
+    ["OWNER_IDENTITY_REQUIRED", "onboarding.owner.error.invalid"],
+    ["OWNER_IDENTITY_CONFIG_CONFLICT", "onboarding.owner.error.stale"],
+    ["OWNER_IDENTITY_WRITE_FAILED", "onboarding.owner.error.write"],
+    ["OWNER_IDENTITY_CONFIG_INVALID", "onboarding.owner.error.configInvalid"],
+  ];
+  return (
+    mappings.find(([code]) => message.includes(code))?.[1] ?? "onboarding.owner.error.unavailable"
+  );
+}
+
+async function pollForSignedInAccount(options: {
+  api: WhiteLilyDesktopApi;
+  attempt: Extract<AccountSnapshot, { status: "pending" }>;
+  isCurrent(): boolean;
+  schedule(timer: ReturnType<typeof setTimeout>, wake: () => void): void;
+}): Promise<void> {
+  const deadline = Math.min(options.attempt.expiresAt, Date.now() + MAX_LOGIN_POLL_MS);
+  while (options.isCurrent() && Date.now() < deadline) {
+    const account = await options.api.getAccount();
+    if (isSignedIn(account)) return;
+    if (account.status === "cancelled" || account.status === "expired") {
+      throw new Error("CODEX_NOT_LOGGED_IN");
+    }
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, LOGIN_POLL_INTERVAL_MS);
+      options.schedule(timer, resolve);
+    });
+  }
+  throw new Error("CODEX_NOT_LOGGED_IN");
+}
+
+interface CatalogSelectionControl {
+  isCurrent(): boolean;
+  select(input: Parameters<WhiteLilyDesktopApi["selectModel"]>[0]): Promise<ModelSelection | null>;
+}
+
+interface RestoredModelPreference {
+  catalog: ModelCatalogSnapshot;
+  preference: SafePreferences["modelPreference"];
+  fallbackFailed: boolean;
+  selectionApplied: boolean;
+}
+
+async function restoreLiveModelPreference(
+  control: CatalogSelectionControl,
+  catalog: ModelCatalogSnapshot,
+  preferences: SafePreferences,
+): Promise<RestoredModelPreference | null> {
+  if (!control.isCurrent()) return null;
+  const preference = preferences.modelPreference;
+  if (!preference) {
+    return { catalog, preference: null, fallbackFailed: false, selectionApplied: false };
+  }
+  if (preference.mode === "automatic") {
+    try {
+      if (!control.isCurrent()) return null;
+      const selection = await control.select({ mode: "automatic" });
+      if (!control.isCurrent() || !selection) return null;
+      return {
+        catalog: { ...catalog, selection },
+        preference,
+        fallbackFailed: false,
+        selectionApplied: true,
+      };
+    } catch {
+      if (!control.isCurrent()) return null;
+      return {
+        catalog: { ...catalog, selection: { mode: "automatic" } },
+        preference: null,
+        fallbackFailed: true,
+        selectionApplied: false,
+      };
+    }
+  }
+  const model = catalog.models.find((candidate) => candidate.id === preference.modelId);
+  if (!model || !model.supportedReasoningEfforts.includes(preference.reasoningEffort)) {
+    if (!control.isCurrent()) return null;
+    return applyAutomaticFallback(control, catalog);
+  }
+  try {
+    if (!control.isCurrent()) return null;
+    const selection = await control.select(preference);
+    if (!control.isCurrent() || !selection) return null;
+    return {
+      catalog: { ...catalog, selection },
+      preference,
+      fallbackFailed: false,
+      selectionApplied: true,
+    };
+  } catch {
+    if (!control.isCurrent()) return null;
+    return applyAutomaticFallback(control, catalog);
+  }
+}
+
+async function applyAutomaticFallback(
+  control: CatalogSelectionControl,
+  catalog: ModelCatalogSnapshot,
+): Promise<RestoredModelPreference | null> {
+  try {
+    if (!control.isCurrent()) return null;
+    const selection = await control.select({ mode: "automatic" });
+    if (!control.isCurrent() || !selection) return null;
+    return {
+      catalog: { ...catalog, selection },
+      preference: null,
+      fallbackFailed: false,
+      selectionApplied: true,
+    };
+  } catch {
+    if (!control.isCurrent()) return null;
+    return {
+      catalog: { ...catalog, selection: { mode: "automatic" } },
+      preference: null,
+      fallbackFailed: true,
+      selectionApplied: false,
+    };
+  }
+}
+
+function isSignedIn(
+  account: AccountSnapshot,
+): account is Extract<AccountSnapshot, { status: "signed_in" }> {
+  return account.status === "signed_in" && account.auth === "chatgpt";
+}
+
+function asStableError(error: unknown, fallbackCode: string): Error {
+  if (error instanceof Error && safeOnboardingErrorKey(error) !== "onboarding.error.UNKNOWN") {
+    return error;
+  }
+  return new Error(fallbackCode);
+}
+
+function readOnboardingPreferences(): SafePreferences {
+  try {
+    const raw = window.localStorage.getItem(ONBOARDING_STORAGE_KEY);
+    if (!raw) return { ...defaultPreferences };
+    if (raw.length > MAX_STORAGE_BYTES) throw new Error("oversized onboarding preferences");
+    const parsed: unknown = JSON.parse(raw);
+    if (isSafePreferences(parsed)) return parsed;
+    const migrated = migrateLegacyPreferences(parsed);
+    if (!migrated) throw new Error("invalid onboarding preferences");
+    writeOnboardingPreferences(migrated);
+    return migrated;
+  } catch {
+    try {
+      window.localStorage.removeItem(ONBOARDING_STORAGE_KEY);
+    } catch {
+      // Storage may be unavailable; onboarding remains live-authority driven.
+    }
+    return { ...defaultPreferences };
+  }
+}
+
+function writeOnboardingPreferences(preferences: SafePreferences): void {
+  try {
+    const raw = JSON.stringify(preferences);
+    if (raw.length > MAX_STORAGE_BYTES) throw new Error("oversized onboarding preferences");
+    window.localStorage.setItem(ONBOARDING_STORAGE_KEY, raw);
+  } catch {
+    try {
+      window.localStorage.removeItem(ONBOARDING_STORAGE_KEY);
+    } catch {
+      // Storage is an optional UI-resume hint, never runtime authority.
+    }
+  }
+}
+
+function isSafePreferences(value: unknown): value is SafePreferences {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  if (
+    Object.keys(record).sort().join(",") !== "locale,modelPreference,progressHint,version" ||
+    record.version !== STORAGE_VERSION ||
+    !(record.locale === "zh-CN" || record.locale === "en") ||
+    !(
+      record.progressHint === "login" ||
+      record.progressHint === "model" ||
+      record.progressHint === "owner" ||
+      record.progressHint === "pcl2" ||
+      record.progressHint === "lan" ||
+      record.progressHint === "ready"
+    )
+  ) {
+    return false;
+  }
+  return isSafeModelPreference(record.modelPreference);
+}
+
+function migrateLegacyPreferences(value: unknown): SafePreferences | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  if (
+    Object.keys(record).sort().join(",") !== "locale,modelPreference,progressHint,version" ||
+    record.version !== 1 ||
+    !(record.locale === "zh-CN" || record.locale === "en") ||
+    !(
+      record.progressHint === "login" ||
+      record.progressHint === "model" ||
+      record.progressHint === "pcl2" ||
+      record.progressHint === "lan" ||
+      record.progressHint === "ready"
+    ) ||
+    !isSafeModelPreference(record.modelPreference)
+  ) {
+    return null;
+  }
+  return {
+    version: STORAGE_VERSION,
+    locale: record.locale,
+    progressHint:
+      record.progressHint === "login" || record.progressHint === "model"
+        ? record.progressHint
+        : "owner",
+    modelPreference: record.modelPreference,
+  };
+}
+
+function isSafeModelPreference(value: unknown): value is SafePreferences["modelPreference"] {
+  if (value === null) return true;
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const preference = value as Record<string, unknown>;
+  if (preference.mode === "automatic") {
+    return Object.keys(preference).join(",") === "mode";
+  }
+  return (
+    Object.keys(preference).sort().join(",") === "mode,modelId,reasoningEffort" &&
+    preference.mode === "explicit" &&
+    typeof preference.modelId === "string" &&
+    MODEL_ID_PATTERN.test(preference.modelId) &&
+    typeof preference.reasoningEffort === "string" &&
+    EFFORT_PATTERN.test(preference.reasoningEffort)
+  );
+}

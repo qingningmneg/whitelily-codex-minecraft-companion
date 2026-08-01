@@ -1,0 +1,10 @@
+{
+  "required": true,
+  "package": "io.github.whitelily.avatar.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "refmap": "whitelily-avatar-fabric-refmap.json",
+  "client": ["LivingEntityRendererMixin", "PlayerRendererMixin", "PlayerRenderStateMixin"],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

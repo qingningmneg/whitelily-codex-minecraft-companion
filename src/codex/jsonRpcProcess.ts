@@ -3,7 +3,10 @@ import {
   type ChildProcessWithoutNullStreams,
   type SpawnOptionsWithoutStdio,
 } from "node:child_process";
-import { resolve } from "node:path";
+import { createHash } from "node:crypto";
+import { mkdirSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
+import { createRequire } from "node:module";
+import { dirname, isAbsolute, join, posix, relative, resolve, sep, win32 } from "node:path";
 
 export type JsonRpcMessage =
   | { id: number; method: string; params: unknown }
@@ -30,6 +33,36 @@ export interface CodexSpawnSpec {
   env: NodeJS.ProcessEnv;
   windowsHide: boolean;
 }
+
+export interface CodexLaunchConfig {
+  executablePath: string;
+  codexHome: string;
+}
+
+export type CodexResourceLayout = "development" | "packaged";
+
+export interface CodexResourceVerification {
+  layout: CodexResourceLayout;
+  manifestPath: string;
+}
+
+interface ReviewedRuntimeManifest {
+  schemaVersion: 1;
+  paths: { codexExecutable: string };
+  allowlist: {
+    exactFiles: Array<{
+      source: string;
+      target: string | null;
+      bytes: number;
+      sha256: string;
+    }>;
+    executableFiles: string[];
+  };
+  policySha256?: string;
+  resources?: Array<{ path: string; bytes: number; sha256: string }>;
+}
+
+const verifiedCodexLaunchConfigs = new WeakSet<CodexLaunchConfig>();
 
 export interface LoginStatusResult {
   stdout: string;
@@ -92,6 +125,36 @@ function ensureSafeCmdExecutable(executable: string): void {
   }
 }
 
+function controlledCodexEnvironment(
+  platform: NodeJS.Platform,
+  config: CodexLaunchConfig,
+  environment: NodeJS.ProcessEnv,
+): NodeJS.ProcessEnv {
+  if (!verifiedCodexLaunchConfigs.has(config)) {
+    throw new Error("Codex launch configuration was not verified");
+  }
+  const pathApi = platform === "win32" ? win32 : posix;
+  if (!pathApi.isAbsolute(config.executablePath)) {
+    throw new Error("Codex executable path must be absolute");
+  }
+  if (!pathApi.isAbsolute(config.codexHome) || /[\u0000\r\n]/u.test(config.codexHome)) {
+    throw new Error("Codex home must be an absolute trusted path");
+  }
+  const env = cleanCodexEnvironment(environment);
+  for (const key of Object.keys(env)) {
+    if (key.toUpperCase() === "PATH" || key.toUpperCase() === "CODEX_HOME") delete env[key];
+  }
+  const binDirectory = pathApi.dirname(config.executablePath);
+  const vendorDirectory = pathApi.dirname(binDirectory);
+  env.PATH = [
+    binDirectory,
+    pathApi.join(vendorDirectory, "codex-path"),
+    pathApi.join(vendorDirectory, "codex-resources"),
+  ].join(pathApi.delimiter);
+  env.CODEX_HOME = pathApi.normalize(config.codexHome);
+  return env;
+}
+
 function codexCommandSpec(
   platform: NodeJS.Platform,
   executable: string,
@@ -104,6 +167,14 @@ function codexCommandSpec(
   }
 
   ensureSafeCmdExecutable(executable);
+  if (!executable.toLowerCase().endsWith(".cmd")) {
+    return {
+      command: executable,
+      args: commandArgs,
+      env,
+      windowsHide: true,
+    };
+  }
   const command = `""${executable}" ${commandArgs.join(" ")}"`;
   return {
     command: "cmd.exe",
@@ -115,24 +186,235 @@ function codexCommandSpec(
 
 export function createCodexAppServerSpawnSpec(
   platform: NodeJS.Platform,
-  executable: string,
+  launch: string | CodexLaunchConfig,
   environment: NodeJS.ProcessEnv,
 ): CodexSpawnSpec {
+  const executable = typeof launch === "string" ? launch : launch.executablePath;
+  const controlledEnvironment =
+    typeof launch === "string"
+      ? environment
+      : controlledCodexEnvironment(platform, launch, environment);
   return codexCommandSpec(
     platform,
     executable,
     ["app-server", "--listen", "stdio://"],
-    environment,
+    controlledEnvironment,
   );
 }
 
-function defaultCodexExecutable(): string {
+export function createBundledCodexLaunchConfig(
+  resourceDirectory: string,
+  dataRoot: string,
+  platform: NodeJS.Platform = process.platform,
+  verification: CodexResourceVerification = {
+    layout: "packaged",
+    manifestPath: join(resourceDirectory, "runtime-manifest.json"),
+  },
+): CodexLaunchConfig {
+  if (
+    !isAbsolute(resourceDirectory) ||
+    !isAbsolute(dataRoot) ||
+    !isAbsolute(verification.manifestPath)
+  ) {
+    throw new Error("WhiteLily Codex resource and data roots must be absolute");
+  }
+  const canonicalResources = realpathSync.native(resourceDirectory);
+  const canonicalManifest = realpathSync.native(verification.manifestPath);
+  const expectedManifest =
+    verification.layout === "packaged"
+      ? resolve(canonicalResources, "runtime-manifest.json")
+      : resolve(
+          canonicalResources,
+          "..",
+          "..",
+          "..",
+          "packaging",
+          "electron",
+          "runtime-manifest.json",
+        );
+  if (canonicalManifest !== realpathSync.native(expectedManifest)) {
+    throw new Error("WhiteLily Codex manifest is not bound to its resource root");
+  }
+  const manifest = JSON.parse(readFileSync(canonicalManifest, "utf8")) as ReviewedRuntimeManifest;
+  if (
+    manifest.schemaVersion !== 1 ||
+    !manifest.allowlist ||
+    !Array.isArray(manifest.allowlist.exactFiles) ||
+    !Array.isArray(manifest.allowlist.executableFiles)
+  ) {
+    throw new Error("WhiteLily reviewed Codex manifest is invalid");
+  }
+  const nativePrefix =
+    verification.layout === "packaged" ? "codex/native/" : "node_modules/@openai/codex-win32-x64/";
+  const nativeRoot =
+    verification.layout === "packaged"
+      ? realpathSync.native(resolve(canonicalResources, "codex", "native"))
+      : canonicalResources;
+  const nativeEntries = manifest.allowlist.exactFiles.filter((entry) => {
+    const portable = verification.layout === "packaged" ? entry.target : entry.source;
+    return portable?.startsWith(nativePrefix) === true;
+  });
+  if (
+    verification.layout === "packaged" &&
+    (!/^[a-f0-9]{64}$/u.test(manifest.policySha256 ?? "") || !Array.isArray(manifest.resources))
+  ) {
+    throw new Error("WhiteLily packaged Codex manifest binding is invalid");
+  }
+  const resolveEntry = (entry: (typeof nativeEntries)[number]): string => {
+    const portable = verification.layout === "packaged" ? entry.target : entry.source;
+    if (portable === null) throw new Error("WhiteLily Codex manifest target is invalid");
+    const relativePath = portable.slice(nativePrefix.length);
+    const path = resolve(nativeRoot, ...relativePath.split("/"));
+    const canonical = realpathSync.native(path);
+    const child = relative(nativeRoot, canonical);
+    if (child === ".." || child.startsWith(`..${sep}`) || isAbsolute(child)) {
+      throw new Error("WhiteLily Codex resource escaped its verified root");
+    }
+    const metadata = statSync(canonical);
+    const hash = createHash("sha256").update(readFileSync(canonical)).digest("hex");
+    if (!metadata.isFile() || metadata.size !== entry.bytes || hash !== entry.sha256) {
+      throw new Error(`WhiteLily Codex resource hash mismatch: ${portable}`);
+    }
+    if (verification.layout === "packaged") {
+      const packaged = manifest.resources?.find((resource) => resource.path === portable);
+      if (!packaged || packaged.bytes !== entry.bytes || packaged.sha256 !== entry.sha256) {
+        throw new Error(`WhiteLily packaged Codex resource is not manifest-bound: ${portable}`);
+      }
+    }
+    return canonical;
+  };
+  const verifiedFiles = new Map(
+    nativeEntries.map((entry) => [
+      verification.layout === "packaged" ? entry.target : entry.source,
+      resolveEntry(entry),
+    ]),
+  );
+  const executablePortable =
+    verification.layout === "packaged"
+      ? manifest.paths.codexExecutable
+      : `node_modules/@openai/codex-win32-x64/${manifest.paths.codexExecutable.replace(
+          "codex/native/",
+          "",
+        )}`;
+  const executablePath = verifiedFiles.get(executablePortable);
+  if (!executablePath) throw new Error("WhiteLily Codex executable is absent from the manifest");
+  const executableRoot = resolve(nativeRoot, "vendor");
+  const actualExecutables: string[] = [];
+  const visit = (directory: string): void => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) visit(path);
+      else if (entry.isFile() && /\.(?:com|exe|msi)$/iu.test(entry.name)) {
+        actualExecutables.push(relative(nativeRoot, path).split(sep).join("/"));
+      } else if (!entry.isFile()) {
+        throw new Error("WhiteLily Codex resources must not contain links");
+      }
+    }
+  };
+  visit(executableRoot);
+  const expectedExecutables = manifest.allowlist.executableFiles
+    .map((path) => path.replace("codex/native/", ""))
+    .sort();
+  if (actualExecutables.sort().join("\n") !== expectedExecutables.join("\n")) {
+    throw new Error("WhiteLily Codex executable allowlist mismatch");
+  }
+  mkdirSync(dataRoot, { recursive: true });
+  const canonicalDataRoot = realpathSync.native(dataRoot);
+  const codexHomeCandidate = join(canonicalDataRoot, "codex");
+  mkdirSync(codexHomeCandidate, { recursive: true });
+  const codexHome = realpathSync.native(codexHomeCandidate);
+  if (dirname(codexHome) !== canonicalDataRoot) {
+    throw new Error("WhiteLily Codex home escaped the data root");
+  }
+  const config = Object.freeze({
+    executablePath,
+    codexHome,
+  });
+  verifiedCodexLaunchConfigs.add(config);
+  return config;
+}
+
+function resolveDevelopmentCodexVerification(): {
+  resourceDirectory: string;
+  verification: CodexResourceVerification;
+} {
+  const localRequire = createRequire(import.meta.url);
+  const resourceDirectory = dirname(localRequire.resolve("@openai/codex-win32-x64/package.json"));
+  return {
+    resourceDirectory,
+    verification: {
+      layout: "development",
+      manifestPath: resolve(
+        resourceDirectory,
+        "..",
+        "..",
+        "..",
+        "packaging",
+        "electron",
+        "runtime-manifest.json",
+      ),
+    },
+  };
+}
+
+export function resolveDefaultCodexExecutable(
+  platform: NodeJS.Platform = process.platform,
+  arch: string = process.arch,
+): string {
+  if (platform === "win32" && arch === "x64") {
+    const localRequire = createRequire(import.meta.url);
+    const packageRoot = dirname(localRequire.resolve("@openai/codex-win32-x64/package.json"));
+    return resolve(packageRoot, "vendor", "x86_64-pc-windows-msvc", "bin", "codex.exe");
+  }
   return resolve(
     process.cwd(),
     "node_modules",
     ".bin",
-    process.platform === "win32" ? "codex.cmd" : "codex",
+    platform === "win32" ? "codex.cmd" : "codex",
   );
+}
+
+export function resolveDefaultCodexLaunchConfig(
+  dataRoot?: string,
+  platform: NodeJS.Platform = process.platform,
+  arch: string = process.arch,
+): CodexLaunchConfig {
+  const pathApi = platform === "win32" ? win32 : posix;
+  const resolvedDataRoot =
+    dataRoot ??
+    process.env.WHITELILY_DATA_ROOT ??
+    (platform === "win32" && process.env.LOCALAPPDATA
+      ? pathApi.join(process.env.LOCALAPPDATA, "WhiteLily")
+      : resolve(process.cwd(), "data"));
+  if (platform === "win32" && arch === "x64") {
+    const configuredRoot = process.env.WHITELILY_CODEX_RESOURCE_ROOT;
+    const configuredManifest = process.env.WHITELILY_CODEX_MANIFEST;
+    const configuredLayout = process.env.WHITELILY_CODEX_LAYOUT;
+    if (configuredRoot || configuredManifest || configuredLayout) {
+      if (
+        !configuredRoot ||
+        !configuredManifest ||
+        (configuredLayout !== "packaged" && configuredLayout !== "development")
+      ) {
+        throw new Error("WhiteLily Codex resource environment is incomplete");
+      }
+      return createBundledCodexLaunchConfig(configuredRoot, resolvedDataRoot, platform, {
+        layout: configuredLayout,
+        manifestPath: configuredManifest,
+      });
+    }
+    const development = resolveDevelopmentCodexVerification();
+    return createBundledCodexLaunchConfig(
+      development.resourceDirectory,
+      resolvedDataRoot,
+      platform,
+      development.verification,
+    );
+  }
+  return {
+    executablePath: resolveDefaultCodexExecutable(platform, arch),
+    codexHome: pathApi.join(pathApi.resolve(resolvedDataRoot), "codex"),
+  };
 }
 
 function spawnFromSpec(spec: CodexSpawnSpec): ChildProcessWithoutNullStreams {
@@ -248,11 +530,11 @@ export function terminateCodexProcessTree(
 }
 
 export function spawnCodexAppServerTransport(
-  executable = defaultCodexExecutable(),
+  launch: string | CodexLaunchConfig = resolveDefaultCodexLaunchConfig(),
   options: CodexAppServerTransportOptions = {},
 ): JsonRpcLineTransport {
   const child = (options.spawnProcess ?? spawnFromSpec)(
-    createCodexAppServerSpawnSpec(process.platform, executable, process.env),
+    createCodexAppServerSpawnSpec(process.platform, launch, process.env),
   );
   const maxBufferedLineBytes = options.maxBufferedLineBytes ?? 1024 * 1024;
   if (!Number.isSafeInteger(maxBufferedLineBytes) || maxBufferedLineBytes < 1) {
@@ -333,7 +615,7 @@ export function spawnCodexAppServerTransport(
 }
 
 export function runCodexLoginStatus(
-  executable = defaultCodexExecutable(),
+  launch: string | CodexLaunchConfig = resolveDefaultCodexLaunchConfig(),
   timeoutMs = 10_000,
   spawnProcess: CodexChildSpawner = spawnFromSpec,
   signal?: AbortSignal,
@@ -344,7 +626,14 @@ export function runCodexLoginStatus(
     let child: ChildProcessWithoutNullStreams;
     try {
       child = spawnProcess(
-        codexCommandSpec(process.platform, executable, ["login", "status"], process.env),
+        codexCommandSpec(
+          process.platform,
+          typeof launch === "string" ? launch : launch.executablePath,
+          ["login", "status"],
+          typeof launch === "string"
+            ? process.env
+            : controlledCodexEnvironment(process.platform, launch, process.env),
+        ),
       );
     } catch (error) {
       reject(error);

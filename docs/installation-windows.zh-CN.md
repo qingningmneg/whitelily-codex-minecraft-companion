@@ -1,268 +1,145 @@
-# Windows 11 + PCL2 安装指南
+# WhiteLily Windows 安装、升级与卸载指南
 
-本指南适用于 WhiteLily v0.1.1、Windows 11、Plain Craft Launcher 2（PCL2）和 Minecraft Java 版 1.21.5。
+[English](installation-windows.md)
 
-白百合不是 Minecraft 客户端模组。她会在 Windows 后台运行，以 Mineflayer 机器人身份加入你开放到局域网的世界；你仍然只需在 Minecraft 聊天框中和她交流。
+> **状态：`v0.2.0-beta.1` 安装包正在构建和验证，尚未发布。** 当前分支还没有完成隔离 Windows 环境中的安装、升级、卸载和 Minecraft 实机验收。本文记录发布后的预期流程，不表示安装包已经可下载或通过验收。
 
-## 1. 安装前须知
+已发布的 `v0.1.1` 是面向开发者和早期测试者的旧版 CLI ZIP 预览，需要系统开发工具；它不是下面介绍的桌面 EXE 安装包。
 
-- 第一次安装和每次更新都只在可丢弃的测试世界中尝试。
-- 不要先在重要存档、重要建筑或正式多人服务器中运行。
-- 首版要求 Minecraft、PCL2、Codex 和白百合运行在同一台电脑上。
-- `minecraft.host` 必须保持为 `127.0.0.1`。
-- 白百合使用本机 `codex login` 的 ChatGPT/Codex 登录状态和适用额度。
-- 保持 `allow_api_key_fallback = false`，避免意外切换到单独计费的 Platform API。
+## 1. 支持边界
 
-## 2. 准备软件
+首个桌面 Beta 的目标范围是：
 
-请先准备：
+- Windows 10/11 x64，按当前 Windows 用户安装，不要求管理员权限。
+- Plain Craft Launcher 2（PCL2）由用户自行下载安装、启动和操作。
+- Minecraft Java 版 **1.21.5**；未测试版本不在首个 Beta 的支持范围内。
+- WhiteLily、PCL2、Minecraft 和内置 Codex 运行在同一台电脑上。
+- 只连接 `127.0.0.1` 上由用户手动开放的 Minecraft LAN 世界；不支持跨电脑部署或远程 LAN 主机。
+- 用户在 WhiteLily 中使用 ChatGPT 登录；不提供 Platform API 密钥回退。
 
-1. Windows 11 64 位。
-2. PCL2。
-3. Minecraft Java 版 1.21.5。
-4. Node.js 24。
-5. Codex CLI，并能在 PowerShell 中运行 `codex login`。
+WhiteLily 不会启动、控制、点击或修改 PCL2，也不会自动启动 Minecraft 或自动开放 LAN。你必须自己完成这些步骤，并在 WhiteLily 中确认检测到的本机会话。
 
-打开一个新的 PowerShell 窗口，检查 Node.js：
+## 2. 发布后下载两个文件
 
-```powershell
-node --version
-npm --version
-```
+只有在 `v0.2.0-beta.1` 通过发布门禁后，才从官方 [GitHub Releases](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/releases) 下载：
 
-`node --version` 应显示 `v24` 开头的版本。然后登录 Codex：
+1. [`WhiteLily-0.2.0-beta.1-windows-x64-setup.exe`](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/releases/download/v0.2.0-beta.1/WhiteLily-0.2.0-beta.1-windows-x64-setup.exe)
+2. [`WhiteLily-0.2.0-beta.1-windows-x64-setup.exe.sha256`](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/releases/download/v0.2.0-beta.1/WhiteLily-0.2.0-beta.1-windows-x64-setup.exe.sha256)
 
-```powershell
-codex login
-```
+在安装包正式出现在 Release 页面之前，不要从源码目录、聊天附件、网盘或第三方镜像寻找同名 EXE。文件名相同不代表内容可信。
 
-按浏览器提示用 ChatGPT 账户完成登录。白百合不需要也不应要求你把 API 密钥写入配置文件。
+## 3. 安装前验证 SHA-256
 
-## 3. 下载并校验
-
-推荐从 GitHub Releases 下载：
-
-- `whitelily-0.1.1-windows-x64.zip`
-- `whitelily-0.1.1-windows-x64.zip.sha256`
-
-两个文件放在同一目录后，在该目录打开 PowerShell，计算 ZIP 的 SHA-256：
+把 EXE 和 `.sha256` 放在同一目录，打开 PowerShell 并进入该目录，然后运行：
 
 ```powershell
-(Get-FileHash -Algorithm SHA256 .\whitelily-0.1.1-windows-x64.zip).Hash.ToLowerInvariant()
-Get-Content .\whitelily-0.1.1-windows-x64.zip.sha256
+$installer = ".\WhiteLily-0.2.0-beta.1-windows-x64-setup.exe"
+$checksum = ".\WhiteLily-0.2.0-beta.1-windows-x64-setup.exe.sha256"
+$expected = ((Get-Content -Raw $checksum).Trim() -split "\s+")[0].ToLowerInvariant()
+$actual = (Get-FileHash -Algorithm SHA256 $installer).Hash.ToLowerInvariant()
+if ($actual -ne $expected) { throw "SHA-256 mismatch. Do not run the installer." }
+"SHA-256 verified: $actual"
 ```
 
-两处显示的 64 位十六进制哈希必须一致。如果不一致，不要运行压缩包中的脚本，请重新下载。
+只有命令显示 `SHA-256 verified` 时才继续。哈希不一致、校验文件格式异常或任一文件来自不同来源时，删除两个文件并重新从官方 Release 下载。不要用“看起来是同一个文件”代替哈希验证。
 
-## 4. 解压
+## 4. 未签名构建与 SmartScreen
 
-建议解压到不受系统保护、也不被网盘自动同步的目录，例如：
+首个 Beta 是**未签名**安装包，因此 Windows SmartScreen 可能显示“Windows 已保护你的电脑”或“未知发布者”。这不是哈希验证的替代品，也不表示任意同名文件都安全。
+
+确认下载来源和 SHA-256 都正确后，按[未签名与 Windows SmartScreen 说明](smartscreen.zh-CN.md)检查文件，再选择“更多信息”→“仍要运行”。不要关闭 SmartScreen，不要降低整台电脑的安全设置，也不要为来源不明或哈希不匹配的文件绕过警告。
+
+## 5. 安装
+
+1. 退出正在运行的 WhiteLily 开发构建或旧桌面构建。
+2. 双击已经验证 SHA-256 的 EXE。
+3. 阅读安装向导并确认当前用户安装。
+4. 完成后从开始菜单或桌面快捷方式打开 WhiteLily。
+
+默认程序目录：
 
 ```text
-C:\Games\WhiteLily
+%LOCALAPPDATA%\Programs\WhiteLily
 ```
 
-不要直接在 ZIP 压缩包预览窗口中运行脚本。
-
-进入解压后的 WhiteLily 目录，在文件资源管理器地址栏输入 `powershell` 并回车，或右键选择“在终端中打开”。
-
-## 5. 执行安装脚本
-
-在 WhiteLily 目录运行：
-
-```powershell
-.\scripts\setup.ps1
-```
-
-如果 Windows 只在当前窗口阻止脚本执行，可先运行：
-
-```powershell
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-.\scripts\setup.ps1
-```
-
-`-Scope Process` 只影响当前 PowerShell 窗口，关闭窗口后失效。
-
-## 6. 创建配置
-
-复制示例配置：
-
-```powershell
-Copy-Item .\config.example.toml .\config.toml
-notepad .\config.toml
-```
-
-首次使用建议只修改下面两项：
-
-```toml
-[minecraft]
-host = "127.0.0.1"
-port = 25565
-bot_username = "WhiteLily"
-owner_username = "你的Minecraft游戏名"
-```
-
-- `owner_username` 必须与游戏内用户名完全一致，包括大小写。
-- `port` 稍后改成 Minecraft 开放到局域网后显示的端口。
-- `bot_username` 是机器人加入世界时显示的名称。
-
-保留这些安全默认值：
-
-```toml
-[codex]
-preferred_model = "gpt-5.6-terra"
-reasoning_effort = "low"
-allow_api_key_fallback = false
-
-[companion]
-start_mode = "friend"
-persona_name = "白百合"
-```
-
-`config.toml` 包含你的本机设置，已被 Git 忽略；不要把它上传到公开仓库。
-
-## 7. 用 PCL2 开放测试世界
-
-1. 用 PCL2 启动 Minecraft Java 版 1.21.5。
-2. 新建一个可以随时删除的测试世界。
-3. 进入世界后按 `Esc`。
-4. 选择“对局域网开放”。
-5. 确认开放后，Minecraft 聊天区会显示本地游戏端口，例如 `52143`。
-6. 把这个数字写入 `config.toml` 的 `minecraft.port`：
-
-```toml
-port = 52143
-```
-
-每次重新开放局域网时端口都可能变化。连接失败时，先检查这里。
-
-如果 Windows 防火墙询问是否允许 Java，请只按你的实际网络环境授权；家庭网络通常只需“专用网络”，不必开放到公共网络。
-
-## 8. 运行检查
-
-保持 Minecraft 世界已经开放到局域网，然后在 WhiteLily 目录运行：
-
-```powershell
-.\scripts\doctor.ps1
-```
-
-重点检查：
-
-- Node.js 版本正确。
-- Codex 已登录。
-- `config.toml` 存在且格式正确。
-- 目标地址为 `127.0.0.1`。
-- Minecraft 局域网端口可连接。
-- 未启用 API 密钥回退。
-
-如果 doctor 报错，先按错误提示修复，不要跳过。
-
-## 9. 启动、聊天和停止
-
-启动：
-
-```powershell
-.\scripts\start.ps1
-```
-
-机器人加入世界后，直接在 Minecraft 聊天框中说话即可，不需要给“白百合”加前缀。
-
-常用命令：
+默认用户数据目录：
 
 ```text
-!status
-!mode friend
-!mode balanced
-!mode autonomous
-!pause
-!resume
-!stop
+%LOCALAPPDATA%\WhiteLily
 ```
 
-三种模式：
+安装包计划内置 Electron、编译后的 WhiteLily 后台运行时、固定版本的 Codex CLI、生产依赖和许可证材料。因此普通用户**不需要系统 Node.js、npm、Git 或 Codex CLI**，安装过程也不会联网下载可执行依赖。PCL2 和 Minecraft 不包含在 WhiteLily 安装包中，仍由用户从各自可信来源安装。
 
-- `friend`：陪伴聊天为主，行动前确认。
-- `balanced`：可以观察并提出有限行动建议。
-- `autonomous`：只在明确配置的安全边界内自行执行。
+## 6. 首次打开
 
-任何时候都可以切换模式。永久拒绝规则始终优先，`!stop` 会立即取消当前行为。
+1. 打开 WhiteLily。
+2. 在应用内完成 ChatGPT 登录。
+3. 从当前账户实时返回的可用模型中选择模型和推理强度。
+4. 设置与游戏内完全一致的 Minecraft Java 主人用户名，包括大小写。
+5. 保留默认安全边界，并先使用可以随时删除的测试世界。
 
-在 Windows 中彻底停止后台服务：
+认证文件保存在 `%LOCALAPPDATA%\WhiteLily` 下的受控本机数据目录。WhiteLily 不要求把 API 密钥粘贴进配置，也不提供 API Key 回退。
 
-```powershell
-.\scripts\stop.ps1
-```
+## 7. 用 PCL2 进入 Minecraft
 
-不要只关闭 Minecraft 就认为后台已经停止。
+1. 用户自行启动和操作 PCL2。
+2. 用 PCL2 启动 Minecraft Java 1.21.5。
+3. 进入一个可丢弃的单人测试世界。
+4. 按 `Esc`，选择“对局域网开放”，并由你手动完成 LAN 开放。
+5. 回到 WhiteLily，核对检测到的版本、进程、`127.0.0.1` 和端口。
+6. 只在信息正确时确认连接。
 
-## 10. 首次安装成功检查
+WhiteLily 不扫描局域网内其他电脑，不接受模型给出的远程主机地址，也不读取 PCL2 账户凭据。每次重新开放世界时端口可能变化，必须重新核对候选会话。
 
-满足以下条件后，才算首次安装基本成功：
+## 8. 更新
 
-1. `doctor.ps1` 没有阻止启动的错误。
-2. `start.ps1` 成功运行。
-3. WhiteLily 机器人出现在测试世界。
-4. 你在聊天框发送普通消息后能收到回复。
-5. `!status` 能显示当前状态。
-6. 三种模式能够切换。
-7. `!stop` 能立即停止行为。
-8. `stop.ps1` 能结束后台进程。
+当前设计是手动更新，不在后台下载或运行新安装包：
 
-之后再完成 [Windows 冒烟测试清单](windows-smoke-test.md)。
+1. 在 WhiteLily 中停止当前任务和伙伴。
+2. 从系统托盘选择“退出”，确认应用完全结束。
+3. 从官方 Release 下载新 EXE 和对应 `.sha256`。
+4. 再次验证 SHA-256，然后运行新安装包。
+5. 在可丢弃世界中完成更新后的冒烟测试。
+
+同一产品标识的升级只替换程序目录。升级会保留 `%LOCALAPPDATA%\WhiteLily` 中的设置、配置、伙伴资料、记忆、世界绑定、日志和其他用户数据。升级前仍建议备份重要的本机配置；不要把数据目录复制到程序目录。
+
+## 9. 卸载
+
+先停止伙伴并从系统托盘退出 WhiteLily，再从 Windows“已安装的应用”运行卸载器。交互式卸载提供两个明确选项：
+
+- **保留 WhiteLily 数据（默认）**：移除程序，保留 `%LOCALAPPDATA%\WhiteLily`，方便以后重装或升级后继续使用。
+- **删除 WhiteLily 数据**：移除程序并删除 WhiteLily 的本机设置、认证状态、伙伴资料、记忆、日志和诊断数据；该操作不可恢复。
+
+静默卸载也默认保留数据。只有用户在交互式卸载中明确选择“删除 WhiteLily 数据”时，卸载器才应删除精确匹配当前用户 `%LOCALAPPDATA%\WhiteLily` 的目录；不会删除父目录、通配符路径、网络路径或其他应用数据。
+
+## 10. 隐私和本机数据
+
+- WhiteLily 不收集遥测，不自动上传日志或诊断包。
+- PCL2 凭据、Minecraft 存档和主人用户名不会作为公开诊断内容上传。
+- ChatGPT/Codex 认证、设置、记忆和脱敏日志保存在本机 WhiteLily 数据目录。
+- WhiteLily 只访问用户确认的同机 `127.0.0.1` Minecraft LAN 会话。
+- 分享日志或截图前仍需人工检查其中是否有个人信息。
 
 ## 11. 常见问题
 
-### 找不到 `node` 或版本不是 24
+### 系统没有 `node`、`npm`、`git` 或 `codex`
 
-安装 Node.js 24 后关闭所有 PowerShell 窗口，再打开一个新窗口检查 `node --version`。
+这是桌面安装包的预期环境。正式安装包包含运行所需组件，不依赖系统 PATH 中的 Node.js、npm、Git 或 Codex CLI。若安装后的 WhiteLily 提示这些系统命令缺失，请不要自行安装工具绕过问题，应保存脱敏诊断并报告安装包缺陷。
 
-### 找不到 `codex` 或尚未登录
+### 找不到 PCL2
 
-确认 Codex CLI 已安装并能从 PowerShell 启动，然后运行：
+WhiteLily 只做只读发现，不替你安装或启动 PCL2。请从 PCL2 官方来源安装，用户自行启动并操作 PCL2，然后回到 WhiteLily 刷新发现结果。
 
-```powershell
-codex login
-.\scripts\doctor.ps1
-```
+### 无法连接 Minecraft
 
-### 机器人无法加入世界
+确认 Minecraft Java 版本是 1.21.5、世界仍处于 LAN 开放状态、候选地址是 `127.0.0.1`，并且世界中没有同名机器人。不要改成局域网其他电脑的 IP。
 
-依次检查：
+### SmartScreen 仍然阻止运行
 
-1. Minecraft 是否仍在运行。
-2. 世界是否已经“对局域网开放”。
-3. `config.toml` 中的端口是否是本次开放后显示的新端口。
-4. Minecraft 版本是否为 1.21.5。
-5. `host` 是否仍是 `127.0.0.1`。
-6. `bot_username` 是否与世界中已有玩家重名。
+不要关闭系统保护。重新核对官方下载来源和 SHA-256，并阅读[SmartScreen 指南](smartscreen.zh-CN.md)。无法确认任一项时不要运行。
 
-### 玩家消息没有触发回复
+## 12. 开发者预览
 
-检查 `owner_username` 是否与游戏内用户名完全一致，然后运行 `!status`。如果服务已暂停，运行 `!resume`。
+公开的 `v0.1.1` CLI ZIP 是旧版开发者预览，确实要求 Node.js、npm、Git/源码工作区和 Codex CLI。它的要求不适用于未来的 `v0.2.0-beta.1` 桌面安装包。
 
-### Codex 额度暂停
-
-等待账户的适用 ChatGPT/Codex 用量恢复，或降低使用频率。白百合不会自动切换到 Platform API 计费。
-
-### 查看本地日志
-
-运行期间的本地日志保存在安装目录下的 `logs\`。分享日志前先检查并删除不希望公开的信息。
-
-## 12. 更新与卸载
-
-更新前：
-
-```powershell
-.\scripts\stop.ps1
-```
-
-保留自己的 `config.toml`，替换其他程序文件，然后重新运行：
-
-```powershell
-.\scripts\setup.ps1
-.\scripts\doctor.ps1
-```
-
-每次更新后都先在可丢弃世界中重新测试。
-
-卸载时先运行 `stop.ps1`，再删除 WhiteLily 安装目录。`data\`、`logs\` 和 `config.toml` 都只保存在本机；若不需要保留记忆或设置，可以一并删除。
+维护者从源码验证桌面构建时应使用锁定依赖和仓库中的开发脚本；普通安装用户不需要克隆仓库或运行 `npm ci`。在安装包完成隔离生命周期和 Minecraft 1.21.5 实机验收之前，不应把开发产物标记为正式可用或上传为 Release。

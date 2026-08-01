@@ -7,10 +7,12 @@ export type ChatRoute =
   | { kind: "owner_text"; text: string };
 
 export class ChatRouter {
-  constructor(private readonly options: { ownerUsername: string; maxMessageLength: number }) {}
+  constructor(
+    private readonly options: { ownerUsername: () => string; maxMessageLength: number },
+  ) {}
 
   route(event: MinecraftEvent): ChatRoute {
-    if (event.kind !== "chat" || event.username !== this.options.ownerUsername) {
+    if (event.kind !== "chat" || event.username !== this.options.ownerUsername()) {
       return { kind: "ignore" };
     }
 

@@ -1,0 +1,129 @@
+{
+  "name": "@whitelily/desktop",
+  "version": "0.2.0-beta.1",
+  "productName": "WhiteLily",
+  "private": true,
+  "type": "module",
+  "main": "dist/main/main.js",
+  "scripts": {
+    "predev": "npm run build:desktop-child --prefix ../..",
+    "dev": "npm run build:main && npm run build:preload && concurrently --kill-others \"vite\" \"wait-on http://127.0.0.1:5173 && electron .\"",
+    "build": "npm run build:renderer && npm run build:main && npm run build:preload",
+    "build:renderer": "vite build",
+    "build:main": "vite build --mode main",
+    "build:preload": "vite build --mode preload",
+    "test": "vitest run --config vitest.config.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "build": {
+    "appId": "io.github.qingningmneg.whitelily",
+    "productName": "WhiteLily",
+    "forceCodeSigning": false,
+    "disableDefaultIgnoredFiles": true,
+    "directories": {
+      "buildResources": "build",
+      "output": "../../build/electron-installer"
+    },
+    "asar": true,
+    "files": [
+      "package.json",
+      "!node_modules{,/**/*}",
+      {
+        "from": "../../build/electron-bundle/desktop/main",
+        "to": "dist/main",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "../../build/electron-bundle/desktop/preload",
+        "to": "dist/preload",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "../../build/electron-bundle/desktop/renderer",
+        "to": "dist-renderer",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "extraResources": [
+      {
+        "from": "../../build/electron-bundle/core",
+        "to": "core",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "../../build/electron-bundle/codex",
+        "to": "codex",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "../../build/electron-bundle/licenses",
+        "to": "licenses",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "../../build/electron-bundle/runtime-manifest.json",
+        "to": "runtime-manifest.json"
+      }
+    ],
+    "afterPack": "apps/desktop/build/after-pack.cjs",
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon.ico",
+      "requestedExecutionLevel": "asInvoker",
+      "signExecutable": false
+    },
+    "nsis": {
+      "guid": "dc0622a7-44a0-5754-9d1a-deb3725832ce",
+      "oneClick": false,
+      "perMachine": false,
+      "selectPerMachineByDefault": false,
+      "allowElevation": false,
+      "allowToChangeInstallationDirectory": false,
+      "packElevateHelper": false,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "WhiteLily",
+      "include": "../../packaging/nsis/installer.nsh",
+      "installerIcon": "build/icon.ico",
+      "uninstallerIcon": "build/icon.ico",
+      "artifactName": "WhiteLily-${version}-windows-x64-setup.${ext}",
+      "deleteAppDataOnUninstall": false
+    }
+  },
+  "dependencies": {
+    "react": "19.2.8",
+    "react-dom": "19.2.8"
+  },
+  "devDependencies": {
+    "@testing-library/react": "16.3.2",
+    "@testing-library/user-event": "14.6.1",
+    "@types/react": "19.2.17",
+    "@types/react-dom": "19.2.3",
+    "@vitejs/plugin-react": "6.0.4",
+    "concurrently": "10.0.4",
+    "electron": "43.2.0",
+    "electron-builder": "26.15.3",
+    "jsdom": "29.0.1",
+    "vite": "8.1.5",
+    "wait-on": "9.1.0"
+  }
+}

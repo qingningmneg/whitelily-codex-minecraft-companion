@@ -9,6 +9,70 @@ const openAiApiKey = ["OPENAI", "_API", "_KEY"].join("");
 const codexAccessToken = ["codex", "_access", "_token"].join("");
 
 describe("redactSecrets", () => {
+  it("removes generic protected memory, profile, auth, PCL2, chat, and message structures", () => {
+    const output = redactPublicText(
+      JSON.stringify({
+        memory: "meet under the oak at sunrise",
+        memories: [{ note: "complete retained memory" }],
+        profile: { persona: "quiet builder", mode: "autonomous" },
+        auth: { callback: "private callback", session: "private session" },
+        account: { refreshToken: "generic private account" },
+        pcl2Account: { displayName: "local account" },
+        chat: ["complete raw chat"],
+        message: "generic private message",
+      }),
+    );
+
+    for (const secret of [
+      "meet under the oak",
+      "complete retained memory",
+      "quiet builder",
+      "autonomous",
+      "private callback",
+      "private session",
+      "generic private account",
+      "local account",
+      "complete raw chat",
+      "generic private message",
+    ]) {
+      expect(output).not.toContain(secret);
+    }
+    expect(JSON.parse(output)).toMatchObject({
+      memory: "[REDACTED_PROTECTED]",
+      memories: "[REDACTED_PROTECTED]",
+      profile: "[REDACTED_PROTECTED]",
+      auth: "[REDACTED_PROTECTED]",
+      account: "[REDACTED_PROTECTED]",
+      pcl2Account: "[REDACTED_PROTECTED]",
+      chat: "[REDACTED_CHAT]",
+      message: "[REDACTED_CHAT]",
+    });
+  });
+
+  it("redacts Minecraft usernames, OAuth fragments, and IPv6 endpoints", () => {
+    const output = redactPublicText(
+      JSON.stringify({
+        playerName: "PrivateOwner",
+        minecraftUsername: "AlsoPrivate",
+        authCallback: "https://auth.openai.com/callback#code=private-code",
+        note: "retry https://auth.openai.com/callback#state=private-state",
+        serverEndpoint: "[2001:db8::1]:25565",
+      }),
+    );
+
+    for (const secret of [
+      "PrivateOwner",
+      "AlsoPrivate",
+      "private-code",
+      "private-state",
+      "2001:db8::1",
+    ]) {
+      expect(output).not.toContain(secret);
+    }
+    expect(output).toContain("[REDACTED_USERNAME]");
+    expect(output).toContain("[REDACTED_IP]");
+  });
+
   it.each([
     ["sk-test-abcdefghijklmnopqrstuvwxyz123456", "[REDACTED_OPENAI_KEY]"],
     ["SK-TEST-ABCDEFGHIJKLMNOPQRSTUVWXYZ123456", "[REDACTED_OPENAI_KEY]"],
@@ -61,7 +125,7 @@ describe("redactSecrets", () => {
     [
       "complete URI userinfo through the final at-sign",
       "https://first-private@second-private:password@[::1]/world",
-      "https://[REDACTED_URI_CREDENTIALS]@[::1]/world",
+      "https://[REDACTED_URI_CREDENTIALS]@[REDACTED_IP]/world",
     ],
   ])("atomically redacts %s", (_case, input, expected) => {
     expect(redactSecrets(input)).toBe(expected);

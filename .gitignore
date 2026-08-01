@@ -1,5 +1,7 @@
 node_modules/
 dist/
+build/
+apps/desktop/dist-renderer/
 coverage/
 /config.toml
 data/
@@ -16,3 +18,5 @@ release/
 **/.minecraft/
 **/saves/
 .worktrees/
+subprojects/whitelily-avatar/**/.gradle/
+subprojects/whitelily-avatar/**/build/

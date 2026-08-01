@@ -3,17 +3,31 @@ import type { ActiveTask, TaskDisclosure } from "../companion/taskController.js"
 import { redactPublicText } from "../memory/redaction.js";
 import type { MinecraftEvent } from "../minecraft/minecraftPort.js";
 import type { TaskBudgetSnapshot, TaskLimits, TaskStopReason } from "../safety/taskBudget.js";
-import type { PublicTaskSnapshot, RuntimeEvent, RuntimeSnapshot } from "./runtimeEvents.js";
+import type { CompanionProfile } from "../profile/profileSchema.js";
+import type { MemoryContextScope } from "../memory/scopedMemoryStore.js";
+import type {
+  PublicTaskSnapshot,
+  RuntimeEvent,
+  RuntimeEventPayload,
+  RuntimeAuthorityLoss,
+  RuntimeSnapshot,
+} from "./runtimeEvents.js";
 
 interface RuntimeLifecycle {
   start(): Promise<void>;
   stop(): Promise<void>;
 }
 
-interface RuntimeTaskAccess {
+export interface RuntimeTaskProjection {
   current(): ActiveTask | null;
   budget(): TaskBudgetSnapshot;
+  status(): "running" | "waiting_confirmation";
   stop(reason: TaskStopReason): void;
+  subscribe(listener: () => void): () => void;
+}
+
+interface RuntimeTaskAccess extends Omit<RuntimeTaskProjection, "status" | "subscribe"> {
+  status?(): "running" | "waiting_confirmation";
   failClosed?(): void;
   subscribe?(listener: () => void): () => void;
 }
@@ -27,7 +41,17 @@ export interface RuntimeFacadeDependencies {
   codex?: {
     model(): string | null;
   };
+  authority?: {
+    subscribe(listener: (event: RuntimeAuthorityLoss) => void): () => void;
+  };
+  profile?: {
+    apply(profile: CompanionProfile): void;
+  };
+  memory?: {
+    setScope(scope: MemoryContextScope): void;
+  };
   createPublicTaskId?: () => string;
+  initialRevision?: number;
 }
 
 type InspectedTaskState =
@@ -37,7 +61,9 @@ type InspectedTaskState =
       kind: "active";
       identity: string;
       leaseId: string;
-      disclosure: TaskDisclosure;
+      goal: string;
+      allowedActions: readonly string[];
+      effectiveLimits: TaskLimits;
       startedAt: string;
       budget: TaskBudgetSnapshot;
     };
@@ -51,6 +77,7 @@ const taskStopReasons = new Set<TaskStopReason>([
   "emergency_stop",
   "disconnect",
   "world_changed",
+  "owner_changed",
   "model_unavailable",
   "process_exit",
 ]);
@@ -58,6 +85,7 @@ const taskStopReasons = new Set<TaskStopReason>([
 const taskKeys = ["id", "lease", "disclosure", "startedAt"] as const;
 const leaseKeys = ["id", "startedAt"] as const;
 const disclosureKeys = ["goal", "expectedActions", "limits", "stopCondition"] as const;
+const publicTaskIdPattern = /^task_[a-z0-9_-]+$/u;
 const limitKeys = [
   "maxToolCalls",
   "maxBlockChanges",
@@ -79,12 +107,15 @@ const budgetKeys = [
 export class RuntimeFacade {
   readonly #dependencies: RuntimeFacadeDependencies;
   readonly #listeners = new Set<(event: RuntimeEvent) => void>();
+  readonly #authorityLossListeners = new Set<(event: RuntimeAuthorityLoss) => void>();
   readonly #eventQueue: RuntimeEvent[] = [];
   #publishing = false;
   #unsubscribeTask: (() => void) | undefined;
   #unsubscribeMinecraft: (() => void) | undefined;
+  #unsubscribeAuthority: (() => void) | undefined;
   #taskEventsFenced = false;
   #snapshot: RuntimeSnapshot = {
+    revision: 0,
     lifecycle: "idle",
     minecraft: { state: "disconnected", sessionId: null },
     codex: { state: "stopped", model: null },
@@ -98,7 +129,12 @@ export class RuntimeFacade {
   #publicTaskId: string | undefined;
 
   constructor(dependencies: RuntimeFacadeDependencies) {
+    const initialRevision = dependencies.initialRevision ?? 0;
+    if (!Number.isSafeInteger(initialRevision) || initialRevision < 0) {
+      throw new Error("Runtime revision is invalid");
+    }
     this.#dependencies = dependencies;
+    this.#snapshot = { ...this.#snapshot, revision: initialRevision };
     this.#refreshTask(false);
     if (this.#terminal) return;
     try {
@@ -118,6 +154,25 @@ export class RuntimeFacade {
     } catch {
       this.#failMinecraftState(false);
     }
+    if (this.#terminal) return;
+    try {
+      this.#unsubscribeAuthority = dependencies.authority?.subscribe((event) => {
+        if (this.#terminal) return;
+        for (const listener of [...this.#authorityLossListeners]) {
+          try {
+            listener(event);
+          } catch {
+            // Authority-loss observers cannot delay runtime containment.
+          }
+        }
+      });
+    } catch {
+      this.#failOperationalState(
+        "RUNTIME_AUTHORITY_STATE_UNKNOWN",
+        "Runtime authority state is unavailable",
+        false,
+      );
+    }
   }
 
   start(): Promise<void> {
@@ -128,11 +183,16 @@ export class RuntimeFacade {
     if (this.#snapshot.lifecycle === "running") return Promise.resolve();
     const operation = Promise.resolve().then(() => this.#startInternal());
     this.#startPromise = operation;
-    this.#setLifecycle("starting");
-    if (this.#terminal) return operation;
-    this.#setMinecraft("connecting");
-    if (this.#terminal) return operation;
-    this.#setCodex("starting", null);
+    try {
+      this.#setLifecycle("starting");
+      if (this.#terminal) return operation;
+      this.#setMinecraft("connecting");
+      if (this.#terminal) return operation;
+      this.#setCodex("starting", null);
+    } catch (error) {
+      this.#startPromise = undefined;
+      return Promise.reject(error);
+    }
     void operation.then(
       () => {
         if (this.#startPromise === operation) this.#startPromise = undefined;
@@ -152,17 +212,42 @@ export class RuntimeFacade {
     this.#terminal = true;
     this.#taskEventsFenced = true;
     this.#clearTask(false);
-    const operation = Promise.resolve().then(() => this.#stopInternal(reason));
+    type StopStart = { readonly run: true } | { readonly run: false; readonly error: unknown };
+    let beginOperation!: (start: StopStart) => void;
+    const operation = new Promise<StopStart>((resolve) => {
+      beginOperation = resolve;
+    }).then(async (start) => {
+      try {
+        if (!start.run) throw start.error;
+        await this.#stopInternal(reason);
+      } catch (error) {
+        if (this.#snapshot.lastError?.code === "RUNTIME_REVISION_EXHAUSTED") {
+          await this.#cleanupAfterRevisionOverflow();
+        }
+        throw error;
+      }
+    });
     this.#stopPromise = operation;
-    this.#setLifecycle("stopping");
-    this.#setMinecraft("disconnected");
-    this.#setCodex("stopped", null);
+    try {
+      this.#setLifecycle("stopping");
+      this.#setMinecraft("disconnected");
+      this.#setCodex("stopped", null);
+    } catch (error) {
+      beginOperation({ run: false, error });
+      return operation;
+    }
+    beginOperation({ run: true });
     return operation;
   }
 
   subscribe(listener: (event: RuntimeEvent) => void): () => void {
     this.#listeners.add(listener);
     return () => this.#listeners.delete(listener);
+  }
+
+  subscribeAuthorityLoss(listener: (event: RuntimeAuthorityLoss) => void): () => void {
+    this.#authorityLossListeners.add(listener);
+    return () => this.#authorityLossListeners.delete(listener);
   }
 
   snapshot(): RuntimeSnapshot {
@@ -174,6 +259,42 @@ export class RuntimeFacade {
       this.#refreshTask(false);
     }
     return cloneRuntimeSnapshot(this.#snapshot);
+  }
+
+  stopTask(): Promise<void> {
+    return Promise.resolve().then(() => {
+      const before = this.#inspectTask();
+      if (before.kind === "unknown") {
+        this.#failTaskState(true);
+        throw new Error("Task state is unavailable");
+      }
+      if (before.kind === "none") {
+        if (this.#snapshot.task !== null) this.#clearTask(true);
+        return;
+      }
+      try {
+        this.#dependencies.task?.stop("owner_stop");
+      } catch {
+        this.#recordError("TASK_STOP_FAILED", "Task failed to stop");
+        throw new Error("Task failed to stop");
+      }
+      const after = this.#inspectTask();
+      if (after.kind !== "none") {
+        this.#recordError("TASK_STOP_FAILED", "Task failed to stop");
+        throw new Error("Task failed to stop");
+      }
+      if (this.#snapshot.task !== null) this.#clearTask(true);
+    });
+  }
+
+  applyProfile(profile: CompanionProfile): void {
+    if (this.#terminal) throw new Error("Runtime is terminal; create a new runtime instance");
+    this.#dependencies.profile?.apply(profile);
+  }
+
+  setMemoryScope(scope: MemoryContextScope): void {
+    if (this.#terminal) throw new Error("Runtime is terminal; create a new runtime instance");
+    this.#dependencies.memory?.setScope(scope);
   }
 
   async #startInternal(): Promise<void> {
@@ -298,7 +419,15 @@ export class RuntimeFacade {
         case "owner_offline":
         case "death":
         case "hostile_nearby":
+          return;
         case "world_changed":
+          try {
+            this.#dependencies.task?.stop("world_changed");
+          } catch {
+            this.#failTaskState(true);
+            return;
+          }
+          this.#setMinecraft("disconnected");
           return;
         default:
           this.#failMinecraftState();
@@ -343,8 +472,15 @@ export class RuntimeFacade {
         return;
       }
       if (this.#privateTaskIdentity !== inspected.identity) {
-        const publicId = (this.#dependencies.createPublicTaskId ?? randomUUID)();
-        if (!/^[A-Za-z0-9_-]{1,128}$/.test(publicId) || publicId.includes(inspected.leaseId)) {
+        const publicId = (
+          this.#dependencies.createPublicTaskId ??
+          (() => `task_${randomUUID().replaceAll("-", "_")}`)
+        )();
+        if (
+          publicId.length > 128 ||
+          !publicTaskIdPattern.test(publicId) ||
+          publicId.includes(inspected.leaseId)
+        ) {
           this.#failTaskState(publish);
           return;
         }
@@ -354,7 +490,10 @@ export class RuntimeFacade {
       this.#setTask(
         {
           id: this.#publicTaskId!,
-          disclosure: cloneDisclosure(inspected.disclosure),
+          goal: inspected.goal,
+          status: this.#readTaskStatus(),
+          allowedActions: cloneActions(inspected.allowedActions),
+          effectiveLimits: cloneLimits(inspected.effectiveLimits),
           startedAt: inspected.startedAt,
           budget: cloneBudget(inspected.budget),
         },
@@ -363,6 +502,21 @@ export class RuntimeFacade {
     } catch {
       this.#failTaskState(publish);
     }
+  }
+
+  #readTaskStatus(): PublicTaskSnapshot["status"] {
+    const task = this.#dependencies.task;
+    if (!task) throw new Error("Task state is unavailable");
+    const descriptor = Object.getOwnPropertyDescriptor(task, "status");
+    if (descriptor === undefined) return "running";
+    if (!("value" in descriptor) || typeof descriptor.value !== "function") {
+      throw new Error("Task state is unavailable");
+    }
+    const status = descriptor.value.call(task) as unknown;
+    if (status !== "running" && status !== "waiting_confirmation") {
+      throw new Error("Task state is unavailable");
+    }
+    return status;
   }
 
   #failTaskState(publish: boolean): void {
@@ -387,6 +541,7 @@ export class RuntimeFacade {
     this.#privateTaskIdentity = undefined;
     this.#publicTaskId = undefined;
     this.#snapshot = {
+      revision: this.#snapshot.revision,
       lifecycle: "failed",
       minecraft: { state: "disconnected", sessionId: null },
       codex: { state: "stopped", model: null },
@@ -462,12 +617,25 @@ export class RuntimeFacade {
     } catch {
       // Observer teardown cannot affect lifecycle cleanup.
     }
+    try {
+      this.#unsubscribeAuthority?.();
+    } catch {
+      // Authority observer teardown cannot affect lifecycle cleanup.
+    }
     this.#unsubscribeTask = undefined;
     this.#unsubscribeMinecraft = undefined;
+    this.#unsubscribeAuthority = undefined;
+    this.#authorityLossListeners.clear();
   }
 
-  #publish(event: RuntimeEvent): void {
-    this.#eventQueue.push(cloneRuntimeEvent(event));
+  #publish(event: RuntimeEventPayload): void {
+    if (this.#snapshot.revision >= Number.MAX_SAFE_INTEGER) {
+      this.#failRevisionOverflow();
+      throw new Error("Runtime revision is exhausted");
+    }
+    const revision = this.#snapshot.revision + 1;
+    this.#snapshot = { ...this.#snapshot, revision };
+    this.#eventQueue.push(cloneRuntimeEvent({ ...event, revision } as RuntimeEvent));
     if (this.#publishing) return;
     this.#publishing = true;
     try {
@@ -484,6 +652,42 @@ export class RuntimeFacade {
     } finally {
       this.#publishing = false;
     }
+  }
+
+  #failRevisionOverflow(): void {
+    if (this.#terminal && this.#snapshot.lastError?.code === "RUNTIME_REVISION_EXHAUSTED") return;
+    this.#terminal = true;
+    this.#taskEventsFenced = true;
+    this.#privateTaskIdentity = undefined;
+    this.#publicTaskId = undefined;
+    this.#snapshot = {
+      revision: this.#snapshot.revision,
+      lifecycle: "failed",
+      minecraft: { state: "disconnected", sessionId: null },
+      codex: { state: "stopped", model: null },
+      task: null,
+      lastError: {
+        code: "RUNTIME_REVISION_EXHAUSTED",
+        message: "Runtime revision is exhausted",
+      },
+    };
+    try {
+      const task = this.#dependencies.task;
+      if (task?.failClosed) task.failClosed();
+      else task?.stop("failed");
+    } catch {
+      // The terminal revision state remains authoritative.
+    }
+    if (!this.#stopPromise) {
+      this.#stopPromise = this.#cleanupAfterRevisionOverflow();
+    }
+  }
+
+  async #cleanupAfterRevisionOverflow(): Promise<void> {
+    await Promise.resolve()
+      .then(() => this.#dependencies.lifecycle.stop())
+      .catch(() => undefined);
+    this.#teardownObservers();
   }
 }
 
@@ -625,7 +829,9 @@ function parseActiveTask(value: unknown, budget: TaskBudgetSnapshot): InspectedT
     kind: "active",
     identity: `${leaseId}\u0000${leaseStartedAt}`,
     leaseId,
-    disclosure: publicDisclosure,
+    goal: publicDisclosure.goal,
+    allowedActions: publicDisclosure.expectedActions,
+    effectiveLimits: publicDisclosure.limits,
     startedAt,
     budget: cloneBudget(budget),
   };
@@ -835,17 +1041,12 @@ function cloneLimits(limits: TaskLimits): TaskLimits {
   };
 }
 
-function cloneDisclosure(disclosure: TaskDisclosure): TaskDisclosure {
-  const expectedActions: string[] = [];
-  for (let index = 0; index < disclosure.expectedActions.length; index += 1) {
-    expectedActions.push(disclosure.expectedActions[index]!);
+function cloneActions(actions: readonly string[]): string[] {
+  const cloned: string[] = [];
+  for (let index = 0; index < actions.length; index += 1) {
+    cloned.push(actions[index]!);
   }
-  return {
-    goal: disclosure.goal,
-    expectedActions,
-    limits: cloneLimits(disclosure.limits),
-    stopCondition: disclosure.stopCondition,
-  };
+  return cloned;
 }
 
 function cloneBudget(budget: TaskBudgetSnapshot): TaskBudgetSnapshot {
@@ -864,7 +1065,10 @@ function cloneBudget(budget: TaskBudgetSnapshot): TaskBudgetSnapshot {
 function clonePublicTask(task: PublicTaskSnapshot): PublicTaskSnapshot {
   return {
     id: task.id,
-    disclosure: cloneDisclosure(task.disclosure),
+    goal: task.goal,
+    status: task.status,
+    allowedActions: cloneActions(task.allowedActions),
+    effectiveLimits: cloneLimits(task.effectiveLimits),
     startedAt: task.startedAt,
     budget: cloneBudget(task.budget),
   };
@@ -873,10 +1077,11 @@ function clonePublicTask(task: PublicTaskSnapshot): PublicTaskSnapshot {
 function cloneRuntimeEvent(event: RuntimeEvent): RuntimeEvent {
   switch (event.kind) {
     case "lifecycle":
-      return { kind: "lifecycle", state: event.state };
+      return { kind: "lifecycle", revision: event.revision, state: event.state };
     case "minecraft":
       return {
         kind: "minecraft",
+        revision: event.revision,
         state: {
           state: event.state.state,
           sessionId: event.state.sessionId,
@@ -885,6 +1090,7 @@ function cloneRuntimeEvent(event: RuntimeEvent): RuntimeEvent {
     case "codex":
       return {
         kind: "codex",
+        revision: event.revision,
         state: {
           state: event.state.state,
           model: event.state.model,
@@ -893,11 +1099,13 @@ function cloneRuntimeEvent(event: RuntimeEvent): RuntimeEvent {
     case "task":
       return {
         kind: "task",
+        revision: event.revision,
         task: event.task === null ? null : clonePublicTask(event.task),
       };
     case "error":
       return {
         kind: "error",
+        revision: event.revision,
         error: {
           code: event.error.code,
           message: event.error.message,
@@ -910,6 +1118,7 @@ function cloneRuntimeEvent(event: RuntimeEvent): RuntimeEvent {
 
 function cloneRuntimeSnapshot(snapshot: RuntimeSnapshot): RuntimeSnapshot {
   return deepFreeze({
+    revision: snapshot.revision,
     lifecycle: snapshot.lifecycle,
     minecraft: {
       state: snapshot.minecraft.state,

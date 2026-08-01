@@ -1,0 +1,22 @@
+[
+  {
+    "path": "C:\\Profiles\\Sample\\Apps\\PCL2\\Plain Craft Launcher 2.exe",
+    "source": "known_location",
+    "running": false
+  },
+  {
+    "path": "c:\\profiles\\sample\\apps\\pcl2\\PLAIN CRAFT LAUNCHER 2.EXE",
+    "source": "running_process",
+    "running": true
+  },
+  {
+    "path": "D:\\Portable\\Minecraft\\Plain Craft Launcher 2.exe",
+    "source": "start_menu",
+    "running": false
+  },
+  {
+    "path": "D:\\Portable\\Minecraft\\PCL2.exe",
+    "source": "running_process",
+    "running": true
+  }
+]

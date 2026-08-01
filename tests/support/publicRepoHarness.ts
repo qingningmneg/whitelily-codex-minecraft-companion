@@ -373,6 +373,10 @@ async function scanFails(fixture: string): Promise<boolean> {
 
 export async function runReleaseSecurityRegressions(): Promise<{
   dirtyHeadExportRejected: boolean;
+  dependencyLockEmailAllowed: boolean;
+  sourceEmailRejected: boolean;
+  placeholderUserPathsAllowed: boolean;
+  personalUserPathRejected: boolean;
   utf16LeRejected: boolean;
   utf16BeRejected: boolean;
   escapedOwnerRejected: boolean;
@@ -383,6 +387,53 @@ export async function runReleaseSecurityRegressions(): Promise<{
 }> {
   const fixtures: string[] = [];
   try {
+    const dependencyLockEmail = await createScanFixture("whitelily-lock-email-");
+    fixtures.push(dependencyLockEmail);
+    await writeFile(
+      join(dependencyLockEmail, "package-lock.json"),
+      `${JSON.stringify({
+        lockfileVersion: 3,
+        packages: {
+          "node_modules/glob": {
+            deprecated: `public registry metadata may mention ${["i", "izs.me"].join("@")}`,
+          },
+        },
+      })}\n`,
+      "utf8",
+    );
+    await commitFixture(dependencyLockEmail);
+    const dependencyLockEmailAllowed = !(await scanFails(dependencyLockEmail));
+
+    const sourceEmail = await createScanFixture("whitelily-source-email-");
+    fixtures.push(sourceEmail);
+    await writeFile(
+      join(sourceEmail, "src", "identity.txt"),
+      `${["author", "personal.dev"].join("@")}\n`,
+      "utf8",
+    );
+    await commitFixture(sourceEmail);
+    const sourceEmailRejected = await scanFails(sourceEmail);
+
+    const placeholderUserPaths = await createScanFixture("whitelily-placeholder-paths-");
+    fixtures.push(placeholderUserPaths);
+    await writeFile(
+      join(placeholderUserPaths, "src", "paths.txt"),
+      "C:\\Users\\Owner\\AppData\\Local\nC:\\Users\\Other\\AppData\\Local\n",
+      "utf8",
+    );
+    await commitFixture(placeholderUserPaths);
+    const placeholderUserPathsAllowed = !(await scanFails(placeholderUserPaths));
+
+    const personalUserPath = await createScanFixture("whitelily-personal-path-");
+    fixtures.push(personalUserPath);
+    await writeFile(
+      join(personalUserPath, "src", "path.txt"),
+      "C:\\Users\\RealPerson\\Private\\notes.txt\n",
+      "utf8",
+    );
+    await commitFixture(personalUserPath);
+    const personalUserPathRejected = await scanFails(personalUserPath);
+
     const dirty = await createScanFixture("whitelily-dirty-head-");
     fixtures.push(dirty);
     const secret = ["sk", "release", "head", "fixture", "credential", "1234567890"].join("-");
@@ -489,6 +540,10 @@ export async function runReleaseSecurityRegressions(): Promise<{
 
     return {
       dirtyHeadExportRejected,
+      dependencyLockEmailAllowed,
+      sourceEmailRejected,
+      placeholderUserPathsAllowed,
+      personalUserPathRejected,
       utf16LeRejected,
       utf16BeRejected,
       escapedOwnerRejected,

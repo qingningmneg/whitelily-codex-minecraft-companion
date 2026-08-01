@@ -1,13 +1,18 @@
 import { randomBytes } from "node:crypto";
-import type { GameAction } from "../domain/types.js";
+import { GAME_ACTION_KINDS } from "../domain/types.js";
 import { TaskControllerBudget, type TaskLease } from "../safety/taskBudget.js";
 
-export type ToolActionKind = GameAction["kind"] | "get_state" | "find_block";
+export const TOOL_ACTION_KINDS = [...GAME_ACTION_KINDS, "get_state", "find_block"] as const;
+export type ToolActionKind = (typeof TOOL_ACTION_KINDS)[number];
 
 export interface TrustedToolConsumption {
   blockChanges?: 0 | 1;
   horizontalTravel?: number;
   dangerousOperations?: 0 | 1;
+}
+
+export interface TurnToolAuthorization {
+  readonly allowedActions?: readonly ToolActionKind[];
 }
 
 export interface TurnToolBudgetSnapshot {
@@ -27,6 +32,7 @@ export type BudgetConsumeResult =
         | "tool turn has not begun"
         | "tool turn has ended"
         | "tool turn lease is invalid"
+        | "tool action is not allowed"
         | "tool call budget exhausted";
     };
 
@@ -40,10 +46,11 @@ export class TurnToolBudget {
   private activeLease: string | undefined;
   private taskLease: TaskLease | undefined;
   private ownsTaskLease = false;
+  private allowedActions: ReadonlySet<ToolActionKind> | undefined;
 
   constructor(private readonly taskBudget = new TaskControllerBudget()) {}
 
-  begin(taskLease?: TaskLease): string {
+  begin(taskLease?: TaskLease, authorization: TurnToolAuthorization = {}): string {
     if (this.active) throw new Error("tool turn is already active");
     this.active = true;
     this.ended = false;
@@ -53,6 +60,10 @@ export class TurnToolBudget {
     this.cumulativeHorizontalTravel = 0;
     this.taskLease = taskLease ?? this.taskBudget.begin();
     this.ownsTaskLease = taskLease === undefined;
+    this.allowedActions =
+      authorization.allowedActions === undefined
+        ? undefined
+        : new Set<ToolActionKind>(authorization.allowedActions);
     this.activeLease = randomBytes(32).toString("base64url");
     return this.activeLease;
   }
@@ -65,6 +76,7 @@ export class TurnToolBudget {
     if (this.ownsTaskLease) this.taskBudget.invalidate("completed");
     this.taskLease = undefined;
     this.ownsTaskLease = false;
+    this.allowedActions = undefined;
   }
 
   checkLease(lease?: string): BudgetConsumeResult {
@@ -89,6 +101,9 @@ export class TurnToolBudget {
   ): BudgetConsumeResult {
     const authorization = this.checkLease(lease);
     if (!authorization.ok) return authorization;
+    if (this.allowedActions !== undefined && !this.allowedActions.has(kind)) {
+      return { ok: false, reason: "tool action is not allowed" };
+    }
     const taskLease = this.taskLease;
     if (!taskLease) return { ok: false, reason: "tool turn lease is invalid" };
     const taskResult = this.taskBudget.consume({

@@ -8,11 +8,8 @@ export interface CodexTurnResult {
 export interface CodexPort {
   start(): Promise<void>;
   listModels(): Promise<string[]>;
-  startThread(input: {
-    cwd: string;
-    model: string;
-    reasoningEffort: "low" | "medium";
-  }): Promise<string>;
+  validateModelSelection(selection: { modelId: string; reasoningEffort: string }): Promise<boolean>;
+  startThread(input: { cwd: string; model: string; reasoningEffort: string }): Promise<string>;
   sendTurn(
     threadId: string,
     text: string,

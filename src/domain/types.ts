@@ -41,6 +41,29 @@ export type GameAction =
   | { kind: "attack_hostile"; entityId: number }
   | { kind: "wait"; milliseconds: number };
 
+function defineGameActionKinds<const Kinds extends readonly GameAction["kind"][]>(
+  kinds: Kinds &
+    ([GameAction["kind"]] extends [Kinds[number]] ? unknown : ["missing game action kind"]),
+): Kinds {
+  return kinds;
+}
+
+export const GAME_ACTION_KINDS = defineGameActionKinds([
+  "say",
+  "move_to",
+  "follow_owner",
+  "look_at",
+  "jump",
+  "dig_block",
+  "place_block",
+  "craft_item",
+  "smelt_item",
+  "collect_dropped",
+  "equip_item",
+  "attack_hostile",
+  "wait",
+] as const);
+
 export type ConfirmableOperation =
   { kind: "game_action"; action: GameAction } | { kind: "memory_clear" };
 

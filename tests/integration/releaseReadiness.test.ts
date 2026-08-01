@@ -1,6 +1,5 @@
 import { access, readFile } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
-import { formatTaskDisclosureForMinecraft } from "../../src/companion/companionService.js";
 import { TaskController, type ActiveTask } from "../../src/companion/taskController.js";
 import { RuntimeFacade } from "../../src/runtime/runtimeFacade.js";
 import { TaskControllerBudget, type TaskBudgetSnapshot } from "../../src/safety/taskBudget.js";
@@ -10,6 +9,7 @@ import {
   runReleasePackage,
   runReleaseSecurityRegressions,
 } from "../support/publicRepoHarness.js";
+import { createCompanionHarness } from "../support/companionHarness.js";
 
 const required = [
   "README.zh-CN.md",
@@ -26,6 +26,10 @@ const required = [
   "scripts/release-path-safety.ps1",
   "scripts/release-check.ps1",
   "docs/runtime-architecture.md",
+  "docs/installation-windows.zh-CN.md",
+  "docs/installation-windows.md",
+  "docs/smartscreen.zh-CN.md",
+  "docs/smartscreen.md",
 ];
 
 describe("public release readiness", () => {
@@ -57,7 +61,6 @@ describe("public release readiness", () => {
       "ActionExecutor performs SafetyEngine policy evaluation",
       "MCP registry does not depend directly on TaskController",
       "authority-free `prepare()`",
-      "awaits every disclosure chunk before calling `TaskController.start()`",
       "exactly one `task_stopped` record",
       "flushes that queue before `stop()` resolves",
     ]) {
@@ -65,58 +68,81 @@ describe("public release readiness", () => {
     }
   });
 
-  it("keeps release disclosure values equal to the later acquired lower limits", () => {
-    const controller = new TaskController(
-      new TaskControllerBudget({
-        now: () => 1_700_000_000_000,
-        randomId: () => "release-task-lease",
-      }),
-    );
-    const requested = {
-      maxToolCalls: 5,
-      maxBlockChanges: 6,
-      maxHorizontalTravel: 7,
-      maxDurationMs: 8_000,
-      maxDangerousOperations: 1,
-    };
-    const prepared = controller.prepare(
-      {
-        goal: "collect safely",
-        expectedActions: ["get_state", "move_to", "dig_block"],
-        limits: {
-          maxToolCalls: 64,
-          maxBlockChanges: 256,
-          maxHorizontalTravel: 1_024,
-          maxDurationMs: 600_000,
-          maxDangerousOperations: 8,
+  it("publishes an auditable public task while Minecraft receives zero authorization disclosure", async () => {
+    const value = await createCompanionHarness({
+      deferredTurns: [0],
+      intentResponses: [
+        JSON.stringify({
+          kind: "start_task",
+          naturalReply: null,
+          task: {
+            goal: "走到主人身边",
+            allowedActions: ["get_state", "move_to"],
+            requestedLimits: { maxToolCalls: 4, maxHorizontalTravel: 64 },
+          },
+          memoryCandidates: [],
+        }),
+      ],
+      executionResponses: [
+        JSON.stringify({ reply: "我到你身边了。", status: "completed", memoryCandidates: [] }),
+      ],
+    });
+    try {
+      await value.start();
+      await value.emitOwnerText("走到我身边来");
+      await value.untilCodexTurns(1);
+      const activeTask = value.taskController.current();
+      if (!activeTask) throw new Error("expected active task state");
+      const { minecraft } = value;
+      const budget: TaskBudgetSnapshot = {
+        active: true,
+        stopReason: null,
+        limits: { ...activeTask.disclosure.limits },
+        toolCalls: 0,
+        blockChanges: 0,
+        horizontalTravel: 0,
+        dangerousOperations: 0,
+        startedAt: activeTask.lease.startedAt,
+      };
+      const runtime = new RuntimeFacade({
+        lifecycle: {
+          start: async () => undefined,
+          stop: async () => undefined,
         },
-        stopCondition: "owner stops or work completes",
-      },
-      requested,
-    );
-    const chunks = formatTaskDisclosureForMinecraft(prepared);
-    const sent = chunks.map((chunk) => chunk.replace(/^任务披露(?:（续）)?：/u, "")).join("");
+        task: {
+          current: () => value.taskController.current(),
+          budget: () => budget,
+          status: () => "running",
+          stop: (reason) => value.taskController.stop(reason),
+          subscribe: () => () => undefined,
+        },
+        createPublicTaskId: () => "task_release_public",
+      });
+      const publicTask = runtime.snapshot().task;
 
-    expect(controller.current()).toBeNull();
-    expect(sent).toContain("预计动作类别：get_state、move_to、dig_block");
-    expect(sent).toContain("工具调用 5");
-    expect(sent).toContain("方块修改 6");
-    expect(sent).toContain("水平移动 7");
-    expect(sent).toContain("持续时间 8000");
-    expect(sent).toContain("危险操作 1");
-    expect(sent).toContain("停止条件：owner stops or work completes");
-    expect(
-      chunks.every(
-        (chunk) =>
-          chunk.length <= 240 &&
-          !/[\uD800-\uDBFF]$/u.test(chunk) &&
-          !/^[\uDC00-\uDFFF]/u.test(chunk) &&
-          !chunk.startsWith("/"),
-      ),
-    ).toBe(true);
+      expect(publicTask).toEqual({
+        id: "task_release_public",
+        goal: "走到主人身边",
+        status: "running",
+        allowedActions: ["get_state", "move_to"],
+        effectiveLimits: budget.limits,
+        startedAt: activeTask.startedAt,
+        budget,
+      });
+      expect(JSON.stringify(publicTask)).not.toContain(activeTask.lease.id);
+      expect(JSON.stringify(publicTask)).not.toContain("ownerMessage");
+      expect(JSON.stringify(publicTask)).not.toContain("prompt");
+      expect(minecraft.chatLog.join("\n")).not.toMatch(
+        /任务披露|expectedActions|allowedActions|maxToolCalls|maxBlockChanges|maxHorizontalTravel|maxDurationMs|maxDangerousOperations|leaseId|stopCondition/u,
+      );
+      expect(value.taskAuditEvents).toEqual(["task_started"]);
 
-    expect(controller.start(prepared, prepared.limits).disclosure.limits).toEqual(requested);
-    controller.stop("completed");
+      value.taskController.stop("owner_stop");
+      expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:owner_stop"]);
+    } finally {
+      await value.stop();
+      await value.cleanup();
+    }
   });
 
   it("enforces the public disclosure and operational fail-closed behavior", async () => {
@@ -171,7 +197,7 @@ describe("public release readiness", () => {
           return () => undefined;
         },
       },
-      createPublicTaskId: () => "release-public-task",
+      createPublicTaskId: () => "task_release_public",
     });
 
     const published = JSON.stringify(runtime.snapshot());
@@ -232,6 +258,10 @@ describe("public release readiness", () => {
   it("fails closed for dirty HEAD exports, UTF-16 secrets, and malformed owner configuration", async () => {
     const result = await runReleaseSecurityRegressions();
     expect(result.dirtyHeadExportRejected).toBe(true);
+    expect(result.dependencyLockEmailAllowed).toBe(true);
+    expect(result.sourceEmailRejected).toBe(true);
+    expect(result.placeholderUserPathsAllowed).toBe(true);
+    expect(result.personalUserPathRejected).toBe(true);
     expect(result.utf16LeRejected).toBe(true);
     expect(result.utf16BeRejected).toBe(true);
     expect(result.escapedOwnerRejected).toBe(true);
@@ -262,5 +292,69 @@ describe("public release readiness", () => {
       "cross-device deployment is not supported",
     );
     await expect(readFile("README.zh-CN.md", "utf8")).resolves.toContain("不支持跨电脑部署");
+  });
+
+  it("publishes the real Windows installer only from beta tags", async () => {
+    const workflow = await readFile(".github/workflows/release.yml", "utf8");
+
+    expect(workflow).toContain('- "v*-beta.*"');
+    expect(workflow).not.toContain('- "v*"\n');
+    expect(workflow).toContain("./scripts/package-installer.ps1");
+    expect(workflow).toContain("WhiteLily-*-windows-x64-setup.exe");
+    expect(workflow).toContain("WhiteLily-*-windows-x64-setup.exe.sha256");
+    expect(workflow).toContain("WhiteLily-*-windows-x64-setup.exe.signing-status.txt");
+    expect(workflow).toContain("--prerelease");
+  });
+
+  it("documents the future Windows installer workflow in Chinese and English", async () => {
+    const [readme, readmeZh, installZh, installEn, smartScreenZh, smartScreenEn] =
+      await Promise.all(
+        [
+          "README.md",
+          "README.zh-CN.md",
+          "docs/installation-windows.zh-CN.md",
+          "docs/installation-windows.md",
+          "docs/smartscreen.zh-CN.md",
+          "docs/smartscreen.md",
+        ].map((path) => readFile(path, "utf8")),
+      );
+    const chinese = [readme, readmeZh, installZh, smartScreenZh].join("\n");
+    const english = [readme, installEn, smartScreenEn].join("\n");
+
+    for (const corpus of [chinese, english]) {
+      expect(corpus).toContain("WhiteLily-0.2.0-beta.1-windows-x64-setup.exe");
+      expect(corpus).toContain(".sha256");
+      expect(corpus).toContain("SHA-256");
+      expect(corpus).toContain("127.0.0.1");
+      expect(corpus).toContain("PCL2");
+      expect(corpus).toContain("Minecraft Java");
+      expect(corpus).toContain("1.21.5");
+      expect(corpus).toContain("ChatGPT");
+      expect(corpus).toMatch(/Node(?:\.js)?[\s\S]{0,160}npm[\s\S]{0,160}Git[\s\S]{0,160}Codex/u);
+    }
+
+    expect(chinese).toMatch(/尚未发布|未发布/u);
+    expect(chinese).toMatch(/未签名/u);
+    expect(chinese).toContain("SmartScreen");
+    expect(chinese).toMatch(/用户自行.{0,80}(?:启动|操作).{0,80}PCL2/u);
+    expect(chinese).toMatch(/不会.{0,80}(?:启动|控制|点击|修改).{0,80}PCL2/u);
+    expect(chinese).toMatch(/不提供.{0,80}API.{0,40}(?:密钥|Key).{0,40}回退/iu);
+    expect(chinese).toMatch(/升级.{0,80}保留.{0,80}(?:设置|配置|记忆|数据)/u);
+    expect(chinese).toContain("保留 WhiteLily 数据");
+    expect(chinese).toContain("删除 WhiteLily 数据");
+    expect(chinese).toMatch(/保留 WhiteLily 数据.{0,40}(?:默认|推荐)/u);
+
+    expect(english).toMatch(/not (?:yet )?published/i);
+    expect(english).toMatch(/unsigned/i);
+    expect(english).toContain("SmartScreen");
+    expect(english).toMatch(/you (?:start|operate).{0,80}PCL2|PCL2.{0,80}under your control/is);
+    expect(english).toMatch(/does not.{0,80}(?:launch|control|click|modify).{0,80}PCL2/is);
+    expect(english).toMatch(/no.{0,80}(?:Platform )?API[- ]key fallback/is);
+    expect(english).toMatch(
+      /upgrade.{0,120}preserv(?:e|es).{0,80}(?:settings|configuration|memory|data)/is,
+    );
+    expect(english).toContain("Keep WhiteLily data");
+    expect(english).toContain("Delete WhiteLily data");
+    expect(english).toMatch(/Keep WhiteLily data.{0,40}default/is);
   });
 });

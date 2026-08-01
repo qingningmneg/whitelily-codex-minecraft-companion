@@ -123,7 +123,7 @@ export class MineflayerAdapter implements MinecraftPort {
   }
 
   async isOwnerOnline(username: string): Promise<boolean> {
-    return this.requireBot().players[username]?.entity !== undefined;
+    return this.requireBot().players[username] !== undefined;
   }
 
   async snapshot(ownerUsername: string): Promise<WorldSnapshot> {

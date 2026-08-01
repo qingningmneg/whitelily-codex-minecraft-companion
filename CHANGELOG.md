@@ -1,5 +1,25 @@
 # Changelog
 
+## 未发布 / Unreleased
+
+### `0.2.0-beta.1`（开发中 / in development）
+
+中文：
+
+- 正在构建面向 Windows 10/11 x64 的 Electron 桌面应用和按用户安装的 NSIS EXE；安装包尚未发布，也尚未通过最终隔离生命周期与 Minecraft 实机验收。
+- 安装包目标是内置 Electron、WhiteLily 后台运行时和固定版本 Codex CLI，不依赖系统 Node.js、npm、Git 或 Codex CLI。
+- 新增 ChatGPT 登录、实时模型选择、只读 PCL2 发现、同机 `127.0.0.1` Minecraft Java 1.21.5 LAN 确认，以及桌面控制面板。
+- 计划发布匹配的 SHA-256 和未签名状态说明；首个 Beta 可能触发 Windows SmartScreen“未知发布者”提示。
+- 升级保留 `%LOCALAPPDATA%\WhiteLily`。卸载提供“保留 WhiteLily 数据（默认）”和“删除 WhiteLily 数据”，静默卸载保留数据。
+
+English:
+
+- Building an Electron desktop app and per-user NSIS EXE for Windows 10/11 x64. The installer is not yet published and has not passed final isolated lifecycle and Minecraft acceptance.
+- The installer is designed to bundle Electron, the WhiteLily child runtime, and an exact Codex CLI without relying on system Node.js, npm, Git, or Codex CLI.
+- Adds ChatGPT sign-in, live model selection, read-only PCL2 discovery, same-machine `127.0.0.1` Minecraft Java Edition 1.21.5 LAN confirmation, and a desktop control panel.
+- Plans to publish a matching SHA-256 and unsigned-status notice. The first Beta may trigger a Windows SmartScreen unknown-publisher warning.
+- Upgrades preserve `%LOCALAPPDATA%\WhiteLily`. Uninstall offers **Keep WhiteLily data (default)** and **Delete WhiteLily data**; silent uninstall keeps data.
+
 ## 0.1.1
 
 - Added the reusable runtime facade, runtime events, and separated Minecraft connection lifecycle.

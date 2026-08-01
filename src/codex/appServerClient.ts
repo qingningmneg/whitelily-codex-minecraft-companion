@@ -1,7 +1,12 @@
 import { resolve } from "node:path";
+import { z } from "zod";
 import type { AppConfig } from "../config/schema.js";
 import type { InitializeParams, InitializeResponse } from "./generated/index.js";
 import type { AgentMessageDeltaNotification } from "./generated/v2/AgentMessageDeltaNotification.js";
+import type { CancelLoginAccountResponse } from "./generated/v2/CancelLoginAccountResponse.js";
+import type { GetAccountResponse } from "./generated/v2/GetAccountResponse.js";
+import type { LoginAccountResponse } from "./generated/v2/LoginAccountResponse.js";
+import type { Model } from "./generated/v2/Model.js";
 import type { ModelListResponse } from "./generated/v2/ModelListResponse.js";
 import type { ModelListParams } from "./generated/v2/ModelListParams.js";
 import type { ThreadStartParams } from "./generated/v2/ThreadStartParams.js";
@@ -12,6 +17,7 @@ import type { TurnInterruptResponse } from "./generated/v2/TurnInterruptResponse
 import type { TurnStartParams } from "./generated/v2/TurnStartParams.js";
 import type { TurnStartResponse } from "./generated/v2/TurnStartResponse.js";
 import type { CodexPort, CodexTurnResult } from "./codexPort.js";
+import type { AccountServerNotification, AccountAppServerPort } from "./accountService.js";
 import {
   JsonRpcProcess,
   runCodexLoginStatus,
@@ -25,6 +31,70 @@ export type { LoginStatusResult } from "./jsonRpcProcess.js";
 
 const loginRefusal =
   "Codex must be signed in with ChatGPT. API-key billing is disabled for WhiteLily.";
+const MAX_MODEL_PAGES = 100;
+const MAX_MODEL_RECORDS = 256;
+
+const wellFormedString = (maxCodePoints: number) =>
+  z
+    .string()
+    .refine((value) => value === value.toWellFormed())
+    .refine((value) => Array.from(value).length <= maxCodePoints);
+const internalLoginIdSchema = wellFormedString(512).refine(
+  (value) => value.length > 0 && !/[\u0000-\u001f\u007f]/u.test(value),
+);
+const authModeSchema = z.enum([
+  "apikey",
+  "chatgpt",
+  "chatgptAuthTokens",
+  "headers",
+  "agentIdentity",
+  "personalAccessToken",
+  "bedrockApiKey",
+]);
+const planTypeSchema = z.enum([
+  "free",
+  "go",
+  "plus",
+  "pro",
+  "prolite",
+  "team",
+  "self_serve_business_usage_based",
+  "business",
+  "enterprise_cbp_usage_based",
+  "enterprise",
+  "edu",
+  "unknown",
+]);
+const accountLoginCompletedNotificationSchema = z
+  .object({
+    method: z.literal("account/login/completed"),
+    params: z
+      .object({
+        loginId: internalLoginIdSchema.nullable(),
+        success: z.boolean(),
+        error: wellFormedString(1_024).nullable(),
+      })
+      .strict(),
+  })
+  .strict();
+const accountUpdatedNotificationSchema = z
+  .object({
+    method: z.literal("account/updated"),
+    params: z
+      .object({
+        authMode: authModeSchema.nullable(),
+        planType: planTypeSchema.nullable(),
+      })
+      .strict(),
+  })
+  .strict();
+
+function parseAccountNotification(value: unknown): AccountServerNotification | undefined {
+  const loginCompleted = accountLoginCompletedNotificationSchema.safeParse(value);
+  if (loginCompleted.success) return loginCompleted.data;
+  const accountUpdated = accountUpdatedNotificationSchema.safeParse(value);
+  return accountUpdated.success ? accountUpdated.data : undefined;
+}
 
 interface ActiveTurn {
   threadId: string;
@@ -116,21 +186,27 @@ function positiveTimeout(value: number, name: string): number {
   return value;
 }
 
-export class CodexAppServerClient implements CodexPort {
+export class CodexAppServerClient implements CodexPort, AccountAppServerPort {
   private readonly runLoginStatus: (signal: AbortSignal) => Promise<LoginStatusResult>;
   private readonly createTransport: () => Promise<JsonRpcLineTransport>;
-  private readonly workspacePath: string;
+  private workspacePath: string;
+  private defaultReasoningEffort: string;
   private readonly loginTimeoutMs: number;
   private readonly requestTimeoutMs: number;
   private readonly turnTimeoutMs: number;
   private readonly turnInterruptGraceMs: number;
   private readonly hasInjectedLoginStatus: boolean;
-  private readonly reasoningEfforts = new Map<string, "low" | "medium">();
+  private readonly reasoningEfforts = new Map<string, string>();
+  private readonly accountNotificationListeners = new Set<
+    (notification: AccountServerNotification) => void
+  >();
   private readonly activeTurns = new Map<string, ActiveTurn>();
   private readonly pendingTurnStarts = new Set<PendingTurnStart>();
   private readonly earlyTurnEvents = new Map<string, EarlyTurnEvents>();
   private rpc: JsonRpcProcess | undefined;
+  private startingRpc: { generation: number; rpc: JsonRpcProcess } | undefined;
   private startPromise: Promise<void> | undefined;
+  private accountStartPromise: Promise<void> | undefined;
   private stopPromise: Promise<void> | undefined;
   private startController: AbortController | undefined;
   private loginController: AbortController | undefined;
@@ -138,13 +214,10 @@ export class CodexAppServerClient implements CodexPort {
   private loginVerified = false;
   private lifecycleGeneration = 0;
   private stopping = false;
-  private gameThreadId: string | undefined;
+  private hasGameThreads = false;
   private threadStarting = false;
 
-  constructor(
-    private readonly config: AppConfig,
-    dependencies: CodexAppServerClientDependencies = {},
-  ) {
+  constructor(config: AppConfig | undefined, dependencies: CodexAppServerClientDependencies = {}) {
     this.loginTimeoutMs = positiveTimeout(dependencies.loginTimeoutMs ?? 10_000, "login timeout");
     this.requestTimeoutMs = positiveTimeout(
       dependencies.requestTimeoutMs ?? 30_000,
@@ -162,22 +235,46 @@ export class CodexAppServerClient implements CodexPort {
     this.createTransport =
       dependencies.createTransport ?? (async () => spawnCodexAppServerTransport());
     this.workspacePath = dependencies.workspacePath ?? resolve(process.cwd(), "codex-workspace");
+    this.defaultReasoningEffort = config?.codex.reasoningEffort ?? "medium";
+  }
+
+  configureRuntime(options: { workspacePath: string; reasoningEffort: string }): void {
+    if (this.activeTurns.size > 0 || this.hasGameThreads || this.threadStarting) {
+      throw new Error("Codex runtime settings cannot change during an active session");
+    }
+    this.workspacePath = resolve(options.workspacePath);
+    this.defaultReasoningEffort = options.reasoningEffort;
   }
 
   async start(): Promise<void> {
-    if (this.rpc) return;
     if (this.stopping) throw new Error("Codex app server is stopping");
     if (this.startPromise) return this.startPromise;
-    this.stopping = false;
-    const generation = ++this.lifecycleGeneration;
-    const controller = new AbortController();
-    this.startController = controller;
-    const start = this.startInternal(generation, controller.signal);
+    const start = (async (): Promise<void> => {
+      await this.assertChatGptLogin();
+      await this.startAccountSession();
+    })();
     this.startPromise = start;
     try {
       await start;
     } finally {
       if (this.startPromise === start) this.startPromise = undefined;
+    }
+  }
+
+  async startAccountSession(): Promise<void> {
+    if (this.stopping) throw new Error("Codex app server is stopping");
+    if (this.accountStartPromise) return this.accountStartPromise;
+    if (this.rpc) return;
+    this.stopping = false;
+    const generation = ++this.lifecycleGeneration;
+    const controller = new AbortController();
+    this.startController = controller;
+    const connecting = this.startInternal(generation, controller.signal);
+    this.accountStartPromise = connecting;
+    try {
+      await connecting;
+    } finally {
+      if (this.accountStartPromise === connecting) this.accountStartPromise = undefined;
       if (this.startController === controller) this.startController = undefined;
     }
   }
@@ -223,15 +320,15 @@ export class CodexAppServerClient implements CodexPort {
       }
       throw loginError();
     }
-    const hasChatGptLoginLine = status.stdout.split(/\r?\n/u).includes("Logged in using ChatGPT");
-    if (status.exitCode !== 0 || !hasChatGptLoginLine) {
+    const statusLines = [status.stdout, status.stderr].flatMap((output) => output.split(/\r?\n/u));
+    const hasChatGptLoginLine = statusLines.includes("Logged in using ChatGPT");
+    const hasApiKeyLoginLine = statusLines.includes("Logged in using an API key");
+    if (status.exitCode !== 0 || !hasChatGptLoginLine || hasApiKeyLoginLine) {
       throw loginError(status);
     }
   }
 
   private async startInternal(generation: number, signal: AbortSignal): Promise<void> {
-    await this.assertChatGptLogin();
-
     if (!this.isCurrent(generation)) throw new Error("Codex app server stopped during startup");
 
     const creatingTransport = this.createTransport();
@@ -257,44 +354,108 @@ export class CodexAppServerClient implements CodexPort {
         clientInfo: { name: "whitelily-companion", title: null, version: "0.1.1" },
         capabilities: { experimentalApi: false, requestAttestation: false },
       };
-      rpc.onNotification((notification) => this.handleNotification(notification));
-      rpc.onExit((error) => {
-        this.failActiveTurns(error);
-        if (this.rpc === rpc) this.rpc = undefined;
+      rpc.onNotification((notification) => {
+        if (this.rpc === rpc && this.isCurrent(generation)) {
+          this.handleNotification(notification);
+        }
       });
-      this.rpc = rpc;
+      rpc.onExit((error) => {
+        if (this.rpc === rpc) this.failActiveTurns(error);
+        if (this.rpc === rpc) this.rpc = undefined;
+        if (this.startingRpc?.rpc === rpc) this.startingRpc = undefined;
+      });
+      this.startingRpc = { generation, rpc };
       await rpc.request<InitializeResponse>("initialize", params);
-      if (!this.isCurrent(generation)) throw new Error("Codex app server stopped during startup");
+      if (
+        !this.isCurrent(generation) ||
+        this.startingRpc?.generation !== generation ||
+        this.startingRpc.rpc !== rpc
+      ) {
+        throw new Error("Codex app server stopped during startup");
+      }
+      this.startingRpc = undefined;
+      this.rpc = rpc;
       rpc.notify("initialized", {});
     } catch (error) {
+      if (this.startingRpc?.rpc === rpc) this.startingRpc = undefined;
+      if (this.rpc === rpc) this.rpc = undefined;
       await rpc.close();
       throw error;
     }
   }
 
   async listModels(): Promise<string[]> {
-    const models: string[] = [];
+    return (await this.listModelRecords()).map((model) => model.model);
+  }
+
+  async validateModelSelection(selection: {
+    modelId: string;
+    reasoningEffort: string;
+  }): Promise<boolean> {
+    const records = await this.listModelRecords();
+    return records.some(
+      (record) =>
+        !record.hidden &&
+        record.model === selection.modelId &&
+        record.supportedReasoningEfforts.some(
+          (option) => option.reasoningEffort === selection.reasoningEffort,
+        ),
+    );
+  }
+
+  async listModelRecords(): Promise<Model[]> {
+    await this.startAccountSession();
+    const rpc = this.requireRpc();
+    const records: Model[] = [];
     const seenCursors = new Set<string>();
     let cursor: string | null = null;
-    for (let page = 0; page < 100; page += 1) {
+    for (let page = 0; page < MAX_MODEL_PAGES; page += 1) {
       const params: ModelListParams = cursor === null ? {} : { cursor };
-      const result = await this.requireRpc().request<ModelListResponse>("model/list", params);
-      models.push(...result.data.map((model) => model.model));
+      const result = await rpc.request<ModelListResponse>("model/list", params);
+      const remaining = MAX_MODEL_RECORDS - records.length;
+      records.push(...result.data.slice(0, remaining));
+      if (records.length >= MAX_MODEL_RECORDS) return records;
       cursor = result.nextCursor;
-      if (cursor === null) return models;
+      if (cursor === null) return records;
       if (seenCursors.has(cursor)) throw new Error("Codex model list repeated a cursor");
       seenCursors.add(cursor);
     }
     throw new Error("Codex model list exceeded the page limit");
   }
 
+  async readAccount(): Promise<GetAccountResponse> {
+    await this.startAccountSession();
+    return this.requireRpc().request<GetAccountResponse>("account/read", {});
+  }
+
+  async startChatGptLogin(): Promise<LoginAccountResponse> {
+    await this.startAccountSession();
+    return this.requireRpc().request<LoginAccountResponse>("account/login/start", {
+      type: "chatgpt",
+    });
+  }
+
+  async cancelChatGptLogin(loginId: string): Promise<CancelLoginAccountResponse> {
+    await this.startAccountSession();
+    return this.requireRpc().request<CancelLoginAccountResponse>("account/login/cancel", {
+      loginId,
+    });
+  }
+
+  subscribeAccountNotifications(
+    listener: (notification: AccountServerNotification) => void,
+  ): () => void {
+    this.accountNotificationListeners.add(listener);
+    return () => this.accountNotificationListeners.delete(listener);
+  }
+
   async startThread(input: {
     cwd: string;
     model: string;
-    reasoningEffort: "low" | "medium";
+    reasoningEffort: string;
   }): Promise<string> {
-    if (this.gameThreadId || this.threadStarting) {
-      throw new Error("a Codex thread is already active for this game session");
+    if (this.threadStarting) {
+      throw new Error("a Codex thread is already starting for this game session");
     }
     this.threadStarting = true;
     const params: ThreadStartParams = {
@@ -305,7 +466,7 @@ export class CodexAppServerClient implements CodexPort {
     };
     try {
       const result = await this.requireRpc().request<ThreadStartResponse>("thread/start", params);
-      this.gameThreadId = result.thread.id;
+      this.hasGameThreads = true;
       this.reasoningEfforts.set(result.thread.id, input.reasoningEffort);
       return result.thread.id;
     } finally {
@@ -321,7 +482,7 @@ export class CodexAppServerClient implements CodexPort {
     const params: TurnStartParams = {
       threadId,
       input: [{ type: "text", text, text_elements: [] }],
-      effort: this.reasoningEfforts.get(threadId) ?? this.config.codex.reasoningEffort,
+      effort: this.reasoningEfforts.get(threadId) ?? this.defaultReasoningEffort,
     };
     return new Promise<CodexTurnResult>((resolveResult, reject) => {
       const pending: PendingTurnStart = { reject };
@@ -389,19 +550,33 @@ export class CodexAppServerClient implements CodexPort {
     this.lifecycleGeneration += 1;
     this.startController?.abort();
     this.loginController?.abort();
-    await this.rpc?.close();
+    const readyRpc = this.rpc;
+    const initializingRpc = this.startingRpc?.rpc;
+    const closeResults = await Promise.allSettled(
+      [...new Set([readyRpc, initializingRpc].filter((rpc) => rpc !== undefined))].map((rpc) =>
+        rpc.close(),
+      ),
+    );
+    const accountStarting = this.accountStartPromise;
+    if (accountStarting) await accountStarting.catch(() => undefined);
     const starting = this.startPromise;
     if (starting) await starting.catch(() => undefined);
     const login = this.loginPromise;
     if (login) await login.catch(() => undefined);
+    const closeFailure = closeResults.find(
+      (result): result is PromiseRejectedResult => result.status === "rejected",
+    );
+    if (closeFailure) throw closeFailure.reason;
     this.rpc = undefined;
+    this.startingRpc = undefined;
     this.reasoningEfforts.clear();
     this.activeTurns.clear();
     this.pendingTurnStarts.clear();
     this.earlyTurnEvents.clear();
-    this.gameThreadId = undefined;
+    this.hasGameThreads = false;
     this.threadStarting = false;
     this.startController = undefined;
+    this.accountStartPromise = undefined;
     this.loginPromise = undefined;
     this.loginController = undefined;
     this.loginVerified = false;
@@ -419,6 +594,21 @@ export class CodexAppServerClient implements CodexPort {
 
   private handleNotification(notification: JsonRpcMessage): void {
     if (!("method" in notification)) return;
+    if (
+      notification.method === "account/login/completed" ||
+      notification.method === "account/updated"
+    ) {
+      const accountNotification = parseAccountNotification(notification);
+      if (!accountNotification) return;
+      for (const listener of this.accountNotificationListeners) {
+        try {
+          listener(accountNotification);
+        } catch {
+          // Authentication observers cannot interfere with the app-server transport.
+        }
+      }
+      return;
+    }
     if (notification.method === "item/agentMessage/delta") {
       const params = notification.params as AgentMessageDeltaNotification;
       if (typeof params.turnId !== "string" || typeof params.delta !== "string") return;

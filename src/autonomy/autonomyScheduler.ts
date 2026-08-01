@@ -1,14 +1,9 @@
 import type { MinecraftPort } from "../minecraft/minecraftPort.js";
 import type { ModeManager } from "../mode/modeManager.js";
+import type { ProactiveKind } from "../companion/promptBuilder.js";
 
 export type AutonomyReason =
   "balanced_idle" | "autonomous_idle" | "goal_completed" | "action_failed" | "nearby_threat";
-
-const idleIntervals = {
-  friend: null,
-  balanced: 120_000,
-  autonomous: 45_000,
-} as const;
 
 const idleReasons = {
   friend: null,
@@ -25,7 +20,7 @@ const proactiveChatCooldowns = {
 export interface AutonomySchedulerOptions {
   mode: ModeManager;
   minecraft: Pick<MinecraftPort, "isOwnerOnline">;
-  ownerUsername: string;
+  ownerUsername: () => string;
   requestTurn: (reason: AutonomyReason) => Promise<void>;
   isBusy: () => boolean;
   now?: () => number;
@@ -49,6 +44,7 @@ export class AutonomyScheduler {
     this.setTimer =
       options.setTimer ?? ((callback, milliseconds) => setTimeout(callback, milliseconds));
     this.clearTimer = options.clearTimer ?? ((timer) => clearTimeout(timer));
+    options.mode.subscribeProfile(() => this.notifyModeChanged());
   }
 
   start(): void {
@@ -89,7 +85,14 @@ export class AutonomyScheduler {
   }
 
   canChatProactively(): boolean {
+    return this.canSendProactively("chat");
+  }
+
+  canSendProactively(kind: ProactiveKind): boolean {
     const mode = this.options.mode.snapshot().mode;
+    const settings = this.options.mode.getModeSettings();
+    if (kind === "chat" && !settings.allowProactiveChat) return false;
+    if (kind === "suggestion" && !settings.allowSuggestions) return false;
     const cooldown = proactiveChatCooldowns[mode];
     return Number.isFinite(cooldown) && this.now() - this.lastProactiveChatAt >= cooldown;
   }
@@ -109,7 +112,9 @@ export class AutonomyScheduler {
   private scheduleIdle(delayOverride?: number): void {
     if (!this.started || this.timer !== null) return;
     const mode = this.options.mode.snapshot().mode;
-    const delay = delayOverride ?? idleIntervals[mode];
+    const delay =
+      delayOverride ??
+      (mode === "friend" ? null : this.options.mode.getModeSettings().idleMinutes * 60_000);
     if (delay === null) return;
     const idleReason = idleReasons[mode];
     if (idleReason === null) return;
@@ -143,7 +148,7 @@ export class AutonomyScheduler {
         this.scheduleIdle(1_000);
         return;
       }
-      if (!(await this.options.minecraft.isOwnerOnline(this.options.ownerUsername))) {
+      if (!(await this.options.minecraft.isOwnerOnline(this.options.ownerUsername()))) {
         if (!this.isCurrentGeneration(generation)) return;
         this.pendingReason = null;
         this.scheduleIdle();

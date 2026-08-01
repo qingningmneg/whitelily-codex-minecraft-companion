@@ -22,7 +22,7 @@ function isFullChatField(key: string): boolean {
   );
 }
 
-function sanitize(value: unknown, seen = new WeakSet<object>()): unknown {
+export function sanitizeLogValue(value: unknown, seen = new WeakSet<object>()): unknown {
   if (typeof value === "string") return redactPublicText(value);
   if (typeof value === "bigint") return value.toString();
   if (typeof value === "undefined" || typeof value === "function" || typeof value === "symbol") {
@@ -35,7 +35,7 @@ function sanitize(value: unknown, seen = new WeakSet<object>()): unknown {
       const code = (value as Error & { code?: unknown }).code;
       return {
         name: redactPublicText(value.name),
-        ...(code === undefined ? {} : { code: sanitize(code, seen) }),
+        ...(code === undefined ? {} : { code: sanitizeLogValue(code, seen) }),
       };
     } finally {
       seen.delete(value);
@@ -45,7 +45,7 @@ function sanitize(value: unknown, seen = new WeakSet<object>()): unknown {
     if (seen.has(value)) return "[CIRCULAR_REFERENCE]";
     seen.add(value);
     try {
-      return value.map((item) => sanitize(item, seen));
+      return value.map((item) => sanitizeLogValue(item, seen));
     } finally {
       seen.delete(value);
     }
@@ -57,7 +57,7 @@ function sanitize(value: unknown, seen = new WeakSet<object>()): unknown {
       return Object.fromEntries(
         Object.entries(value)
           .filter(([key]) => !isFullChatField(key))
-          .map(([key, nested]) => [key, sanitize(nested, seen)]),
+          .map(([key, nested]) => [key, sanitizeLogValue(nested, seen)]),
       );
     } finally {
       seen.delete(value);
@@ -88,10 +88,9 @@ export class SafeLogger {
   ): Promise<void> {
     return serializeByPath(this.path, async () => {
       await mkdir(dirname(this.path), { recursive: true });
-      const safeFields = JSON.parse(redactSecrets(JSON.stringify(sanitize(fields)))) as Record<
-        string,
-        unknown
-      >;
+      const safeFields = JSON.parse(
+        redactSecrets(JSON.stringify(sanitizeLogValue(fields))),
+      ) as Record<string, unknown>;
       const line = JSON.stringify({
         ...safeFields,
         at: new Date().toISOString(),

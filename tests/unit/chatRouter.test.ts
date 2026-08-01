@@ -2,7 +2,28 @@ import { describe, expect, it } from "vitest";
 import { ChatRouter } from "../../src/companion/chatRouter.js";
 
 describe("ChatRouter", () => {
-  const router = new ChatRouter({ ownerUsername: "TestOwner", maxMessageLength: 4_000 });
+  const router = new ChatRouter({ ownerUsername: () => "TestOwner", maxMessageLength: 4_000 });
+
+  it("routes the next chat event using the current owner", () => {
+    let owner = "OldOwner";
+    const dynamicRouter = new ChatRouter({
+      ownerUsername: () => owner,
+      maxMessageLength: 4_000,
+    });
+
+    expect(
+      dynamicRouter.route({ kind: "chat", username: "OldOwner", message: "!status" }).kind,
+    ).toBe("command");
+    owner = "NewOwner";
+    expect(dynamicRouter.route({ kind: "chat", username: "OldOwner", message: "!status" })).toEqual(
+      {
+        kind: "ignore",
+      },
+    );
+    expect(
+      dynamicRouter.route({ kind: "chat", username: "NewOwner", message: "!status" }).kind,
+    ).toBe("command");
+  });
 
   it("ignores another player's management command", () => {
     expect(router.route({ kind: "chat", username: "Visitor", message: "!stop" })).toEqual({

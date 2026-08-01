@@ -18,7 +18,7 @@ function confirmedExecutor(
   safety: ActionSafety,
   confirmations: ConfirmationStore,
 ): ActionExecutor {
-  return new ActionExecutor(minecraft, safety, confirmations, "TestOwner", undefined, {
+  return new ActionExecutor(minecraft, safety, confirmations, () => "TestOwner", undefined, {
     isLeaseLive: (lease) => lease.id === taskLease.id && lease.startedAt === taskLease.startedAt,
     reserveAdditionalTravel: () => {
       throw new Error("no additional travel expected");
@@ -39,6 +39,27 @@ function waitsForAbort(signal: AbortSignal): Promise<void> {
 afterEach(() => vi.useRealTimers());
 
 describe("ActionExecutor", () => {
+  it("reads the current owner when follow work reaches Minecraft", async () => {
+    const minecraft = new FakeMinecraftPort();
+    let owner = "OldOwner";
+    const confirmations = new ConfirmationStore();
+    const executor = new ActionExecutor(
+      minecraft,
+      new SafetyEngine(confirmations),
+      confirmations,
+      () => owner,
+    );
+    owner = "NewOwner";
+
+    await expect(executor.execute({ kind: "follow_owner", distance: 4 }, context)).resolves.toEqual(
+      { status: "completed" },
+    );
+    expect(minecraft.calls).toContainEqual({
+      method: "followOwner",
+      args: ["NewOwner", 4],
+    });
+  });
+
   it("invalidates task work synchronously before cancellation aborts the action", async () => {
     const minecraft = new FakeMinecraftPort();
     const order: string[] = [];
@@ -53,7 +74,7 @@ describe("ActionExecutor", () => {
       minecraft,
       new SafetyEngine(confirmations),
       confirmations,
-      "TestOwner",
+      () => "TestOwner",
       () => order.push("task_invalidated"),
     );
     const running = executor.execute({ kind: "wait", milliseconds: 60_000 }, context);
@@ -262,7 +283,12 @@ describe("ActionExecutor", () => {
       },
       evaluatePermanent: () => ({ kind: "allow" }),
     };
-    const executor = new ActionExecutor(minecraft, safety, new ConfirmationStore(), "TestOwner");
+    const executor = new ActionExecutor(
+      minecraft,
+      safety,
+      new ConfirmationStore(),
+      () => "TestOwner",
+    );
     const failed = executor.execute({ kind: "say", message: "blocked" }, context);
     let result: string | undefined;
     void failed.then((value) => {
@@ -481,7 +507,7 @@ describe("ActionExecutor", () => {
         evaluatePermanent: () => ({ kind: "allow" }),
       },
       confirmations,
-      "TestOwner",
+      () => "TestOwner",
       undefined,
       {
         isLeaseLive: (lease) =>
@@ -526,7 +552,7 @@ describe("ActionExecutor", () => {
         evaluatePermanent: () => ({ kind: "allow" }),
       },
       confirmations,
-      "TestOwner",
+      () => "TestOwner",
       undefined,
       {
         isLeaseLive: () => live,

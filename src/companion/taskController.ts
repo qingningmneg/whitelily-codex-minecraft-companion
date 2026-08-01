@@ -24,12 +24,20 @@ export interface ActiveTask {
 
 export type TaskAuditEvent = "task_started" | "task_stopped";
 
-export type TaskAuditData = { task: ActiveTask } | { task: ActiveTask; reason: TaskStopReason };
+interface TaskAuditSnapshot {
+  startedAt: string;
+  expectedActionCategoryCount: number;
+  limits: TaskLimits;
+}
+
+export type TaskAuditData =
+  (TaskAuditSnapshot & { reason?: never }) | (TaskAuditSnapshot & { reason: TaskStopReason });
 
 export type TaskAuditCallback = (event: TaskAuditEvent, data: TaskAuditData) => void;
 
 export interface TaskControllerDependencies {
   onTerminal?: (reason: TaskStopReason, forceCleanup: boolean) => void;
+  ownerIdentityRevision?: () => number;
   setTimer?: (callback: () => void, milliseconds: number) => ReturnType<typeof setTimeout>;
   clearTimer?: (timer: ReturnType<typeof setTimeout>) => void;
 }
@@ -53,12 +61,14 @@ const taskStopReasons = new Set<TaskStopReason>([
   "emergency_stop",
   "disconnect",
   "world_changed",
+  "owner_changed",
   "model_unavailable",
   "process_exit",
 ]);
 
 export class TaskController {
   private activeTask: ActiveTask | undefined;
+  private activeOwnerIdentityRevision: number | undefined;
   private deadlineTimer: ReturnType<typeof setTimeout> | undefined;
   private readonly terminalListeners = new Set<
     (reason: TaskStopReason, forceCleanup: boolean) => void
@@ -107,7 +117,8 @@ export class TaskController {
         startedAt: startedAt.toISOString(),
       };
       this.activeTask = active;
-      this.emitAudit("task_started", { task: cloneActiveTask(active) });
+      this.activeOwnerIdentityRevision = this.dependencies.ownerIdentityRevision?.();
+      this.emitAudit("task_started", createTaskAuditData(active));
       this.scheduleDeadline(active);
       return cloneActiveTask(active);
     } catch (error) {
@@ -187,6 +198,10 @@ export class TaskController {
 
   private reconcileBudget(): void {
     if (!this.activeTask) return;
+    if (this.activeOwnerIdentityRevision !== this.dependencies.ownerIdentityRevision?.()) {
+      this.finish("owner_changed", false, true);
+      return;
+    }
     const snapshot = this.budget.snapshot();
     if (!snapshot.active) this.finish(snapshot.stopReason ?? "failed", true);
   }
@@ -199,6 +214,7 @@ export class TaskController {
     const active = this.activeTask;
     if (!active) return;
     this.activeTask = undefined;
+    this.activeOwnerIdentityRevision = undefined;
     this.clearDeadline();
     if (!budgetAlreadyStopped) this.budget.invalidate(reason);
     try {
@@ -213,10 +229,7 @@ export class TaskController {
         // Terminal observers cannot affect task lifecycle or lease invalidation.
       }
     }
-    this.emitAudit("task_stopped", {
-      task: cloneActiveTask(active),
-      reason,
-    });
+    this.emitAudit("task_stopped", createTaskAuditData(active, reason));
   }
 
   private scheduleDeadline(active: ActiveTask): void {
@@ -338,6 +351,20 @@ function cloneActiveTask(task: ActiveTask): ActiveTask {
 }
 
 function cloneAuditData(data: TaskAuditData): TaskAuditData {
-  if ("reason" in data) return { task: cloneActiveTask(data.task), reason: data.reason };
-  return { task: cloneActiveTask(data.task) };
+  const snapshot = {
+    startedAt: data.startedAt,
+    expectedActionCategoryCount: data.expectedActionCategoryCount,
+    limits: { ...data.limits },
+  };
+  if ("reason" in data) return { ...snapshot, reason: data.reason };
+  return snapshot;
+}
+
+function createTaskAuditData(task: ActiveTask, reason?: TaskStopReason): TaskAuditData {
+  const snapshot = {
+    startedAt: task.startedAt,
+    expectedActionCategoryCount: task.disclosure.expectedActions.length,
+    limits: { ...task.disclosure.limits },
+  };
+  return reason === undefined ? snapshot : { ...snapshot, reason };
 }

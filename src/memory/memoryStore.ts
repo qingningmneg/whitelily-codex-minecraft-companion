@@ -11,7 +11,7 @@ export interface MemoryRecord {
   createdAt: string;
 }
 
-type NewMemory = Omit<MemoryRecord, "id" | "createdAt">;
+export type NewMemory = Omit<MemoryRecord, "id" | "createdAt">;
 
 export interface MemoryValidationSource {
   ownerText?: string;

@@ -53,6 +53,10 @@ function dependencies(
   };
 }
 
+async function flushMicrotasks(): Promise<void> {
+  for (let index = 0; index < 10; index += 1) await Promise.resolve();
+}
+
 describe("CodexAppServerClient", () => {
   it("shares concurrent ChatGPT preflight and reuses it when starting the app server", async () => {
     const harness = createJsonRpcLineTransportHarness();
@@ -320,6 +324,36 @@ describe("CodexAppServerClient", () => {
     await expect(client.assertChatGptLogin()).resolves.toBeUndefined();
   });
 
+  it("accepts the exact ChatGPT login line when the Codex CLI writes status to stderr", async () => {
+    const harness = createJsonRpcLineTransportHarness();
+    const client = new CodexAppServerClient(
+      config,
+      dependencies(harness, async () => ({
+        stdout: "",
+        stderr: "Logged in using ChatGPT\n",
+        exitCode: 0,
+      })),
+    );
+
+    await expect(client.assertChatGptLogin()).resolves.toBeUndefined();
+  });
+
+  it("rejects contradictory ChatGPT and API-key login status lines", async () => {
+    const harness = createJsonRpcLineTransportHarness();
+    const client = new CodexAppServerClient(
+      config,
+      dependencies(harness, async () => ({
+        stdout: "Logged in using ChatGPT\n",
+        stderr: "Logged in using an API key\n",
+        exitCode: 0,
+      })),
+    );
+
+    await expect(client.assertChatGptLogin()).rejects.toThrow(
+      "Codex must be signed in with ChatGPT",
+    );
+  });
+
   it.each([" Logged in using ChatGPT", "Logged in using ChatGPT ", "Logged in using ChatGPT\t"])(
     "rejects a whitespace-mutated ChatGPT login line: %j",
     async (stdout) => {
@@ -372,7 +406,7 @@ describe("CodexAppServerClient", () => {
     expect(aborted).toBe(true);
   });
 
-  it("allows only one Codex thread for a game session", async () => {
+  it("starts two independent Codex threads for one game session", async () => {
     const harness = createJsonRpcLineTransportHarness();
     const client = new CodexAppServerClient(config, dependencies(harness));
     const start = client.start();
@@ -390,16 +424,27 @@ describe("CodexAppServerClient", () => {
     harness.receive({ id: 2, result: { thread: { id: "thread-1" } } });
     await firstThread;
 
-    const duplicate = client.startThread({
+    const secondThread = client.startThread({
       cwd: "C:/ignored",
       model: "gpt-5.6-terra",
-      reasoningEffort: "low",
+      reasoningEffort: "high",
     });
-    void duplicate.catch(() => undefined);
+    await flushMicrotasks();
 
-    expect(harness.sent()).not.toContainEqual(
-      expect.objectContaining({ id: 3, method: "thread/start" }),
-    );
+    expect(harness.sent()).toContainEqual({
+      id: 3,
+      method: "thread/start",
+      params: {
+        model: "gpt-5.6-terra",
+        cwd: "C:/WhiteLily/codex-workspace",
+        sandbox: "read-only",
+        approvalPolicy: "never",
+      },
+    });
+    harness.receive({ id: 3, result: { thread: { id: "thread-2" } } });
+    await expect(secondThread).resolves.toBe("thread-2");
+
+    await client.stop();
   });
 
   it("settles an active turn when the app-server child exits", async () => {
@@ -689,5 +734,544 @@ describe("CodexAppServerClient", () => {
     });
     harness.receive({ id: 3, result: { data: [{ model: "gpt-5.6-luna" }], nextCursor: null } });
     await expect(listed).resolves.toEqual(["gpt-5.6-terra", "gpt-5.6-luna"]);
+  });
+
+  it("starts bounded account operations before ChatGPT is signed in", async () => {
+    const harness = createJsonRpcLineTransportHarness();
+    let loginChecks = 0;
+    const client = new CodexAppServerClient(
+      config,
+      dependencies(harness, async () => {
+        loginChecks += 1;
+        return { stdout: "Not logged in\n", stderr: "", exitCode: 1 };
+      }),
+    );
+
+    const starting = client.startAccountSession();
+    await expect(harness.nextSent()).resolves.toMatchObject({
+      id: 1,
+      method: "initialize",
+    });
+    harness.receive({ id: 1, result: initialized });
+    await starting;
+    await harness.nextSent();
+
+    const reading = client.readAccount();
+    await expect(harness.nextSent()).resolves.toEqual({
+      id: 2,
+      method: "account/read",
+      params: {},
+    });
+    harness.receive({
+      id: 2,
+      result: { account: null, requiresOpenaiAuth: true },
+    });
+    await expect(reading).resolves.toEqual({
+      account: null,
+      requiresOpenaiAuth: true,
+    });
+    expect(loginChecks).toBe(0);
+    await client.stop();
+  });
+
+  it("keeps concurrent account starts and account/model requests behind initialize", async () => {
+    const harness = createJsonRpcLineTransportHarness();
+    let transports = 0;
+    const deps = dependencies(harness);
+    deps.createTransport = async () => {
+      transports += 1;
+      return harness.transport;
+    };
+    const client = new CodexAppServerClient(config, deps);
+
+    const firstStart = client.startAccountSession();
+    let secondSettled = false;
+    const secondStart = client.startAccountSession().finally(() => {
+      secondSettled = true;
+    });
+    await expect(harness.nextSent()).resolves.toMatchObject({
+      id: 1,
+      method: "initialize",
+    });
+    const reading = client.readAccount();
+    const listing = client.listModelRecords();
+    await flushMicrotasks();
+
+    expect(transports).toBe(1);
+    expect(secondSettled).toBe(false);
+    expect(harness.sent()).toHaveLength(1);
+
+    harness.receive({ id: 1, result: initialized });
+    await Promise.all([firstStart, secondStart]);
+    await expect(harness.nextSent()).resolves.toEqual({ method: "initialized", params: {} });
+    await expect(harness.nextSent()).resolves.toEqual({
+      id: 2,
+      method: "account/read",
+      params: {},
+    });
+    await expect(harness.nextSent()).resolves.toEqual({
+      id: 3,
+      method: "model/list",
+      params: {},
+    });
+    harness.receive({
+      id: 2,
+      result: { account: null, requiresOpenaiAuth: true },
+    });
+    harness.receive({
+      id: 3,
+      result: { data: [], nextCursor: null },
+    });
+    await expect(reading).resolves.toEqual({
+      account: null,
+      requiresOpenaiAuth: true,
+    });
+    await expect(listing).resolves.toEqual([]);
+    await client.stop();
+  });
+
+  it("cleans up an initialize failure and reconnects with a fresh transport", async () => {
+    const first = createJsonRpcLineTransportHarness();
+    const second = createJsonRpcLineTransportHarness();
+    let transports = 0;
+    const deps = dependencies(first);
+    deps.createTransport = async () => {
+      transports += 1;
+      return transports === 1 ? first.transport : second.transport;
+    };
+    const client = new CodexAppServerClient(config, deps);
+
+    const failedStart = client.startAccountSession();
+    await expect(first.nextSent()).resolves.toMatchObject({ id: 1, method: "initialize" });
+    first.receive({ id: 1, error: { code: -32_000, message: "private failure" } });
+    await expect(failedStart).rejects.toThrow("Codex app-server request failed");
+    expect(first.closed()).toBe(true);
+
+    const freshStart = client.startAccountSession();
+    await expect(second.nextSent()).resolves.toMatchObject({ id: 1, method: "initialize" });
+    second.receive({ id: 1, result: initialized });
+    await freshStart;
+    await expect(second.nextSent()).resolves.toEqual({ method: "initialized", params: {} });
+    expect(transports).toBe(2);
+    await client.stop();
+  });
+
+  it("stops a private initializing RPC and reconnects only after stop completes", async () => {
+    const first = createJsonRpcLineTransportHarness();
+    const second = createJsonRpcLineTransportHarness();
+    let transports = 0;
+    const deps = dependencies(first);
+    deps.createTransport = async () => {
+      transports += 1;
+      return transports === 1 ? first.transport : second.transport;
+    };
+    const client = new CodexAppServerClient(config, deps);
+
+    const interruptedStart = client.startAccountSession();
+    await expect(first.nextSent()).resolves.toMatchObject({ id: 1, method: "initialize" });
+    const stopping = client.stop();
+    await expect(client.startAccountSession()).rejects.toThrow("stopping");
+    await stopping;
+    await expect(interruptedStart).rejects.toThrow("stopped");
+    expect(first.closed()).toBe(true);
+
+    const freshStart = client.startAccountSession();
+    await expect(second.nextSent()).resolves.toMatchObject({ id: 1, method: "initialize" });
+    second.receive({ id: 1, result: initialized });
+    await freshStart;
+    await expect(second.nextSent()).resolves.toEqual({ method: "initialized", params: {} });
+    expect(transports).toBe(2);
+    await client.stop();
+  });
+
+  it("uses only ChatGPT browser login and typed cancel RPC methods", async () => {
+    const harness = createJsonRpcLineTransportHarness();
+    const client = new CodexAppServerClient(config, dependencies(harness));
+    const starting = client.startAccountSession();
+    await harness.nextSent();
+    harness.receive({ id: 1, result: initialized });
+    await starting;
+    await harness.nextSent();
+
+    const login = client.startChatGptLogin();
+    await expect(harness.nextSent()).resolves.toEqual({
+      id: 2,
+      method: "account/login/start",
+      params: { type: "chatgpt" },
+    });
+    harness.receive({
+      id: 2,
+      result: {
+        type: "chatgpt",
+        loginId: "server-login",
+        authUrl: "https://auth.openai.com/oauth?state=private",
+      },
+    });
+    await expect(login).resolves.toMatchObject({
+      type: "chatgpt",
+      loginId: "server-login",
+    });
+
+    const cancel = client.cancelChatGptLogin("server-login");
+    await expect(harness.nextSent()).resolves.toEqual({
+      id: 3,
+      method: "account/login/cancel",
+      params: { loginId: "server-login" },
+    });
+    harness.receive({ id: 3, result: { status: "canceled" } });
+    await expect(cancel).resolves.toEqual({ status: "canceled" });
+    await client.stop();
+  });
+
+  it("forwards only generated account notifications to account observers", async () => {
+    const harness = createJsonRpcLineTransportHarness();
+    const client = new CodexAppServerClient(config, dependencies(harness));
+    const notifications: unknown[] = [];
+    client.subscribeAccountNotifications((notification) => notifications.push(notification));
+    const starting = client.startAccountSession();
+    await harness.nextSent();
+    harness.receive({ id: 1, result: initialized });
+    await starting;
+    await harness.nextSent();
+
+    harness.receive({
+      method: "account/login/completed",
+      params: { loginId: "login-1", success: true, error: null },
+    });
+    harness.receive({
+      method: "account/updated",
+      params: { authMode: "chatgpt", planType: "plus" },
+    });
+    harness.receive({ method: "turn/completed", params: {} });
+
+    expect(notifications).toEqual([
+      {
+        method: "account/login/completed",
+        params: { loginId: "login-1", success: true, error: null },
+      },
+      {
+        method: "account/updated",
+        params: { authMode: "chatgpt", planType: "plus" },
+      },
+    ]);
+    await client.stop();
+  });
+
+  it("does not publish account notifications from an initializing candidate RPC", async () => {
+    const harness = createJsonRpcLineTransportHarness();
+    const client = new CodexAppServerClient(config, dependencies(harness));
+    const notifications: unknown[] = [];
+    client.subscribeAccountNotifications((notification) => notifications.push(notification));
+    const starting = client.startAccountSession();
+    await harness.nextSent();
+
+    harness.receive({
+      method: "account/updated",
+      params: { authMode: "chatgpt", planType: "plus" },
+    });
+    await flushMicrotasks();
+    expect(notifications).toEqual([]);
+
+    harness.receive({ id: 1, result: initialized });
+    await starting;
+    await harness.nextSent();
+    harness.receive({
+      method: "account/updated",
+      params: { authMode: "chatgpt", planType: "plus" },
+    });
+    await flushMicrotasks();
+    expect(notifications).toHaveLength(1);
+    await client.stop();
+  });
+
+  it.each([
+    ["missing notification params", { method: "account/login/completed" }],
+    [
+      "unknown top-level fields",
+      {
+        method: "account/login/completed",
+        params: { loginId: "login-1", success: true, error: null },
+        extra: true,
+      },
+    ],
+    [
+      "unknown login-completion fields",
+      {
+        method: "account/login/completed",
+        params: { loginId: "login-1", success: true, error: null, extra: true },
+      },
+    ],
+    [
+      "overlong login IDs",
+      {
+        method: "account/login/completed",
+        params: { loginId: "x".repeat(513), success: true, error: null },
+      },
+    ],
+    [
+      "overlong completion errors",
+      {
+        method: "account/login/completed",
+        params: { loginId: "login-1", success: false, error: "x".repeat(1_025) },
+      },
+    ],
+    [
+      "unknown auth modes",
+      {
+        method: "account/updated",
+        params: { authMode: "unknown-provider", planType: "plus" },
+      },
+    ],
+    [
+      "missing account-update fields",
+      {
+        method: "account/updated",
+        params: { authMode: "chatgpt" },
+      },
+    ],
+    [
+      "unknown account-update fields",
+      {
+        method: "account/updated",
+        params: { authMode: "chatgpt", planType: "plus", extra: true },
+      },
+    ],
+  ])("drops malformed account notifications with %s", async (_label, notification) => {
+    const harness = createJsonRpcLineTransportHarness();
+    const client = new CodexAppServerClient(config, dependencies(harness));
+    const notifications: unknown[] = [];
+    client.subscribeAccountNotifications((value) => notifications.push(value));
+    const starting = client.startAccountSession();
+    await harness.nextSent();
+    harness.receive({ id: 1, result: initialized });
+    await starting;
+    await harness.nextSent();
+
+    harness.receive(notification as never);
+    await flushMicrotasks();
+
+    expect(notifications).toEqual([]);
+    await client.stop();
+  });
+
+  it("returns complete live model records across bounded pagination", async () => {
+    const harness = createJsonRpcLineTransportHarness();
+    const client = new CodexAppServerClient(config, dependencies(harness));
+    const starting = client.startAccountSession();
+    await harness.nextSent();
+    harness.receive({ id: 1, result: initialized });
+    await starting;
+    await harness.nextSent();
+
+    const firstRecord = {
+      id: "record-one",
+      model: "live-one",
+      displayName: "Live One",
+      hidden: false,
+      supportedReasoningEfforts: [{ reasoningEffort: "medium", description: "Service medium" }],
+    };
+    const secondRecord = {
+      id: "record-two",
+      model: "live-two",
+      displayName: "Live Two",
+      hidden: false,
+      supportedReasoningEfforts: [{ reasoningEffort: "high", description: "Service high" }],
+    };
+    const listing = client.listModelRecords();
+    await expect(harness.nextSent()).resolves.toEqual({
+      id: 2,
+      method: "model/list",
+      params: {},
+    });
+    harness.receive({ id: 2, result: { data: [firstRecord], nextCursor: "next-page" } });
+    await expect(harness.nextSent()).resolves.toEqual({
+      id: 3,
+      method: "model/list",
+      params: { cursor: "next-page" },
+    });
+    harness.receive({ id: 3, result: { data: [secondRecord], nextCursor: null } });
+
+    await expect(listing).resolves.toEqual([firstRecord, secondRecord]);
+    await client.stop();
+  });
+
+  it("validates the exact live model and service-supported reasoning effort", async () => {
+    const harness = createJsonRpcLineTransportHarness();
+    const client = new CodexAppServerClient(config, dependencies(harness));
+    const starting = client.startAccountSession();
+    await harness.nextSent();
+    harness.receive({ id: 1, result: initialized });
+    await starting;
+    await harness.nextSent();
+
+    const validate = client.validateModelSelection({
+      modelId: "service-live-model",
+      reasoningEffort: "xhigh",
+    });
+    await expect(harness.nextSent()).resolves.toEqual({
+      id: 2,
+      method: "model/list",
+      params: {},
+    });
+    harness.receive({
+      id: 2,
+      result: {
+        data: [
+          {
+            id: "service-record",
+            model: "service-live-model",
+            displayName: "Service Live Model",
+            hidden: false,
+            supportedReasoningEfforts: [{ reasoningEffort: "xhigh", description: "Service xhigh" }],
+          },
+        ],
+        nextCursor: null,
+      },
+    });
+    await expect(validate).resolves.toBe(true);
+
+    const unavailableEffort = client.validateModelSelection({
+      modelId: "service-live-model",
+      reasoningEffort: "medium",
+    });
+    await harness.nextSent();
+    harness.receive({
+      id: 3,
+      result: {
+        data: [
+          {
+            id: "service-record",
+            model: "service-live-model",
+            displayName: "Service Live Model",
+            hidden: false,
+            supportedReasoningEfforts: [{ reasoningEffort: "xhigh", description: "Service xhigh" }],
+          },
+        ],
+        nextCursor: null,
+      },
+    });
+    await expect(unavailableEffort).resolves.toBe(false);
+    await client.stop();
+  });
+
+  it("accepts exactly one hundred live model pages in service order", async () => {
+    const harness = createJsonRpcLineTransportHarness();
+    const client = new CodexAppServerClient(config, dependencies(harness));
+    const starting = client.startAccountSession();
+    await harness.nextSent();
+    harness.receive({ id: 1, result: initialized });
+    await starting;
+    await harness.nextSent();
+
+    const listing = client.listModelRecords();
+    for (let page = 0; page < 100; page += 1) {
+      await expect(harness.nextSent()).resolves.toEqual({
+        id: page + 2,
+        method: "model/list",
+        params: page === 0 ? {} : { cursor: `cursor-${page}` },
+      });
+      harness.receive({
+        id: page + 2,
+        result: {
+          data: [],
+          nextCursor: page === 99 ? null : `cursor-${page + 1}`,
+        },
+      });
+    }
+
+    await expect(listing).resolves.toEqual([]);
+    await client.stop();
+  });
+
+  it("rejects a model catalog that exceeds one hundred pages", async () => {
+    const harness = createJsonRpcLineTransportHarness();
+    const client = new CodexAppServerClient(config, dependencies(harness));
+    const starting = client.startAccountSession();
+    await harness.nextSent();
+    harness.receive({ id: 1, result: initialized });
+    await starting;
+    await harness.nextSent();
+
+    const listing = client.listModelRecords();
+    for (let page = 0; page < 100; page += 1) {
+      await harness.nextSent();
+      harness.receive({
+        id: page + 2,
+        result: { data: [], nextCursor: `cursor-${page + 1}` },
+      });
+    }
+
+    await expect(listing).rejects.toThrow("Codex model list exceeded the page limit");
+    expect(
+      harness.sent().filter((message) => "method" in message && message.method === "model/list"),
+    ).toHaveLength(100);
+    await client.stop();
+  });
+
+  it("returns exactly two hundred fifty-six live records without truncation", async () => {
+    const harness = createJsonRpcLineTransportHarness();
+    const client = new CodexAppServerClient(config, dependencies(harness));
+    const starting = client.startAccountSession();
+    await harness.nextSent();
+    harness.receive({ id: 1, result: initialized });
+    await starting;
+    await harness.nextSent();
+
+    const listing = client.listModelRecords();
+    await harness.nextSent();
+    harness.receive({
+      id: 2,
+      result: {
+        data: Array.from({ length: 256 }, (_, index) => ({
+          model: `live-${String(index).padStart(3, "0")}`,
+        })),
+        nextCursor: null,
+      },
+    });
+
+    const records = await listing;
+    expect(records).toHaveLength(256);
+    expect(records.at(-1)?.model).toBe("live-255");
+    await client.stop();
+  });
+
+  it("caps accumulated live records at the public model limit", async () => {
+    const harness = createJsonRpcLineTransportHarness();
+    const client = new CodexAppServerClient(config, dependencies(harness));
+    const starting = client.startAccountSession();
+    await harness.nextSent();
+    harness.receive({ id: 1, result: initialized });
+    await starting;
+    await harness.nextSent();
+
+    const listing = client.listModelRecords();
+    await harness.nextSent();
+    harness.receive({
+      id: 2,
+      result: {
+        data: Array.from({ length: 200 }, (_, index) => ({
+          model: `live-${String(index).padStart(3, "0")}`,
+        })),
+        nextCursor: "page-2",
+      },
+    });
+    await harness.nextSent();
+    harness.receive({
+      id: 3,
+      result: {
+        data: Array.from({ length: 100 }, (_, index) => ({
+          model: `live-${String(index + 200).padStart(3, "0")}`,
+        })),
+        nextCursor: null,
+      },
+    });
+
+    const records = await listing;
+    expect(records).toHaveLength(256);
+    expect(records.at(-1)?.model).toBe("live-255");
+    expect(
+      harness.sent().filter((message) => "method" in message && message.method === "model/list"),
+    ).toHaveLength(2);
+    await client.stop();
   });
 });
