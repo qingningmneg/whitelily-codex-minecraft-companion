@@ -8,6 +8,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 const repositoryRoot = resolve(import.meta.dirname, "..", "..");
 const packageScript = join(repositoryRoot, "scripts", "package-installer.ps1");
+const releaseScript = join(repositoryRoot, "scripts", "package-release.ps1");
 const inspectScript = join(repositoryRoot, "scripts", "inspect-installer.ps1");
 const lifecycleScript = join(repositoryRoot, "scripts", "test-installer.ps1");
 const version = "0.2.0-beta.1";
@@ -380,6 +381,14 @@ afterAll(async () => {
 });
 
 describe("WhiteLily installer packaging scripts", () => {
+  it("computes release hashes without depending on the optional Get-FileHash cmdlet", async () => {
+    for (const scriptPath of [releaseScript, inspectScript, lifecycleScript]) {
+      const script = await readFile(scriptPath, "utf8");
+      expect(script).not.toMatch(/\bGet-FileHash\b/u);
+      expect(script).toMatch(/System\.Security\.Cryptography\.SHA256/u);
+    }
+  });
+
   it("rejects a non-canonical semantic version before invoking the build", async () => {
     const fixture = await createRepositoryFixture();
     const result = runPowerShell(

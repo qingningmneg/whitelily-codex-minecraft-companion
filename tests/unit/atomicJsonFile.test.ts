@@ -132,8 +132,16 @@ describe("AtomicJsonFile", () => {
     const actualRoot = join(actualParent, "WhiteLily", "data");
     const path = join(rootDirectory, "settings.json");
     await mkdir(rootDirectory, { recursive: true });
+    const openedPaths: string[] = [];
+    const io: AtomicJsonFileIo = {
+      ...nodeAtomicJsonFileIo,
+      open: async (candidate, flags) => {
+        openedPaths.push(candidate);
+        return nodeAtomicJsonFileIo.open(candidate, flags);
+      },
+    };
 
-    const file = createFile(path, rootDirectory);
+    const file = createFile(path, rootDirectory, io);
     await expect(file.write({ nested: { count: 7 } })).resolves.toEqual({
       nested: { count: 7 },
     });
@@ -141,6 +149,8 @@ describe("AtomicJsonFile", () => {
     await expect(readFile(join(actualRoot, "settings.json"), "utf8")).resolves.toContain(
       '"count": 7',
     );
+    expect(openedPaths).toHaveLength(1);
+    expect(dirname(openedPaths[0]!)).toBe(rootDirectory);
   });
 
   it("still rejects a verified root that is itself a directory junction", async () => {

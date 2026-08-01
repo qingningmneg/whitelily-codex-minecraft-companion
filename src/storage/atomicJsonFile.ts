@@ -97,6 +97,7 @@ interface AtomicJsonRead<T> {
 
 interface PathIdentity {
   canonicalPath: string;
+  operationPath: string;
   device: number | bigint;
   inode: number | bigint;
 }
@@ -107,6 +108,7 @@ interface TrustedDirectory extends PathIdentity {
 
 interface MissingDirectory {
   canonicalPath: string;
+  operationPath: string;
   exists: false;
 }
 
@@ -287,9 +289,9 @@ export class AtomicJsonFile<T> {
     if (!/^[A-Za-z0-9-]{1,128}$/u.test(randomId)) {
       throw new AtomicJsonFileError("ATOMIC_JSON_PATH", "atomic JSON random id is invalid");
     }
-    const tempPath = resolve(directory.canonicalPath, `.${basename(this.#path)}.${randomId}.tmp`);
+    const tempPath = resolve(directory.operationPath, `.${basename(this.#path)}.${randomId}.tmp`);
     if (
-      normalizePathIdentity(dirname(tempPath)) !== normalizePathIdentity(directory.canonicalPath)
+      normalizePathIdentity(dirname(tempPath)) !== normalizePathIdentity(directory.operationPath)
     ) {
       throw new AtomicJsonFileError("ATOMIC_JSON_PATH", "atomic JSON temp path escaped");
     }
@@ -366,10 +368,10 @@ export class AtomicJsonFile<T> {
   ): Promise<void> {
     await this.#beforeBoundary({
       operation: "rename",
-      source: temp.canonicalPath,
+      source: temp.operationPath,
       destination,
     });
-    const source = await this.#requireFile(temp.canonicalPath);
+    const source = await this.#requireFile(temp.operationPath);
     this.#assertSameIdentity(temp, source, "atomic JSON temp changed at publish");
     this.#assertSameIdentity(directory, source.parent, "atomic JSON parent changed at publish");
     const destinationParent = await this.#trustedDirectory(false);
@@ -386,8 +388,8 @@ export class AtomicJsonFile<T> {
         "atomic JSON destination parent changed at publish",
       );
     }
-    const trustedDestination = join(directory.canonicalPath, basename(destination));
-    await this.#io.rename(source.canonicalPath, trustedDestination);
+    const trustedDestination = join(directory.operationPath, basename(destination));
+    await this.#io.rename(source.operationPath, trustedDestination);
     const published = await this.#requireFile(trustedDestination);
     this.#assertSameIdentity(directory, published.parent, "atomic JSON publish escaped its parent");
     this.#assertFileIdentity(temp, published, "atomic JSON published file changed after rename");
@@ -411,31 +413,31 @@ export class AtomicJsonFile<T> {
     ) {
       return;
     }
-    await this.#io.rm(current.canonicalPath);
+    await this.#io.rm(current.operationPath);
   }
 
   async #removeTemp(temp: TrustedFile): Promise<void> {
     let current: TrustedFile | undefined;
     try {
-      current = await this.#resolveFile(temp.canonicalPath, true);
+      current = await this.#resolveFile(temp.operationPath, true);
     } catch {
       return;
     }
     if (current === undefined || !sameIdentity(temp, current)) return;
-    await this.#io.rm(current.canonicalPath);
+    await this.#io.rm(current.operationPath);
   }
 
   async #readPath(path: string): Promise<AtomicJsonRead<T>> {
     const initial = await this.#resolveFile(path, true);
     if (initial === undefined) return { found: false };
-    await this.#beforeBoundary({ operation: "open-read", path: initial.canonicalPath });
+    await this.#beforeBoundary({ operation: "open-read", path: initial.operationPath });
     const rechecked = await this.#requireFile(path);
     this.#assertSameIdentity(initial, rechecked, "atomic JSON document changed before read");
 
     let handle: AtomicJsonReadable | undefined;
     let contents: string;
     try {
-      handle = await this.#io.openRead(rechecked.canonicalPath);
+      handle = await this.#io.openRead(rechecked.operationPath);
       const handleStat = await handle.stat();
       this.#assertRegularStat(handleStat, "atomic JSON read handle is not a regular file");
       const opened = await this.#requireFile(path);
@@ -460,7 +462,7 @@ export class AtomicJsonFile<T> {
       if (allowMissing) return undefined;
       throw this.#pathError("atomic JSON verified parent does not exist");
     }
-    const candidate = join(parent.canonicalPath, basename(path));
+    const candidate = join(parent.operationPath, basename(path));
     let stats: Stats;
     try {
       stats = await this.#io.lstat(candidate);
@@ -470,12 +472,13 @@ export class AtomicJsonFile<T> {
     }
     this.#assertRegularStat(stats, "atomic JSON document is not a regular file");
     const canonicalPath = await this.#io.realpath(candidate);
-    if (normalizePathIdentity(candidate) !== normalizePathIdentity(canonicalPath)) {
+    const expectedCanonicalPath = join(parent.canonicalPath, basename(path));
+    if (normalizePathIdentity(expectedCanonicalPath) !== normalizePathIdentity(canonicalPath)) {
       throw this.#pathError("atomic JSON document uses a reparse alias");
     }
     const recheckedParent = await this.#trustedDirectory(false);
     this.#assertSameIdentity(parent, recheckedParent, "atomic JSON parent changed");
-    return this.#identity(canonicalPath, stats, parent);
+    return this.#identity(canonicalPath, stats, candidate, parent);
   }
 
   async #requireFile(path: string): Promise<TrustedFile> {
@@ -514,7 +517,7 @@ export class AtomicJsonFile<T> {
     let current = await this.#inspectExistingDirectory(currentPath);
 
     for (let index = 0; index < parts.length; index += 1) {
-      const candidate = join(current.canonicalPath, parts[index]!);
+      const candidate = join(current.operationPath, parts[index]!);
       let stats: Stats;
       try {
         stats = await this.#io.lstat(candidate);
@@ -524,9 +527,10 @@ export class AtomicJsonFile<T> {
           return {
             exists: false,
             canonicalPath: join(current.canonicalPath, ...parts.slice(index)),
+            operationPath: join(current.operationPath, ...parts.slice(index)),
           };
         }
-        const parentBeforeCreate = await this.#inspectExistingDirectory(current.canonicalPath);
+        const parentBeforeCreate = await this.#reinspectDirectory(current);
         this.#assertSameIdentity(current, parentBeforeCreate, "atomic JSON parent changed");
         try {
           await this.#io.mkdir(candidate);
@@ -536,13 +540,12 @@ export class AtomicJsonFile<T> {
         stats = await this.#io.lstat(candidate);
       }
       const canonicalPath = await this.#io.realpath(candidate);
+      const expectedCanonicalPath = join(current.canonicalPath, parts[index]!);
+      const introducesAlias =
+        normalizePathIdentity(expectedCanonicalPath) !== normalizePathIdentity(canonicalPath);
       const isAncestorAboveVerifiedRoot = index < rootParts.length - 1;
       let identityStats = stats;
-      if (
-        isAncestorAboveVerifiedRoot &&
-        (stats.isSymbolicLink() ||
-          normalizePathIdentity(candidate) !== normalizePathIdentity(canonicalPath))
-      ) {
+      if (isAncestorAboveVerifiedRoot && (stats.isSymbolicLink() || introducesAlias)) {
         identityStats = await this.#io.lstat(canonicalPath);
         this.#assertDirectoryStat(
           identityStats,
@@ -551,18 +554,32 @@ export class AtomicJsonFile<T> {
       } else {
         this.#assertDirectoryStat(stats, "atomic JSON path component is not a safe directory");
       }
-      if (
-        !isAncestorAboveVerifiedRoot &&
-        normalizePathIdentity(candidate) !== normalizePathIdentity(canonicalPath)
-      ) {
+      if (!isAncestorAboveVerifiedRoot && introducesAlias) {
         throw this.#pathError("atomic JSON path component uses a reparse alias");
       }
-      const parentAfterLookup = await this.#inspectExistingDirectory(current.canonicalPath);
+      const parentAfterLookup = await this.#reinspectDirectory(current);
       this.#assertSameIdentity(current, parentAfterLookup, "atomic JSON parent changed");
       currentPath = canonicalPath;
-      current = { ...this.#identity(currentPath, identityStats), exists: true };
+      current = { ...this.#identity(currentPath, identityStats, candidate), exists: true };
     }
     return { ...current, exists: true };
+  }
+
+  async #reinspectDirectory(directory: TrustedDirectory): Promise<TrustedDirectory> {
+    const stats = await this.#io.lstat(directory.operationPath);
+    const canonicalPath = await this.#io.realpath(directory.operationPath);
+    let identityStats = stats;
+    if (
+      stats.isSymbolicLink() ||
+      normalizePathIdentity(directory.operationPath) !== normalizePathIdentity(canonicalPath)
+    ) {
+      identityStats = await this.#io.lstat(canonicalPath);
+    }
+    this.#assertDirectoryStat(identityStats, "atomic JSON path component is not a safe directory");
+    return {
+      ...this.#identity(canonicalPath, identityStats, directory.operationPath),
+      exists: true,
+    };
   }
 
   async #inspectExistingDirectory(path: string): Promise<TrustedDirectory> {
@@ -572,18 +589,25 @@ export class AtomicJsonFile<T> {
     if (normalizePathIdentity(path) !== normalizePathIdentity(canonicalPath)) {
       throw this.#pathError("atomic JSON path component uses a reparse alias");
     }
-    return { ...this.#identity(canonicalPath, stats), exists: true };
+    return { ...this.#identity(canonicalPath, stats, path), exists: true };
   }
 
-  #identity(canonicalPath: string, stats: Stats, parent?: TrustedDirectory): TrustedFile;
-  #identity(canonicalPath: string, stats: Stats): PathIdentity;
   #identity(
     canonicalPath: string,
     stats: Stats,
+    operationPath: string,
+    parent: TrustedDirectory,
+  ): TrustedFile;
+  #identity(canonicalPath: string, stats: Stats, operationPath: string): PathIdentity;
+  #identity(
+    canonicalPath: string,
+    stats: Stats,
+    operationPath: string,
     parent?: TrustedDirectory,
   ): PathIdentity | TrustedFile {
     const identity: PathIdentity = {
       canonicalPath,
+      operationPath,
       device: stats.dev,
       inode: stats.ino,
     };

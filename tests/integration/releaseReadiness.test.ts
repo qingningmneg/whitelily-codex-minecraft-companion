@@ -315,11 +315,15 @@ describe("public release readiness", () => {
       const runCommands = [...workflow.matchAll(/^\s*-\s+run:\s+(.+)$/gmu)].map(
         (match) => match[1]?.trim() ?? "",
       );
+      const testCommand = runCommands.find((command) => command.startsWith("npm test"));
 
       expect(runCommands).toContain("npm run desktop:prepare");
       expect(runCommands.indexOf("npm run desktop:prepare")).toBeLessThan(
-        runCommands.indexOf("npm test"),
+        runCommands.indexOf(testCommand ?? ""),
       );
+      expect(testCommand).toBe("npm test -- --no-file-parallelism");
+      expect(workflow).toContain("TEMP: ${{ runner.temp }}");
+      expect(workflow).toContain("TMP: ${{ runner.temp }}");
     },
   );
 

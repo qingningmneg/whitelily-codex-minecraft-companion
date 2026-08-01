@@ -9,6 +9,19 @@ $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot 'release-path-safety.ps1')
 
+function Get-Sha256Hex {
+  param([Parameter(Mandatory = $true)][string]$LiteralPath)
+
+  $stream = [IO.File]::OpenRead($LiteralPath)
+  $sha256 = [System.Security.Cryptography.SHA256]::Create()
+  try {
+    return [BitConverter]::ToString($sha256.ComputeHash($stream)).Replace('-', '').ToLowerInvariant()
+  } finally {
+    $sha256.Dispose()
+    $stream.Dispose()
+  }
+}
+
 function Assert-SafePayload {
   param([string]$Root)
   $files = @(Get-SafePayloadFiles $Root)
@@ -105,7 +118,7 @@ try {
   Expand-Archive -LiteralPath $zip -DestinationPath $verify -Force
   $verifiedFiles = Assert-SafePayload $verify
   if (@(Compare-Object $stageFiles $verifiedFiles).Count -ne 0) { throw "Archive contents do not match the validated staging payload." }
-  $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+  $hash = Get-Sha256Hex $zip
   [IO.File]::WriteAllText($checksum, "$hash  $(Split-Path -Leaf $zip)`n", [Text.UTF8Encoding]::new($false))
   Write-Host "Created $zip and $checksum"
 } finally {

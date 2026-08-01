@@ -10,6 +10,19 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
+function Get-Sha256Hex {
+    param([Parameter(Mandatory = $true)][string]$LiteralPath)
+
+    $stream = [System.IO.File]::OpenRead($LiteralPath)
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        return [System.BitConverter]::ToString($sha256.ComputeHash($stream)).Replace('-', '').ToLowerInvariant()
+    } finally {
+        $sha256.Dispose()
+        $stream.Dispose()
+    }
+}
+
 function Resolve-FullPath {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
@@ -185,7 +198,7 @@ try {
     }
     $resourceRoot = $manifestFiles[0].Directory.FullName
     $runtimeManifest = Get-Content -LiteralPath $manifestFiles[0].FullName -Raw -Encoding UTF8 | ConvertFrom-Json
-    $policySha256 = (Get-FileHash -LiteralPath $sourceManifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $policySha256 = Get-Sha256Hex $sourceManifestPath
     if (
         -not [StringComparer]::Ordinal.Equals([string]$runtimeManifest.policySha256, $policySha256) -or
         -not [StringComparer]::Ordinal.Equals([string]$runtimeManifest.productVersion, $ExpectedVersion) -or
@@ -218,7 +231,7 @@ try {
                 throw "INSTALLER_RESOURCE_MISSING: $portablePath"
             }
             $metadata = Get-Item -LiteralPath $resourcePath
-            $actualHash = (Get-FileHash -LiteralPath $resourcePath -Algorithm SHA256).Hash.ToLowerInvariant()
+            $actualHash = Get-Sha256Hex $resourcePath
             if (
                 $metadata.Length -ne [long]$resource.bytes -or
                 -not [StringComparer]::Ordinal.Equals($actualHash, [string]$resource.sha256)
@@ -259,7 +272,7 @@ try {
         schemaVersion = 1
         productVersion = $ExpectedVersion
         installerName = $expectedName
-        sha256 = (Get-FileHash -LiteralPath $resolvedInstaller -Algorithm SHA256).Hash.ToLowerInvariant()
+        sha256 = Get-Sha256Hex $resolvedInstaller
         signingStatus = Get-SigningStatus $resolvedInstaller
         resourcesVerified = $declared.Count
     }

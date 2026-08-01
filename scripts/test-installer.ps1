@@ -9,6 +9,19 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
+function Get-Sha256Hex {
+    param([Parameter(Mandatory = $true)][string]$LiteralPath)
+
+    $stream = [System.IO.File]::OpenRead($LiteralPath)
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        return [System.BitConverter]::ToString($sha256.ComputeHash($stream)).Replace('-', '').ToLowerInvariant()
+    } finally {
+        $sha256.Dispose()
+        $stream.Dispose()
+    }
+}
+
 function Resolve-FullPath {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
@@ -137,7 +150,7 @@ try {
     $result.stages.Add('isolated_path')
 
     $installer = Join-Path 'C:\WhiteLilyInstaller' $InstallerName
-    $actualHash = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant()
+    $actualHash = Get-Sha256Hex $installer
     if (-not [StringComparer]::Ordinal.Equals($actualHash, $InstallerSha256)) {
         throw 'mapped installer hash mismatch'
     }
