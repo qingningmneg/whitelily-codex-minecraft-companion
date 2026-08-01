@@ -43,6 +43,7 @@ interface ActivePreview {
 interface FileIdentity {
   dev: number | bigint;
   ino: number | bigint;
+  size?: number;
 }
 
 interface PreparedArtifact {
@@ -169,7 +170,7 @@ export class DiagnosticExporter {
       this.#preparedArtifact = {
         path,
         parent: diagnosticsIdentity,
-        file: attestation.file,
+        file: { ...attestation.file, size: value.size },
       };
       return Object.freeze({
         exportId,
@@ -360,7 +361,8 @@ async function removeTrustedArchive(artifact: PreparedArtifact): Promise<void> {
       !value.isFile() ||
       value.isSymbolicLink() ||
       value.dev !== artifact.file.dev ||
-      value.ino !== artifact.file.ino
+      value.ino !== artifact.file.ino ||
+      (artifact.file.size !== undefined && value.size !== artifact.file.size)
     ) {
       return;
     }
@@ -477,7 +479,8 @@ async function removeCreatedArchive(path: string, expected: FileIdentity): Promi
       !current.isFile() ||
       current.isSymbolicLink() ||
       current.dev !== expected.dev ||
-      current.ino !== expected.ino
+      current.ino !== expected.ino ||
+      (expected.size !== undefined && current.size !== expected.size)
     ) {
       return;
     }
@@ -487,7 +490,8 @@ async function removeCreatedArchive(path: string, expected: FileIdentity): Promi
       !moved.isFile() ||
       moved.isSymbolicLink() ||
       moved.dev !== expected.dev ||
-      moved.ino !== expected.ino
+      moved.ino !== expected.ino ||
+      (expected.size !== undefined && moved.size !== expected.size)
     ) {
       try {
         await lstat(path);

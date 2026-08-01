@@ -271,6 +271,7 @@ interface TrustedDirectoryIdentity {
 interface TrustedFileIdentity {
   dev: number | bigint;
   ino: number | bigint;
+  size: number;
 }
 
 interface RotationRecord {
@@ -457,7 +458,7 @@ async function listManagedAuditFiles(
       originalPath: filePath,
       currentPath: filePath,
       generation,
-      identity: { dev: value.dev, ino: value.ino },
+      identity: { dev: value.dev, ino: value.ino, size: value.size },
     });
   }
   return records;
@@ -488,7 +489,7 @@ async function listAuditTombstones(
     tombstones.push({
       path: tombstonePath,
       slot,
-      identity: { dev: value.dev, ino: value.ino },
+      identity: { dev: value.dev, ino: value.ino, size: value.size },
     });
   }
   return tombstones;
@@ -548,7 +549,7 @@ async function zeroizeExpectedFile(
     await handle.truncate(0);
     await handle.sync();
     const zeroized = await handle.stat();
-    if (!sameFileIdentity(zeroized, expected) || zeroized.size !== 0) {
+    if (!sameFileObjectIdentity(zeroized, expected) || zeroized.size !== 0) {
       throw new Error("audit disposition failed");
     }
   } finally {
@@ -577,6 +578,13 @@ async function rollbackRotation(
 }
 
 function sameFileIdentity(
+  value: { dev: number | bigint; ino: number | bigint; size: number },
+  expected: TrustedFileIdentity,
+): boolean {
+  return sameFileObjectIdentity(value, expected) && value.size === expected.size;
+}
+
+function sameFileObjectIdentity(
   value: { dev: number | bigint; ino: number | bigint },
   expected: TrustedFileIdentity,
 ): boolean {

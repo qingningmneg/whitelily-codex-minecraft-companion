@@ -322,8 +322,12 @@ describe("public release readiness", () => {
         runCommands.indexOf(testCommand ?? ""),
       );
       expect(testCommand).toBe("npm test -- --no-file-parallelism");
-      expect(workflow).toContain("TEMP: ${{ runner.temp }}");
-      expect(workflow).toContain("TMP: ${{ runner.temp }}");
+      expect(workflow).not.toContain("${{ runner.temp }}");
+      expect(workflow).toContain('"TEMP=$env:RUNNER_TEMP" >> $env:GITHUB_ENV');
+      expect(workflow).toContain('"TMP=$env:RUNNER_TEMP" >> $env:GITHUB_ENV');
+      expect(workflow.indexOf('"TEMP=$env:RUNNER_TEMP"')).toBeLessThan(
+        workflow.indexOf("- run: npm ci"),
+      );
     },
   );
 

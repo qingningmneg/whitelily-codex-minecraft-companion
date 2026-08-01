@@ -13,6 +13,8 @@ const race = vi.hoisted(() => ({
   outsideParent: "",
   triggered: false,
   failed: false,
+  expectedDev: 0 as number | bigint,
+  expectedIno: 0 as number | bigint,
 }));
 
 vi.mock("node:crypto", async (importOriginal) => ({
@@ -24,12 +26,25 @@ vi.mock("node:fs/promises", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs/promises")>();
   const injectSwap = async (path: string): Promise<void> => {
     if (race.mode !== "swap" || race.triggered || path !== race.target) return;
+    const original = await actual.lstat(path);
+    race.expectedDev = original.dev;
+    race.expectedIno = original.ino;
     race.triggered = true;
     await actual.rename(path, race.saved);
     await actual.writeFile(path, "same-path replacement", "utf8");
   };
   return {
     ...actual,
+    lstat: async (path: Parameters<typeof actual.lstat>[0]) => {
+      const value = await actual.lstat(path);
+      if (race.mode === "swap" && race.triggered && String(path).includes(".rotate-")) {
+        Object.defineProperties(value, {
+          dev: { value: race.expectedDev },
+          ino: { value: race.expectedIno },
+        });
+      }
+      return value;
+    },
     rm: async (
       path: Parameters<typeof actual.rm>[0],
       options?: Parameters<typeof actual.rm>[1],
@@ -105,7 +120,7 @@ function event(counter: number): AuditEvent {
 }
 
 describe("AuditLogger rotation identity and recovery", () => {
-  it("does not delete or rotate a same-path replacement introduced at the destructive boundary", async () => {
+  it("rejects a same-path replacement when Windows reports a reused file identity", async () => {
     const path = await rotationFixture();
     race.mode = "swap";
     race.target = `${path}.4`;

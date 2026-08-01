@@ -7,18 +7,33 @@ const race = vi.hoisted(() => ({
   target: "",
   saved: "",
   triggered: false,
+  expectedDev: 0 as number | bigint,
+  expectedIno: 0 as number | bigint,
 }));
 
 vi.mock("node:fs/promises", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs/promises")>();
   const injectSwap = async (path: string): Promise<void> => {
     if (race.triggered || path !== race.target) return;
+    const original = await actual.lstat(path);
+    race.expectedDev = original.dev;
+    race.expectedIno = original.ino;
     race.triggered = true;
     await actual.rename(path, race.saved);
     await actual.writeFile(path, "same-path replacement", "utf8");
   };
   return {
     ...actual,
+    lstat: async (path: Parameters<typeof actual.lstat>[0]) => {
+      const value = await actual.lstat(path);
+      if (race.triggered && String(path).includes(".cleanup-")) {
+        Object.defineProperties(value, {
+          dev: { value: race.expectedDev },
+          ino: { value: race.expectedIno },
+        });
+      }
+      return value;
+    },
     rename: async (from: string, to: string) => {
       await injectSwap(from);
       return actual.rename(from, to);
@@ -43,7 +58,7 @@ afterEach(async () => {
 });
 
 describe("DiagnosticExporter retained archive cleanup identity", () => {
-  it("preserves a same-path replacement introduced at the destructive boundary", async () => {
+  it("preserves a same-path replacement when Windows reports a reused file identity", async () => {
     const dataRoot = await mkdtemp(join(tmpdir(), "whitelily-retained-cleanup-race-"));
     cleanup.push(dataRoot);
     await mkdir(join(dataRoot, "logs"), { recursive: true });
