@@ -509,6 +509,7 @@ export class AtomicJsonFile<T> {
     const absolute = resolve(path);
     const volumeRoot = parse(absolute).root;
     const parts = relative(volumeRoot, absolute).split(sep).filter(Boolean);
+    const rootParts = relative(volumeRoot, this.#rootDirectory).split(sep).filter(Boolean);
     let currentPath = volumeRoot;
     let current = await this.#inspectExistingDirectory(currentPath);
 
@@ -534,15 +535,32 @@ export class AtomicJsonFile<T> {
         }
         stats = await this.#io.lstat(candidate);
       }
-      this.#assertDirectoryStat(stats, "atomic JSON path component is not a safe directory");
       const canonicalPath = await this.#io.realpath(candidate);
-      if (normalizePathIdentity(candidate) !== normalizePathIdentity(canonicalPath)) {
+      const isAncestorAboveVerifiedRoot = index < rootParts.length - 1;
+      let identityStats = stats;
+      if (
+        isAncestorAboveVerifiedRoot &&
+        (stats.isSymbolicLink() ||
+          normalizePathIdentity(candidate) !== normalizePathIdentity(canonicalPath))
+      ) {
+        identityStats = await this.#io.lstat(canonicalPath);
+        this.#assertDirectoryStat(
+          identityStats,
+          "atomic JSON ancestor alias does not resolve to a safe directory",
+        );
+      } else {
+        this.#assertDirectoryStat(stats, "atomic JSON path component is not a safe directory");
+      }
+      if (
+        !isAncestorAboveVerifiedRoot &&
+        normalizePathIdentity(candidate) !== normalizePathIdentity(canonicalPath)
+      ) {
         throw this.#pathError("atomic JSON path component uses a reparse alias");
       }
       const parentAfterLookup = await this.#inspectExistingDirectory(current.canonicalPath);
       this.#assertSameIdentity(current, parentAfterLookup, "atomic JSON parent changed");
       currentPath = canonicalPath;
-      current = { ...this.#identity(currentPath, stats), exists: true };
+      current = { ...this.#identity(currentPath, identityStats), exists: true };
     }
     return { ...current, exists: true };
   }

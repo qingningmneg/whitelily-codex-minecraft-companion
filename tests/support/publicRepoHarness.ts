@@ -102,6 +102,13 @@ export async function runPublicRepoPreparation(options: {
     await run("git", ["init", "-b", "main"], fixture);
     await run("git", ["config", "core.autocrlf", "false"], fixture);
     await run("git", ["add", "."], fixture);
+    // The fixture models the two real tracked installer resources whose paths
+    // are also covered by broad build-output ignore rules.
+    await run(
+      "git",
+      ["add", "-f", "--", "apps/desktop/build/after-pack.cjs", "apps/desktop/build/icon.ico"],
+      fixture,
+    );
     await run(
       "git",
       [

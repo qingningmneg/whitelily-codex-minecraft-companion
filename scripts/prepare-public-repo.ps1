@@ -24,7 +24,7 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "git init failed." }
     & git config core.autocrlf false
     if ($LASTEXITCODE -ne 0) { throw "git config failed." }
-    & git add .
+    & git add -f -- .
     if ($LASTEXITCODE -ne 0) { throw "git add failed." }
     & (Join-Path $candidate "scripts\release-check.ps1") -ScanOnly -OwnerConfigPath $sourceOwnerConfig
     if ($LASTEXITCODE -ne 0) { throw "Exported release owner scan failed." }

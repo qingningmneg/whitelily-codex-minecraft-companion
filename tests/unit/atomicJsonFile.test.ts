@@ -118,6 +118,47 @@ describe("AtomicJsonFile", () => {
     );
   });
 
+  it("allows a verified root below an ancestor directory junction", async () => {
+    const actualParent = await mkdtemp(join(tmpdir(), "whitelily-atomic-json-actual-parent-"));
+    const aliasContainer = await mkdtemp(join(tmpdir(), "whitelily-atomic-json-alias-parent-"));
+    const aliasParent = join(aliasContainer, "runner-work");
+    cleanups.push(async () => {
+      await rm(aliasParent, { force: true });
+      await rm(aliasContainer, { recursive: true, force: true });
+      await rm(actualParent, { recursive: true, force: true });
+    });
+    await symlink(actualParent, aliasParent, "junction");
+    const rootDirectory = join(aliasParent, "WhiteLily", "data");
+    const actualRoot = join(actualParent, "WhiteLily", "data");
+    const path = join(rootDirectory, "settings.json");
+    await mkdir(rootDirectory, { recursive: true });
+
+    const file = createFile(path, rootDirectory);
+    await expect(file.write({ nested: { count: 7 } })).resolves.toEqual({
+      nested: { count: 7 },
+    });
+    await expect(file.read()).resolves.toEqual({ nested: { count: 7 } });
+    await expect(readFile(join(actualRoot, "settings.json"), "utf8")).resolves.toContain(
+      '"count": 7',
+    );
+  });
+
+  it("still rejects a verified root that is itself a directory junction", async () => {
+    const actualRoot = await mkdtemp(join(tmpdir(), "whitelily-atomic-json-actual-root-"));
+    const aliasContainer = await mkdtemp(join(tmpdir(), "whitelily-atomic-json-alias-root-"));
+    const aliasRoot = join(aliasContainer, "data");
+    cleanups.push(async () => {
+      await rm(aliasRoot, { force: true });
+      await rm(aliasContainer, { recursive: true, force: true });
+      await rm(actualRoot, { recursive: true, force: true });
+    });
+    await symlink(actualRoot, aliasRoot, "junction");
+
+    await expect(createFile(join(aliasRoot, "settings.json"), aliasRoot).read()).rejects.toEqual(
+      expect.objectContaining<Partial<AtomicJsonFileError>>({ code: "ATOMIC_JSON_PATH" }),
+    );
+  });
+
   it("refuses to follow a directory junction outside the verified root", async () => {
     const { rootDirectory } = await fixture();
     const outsideDirectory = await mkdtemp(join(tmpdir(), "whitelily-atomic-json-outside-"));

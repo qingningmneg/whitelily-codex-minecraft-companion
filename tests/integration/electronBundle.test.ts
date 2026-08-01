@@ -586,11 +586,7 @@ describe("deterministic Electron resources", () => {
   it("starts the prepared child with pinned Electron, becomes ready, and exits on stdin EOF", async () => {
     const manifest = await readManifest(bundleManifestPath);
     const childEntry = resolve(bundleRoot, ...manifest.paths.childEntry.split("/"));
-    const electronExecutable = join(
-      dirname(require.resolve("electron/package.json")),
-      "dist",
-      "electron.exe",
-    );
+    const electronExecutable = require("electron") as string;
     const root = await mkdtemp(join(tmpdir(), "whitelily-electron-child-"));
     const configPath = join(root, "config.toml");
     await writeFile(configPath, validConfig, "utf8");

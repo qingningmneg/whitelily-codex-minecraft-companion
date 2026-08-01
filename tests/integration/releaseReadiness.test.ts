@@ -228,6 +228,8 @@ describe("public release readiness", () => {
     const candidate = await runPublicRepoPreparation({ initializeFreshHistory: true });
     expect(candidate.commitCount).toBe(1);
     expect(candidate.remotes).toEqual([]);
+    expect(candidate.files).toContain("apps/desktop/build/after-pack.cjs");
+    expect(candidate.files).toContain("apps/desktop/build/icon.ico");
     expect(candidate.files).not.toContain(".git/config.from-internal-repo");
     expect(candidate.files.some((file) => file.startsWith(".superpowers/"))).toBe(false);
     expect(candidate.files.some((file) => file.startsWith("docs/superpowers/"))).toBe(false);
@@ -305,6 +307,21 @@ describe("public release readiness", () => {
     expect(workflow).toContain("WhiteLily-*-windows-x64-setup.exe.signing-status.txt");
     expect(workflow).toContain("--prerelease");
   });
+
+  it.each([".github/workflows/ci.yml", ".github/workflows/release.yml"])(
+    "%s prepares deterministic desktop resources before testing",
+    async (path) => {
+      const workflow = await readFile(path, "utf8");
+      const runCommands = [...workflow.matchAll(/^\s*-\s+run:\s+(.+)$/gmu)].map(
+        (match) => match[1]?.trim() ?? "",
+      );
+
+      expect(runCommands).toContain("npm run desktop:prepare");
+      expect(runCommands.indexOf("npm run desktop:prepare")).toBeLessThan(
+        runCommands.indexOf("npm test"),
+      );
+    },
+  );
 
   it("documents the future Windows installer workflow in Chinese and English", async () => {
     const [readme, readmeZh, installZh, installEn, smartScreenZh, smartScreenEn] =
