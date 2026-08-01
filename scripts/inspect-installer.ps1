@@ -104,16 +104,144 @@ function Resolve-ContainedResource {
     return $resolved
 }
 
+if (-not ('WhiteLily.Installer.WinTrustVerifier' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+namespace WhiteLily.Installer
+{
+    public sealed class WinTrustResult
+    {
+        public int Status { get; private set; }
+        public int LastError { get; private set; }
+
+        public WinTrustResult(int status, int lastError)
+        {
+            Status = status;
+            LastError = lastError;
+        }
+    }
+
+    public static class WinTrustVerifier
+    {
+        public const int TRUST_E_NOSIGNATURE = unchecked((int)0x800B0100);
+        public const int TRUST_E_SUBJECT_FORM_UNKNOWN = unchecked((int)0x800B0003);
+        public const int TRUST_E_PROVIDER_UNKNOWN = unchecked((int)0x800B0001);
+
+        private const uint WtdUiNone = 2;
+        private const uint WtdRevokeNone = 0;
+        private const uint WtdChoiceFile = 1;
+        private const uint WtdStateActionVerify = 1;
+        private const uint WtdStateActionClose = 2;
+        private const uint WtdCacheOnlyUrlRetrieval = 0x1000;
+        private const uint WtdUiContextInstall = 1;
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct WinTrustFileInfo
+        {
+            public uint cbStruct;
+
+            [MarshalAs(UnmanagedType.LPWStr)]
+            public string pcwszFilePath;
+
+            public IntPtr hFile;
+            public IntPtr pgKnownSubject;
+        }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct WinTrustData
+        {
+            public uint cbStruct;
+            public IntPtr pPolicyCallbackData;
+            public IntPtr pSIPClientData;
+            public uint dwUIChoice;
+            public uint fdwRevocationChecks;
+            public uint dwUnionChoice;
+            public IntPtr pFile;
+            public uint dwStateAction;
+            public IntPtr hWVTStateData;
+            public IntPtr pwszURLReference;
+            public uint dwProvFlags;
+            public uint dwUIContext;
+            public IntPtr pSignatureSettings;
+        }
+
+        [DllImport("wintrust.dll", ExactSpelling = true, SetLastError = true)]
+        private static extern int WinVerifyTrust(
+            IntPtr hwnd,
+            [In] ref Guid actionId,
+            [In, Out] ref WinTrustData trustData);
+
+        public static WinTrustResult Verify(string path)
+        {
+            if (String.IsNullOrWhiteSpace(path))
+            {
+                throw new ArgumentException("A file path is required.", "path");
+            }
+
+            WinTrustFileInfo fileInfo = new WinTrustFileInfo
+            {
+                cbStruct = (uint)Marshal.SizeOf(typeof(WinTrustFileInfo)),
+                pcwszFilePath = path,
+                hFile = IntPtr.Zero,
+                pgKnownSubject = IntPtr.Zero
+            };
+            IntPtr fileInfoPointer = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(WinTrustFileInfo)));
+            try
+            {
+                Marshal.StructureToPtr(fileInfo, fileInfoPointer, false);
+                WinTrustData trustData = new WinTrustData
+                {
+                    cbStruct = (uint)Marshal.SizeOf(typeof(WinTrustData)),
+                    pPolicyCallbackData = IntPtr.Zero,
+                    pSIPClientData = IntPtr.Zero,
+                    dwUIChoice = WtdUiNone,
+                    fdwRevocationChecks = WtdRevokeNone,
+                    dwUnionChoice = WtdChoiceFile,
+                    pFile = fileInfoPointer,
+                    dwStateAction = WtdStateActionVerify,
+                    hWVTStateData = IntPtr.Zero,
+                    pwszURLReference = IntPtr.Zero,
+                    dwProvFlags = WtdCacheOnlyUrlRetrieval,
+                    dwUIContext = WtdUiContextInstall,
+                    pSignatureSettings = IntPtr.Zero
+                };
+                Guid actionId = new Guid("00AAC56B-CD44-11d0-8CC2-00C04FC295EE");
+                int status = WinVerifyTrust(new IntPtr(-1), ref actionId, ref trustData);
+                int lastError = Marshal.GetLastWin32Error();
+                trustData.dwStateAction = WtdStateActionClose;
+                WinVerifyTrust(new IntPtr(-1), ref actionId, ref trustData);
+                return new WinTrustResult(status, lastError);
+            }
+            finally
+            {
+                Marshal.DestroyStructure(fileInfoPointer, typeof(WinTrustFileInfo));
+                Marshal.FreeHGlobal(fileInfoPointer);
+            }
+        }
+    }
+}
+'@
+}
+
 function Get-SigningStatus {
     param([Parameter(Mandatory = $true)][string]$Path)
-    $signature = Get-AuthenticodeSignature -LiteralPath $Path
-    if ($signature.Status -eq [System.Management.Automation.SignatureStatus]::Valid) {
+    $verification = [WhiteLily.Installer.WinTrustVerifier]::Verify($Path)
+    if ($verification.Status -eq 0) {
         return 'signed'
     }
-    if ($signature.Status -eq [System.Management.Automation.SignatureStatus]::NotSigned) {
+    if (
+        $verification.Status -eq [WhiteLily.Installer.WinTrustVerifier]::TRUST_E_NOSIGNATURE -and
+        $verification.LastError -in @(
+            [WhiteLily.Installer.WinTrustVerifier]::TRUST_E_NOSIGNATURE,
+            [WhiteLily.Installer.WinTrustVerifier]::TRUST_E_SUBJECT_FORM_UNKNOWN,
+            [WhiteLily.Installer.WinTrustVerifier]::TRUST_E_PROVIDER_UNKNOWN
+        )
+    ) {
         return 'unsigned'
     }
-    throw "SIGNATURE_STATE_INVALID: $($signature.Status)"
+    throw "SIGNATURE_STATE_INVALID: status=$($verification.Status), lastError=$($verification.LastError)"
 }
 
 function Invoke-ReviewedRuntimeVerifier {

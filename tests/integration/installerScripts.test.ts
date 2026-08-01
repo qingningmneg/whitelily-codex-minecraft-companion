@@ -64,6 +64,29 @@ function runPowerShell(
   );
 }
 
+async function runEmbeddedWinTrustVerifier(targetPath: string): Promise<CommandResult> {
+  const root = await createTemporaryRoot("whitelily-wintrust-");
+  const harnessPath = join(root, "verify-wintrust.ps1");
+  await writeFile(
+    harnessPath,
+    [
+      "param(",
+      "    [Parameter(Mandatory = $true)][string]$InspectScript,",
+      "    [Parameter(Mandatory = $true)][string]$TargetPath",
+      ")",
+      "$scriptText = [System.IO.File]::ReadAllText($InspectScript)",
+      "$match = [regex]::Match($scriptText, \"(?s)Add-Type -TypeDefinition @'\\r?\\n(?<code>.*?)\\r?\\n'@\")",
+      "if (-not $match.Success) { throw 'EMBEDDED_WINTRUST_SOURCE_MISSING' }",
+      "Add-Type -TypeDefinition $match.Groups['code'].Value",
+      "$result = [WhiteLily.Installer.WinTrustVerifier]::Verify($TargetPath)",
+      "[Console]::Out.WriteLine($result.Status)",
+      "",
+    ].join("\r\n"),
+    "utf8",
+  );
+  return runPowerShell(harnessPath, ["-InspectScript", inspectScript, "-TargetPath", targetPath]);
+}
+
 function runChecked(
   command: string,
   args: string[],
@@ -387,6 +410,21 @@ describe("WhiteLily installer packaging scripts", () => {
       expect(script).not.toMatch(/\bGet-FileHash\b/u);
       expect(script).toMatch(/System\.Security\.Cryptography\.SHA256/u);
     }
+  });
+
+  it("verifies Authenticode without the optional PowerShell security module", async () => {
+    const script = await readFile(inspectScript, "utf8");
+
+    expect(script).not.toMatch(/\bGet-AuthenticodeSignature\b/u);
+    expect(script).toMatch(/WinVerifyTrust/u);
+    expect(script).toMatch(/TRUST_E_NOSIGNATURE/u);
+  });
+
+  it("accepts an executable with an embedded Authenticode signature", async () => {
+    const result = await runEmbeddedWinTrustVerifier(process.execPath);
+
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(result.stdout.trim()).toBe("0");
   });
 
   it("rejects a non-canonical semantic version before invoking the build", async () => {
