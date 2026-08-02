@@ -126,6 +126,18 @@ $result = [ordered]@{
     stages = [Collections.Generic.List[string]]::new()
     error = $null
 }
+function Get-Sha256Hex {
+    param([Parameter(Mandatory = $true)][string]$LiteralPath)
+
+    $stream = [System.IO.File]::OpenRead($LiteralPath)
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        return [System.BitConverter]::ToString($sha256.ComputeHash($stream)).Replace('-', '').ToLowerInvariant()
+    } finally {
+        $sha256.Dispose()
+        $stream.Dispose()
+    }
+}
 function Invoke-Process {
     param([Parameter(Mandatory = $true)][string]$Path, [string[]]$Arguments = @())
     $process = Start-Process -FilePath $Path -ArgumentList $Arguments -Wait -PassThru
@@ -138,6 +150,35 @@ function Get-Uninstaller {
     $matches = @(Get-ChildItem -LiteralPath $ProgramRoot -File -Filter 'Uninstall*.exe')
     if ($matches.Count -ne 1) { throw 'installed uninstaller was not found' }
     return $matches[0].FullName
+}
+function Get-UninstallerUiProcessIds {
+    param(
+        [Parameter(Mandatory = $true)][int]$LauncherPid,
+        [Parameter(Mandatory = $true)][string]$ProgramRoot
+    )
+    $ids = [Collections.Generic.List[int]]::new()
+    $ids.Add($LauncherPid)
+    $nsisMarker = '_?=' + $ProgramRoot.TrimEnd('\') + '\'
+    $delegatedProcesses = @(
+        Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+            Where-Object {
+                [int]$_.ParentProcessId -eq $LauncherPid -or
+                (
+                    -not [string]::IsNullOrWhiteSpace([string]$_.CommandLine) -and
+                    ([string]$_.CommandLine).IndexOf(
+                        $nsisMarker,
+                        [StringComparison]::OrdinalIgnoreCase
+                    ) -ge 0
+                )
+            }
+    )
+    foreach ($delegatedProcess in $delegatedProcesses) {
+        $processId = [int]$delegatedProcess.ProcessId
+        if (-not $ids.Contains($processId)) {
+            $ids.Add($processId)
+        }
+    }
+    return $ids.ToArray()
 }
 try {
     $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
@@ -240,27 +281,68 @@ public static class WhiteLilyInstallerUi {
         SendMessage(found, BM_CLICK, IntPtr.Zero, IntPtr.Zero);
         return true;
     }
-}
+    }
 "@
-    $uninstaller = Get-Uninstaller $programRoot
-    $deleteProcess = Start-Process -FilePath $uninstaller -PassThru
-    Start-Sleep -Seconds 2
-    if (-not [WhiteLilyInstallerUi]::ClickId([uint32]$deleteProcess.Id, 1)) {
-        throw 'could not advance the interactive uninstaller welcome page'
-    }
-    Start-Sleep -Seconds 2
-    if (-not [WhiteLilyInstallerUi]::ClickContaining([uint32]$deleteProcess.Id, 'Delete WhiteLily data')) {
-        throw 'could not explicitly select Delete Data'
-    }
-    if (-not [WhiteLilyInstallerUi]::ClickId([uint32]$deleteProcess.Id, 1)) {
-        throw 'could not advance the interactive Delete Data page'
-    }
-    if (-not $deleteProcess.WaitForExit(120000)) {
-        Stop-Process -Id $deleteProcess.Id -Force
+    function Complete-UninstallerUi {
+        param(
+            [Parameter(Mandatory = $true)][int]$UiProcessId,
+            [int]$TimeoutMilliseconds = 120000
+        )
+        $process = Get-Process -Id $UiProcessId -ErrorAction SilentlyContinue
+        if ($null -eq $process) {
+            throw 'interactive Delete Data uninstall process was unavailable'
+        }
+        $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMilliseconds)
+        while ([DateTime]::UtcNow -lt $deadline) {
+            if ($process.HasExited) {
+                return [int]$process.ExitCode
+            }
+            [void][WhiteLilyInstallerUi]::ClickId([uint32]$UiProcessId, 1)
+            if ($process.WaitForExit(250)) {
+                return [int]$process.ExitCode
+            }
+            $process.Refresh()
+        }
+        if (-not $process.HasExited) {
+            Stop-Process -Id $UiProcessId -Force -ErrorAction SilentlyContinue
+        }
         throw 'interactive Delete Data uninstall timed out'
     }
-    if ($deleteProcess.ExitCode -ne 0) {
-        throw "interactive Delete Data uninstall failed with exit code $($deleteProcess.ExitCode)"
+    $uninstaller = Get-Uninstaller $programRoot
+    $deleteProcess = Start-Process -FilePath $uninstaller -PassThru
+    $uiProcessId = $null
+    $welcomeDeadline = [DateTime]::UtcNow.AddSeconds(30)
+    do {
+        foreach ($candidateId in @(Get-UninstallerUiProcessIds -LauncherPid $deleteProcess.Id -ProgramRoot $programRoot)) {
+            if ([WhiteLilyInstallerUi]::ClickId([uint32]$candidateId, 1)) {
+                $uiProcessId = [int]$candidateId
+                break
+            }
+        }
+        if ($null -ne $uiProcessId) { break }
+        Start-Sleep -Milliseconds 250
+    } while ([DateTime]::UtcNow -lt $welcomeDeadline)
+    if ($null -eq $uiProcessId) {
+        throw 'could not advance the interactive uninstaller welcome page'
+    }
+
+    $choiceDeadline = [DateTime]::UtcNow.AddSeconds(30)
+    $choiceSelected = $false
+    do {
+        $choiceSelected = [WhiteLilyInstallerUi]::ClickContaining(
+            [uint32]$uiProcessId,
+            'Delete WhiteLily data'
+        )
+        if ($choiceSelected) { break }
+        Start-Sleep -Milliseconds 250
+    } while ([DateTime]::UtcNow -lt $choiceDeadline)
+    if (-not $choiceSelected) {
+        throw 'could not explicitly select Delete Data'
+    }
+
+    $deleteExitCode = Complete-UninstallerUi -UiProcessId $uiProcessId
+    if ($deleteExitCode -ne 0) {
+        throw "interactive Delete Data uninstall failed with exit code $deleteExitCode"
     }
     if (Test-Path -LiteralPath $dataRoot) {
         throw 'explicit Delete Data uninstall preserved the data root'
@@ -326,7 +408,7 @@ try {
         if ([DateTime]::UtcNow -ge $deadline) {
             throw 'SANDBOX_LIFECYCLE_TIMEOUT'
         }
-        if ($sandboxProcess.HasExited) {
+        if ($sandboxProcess.HasExited -and $sandboxProcess.ExitCode -ne 0) {
             throw 'SANDBOX_LIFECYCLE_REPORT_MISSING'
         }
         Start-Sleep -Seconds 2
@@ -357,10 +439,40 @@ try {
     if ($null -ne $sandboxProcess -and -not $sandboxProcess.HasExited) {
         Stop-Process -Id $sandboxProcess.Id -Force -ErrorAction SilentlyContinue
     }
+    $boundRemoteSessions = @(
+        Get-CimInstance Win32_Process `
+            -Filter "Name = 'WindowsSandboxRemoteSession.exe'" `
+            -ErrorAction SilentlyContinue |
+            Where-Object {
+                -not [string]::IsNullOrWhiteSpace([string]$_.CommandLine) -and
+                ([string]$_.CommandLine).IndexOf(
+                    $sandboxConfigurationPath,
+                    [StringComparison]::OrdinalIgnoreCase
+                ) -ge 0
+            }
+    )
+    foreach ($remoteSession in $boundRemoteSessions) {
+        Stop-Process -Id $remoteSession.ProcessId -Force -ErrorAction SilentlyContinue
+    }
     if (
         (Test-Path -LiteralPath $sandboxRoot) -and
         $sandboxRoot.StartsWith($sandboxPrefix, [StringComparison]::OrdinalIgnoreCase)
     ) {
-        Remove-Item -LiteralPath $sandboxRoot -Recurse -Force
+        $cleanupDeadline = [DateTime]::UtcNow.AddSeconds(30)
+        while (Test-Path -LiteralPath $sandboxRoot) {
+            try {
+                Remove-Item -LiteralPath $sandboxRoot -Recurse -Force
+            } catch [System.IO.IOException] {
+                if ([DateTime]::UtcNow -ge $cleanupDeadline) {
+                    throw
+                }
+                Start-Sleep -Seconds 1
+            } catch [System.UnauthorizedAccessException] {
+                if ([DateTime]::UtcNow -ge $cleanupDeadline) {
+                    throw
+                }
+                Start-Sleep -Seconds 1
+            }
+        }
     }
 }
