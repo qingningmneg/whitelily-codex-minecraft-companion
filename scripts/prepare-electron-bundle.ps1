@@ -115,6 +115,12 @@ Invoke-CheckedNpm @('run', 'build')
 Invoke-CheckedNpm @('run', 'build:desktop-child')
 Invoke-CheckedNpm @('run', 'build', '--workspace', '@whitelily/desktop')
 
+$packagedMainPath = Join-Path $repositoryRoot 'apps/desktop/dist/main/main.js'
+& node (Join-Path $PSScriptRoot 'verify-electron-main-imports.mjs') $packagedMainPath
+if ($LASTEXITCODE -ne 0) {
+    throw "packaged Electron main import verification failed with exit code $LASTEXITCODE"
+}
+
 New-Item -ItemType Directory -Path $buildRoot -Force | Out-Null
 $staging = Join-Path $buildRoot ('.electron-bundle-staging-' + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $staging | Out-Null

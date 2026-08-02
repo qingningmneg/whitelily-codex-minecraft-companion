@@ -649,6 +649,135 @@ describe("WhiteLily installer inspection", () => {
 });
 
 describe("WhiteLily isolated installer lifecycle", () => {
+  it("requires a real WhiteLily window and rejects any Error window from the app process", async () => {
+    const root = await createTemporaryRoot("whitelily-smoke-window-");
+    const sourcePath = join(root, "SmokeWindowFixture.cs");
+    const compilerPath = join(root, "compile-smoke-window.ps1");
+    const fixturePath = join(root, "SmokeWindowFixture.exe");
+    await writeFile(
+      sourcePath,
+      String.raw`
+using System;
+using System.Windows.Forms;
+
+public static class SmokeWindowFixture {
+    [STAThread]
+    public static int Main(string[] args) {
+        var mode = args.Length == 0 ? "white" : args[0];
+        if (StringComparer.Ordinal.Equals(mode, "exit")) return 0;
+        Application.EnableVisualStyles();
+        var main = new Form {
+            Text = StringComparer.Ordinal.Equals(mode, "error")
+                ? "Error"
+                : StringComparer.Ordinal.Equals(mode, "blank") ? "" : "WhiteLily",
+            Width = 320,
+            Height = 200,
+            ShowInTaskbar = true
+        };
+        Form error = null;
+        if (StringComparer.Ordinal.Equals(mode, "both")) {
+            main.Shown += (sender, eventArgs) => {
+                error = new Form { Text = "Error", Width = 240, Height = 120 };
+                error.Show(main);
+            };
+        }
+        Application.Run(main);
+        if (error != null) error.Dispose();
+        return 0;
+    }
+}
+`,
+      "utf8",
+    );
+    await writeFile(
+      compilerPath,
+      [
+        "param(",
+        "    [Parameter(Mandatory = $true)][string]$SourcePath,",
+        "    [Parameter(Mandatory = $true)][string]$OutputPath",
+        ")",
+        "$ErrorActionPreference = 'Stop'",
+        "Add-Type -TypeDefinition ([IO.File]::ReadAllText($SourcePath)) -Language CSharp -ReferencedAssemblies @('System.Windows.Forms.dll', 'System.Drawing.dll') -OutputAssembly $OutputPath -OutputType WindowsApplication",
+        "",
+      ].join("\r\n"),
+      "utf8",
+    );
+    const compilation = runPowerShell(compilerPath, [
+      "-SourcePath",
+      sourcePath,
+      "-OutputPath",
+      fixturePath,
+    ]);
+    expect(compilation.status, `${compilation.stdout}\n${compilation.stderr}`).toBe(0);
+
+    const harness = join(root, "verify-smoke-window.ps1");
+    await writeFile(
+      harness,
+      [
+        "param(",
+        "    [Parameter(Mandatory = $true)][string]$LifecycleScript,",
+        "    [Parameter(Mandatory = $true)][string]$FixturePath",
+        ")",
+        "$ErrorActionPreference = 'Stop'",
+        "$scriptText = [IO.File]::ReadAllText($LifecycleScript)",
+        "$guestMatch = [regex]::Match($scriptText, \"(?s)\\$guestScript = @'\\r?\\n(?<guest>.*?)\\r?\\n'@\")",
+        "if (-not $guestMatch.Success) { throw 'GUEST_SCRIPT_MISSING' }",
+        "$guestText = $guestMatch.Groups['guest'].Value",
+        "$typeMatch = [regex]::Match($guestText, '(?s)Add-Type -TypeDefinition @\"\\r?\\n(?<code>.*?public static class WhiteLilySmokeWindows.*?)\\r?\\n\"@')",
+        "if (-not $typeMatch.Success) { throw 'SMOKE_WINDOW_ENUMERATOR_MISSING' }",
+        "Add-Type -TypeDefinition $typeMatch.Groups['code'].Value",
+        "$tokens = $null",
+        "$errors = $null",
+        "$ast = [Management.Automation.Language.Parser]::ParseInput($guestText, [ref]$tokens, [ref]$errors)",
+        "$functionAst = $ast.Find({",
+        "    param($node)",
+        "    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and",
+        "        $node.Name -eq 'Wait-WhiteLilyMainWindow'",
+        "}, $true)",
+        "if ($null -eq $functionAst) { throw 'SMOKE_WINDOW_WAIT_MISSING' }",
+        "Invoke-Expression $functionAst.Extent.Text",
+        "function Invoke-WindowCase {",
+        "    param([string]$Mode, [int]$TimeoutMilliseconds)",
+        "    $process = Start-Process -FilePath $FixturePath -ArgumentList @($Mode) -PassThru",
+        "    try {",
+        "        Wait-WhiteLilyMainWindow $process -TimeoutMilliseconds $TimeoutMilliseconds",
+        "        return 'success'",
+        "    } catch {",
+        "        return $_.Exception.Message",
+        "    } finally {",
+        "        if (-not $process.HasExited) { $process.Kill(); $process.WaitForExit() }",
+        "        $process.Dispose()",
+        "    }",
+        "}",
+        "$results = [ordered]@{",
+        "    white = Invoke-WindowCase 'white' 3000",
+        "    error = Invoke-WindowCase 'error' 3000",
+        "    both = Invoke-WindowCase 'both' 3000",
+        "    exit = Invoke-WindowCase 'exit' 3000",
+        "    blank = Invoke-WindowCase 'blank' 500",
+        "}",
+        "$results | ConvertTo-Json -Compress",
+        "",
+      ].join("\r\n"),
+      "utf8",
+    );
+
+    const verification = runPowerShell(harness, [
+      "-LifecycleScript",
+      lifecycleScript,
+      "-FixturePath",
+      fixturePath,
+    ]);
+    expect(verification.status, `${verification.stdout}\n${verification.stderr}`).toBe(0);
+    expect(JSON.parse(verification.stdout)).toEqual({
+      white: "success",
+      error: "installer smoke application displayed an error window",
+      both: "installer smoke application displayed an error window",
+      exit: "installer smoke application exited before opening its main window: 0",
+      blank: "installer smoke application did not open the WhiteLily main window",
+    });
+  }, 180_000);
+
   it("requires stable identity before terminating a bound Sandbox remote session", async () => {
     const root = await createTemporaryRoot("whitelily-session-identity-");
     const harness = join(root, "verify-session-identity.ps1");
@@ -1295,9 +1424,9 @@ public static class FakeUninstallerWizard {
         ")",
         "$ErrorActionPreference = 'Stop'",
         "$scriptText = [IO.File]::ReadAllText($GuestScript)",
-        "$typeMatch = [regex]::Match($scriptText, '(?s)Add-Type -TypeDefinition @\"\\r?\\n(?<code>.*?)\\r?\\n\"@')",
-        "if (-not $typeMatch.Success) { throw 'INSTALLER_UI_TYPE_MISSING' }",
-        "Add-Type -TypeDefinition $typeMatch.Groups['code'].Value",
+        "$typeMatches = @([regex]::Matches($scriptText, '(?s)Add-Type -TypeDefinition @\"\\r?\\n(?<code>.*?)\\r?\\n\"@') | Where-Object { $_.Groups['code'].Value.Contains('class WhiteLilyInstallerUi') })",
+        "if ($typeMatches.Count -ne 1) { throw 'INSTALLER_UI_TYPE_MISSING' }",
+        "Add-Type -TypeDefinition $typeMatches[0].Groups['code'].Value",
         "$tokens = $null",
         "$errors = $null",
         "$ast = [Management.Automation.Language.Parser]::ParseFile($GuestScript, [ref]$tokens, [ref]$errors)",

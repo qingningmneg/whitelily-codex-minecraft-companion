@@ -201,6 +201,47 @@ function Invoke-Process {
         throw "process failed with exit code $($process.ExitCode): $Path"
     }
 }
+Add-Type -TypeDefinition @"
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Text;
+
+public static class WhiteLilySmokeWindows {
+    public delegate bool EnumWindowsProc(IntPtr window, IntPtr state);
+
+    [DllImport("user32.dll")]
+    private static extern bool EnumWindows(EnumWindowsProc callback, IntPtr state);
+
+    [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
+
+    [DllImport("user32.dll")]
+    private static extern bool IsWindowVisible(IntPtr window);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int GetWindowText(IntPtr window, StringBuilder text, int count);
+
+    [DllImport("user32.dll")]
+    private static extern int GetWindowTextLength(IntPtr window);
+
+    public static string[] Titles(uint expectedProcessId) {
+        var titles = new List<string>();
+        EnumWindows((window, state) => {
+            uint processId;
+            GetWindowThreadProcessId(window, out processId);
+            if (processId != expectedProcessId || !IsWindowVisible(window)) return true;
+            var length = GetWindowTextLength(window);
+            if (length <= 0) return true;
+            var title = new StringBuilder(length + 1);
+            GetWindowText(window, title, title.Capacity);
+            if (title.Length > 0) titles.Add(title.ToString());
+            return true;
+        }, IntPtr.Zero);
+        return titles.ToArray();
+    }
+}
+"@
 function Wait-WhiteLilyMainWindow {
     param(
         [Parameter(Mandatory = $true)]$Process,
@@ -212,15 +253,16 @@ function Wait-WhiteLilyMainWindow {
         if ($Process.HasExited) {
             throw "installer smoke application exited before opening its main window: $($Process.ExitCode)"
         }
-        if ($Process.MainWindowHandle -ne 0) {
-            $title = [string]$Process.MainWindowTitle
+        $hasWhiteLilyWindow = $false
+        foreach ($title in @([WhiteLilySmokeWindows]::Titles([uint32]$Process.Id))) {
             if ([StringComparer]::OrdinalIgnoreCase.Equals($title, 'Error')) {
                 throw 'installer smoke application displayed an error window'
             }
             if ([StringComparer]::Ordinal.Equals($title, 'WhiteLily')) {
-                return
+                $hasWhiteLilyWindow = $true
             }
         }
+        if ($hasWhiteLilyWindow) { return }
         if ($Process.WaitForExit(250)) {
             throw "installer smoke application exited before opening its main window: $($Process.ExitCode)"
         }

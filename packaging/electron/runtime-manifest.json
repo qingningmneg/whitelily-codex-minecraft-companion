@@ -52,8 +52,8 @@
       {
         "source": "package-lock.json",
         "target": null,
-        "bytes": 327566,
-        "sha256": "7827816daef5b6bc2553a83ab9a7c1a033f54b58f9ac899a5ae5431e97d3c776"
+        "bytes": 327602,
+        "sha256": "c8d3f3480aeffbc416770889cd1f46879485b411681dc610c9783cc4da18bec8"
       },
       {
         "source": "node_modules/electron/package.json",
