@@ -4,26 +4,26 @@
 
 ## 中文
 
-### 下一版本 Windows 安装包
+### Windows 安装包（v0.2.0-beta.1）
 
-> **发布状态：尚未发布。** `v0.2.0-beta.1` 的真实 Windows x64 EXE 安装包正在本分支构建和验证；它还没有通过隔离安装/升级/卸载验收，也没有上传到 GitHub Releases。下面是发布后的预期安装流程，不是可用性声明。
+> **发布状态：Public Beta。** `v0.2.0-beta.1` Windows x64 EXE 已通过 Windows Sandbox 隔离安装/启动/保留数据卸载/重装/删除数据卸载验收，并完成 Minecraft Java 1.21.5 同机 LAN 连接验收。本版本以 GitHub 预发布版提供。
 
-发布并通过验收后，从官方 [GitHub Releases](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/releases) 同时下载：
+从官方 [GitHub Releases](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/releases) 同时下载：
 
 - [`WhiteLily-0.2.0-beta.1-windows-x64-setup.exe`](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/releases/download/v0.2.0-beta.1/WhiteLily-0.2.0-beta.1-windows-x64-setup.exe)
 - [`WhiteLily-0.2.0-beta.1-windows-x64-setup.exe.sha256`](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/releases/download/v0.2.0-beta.1/WhiteLily-0.2.0-beta.1-windows-x64-setup.exe.sha256)
 
 先按[中文安装指南](docs/installation-windows.zh-CN.md)验证 SHA-256，再阅读[未签名与 SmartScreen 说明](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/blob/main/docs/smartscreen.zh-CN.md)。首个 Beta 是未签名构建，Windows SmartScreen 可能显示“未知发布者”；不要关闭系统保护，也不要运行哈希不匹配或来源不明的文件。
 
-安装包计划内置 Electron、WhiteLily 后台运行时和固定版本的 Codex CLI，因此普通用户不需要在系统中另装 Node.js、npm、Git 或 Codex CLI。首次打开后在 WhiteLily 中完成 ChatGPT 登录；不提供 Platform API 密钥回退。用户自行启动和操作 PCL2、用 PCL2 启动 Minecraft Java 1.21.5，并手动把可丢弃世界开放到 LAN。WhiteLily 不会启动、控制、点击或修改 PCL2，只连接同一台电脑上的 `127.0.0.1`。
+安装包内置 Electron、WhiteLily 后台运行时和固定版本的 Codex CLI，因此普通用户不需要在系统中另装 Node.js、npm、Git 或 Codex CLI。首次打开后在 WhiteLily 中完成 ChatGPT 登录；不提供 Platform API 密钥回退。用户自行启动和操作 PCL2、用 PCL2 启动 Minecraft Java 1.21.5，并手动把可丢弃世界开放到 LAN。WhiteLily 不会启动、控制、点击或修改 PCL2，只连接同一台电脑上的 `127.0.0.1`。
 
 ### 项目定位与状态
 
 WhiteLily（白百合）是一个面向 Minecraft Java 版的本地 AI 伙伴运行时。它通过 Mineflayer 以机器人身份加入 Minecraft 世界，让主人直接在游戏聊天框中与本机已登录的 Codex 交互。它不是 Minecraft 客户端模组，也不替代启动器。
 
-**当前状态：Public Beta / 开发中。** 最新公开版本是 **v0.1.1 Preview**。已发布的 [`whitelily-0.1.1-windows-x64.zip`](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/releases/tag/v0.1.1) 是供开发者和早期测试者使用的 CLI ZIP 预览包，**不是一键安装器，也不包含下文的桌面流程**。它仍要求用户自行安装 Node.js 24、Codex CLI，使用 ChatGPT 完成 `codex login`，并运行 `setup.ps1`。
+**当前状态：Public Beta。** 最新公开版本是 **v0.2.0-beta.1**，提供按用户安装的 Windows x64 EXE。旧版 [`v0.1.1`](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/releases/tag/v0.1.1) CLI ZIP 仍保留给开发者参考，但它不是桌面安装器。
 
-本仓库当前的未发布桌面开发构建已经包含 Electron 控制中心、ChatGPT 登录、实时模型选择、只读 PCL2 发现、Minecraft LAN 检测与确认，以及主人身份首次设置和在线切换。`v0.2.0-beta.1` 桌面安装器正在本分支构建，但仍未发布或完成最终验收；这不改变已发布 v0.1.1 的 CLI 使用边界。
+`v0.2.0-beta.1` 包含 Electron 控制中心、ChatGPT 登录与状态恢复、实时模型选择、只读 PCL2 发现、Minecraft LAN 检测与确认，以及主人身份首次设置和在线切换。它是首个面向普通测试用户的一键桌面安装包，仍应只在可丢弃世界中试用。
 
 ### 当前运行架构
 
@@ -71,7 +71,7 @@ PCL2 始终由用户自行启动和操作。WhiteLily 不会启动、控制、�
 
 ### 快速开始
 
-以下步骤是 `v0.2.0-beta.1` 通过验收并发布后的流程预览，当前还不能作为可用安装步骤；它也不适用于已发布的 v0.1.1 CLI ZIP。请先阅读 [Windows 11 + PCL2 完整安装指南](docs/installation-windows.zh-CN.md)。首次安装和每次更新都应在可丢弃世界中验证。
+以下步骤适用于 `v0.2.0-beta.1` 桌面安装包，不适用于旧版 v0.1.1 CLI ZIP。请先阅读 [Windows 11 + PCL2 完整安装指南](docs/installation-windows.zh-CN.md)。首次安装和每次更新都应在可丢弃世界中验证。
 
 1. 按安装指南完成 WhiteLily 安装并打开桌面应用。
 2. 在 WhiteLily 中使用 ChatGPT 登录，然后从实时模型列表中选择模型。
@@ -133,14 +133,14 @@ npm run build
 
 下面四份 Electron 实施计划取代早期 Tauri/Rust/sidecar 打包方向。开发构建中的能力尚不等于已经发布，也不构成固定发布日期承诺。
 
-| 阶段                                                                                                                                                                                            | 状态           | 范围                                                      |
-| ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------- | --------------------------------------------------------- |
-| [Electron 01 桌面基础](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/blob/main/docs/superpowers/plans/2026-07-27-whitelily-electron-01-desktop-foundation.md)             | 开发构建已实现 | Electron 主进程、preload、渲染器、托盘和受管运行时子进程  |
-| [Electron 02 引导与连接](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/blob/main/docs/superpowers/plans/2026-07-27-whitelily-electron-02-onboarding-connection.md)        | 开发构建已实现 | ChatGPT 登录、实时模型选择、只读 PCL2 发现和 LAN 确认     |
-| [Electron 03 配置、记忆与安全](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/blob/main/docs/superpowers/plans/2026-07-27-whitelily-electron-03-profiles-memory-safety.md) | 开发中         | 可编辑伙伴配置、分层记忆、世界绑定、安全预设与本地诊断    |
-| [Electron 04 安装包与发布](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/blob/main/docs/superpowers/plans/2026-07-27-whitelily-electron-04-installer-release.md)          | 开发中         | 内置运行时的 NSIS 安装器、升级/卸载保护、校验和与发布门禁 |
+| 阶段                                                                                                                                                                                            | 状态        | 范围                                                      |
+| ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------- | --------------------------------------------------------- |
+| [Electron 01 桌面基础](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/blob/main/docs/superpowers/plans/2026-07-27-whitelily-electron-01-desktop-foundation.md)             | Beta 已实现 | Electron 主进程、preload、渲染器、托盘和受管运行时子进程  |
+| [Electron 02 引导与连接](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/blob/main/docs/superpowers/plans/2026-07-27-whitelily-electron-02-onboarding-connection.md)        | Beta 已实现 | ChatGPT 登录、实时模型选择、只读 PCL2 发现和 LAN 确认     |
+| [Electron 03 配置、记忆与安全](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/blob/main/docs/superpowers/plans/2026-07-27-whitelily-electron-03-profiles-memory-safety.md) | 开发中      | 可编辑伙伴配置、分层记忆、世界绑定、安全预设与本地诊断    |
+| [Electron 04 安装包与发布](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/blob/main/docs/superpowers/plans/2026-07-27-whitelily-electron-04-installer-release.md)          | Beta 已发布 | 内置运行时的 NSIS 安装器、升级/卸载保护、校验和与发布门禁 |
 
-因此，已发布的 v0.1.1 CLI ZIP 没有桌面端、PCL2/LAN 检测或模型选择 UI；当前仓库开发构建已经包含这些能力，但仍没有已发布的桌面包或一键安装器。
+旧版 v0.1.1 CLI ZIP 没有桌面端、PCL2/LAN 检测或模型选择 UI；这些能力从 `v0.2.0-beta.1` Windows 桌面安装包开始提供。
 
 ### 文档
 
@@ -162,26 +162,26 @@ npm run build
 
 ## English
 
-### Next Windows installer
+### Windows installer (v0.2.0-beta.1)
 
-> **Release status: not yet published.** The real Windows x64 EXE for `v0.2.0-beta.1` is being built and verified on this branch. It has not passed the isolated install/upgrade/uninstall acceptance gate and has not been uploaded to GitHub Releases. The workflow below describes the intended release, not current availability.
+> **Release status: Public Beta.** The `v0.2.0-beta.1` Windows x64 EXE passed Windows Sandbox install, launch, keep-data uninstall, reinstall, and delete-data uninstall acceptance, plus a same-machine Minecraft Java 1.21.5 LAN connection check. It is distributed as a GitHub prerelease.
 
-After the release passes acceptance, download both assets from the official [GitHub Releases](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/releases) page:
+Download both assets from the official [GitHub Releases](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/releases) page:
 
 - [`WhiteLily-0.2.0-beta.1-windows-x64-setup.exe`](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/releases/download/v0.2.0-beta.1/WhiteLily-0.2.0-beta.1-windows-x64-setup.exe)
 - [`WhiteLily-0.2.0-beta.1-windows-x64-setup.exe.sha256`](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/releases/download/v0.2.0-beta.1/WhiteLily-0.2.0-beta.1-windows-x64-setup.exe.sha256)
 
 Verify the SHA-256 using the [Windows installation guide](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/blob/main/docs/installation-windows.md), then read the [unsigned build and SmartScreen guide](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/blob/main/docs/smartscreen.md). The first Beta is unsigned, so Windows SmartScreen may report an unknown publisher. Do not disable system protection or run a file from another source or with a mismatched hash.
 
-The installer is designed to bundle Electron, the WhiteLily child runtime, and an exact Codex CLI, so ordinary users do not need system Node.js, npm, Git, or Codex CLI. Complete ChatGPT sign-in inside WhiteLily; there is no Platform API-key fallback. You start and operate PCL2 yourself, use it to start Minecraft Java 1.21.5, and manually open a disposable world to LAN. WhiteLily does not launch, control, click, or modify PCL2 and connects only to `127.0.0.1` on the same computer.
+The installer bundles Electron, the WhiteLily child runtime, and an exact Codex CLI, so ordinary users do not need system Node.js, npm, Git, or Codex CLI. Complete ChatGPT sign-in inside WhiteLily; there is no Platform API-key fallback. You start and operate PCL2 yourself, use it to start Minecraft Java 1.21.5, and manually open a disposable world to LAN. WhiteLily does not launch, control, click, or modify PCL2 and connects only to `127.0.0.1` on the same computer.
 
 ### Positioning and status
 
 WhiteLily is a local AI companion runtime for Minecraft Java Edition. It joins a Minecraft world as a Mineflayer bot and lets the configured owner interact with a locally authenticated Codex session from the normal in-game chat. It is not a Minecraft client mod and does not replace the launcher.
 
-**Current status: Public Beta / in development.** The latest public version is **v0.1.1 Preview**. The published [`whitelily-0.1.1-windows-x64.zip`](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/releases/tag/v0.1.1) is a CLI ZIP preview for developers and early testers, **not a one-click installer, and it does not include the desktop workflow below**. Users must still install Node.js 24 and the Codex CLI, complete `codex login` with ChatGPT, and run `setup.ps1`.
+**Current status: Public Beta.** The latest public version is **v0.2.0-beta.1**, with a per-user Windows x64 installer. The older [`v0.1.1`](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/releases/tag/v0.1.1) CLI ZIP remains available for developer reference, but it is not the desktop installer.
 
-The current unreleased desktop development build in this repository includes the Electron control center, ChatGPT sign-in, live model selection, read-only PCL2 discovery, Minecraft LAN detection and confirmation, and first-run/live-switch owner identity. The `v0.2.0-beta.1` desktop installer is being built on this branch but is not published or finally accepted; this does not change the published v0.1.1 CLI boundary.
+`v0.2.0-beta.1` includes the Electron control center, ChatGPT sign-in and state recovery, live model selection, read-only PCL2 discovery, Minecraft LAN detection and confirmation, and first-run/live-switch owner identity. It is the first one-click desktop installer for general Beta testers and should still be used only with a disposable world.
 
 ### Current runtime architecture
 
@@ -229,7 +229,7 @@ Availability and limits depend on the user's ChatGPT/Codex account and current p
 
 ### Quick start
 
-The following workflow is a preview of `v0.2.0-beta.1` after it passes acceptance and is published; it is not currently an available installation path and does not apply to the published v0.1.1 CLI ZIP. Read the [complete Windows 11 + PCL2 installation guide](docs/installation-windows.zh-CN.md) first. Validate every installation and update in a disposable world.
+The following workflow applies to the `v0.2.0-beta.1` desktop installer, not the older v0.1.1 CLI ZIP. Read the [complete Windows 11 + PCL2 installation guide](docs/installation-windows.zh-CN.md) first. Validate every installation and update in a disposable world.
 
 1. Complete the installation guide, then open the WhiteLily desktop app.
 2. Sign in with ChatGPT inside WhiteLily and choose a model from the live catalog.
@@ -291,14 +291,14 @@ Validate behavior changes in a disposable Minecraft world. The release check sca
 
 These four Electron implementation plans replace the earlier Tauri/Rust/sidecar packaging direction. A capability in a development build is not a published release and does not promise a fixed delivery date.
 
-| Stage                                                                                                                                                                                                       | Status                     | Scope                                                                                            |
-| ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------- | ------------------------------------------------------------------------------------------------ |
-| [Electron 01 Desktop foundation](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/blob/main/docs/superpowers/plans/2026-07-27-whitelily-electron-01-desktop-foundation.md)               | Implemented in development | Electron main process, preload, renderer, tray, and managed runtime child                        |
-| [Electron 02 Onboarding and connection](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/blob/main/docs/superpowers/plans/2026-07-27-whitelily-electron-02-onboarding-connection.md)     | Implemented in development | ChatGPT sign-in, live model selection, read-only PCL2 discovery, and LAN confirmation            |
-| [Electron 03 Profiles, memory, and safety](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/blob/main/docs/superpowers/plans/2026-07-27-whitelily-electron-03-profiles-memory-safety.md) | In development             | Editable companion profiles, scoped memory, world binding, safety presets, and local diagnostics |
-| [Electron 04 Installer and release](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/blob/main/docs/superpowers/plans/2026-07-27-whitelily-electron-04-installer-release.md)             | In development             | Bundled-runtime NSIS installer, upgrade/uninstall protection, checksums, and release gates       |
+| Stage                                                                                                                                                                                                       | Status              | Scope                                                                                            |
+| ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------- | ------------------------------------------------------------------------------------------------ |
+| [Electron 01 Desktop foundation](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/blob/main/docs/superpowers/plans/2026-07-27-whitelily-electron-01-desktop-foundation.md)               | Implemented in Beta | Electron main process, preload, renderer, tray, and managed runtime child                        |
+| [Electron 02 Onboarding and connection](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/blob/main/docs/superpowers/plans/2026-07-27-whitelily-electron-02-onboarding-connection.md)     | Implemented in Beta | ChatGPT sign-in, live model selection, read-only PCL2 discovery, and LAN confirmation            |
+| [Electron 03 Profiles, memory, and safety](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/blob/main/docs/superpowers/plans/2026-07-27-whitelily-electron-03-profiles-memory-safety.md) | In development      | Editable companion profiles, scoped memory, world binding, safety presets, and local diagnostics |
+| [Electron 04 Installer and release](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/blob/main/docs/superpowers/plans/2026-07-27-whitelily-electron-04-installer-release.md)             | Published in Beta   | Bundled-runtime NSIS installer, upgrade/uninstall protection, checksums, and release gates       |
 
-The published v0.1.1 CLI ZIP therefore has no desktop app, PCL2/LAN detection, or model-selection UI. The current repository development build includes those capabilities, but there is still no published desktop package or one-click installer.
+The older v0.1.1 CLI ZIP has no desktop app, PCL2/LAN detection, or model-selection UI. Those capabilities are available starting with the `v0.2.0-beta.1` Windows desktop installer.
 
 ### Documentation
 

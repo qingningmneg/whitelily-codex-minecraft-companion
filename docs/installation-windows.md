@@ -2,7 +2,7 @@
 
 [中文](installation-windows.zh-CN.md)
 
-> **Status: the `v0.2.0-beta.1` installer is being built and verified and is not yet published.** This branch has not completed isolated Windows install, upgrade, uninstall, and Minecraft acceptance. This guide documents the intended release workflow; it is not a claim that the installer is currently available or accepted.
+> **Status: the `v0.2.0-beta.1` Public Beta passed isolated Windows installer lifecycle and same-machine Minecraft Java 1.21.5 LAN connection acceptance and is available as a GitHub prerelease.** This is an unsigned test build. Verify its SHA-256 and use only a disposable world.
 
 The published `v0.1.1` is an older CLI ZIP preview for developers and early testers. It requires system development tools and is not the desktop EXE described below.
 
@@ -19,14 +19,14 @@ The first desktop Beta targets:
 
 WhiteLily does not launch, control, click, or modify PCL2. It does not automatically start Minecraft or open a world to LAN. You perform those steps and confirm the detected local session in WhiteLily.
 
-## 2. Download both files after publication
+## 2. Download both files
 
-Only after `v0.2.0-beta.1` passes its release gates, download these files from the official [GitHub Releases](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/releases) page:
+Download these files from the official [GitHub Releases](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/releases) page:
 
 1. [`WhiteLily-0.2.0-beta.1-windows-x64-setup.exe`](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/releases/download/v0.2.0-beta.1/WhiteLily-0.2.0-beta.1-windows-x64-setup.exe)
 2. [`WhiteLily-0.2.0-beta.1-windows-x64-setup.exe.sha256`](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/releases/download/v0.2.0-beta.1/WhiteLily-0.2.0-beta.1-windows-x64-setup.exe.sha256)
 
-Until the installer actually appears on that Release page, do not look for a same-named EXE in source folders, chat attachments, file-sharing services, or third-party mirrors. A matching filename does not prove matching contents.
+Do not obtain a same-named EXE from source folders, chat attachments, file-sharing services, or third-party mirrors. A matching filename does not prove matching contents.
 
 ## 3. Verify SHA-256 before installation
 
@@ -140,6 +140,6 @@ Do not disable system protection. Recheck the official download source and SHA-2
 
 ## 12. Developer preview
 
-The published `v0.1.1` CLI ZIP is an older developer preview and does require Node.js, npm, a Git/source workspace, and Codex CLI. Those requirements do not apply to the future `v0.2.0-beta.1` desktop installer.
+The published `v0.1.1` CLI ZIP is an older developer preview and does require Node.js, npm, a Git/source workspace, and Codex CLI. Those requirements do not apply to the `v0.2.0-beta.1` desktop installer.
 
-Maintainers validating a desktop build from source use locked dependencies and repository development scripts. Ordinary installer users do not clone the repository or run `npm ci`. No development artifact should be described as released or uploaded to Releases until the isolated lifecycle and Minecraft 1.21.5 acceptance gates pass.
+Maintainers validating a desktop build from source use locked dependencies and repository development scripts. Ordinary installer users do not clone the repository or run `npm ci`. Only a build that passes isolated lifecycle and same-machine Minecraft 1.21.5 connection acceptance may be offered as a prerelease installer.

@@ -340,7 +340,7 @@ describe("Windows scripts", { timeout: 30_000 }, () => {
       existingConfig: config,
     });
 
-    expect(started.exitCode).toBe(0);
+    expect(started.exitCode, `${started.stdout}\n${started.stderr}`).toBe(0);
     expect(started.stdout).toContain("stop.ps1");
     expect(started.stdout).toContain("!status");
     const pidText = await readFile(join(root, "data", "whitelily.pid"), "utf8");
@@ -375,7 +375,7 @@ describe("Windows scripts", { timeout: 30_000 }, () => {
       unrelatedDataFile: "preserve-me",
     });
 
-    expect(started.exitCode).toBe(0);
+    expect(started.exitCode, `${started.stdout}\n${started.stderr}`).toBe(0);
     await expect(access(join(root, "data", "stop.request"))).rejects.toThrow();
     await expect(readFile(join(root, "data", "keep.txt"), "utf8")).resolves.toBe("preserve-me");
     const pidText = await readFile(join(root, "data", "whitelily.pid"), "utf8");
@@ -395,7 +395,7 @@ describe("Windows scripts", { timeout: 30_000 }, () => {
     const firstStart = await runWindowsScriptFixture(root, "start.ps1", [], {
       existingConfig: config,
     });
-    expect(firstStart.exitCode).toBe(0);
+    expect(firstStart.exitCode, `${firstStart.stdout}\n${firstStart.stderr}`).toBe(0);
     const firstPid = await readFile(join(root, "data", "whitelily.pid"), "utf8");
 
     const firstStop = await runWindowsScriptFixture(
@@ -629,7 +629,7 @@ describe("Windows scripts", { timeout: 30_000 }, () => {
       codexStatus: "Logged in using ChatGPT",
     });
 
-    expect(result.exitCode).toBe(0);
+    expect(result.exitCode, `${result.stdout}\n${result.stderr}`).toBe(0);
     expect(result.stdout).toContain("PASS");
     expect(result.createdPaths).toEqual([]);
     expect(result.deletedPaths).toEqual([]);
@@ -642,7 +642,7 @@ describe("Windows scripts", { timeout: 30_000 }, () => {
       codexStatus: "Codex status\r\nLogged in using ChatGPT\r\nReady",
     });
 
-    expect(result.exitCode).toBe(0);
+    expect(result.exitCode, `${result.stdout}\n${result.stderr}`).toBe(0);
     expect(result.stdout).toContain("PASS: Codex login");
   });
 

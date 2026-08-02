@@ -2,11 +2,11 @@
 
 [中文](smartscreen.zh-CN.md)
 
-> `WhiteLily-0.2.0-beta.1-windows-x64-setup.exe` is being built and verified and is not yet published. This page explains how to handle the unsigned warning only after the first Beta passes acceptance and is released.
+> `WhiteLily-0.2.0-beta.1-windows-x64-setup.exe` is available as an unsigned Public Beta prerelease. This page explains how to handle its unsigned warning safely.
 
 ## Why Windows warns
 
-The first WhiteLily desktop Beta is planned as an **unsigned** EXE without an Authenticode code-signing certificate. Windows SmartScreen may therefore show “Windows protected your PC” or “Unknown publisher.” Unsigned status is a disclosed release limitation and must not be described as signed or reputation-established.
+The first WhiteLily desktop Beta is released as an **unsigned** EXE without an Authenticode code-signing certificate. Windows SmartScreen may therefore show “Windows protected your PC” or “Unknown publisher.” Unsigned status is a disclosed release limitation and must not be described as signed or reputation-established.
 
 A SmartScreen warning proves neither that a file is malicious nor that it is safe. Trust the file only when it came from the official Release and its locally calculated SHA-256 exactly matches the `.sha256` published in that same Release.
 

@@ -2,7 +2,7 @@
 
 [English](installation-windows.md)
 
-> **状态：`v0.2.0-beta.1` 安装包正在构建和验证，尚未发布。** 当前分支还没有完成隔离 Windows 环境中的安装、升级、卸载和 Minecraft 实机验收。本文记录发布后的预期流程，不表示安装包已经可下载或通过验收。
+> **状态：`v0.2.0-beta.1` Public Beta 已通过隔离 Windows 安装生命周期与 Minecraft Java 1.21.5 同机 LAN 连接验收，并以 GitHub 预发布版提供。** 这是未签名测试版，请严格核对 SHA-256，并只在可丢弃世界中使用。
 
 已发布的 `v0.1.1` 是面向开发者和早期测试者的旧版 CLI ZIP 预览，需要系统开发工具；它不是下面介绍的桌面 EXE 安装包。
 
@@ -19,14 +19,14 @@
 
 WhiteLily 不会启动、控制、点击或修改 PCL2，也不会自动启动 Minecraft 或自动开放 LAN。你必须自己完成这些步骤，并在 WhiteLily 中确认检测到的本机会话。
 
-## 2. 发布后下载两个文件
+## 2. 下载两个文件
 
-只有在 `v0.2.0-beta.1` 通过发布门禁后，才从官方 [GitHub Releases](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/releases) 下载：
+从官方 [GitHub Releases](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/releases) 下载：
 
 1. [`WhiteLily-0.2.0-beta.1-windows-x64-setup.exe`](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/releases/download/v0.2.0-beta.1/WhiteLily-0.2.0-beta.1-windows-x64-setup.exe)
 2. [`WhiteLily-0.2.0-beta.1-windows-x64-setup.exe.sha256`](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/releases/download/v0.2.0-beta.1/WhiteLily-0.2.0-beta.1-windows-x64-setup.exe.sha256)
 
-在安装包正式出现在 Release 页面之前，不要从源码目录、聊天附件、网盘或第三方镜像寻找同名 EXE。文件名相同不代表内容可信。
+不要从源码目录、聊天附件、网盘或第三方镜像获取同名 EXE。文件名相同不代表内容可信。
 
 ## 3. 安装前验证 SHA-256
 
@@ -140,6 +140,6 @@ WhiteLily 只做只读发现，不替你安装或启动 PCL2。请从 PCL2 官�
 
 ## 12. 开发者预览
 
-公开的 `v0.1.1` CLI ZIP 是旧版开发者预览，确实要求 Node.js、npm、Git/源码工作区和 Codex CLI。它的要求不适用于未来的 `v0.2.0-beta.1` 桌面安装包。
+公开的 `v0.1.1` CLI ZIP 是旧版开发者预览，确实要求 Node.js、npm、Git/源码工作区和 Codex CLI。它的要求不适用于 `v0.2.0-beta.1` 桌面安装包。
 
-维护者从源码验证桌面构建时应使用锁定依赖和仓库中的开发脚本；普通安装用户不需要克隆仓库或运行 `npm ci`。在安装包完成隔离生命周期和 Minecraft 1.21.5 实机验收之前，不应把开发产物标记为正式可用或上传为 Release。
+维护者从源码验证桌面构建时应使用锁定依赖和仓库中的开发脚本；普通安装用户不需要克隆仓库或运行 `npm ci`。只有通过隔离生命周期和 Minecraft 1.21.5 同机连接验收的构建才可作为预发布安装包提供。
