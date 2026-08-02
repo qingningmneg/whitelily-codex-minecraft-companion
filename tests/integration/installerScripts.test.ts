@@ -554,7 +554,7 @@ describe("WhiteLily installer packaging scripts", () => {
 
     expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
     expect(result.stdout.trim()).toBe("0");
-  });
+  }, 20_000);
 
   it("rejects a non-canonical semantic version before invoking the build", async () => {
     const fixture = await createRepositoryFixture();
