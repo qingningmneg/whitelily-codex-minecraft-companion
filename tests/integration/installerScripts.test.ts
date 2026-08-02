@@ -751,10 +751,14 @@ describe("WhiteLily isolated installer lifecycle", () => {
     const fakeWindowsRoot = await createTemporaryRoot("whitelily-fake-windows-");
     await createDelegatingSandboxLauncher(fakeWindowsRoot);
     const lockerScript = join(fixture.root, "hold-sandbox-mapping.ps1");
+    const lockerReady = join(fixture.root, "sandbox-mapping-lock.ready");
     await writeFile(
       lockerScript,
       [
-        "param([Parameter(Mandatory = $true)][string]$BuildRoot)",
+        "param(",
+        "    [Parameter(Mandatory = $true)][string]$BuildRoot,",
+        "    [Parameter(Mandatory = $true)][string]$ReadyPath",
+        ")",
         "$ErrorActionPreference = 'Stop'",
         "$deadline = [DateTime]::UtcNow.AddSeconds(30)",
         "$target = $null",
@@ -765,7 +769,10 @@ describe("WhiteLily isolated installer lifecycle", () => {
         "} while ([DateTime]::UtcNow -lt $deadline)",
         "if ($null -eq $target) { throw 'LOCK_TARGET_NOT_FOUND' }",
         "$stream = [IO.File]::Open($target.FullName, 'Open', 'Read', 'Read')",
-        "try { Start-Sleep -Seconds 12 } finally { $stream.Dispose() }",
+        "try {",
+        "    [IO.File]::WriteAllText($ReadyPath, $target.FullName)",
+        "    Start-Sleep -Seconds 12",
+        "} finally { $stream.Dispose() }",
         "",
       ].join("\r\n"),
       "utf8",
@@ -780,6 +787,8 @@ describe("WhiteLily isolated installer lifecycle", () => {
         lockerScript,
         "-BuildRoot",
         join(fixture.root, "build"),
+        "-ReadyPath",
+        lockerReady,
       ],
       { windowsHide: true, stdio: "ignore" },
     );
@@ -802,6 +811,7 @@ describe("WhiteLily isolated installer lifecycle", () => {
     }
 
     expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    await expect(readFile(lockerReady, "utf8")).resolves.toContain("guest-lifecycle.ps1");
     await expect(readdir(join(fixture.root, "build"))).resolves.not.toContainEqual(
       expect.stringMatching(/^installer-sandbox-/u),
     );
@@ -849,6 +859,31 @@ describe("WhiteLily isolated installer lifecycle", () => {
     await mkdir(unrelatedReportRoot, { recursive: true });
     await writeFile(join(unrelatedReportRoot, "guest-lifecycle.ps1"), "# unrelated\n", "utf8");
     await writeFile(unrelatedConfiguration, "<Configuration />\n", "utf8");
+    const identityScript = join(unrelatedRoot, "get-process-identity.ps1");
+    await writeFile(
+      identityScript,
+      [
+        "param([Parameter(Mandatory = $true)][int]$ProcessId)",
+        "$ErrorActionPreference = 'Stop'",
+        "$deadline = [DateTime]::UtcNow.AddSeconds(5)",
+        "$current = $null",
+        "do {",
+        '    $current = Get-CimInstance Win32_Process -Filter "ProcessId = $ProcessId" -ErrorAction Stop',
+        "    if ($null -ne $current) { break }",
+        "    Start-Sleep -Milliseconds 50",
+        "} while ([DateTime]::UtcNow -lt $deadline)",
+        "if ($null -eq $current) { throw 'PROCESS_NOT_FOUND' }",
+        "[pscustomobject]@{",
+        "    ProcessId = [int]$current.ProcessId",
+        "    Name = [string]$current.Name",
+        "    CreationDate = $current.CreationDate",
+        "    ExecutablePath = [string]$current.ExecutablePath",
+        "    CommandLine = [string]$current.CommandLine",
+        "} | ConvertTo-Json -Compress",
+        "",
+      ].join("\r\n"),
+      "utf8",
+    );
     const unrelated = spawn(
       join(dirname(sandboxLauncher), "WindowsSandboxRemoteSession.exe"),
       ["--worker", unrelatedConfiguration, unrelatedReportRoot, "a".repeat(64)],
@@ -863,6 +898,15 @@ describe("WhiteLily isolated installer lifecycle", () => {
     );
 
     try {
+      const initialIdentityResult = runPowerShell(identityScript, [
+        "-ProcessId",
+        String(unrelated.pid),
+      ]);
+      expect(
+        initialIdentityResult.status,
+        `${initialIdentityResult.stdout}\n${initialIdentityResult.stderr}`,
+      ).toBe(0);
+      const initialIdentity = JSON.parse(initialIdentityResult.stdout) as Record<string, unknown>;
       const result = runPowerShell(
         join(fixture.root, "scripts", "test-installer.ps1"),
         ["-InstallerPath", releaseInstaller],
@@ -877,7 +921,16 @@ describe("WhiteLily isolated installer lifecycle", () => {
       );
 
       expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
-      expect(unrelated.exitCode).toBeNull();
+      await new Promise<void>((resolvePromise) => setImmediate(resolvePromise));
+      const currentIdentityResult = runPowerShell(identityScript, [
+        "-ProcessId",
+        String(unrelated.pid),
+      ]);
+      expect(
+        currentIdentityResult.status,
+        `${currentIdentityResult.stdout}\n${currentIdentityResult.stderr}`,
+      ).toBe(0);
+      expect(JSON.parse(currentIdentityResult.stdout)).toEqual(initialIdentity);
     } finally {
       unrelated.kill();
     }
@@ -891,10 +944,14 @@ describe("WhiteLily isolated installer lifecycle", () => {
     const fakeWindowsRoot = await createTemporaryRoot("whitelily-fake-windows-");
     await createDelegatingSandboxLauncher(fakeWindowsRoot);
     const lockerScript = join(fixture.root, "hold-sandbox-artifact.ps1");
+    const lockerReady = join(fixture.root, "sandbox-artifact-lock.ready");
     await writeFile(
       lockerScript,
       [
-        "param([Parameter(Mandatory = $true)][string]$BuildRoot)",
+        "param(",
+        "    [Parameter(Mandatory = $true)][string]$BuildRoot,",
+        "    [Parameter(Mandatory = $true)][string]$ReadyPath",
+        ")",
         "$ErrorActionPreference = 'Stop'",
         "$deadline = [DateTime]::UtcNow.AddSeconds(30)",
         "$target = $null",
@@ -905,7 +962,10 @@ describe("WhiteLily isolated installer lifecycle", () => {
         "} while ([DateTime]::UtcNow -lt $deadline)",
         "if ($null -eq $target) { throw 'LOCK_TARGET_NOT_FOUND' }",
         "$stream = [IO.File]::Open($target.FullName, 'Open', 'Read', 'Read')",
-        "try { Start-Sleep -Seconds 45 } finally { $stream.Dispose() }",
+        "try {",
+        "    [IO.File]::WriteAllText($ReadyPath, $target.FullName)",
+        "    Start-Sleep -Seconds 45",
+        "} finally { $stream.Dispose() }",
         "",
       ].join("\r\n"),
       "utf8",
@@ -920,6 +980,8 @@ describe("WhiteLily isolated installer lifecycle", () => {
         lockerScript,
         "-BuildRoot",
         join(fixture.root, "build"),
+        "-ReadyPath",
+        lockerReady,
       ],
       { windowsHide: true, stdio: "ignore" },
     );
@@ -927,7 +989,7 @@ describe("WhiteLily isolated installer lifecycle", () => {
     try {
       result = runPowerShell(
         join(fixture.root, "scripts", "test-installer.ps1"),
-        ["-InstallerPath", releaseInstaller],
+        ["-InstallerPath", releaseInstaller, "-WarningAction", "Stop"],
         {
           cwd: fixture.root,
           env: {
@@ -943,9 +1005,11 @@ describe("WhiteLily isolated installer lifecycle", () => {
     }
 
     expect(result.status).not.toBe(0);
+    await expect(readFile(lockerReady, "utf8")).resolves.toContain("guest-lifecycle.ps1");
     expect(`${result.stdout}\n${result.stderr}`).toContain(
       "SANDBOX_LIFECYCLE_FAILED: forced guest failure",
     );
+    expect(`${result.stdout}\n${result.stderr}`).toContain("SANDBOX_CLEANUP_FAILED:");
   }, 180_000);
 
   it("embeds a working SHA-256 verifier in the guest lifecycle script", async () => {

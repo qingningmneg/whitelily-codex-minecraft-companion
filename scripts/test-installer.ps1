@@ -497,80 +497,86 @@ try {
 } catch {
     $lifecycleError = $_
 } finally {
-    if ($null -ne $sandboxProcess -and -not $sandboxProcess.HasExited) {
-        try {
-            $sandboxProcess.Kill()
-            $sandboxProcess.WaitForExit()
-        } catch {
-            # The launcher may exit between HasExited and Kill.
-        }
-    }
-    $boundRemoteSessions = @(
-        Get-CimInstance Win32_Process `
-            -Filter "Name = 'WindowsSandboxRemoteSession.exe'" `
-            -ErrorAction SilentlyContinue |
-            Where-Object {
-                -not [string]::IsNullOrWhiteSpace([string]$_.CommandLine) -and
-                ([string]$_.CommandLine).IndexOf(
-                    $sandboxConfigurationPath,
-                    [StringComparison]::OrdinalIgnoreCase
-                ) -ge 0
-            }
-    )
-    foreach ($expectedRemoteSession in $boundRemoteSessions) {
-        $remoteProcess = $null
-        try {
-            $remoteProcess = Get-Process -Id $expectedRemoteSession.ProcessId -ErrorAction Stop
-            # Opening Handle binds this object to the current OS process before identity is revalidated.
-            $remoteProcess.Handle | Out-Null
-            $currentRemoteSession = Get-CimInstance Win32_Process `
-                -Filter "ProcessId = $($expectedRemoteSession.ProcessId)" `
-                -ErrorAction Stop
-            if (
-                Test-SandboxRemoteSessionIdentity `
-                    -Expected $expectedRemoteSession `
-                    -Current $currentRemoteSession `
-                    -ConfigurationPath $sandboxConfigurationPath
-            ) {
-                $remoteProcess.Kill()
-                $remoteProcess.WaitForExit()
-            }
-        } catch {
-            # A session may exit while the lifecycle report is being processed.
-        } finally {
-            if ($null -ne $remoteProcess) {
-                $remoteProcess.Dispose()
-            }
-        }
-    }
-    if (
-        (Test-Path -LiteralPath $sandboxRoot) -and
-        $sandboxRoot.StartsWith($sandboxPrefix, [StringComparison]::OrdinalIgnoreCase)
-    ) {
-        $cleanupDeadline = [DateTime]::UtcNow.AddSeconds(30)
-        while (Test-Path -LiteralPath $sandboxRoot) {
+    try {
+        if ($null -ne $sandboxProcess -and -not $sandboxProcess.HasExited) {
             try {
-                Remove-Item -LiteralPath $sandboxRoot -Recurse -Force
-            } catch [System.IO.IOException] {
-                if ([DateTime]::UtcNow -ge $cleanupDeadline) {
-                    $cleanupError = $_
-                    break
-                }
-                Start-Sleep -Seconds 1
-            } catch [System.UnauthorizedAccessException] {
-                if ([DateTime]::UtcNow -ge $cleanupDeadline) {
-                    $cleanupError = $_
-                    break
-                }
-                Start-Sleep -Seconds 1
+                $sandboxProcess.Kill()
+                $sandboxProcess.WaitForExit()
+            } catch {
+                # The launcher may exit between HasExited and Kill.
             }
         }
+        $boundRemoteSessions = @(
+            Get-CimInstance Win32_Process `
+                -Filter "Name = 'WindowsSandboxRemoteSession.exe'" `
+                -ErrorAction SilentlyContinue |
+                Where-Object {
+                    -not [string]::IsNullOrWhiteSpace([string]$_.CommandLine) -and
+                    ([string]$_.CommandLine).IndexOf(
+                        $sandboxConfigurationPath,
+                        [StringComparison]::OrdinalIgnoreCase
+                    ) -ge 0
+                }
+        )
+        foreach ($expectedRemoteSession in $boundRemoteSessions) {
+            $remoteProcess = $null
+            try {
+                $remoteProcess = Get-Process -Id $expectedRemoteSession.ProcessId -ErrorAction Stop
+                # Opening Handle binds this object to the current OS process before identity is revalidated.
+                $remoteProcess.Handle | Out-Null
+                $currentRemoteSession = Get-CimInstance Win32_Process `
+                    -Filter "ProcessId = $($expectedRemoteSession.ProcessId)" `
+                    -ErrorAction Stop
+                if (
+                    Test-SandboxRemoteSessionIdentity `
+                        -Expected $expectedRemoteSession `
+                        -Current $currentRemoteSession `
+                        -ConfigurationPath $sandboxConfigurationPath
+                ) {
+                    $remoteProcess.Kill()
+                    $remoteProcess.WaitForExit()
+                }
+            } catch {
+                # A session may exit while the lifecycle report is being processed.
+            } finally {
+                if ($null -ne $remoteProcess) {
+                    $remoteProcess.Dispose()
+                }
+            }
+        }
+        if (
+            (Test-Path -LiteralPath $sandboxRoot) -and
+            $sandboxRoot.StartsWith($sandboxPrefix, [StringComparison]::OrdinalIgnoreCase)
+        ) {
+            $cleanupDeadline = [DateTime]::UtcNow.AddSeconds(30)
+            while (Test-Path -LiteralPath $sandboxRoot) {
+                try {
+                    Remove-Item -LiteralPath $sandboxRoot -Recurse -Force
+                } catch [System.IO.IOException] {
+                    if ([DateTime]::UtcNow -ge $cleanupDeadline) {
+                        $cleanupError = $_
+                        break
+                    }
+                    Start-Sleep -Seconds 1
+                } catch [System.UnauthorizedAccessException] {
+                    if ([DateTime]::UtcNow -ge $cleanupDeadline) {
+                        $cleanupError = $_
+                        break
+                    }
+                    Start-Sleep -Seconds 1
+                }
+            }
+        }
+    } catch {
+        $cleanupError = $_
     }
 }
 
 if ($null -ne $lifecycleError) {
     if ($null -ne $cleanupError) {
-        Write-Warning "SANDBOX_CLEANUP_FAILED: $($cleanupError.Exception.Message)"
+        Write-Warning `
+            "SANDBOX_CLEANUP_FAILED: $($cleanupError.Exception.Message)" `
+            -WarningAction Continue
     }
     throw $lifecycleError
 }
