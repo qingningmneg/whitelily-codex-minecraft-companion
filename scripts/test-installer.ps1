@@ -38,6 +38,62 @@ function ConvertTo-XmlEscapedText {
     return [System.Security.SecurityElement]::Escape($Value)
 }
 
+function Test-SandboxRemoteSessionIdentity {
+    param(
+        [Parameter(Mandatory = $true)]$Expected,
+        [Parameter(Mandatory = $true)]$Current,
+        [Parameter(Mandatory = $true)][string]$ConfigurationPath
+    )
+
+    if ($null -eq $Expected -or $null -eq $Current) {
+        return $false
+    }
+    if ([uint32]$Expected.ProcessId -ne [uint32]$Current.ProcessId) {
+        return $false
+    }
+    if (
+        -not [StringComparer]::OrdinalIgnoreCase.Equals(
+            [string]$Expected.Name,
+            [string]$Current.Name
+        ) -or
+        -not [StringComparer]::OrdinalIgnoreCase.Equals(
+            [string]$Current.Name,
+            'WindowsSandboxRemoteSession.exe'
+        )
+    ) {
+        return $false
+    }
+    if (-not [object]::Equals($Expected.CreationDate, $Current.CreationDate)) {
+        return $false
+    }
+
+    $expectedExecutable = [string]$Expected.ExecutablePath
+    $currentExecutable = [string]$Current.ExecutablePath
+    if (
+        [string]::IsNullOrWhiteSpace($expectedExecutable) -or
+        [string]::IsNullOrWhiteSpace($currentExecutable) -or
+        -not [StringComparer]::OrdinalIgnoreCase.Equals($expectedExecutable, $currentExecutable)
+    ) {
+        return $false
+    }
+
+    $expectedCommandLine = [string]$Expected.CommandLine
+    $currentCommandLine = [string]$Current.CommandLine
+    if (
+        [string]::IsNullOrWhiteSpace($expectedCommandLine) -or
+        [string]::IsNullOrWhiteSpace($currentCommandLine) -or
+        -not [StringComparer]::Ordinal.Equals($expectedCommandLine, $currentCommandLine) -or
+        $currentCommandLine.IndexOf(
+            $ConfigurationPath,
+            [StringComparison]::OrdinalIgnoreCase
+        ) -lt 0
+    ) {
+        return $false
+    }
+
+    return $true
+}
+
 $repositoryRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $resolvedInstaller = Resolve-FullPath $InstallerPath (Get-Location).Path
 if (-not (Test-Path -LiteralPath $resolvedInstaller -PathType Leaf)) {
@@ -393,6 +449,9 @@ $configuration = @"
 [System.IO.File]::WriteAllText($sandboxConfigurationPath, $configuration, $utf8)
 
 $sandboxProcess = $null
+$lifecycleError = $null
+$cleanupError = $null
+$lifecycleOutput = $null
 try {
     try {
         $sandboxProcess = Start-Process `
@@ -434,10 +493,17 @@ try {
         throw "SANDBOX_LIFECYCLE_FAILED: $([string]$report.error)"
     }
     Copy-Item -LiteralPath $sandboxResultPath -Destination $resolvedReport -Force
-    Write-Output ($report | ConvertTo-Json -Compress)
+    $lifecycleOutput = $report | ConvertTo-Json -Compress
+} catch {
+    $lifecycleError = $_
 } finally {
     if ($null -ne $sandboxProcess -and -not $sandboxProcess.HasExited) {
-        Stop-Process -Id $sandboxProcess.Id -Force -ErrorAction SilentlyContinue
+        try {
+            $sandboxProcess.Kill()
+            $sandboxProcess.WaitForExit()
+        } catch {
+            # The launcher may exit between HasExited and Kill.
+        }
     }
     $boundRemoteSessions = @(
         Get-CimInstance Win32_Process `
@@ -451,8 +517,31 @@ try {
                 ) -ge 0
             }
     )
-    foreach ($remoteSession in $boundRemoteSessions) {
-        Stop-Process -Id $remoteSession.ProcessId -Force -ErrorAction SilentlyContinue
+    foreach ($expectedRemoteSession in $boundRemoteSessions) {
+        $remoteProcess = $null
+        try {
+            $remoteProcess = Get-Process -Id $expectedRemoteSession.ProcessId -ErrorAction Stop
+            # Opening Handle binds this object to the current OS process before identity is revalidated.
+            $remoteProcess.Handle | Out-Null
+            $currentRemoteSession = Get-CimInstance Win32_Process `
+                -Filter "ProcessId = $($expectedRemoteSession.ProcessId)" `
+                -ErrorAction Stop
+            if (
+                Test-SandboxRemoteSessionIdentity `
+                    -Expected $expectedRemoteSession `
+                    -Current $currentRemoteSession `
+                    -ConfigurationPath $sandboxConfigurationPath
+            ) {
+                $remoteProcess.Kill()
+                $remoteProcess.WaitForExit()
+            }
+        } catch {
+            # A session may exit while the lifecycle report is being processed.
+        } finally {
+            if ($null -ne $remoteProcess) {
+                $remoteProcess.Dispose()
+            }
+        }
     }
     if (
         (Test-Path -LiteralPath $sandboxRoot) -and
@@ -464,15 +553,28 @@ try {
                 Remove-Item -LiteralPath $sandboxRoot -Recurse -Force
             } catch [System.IO.IOException] {
                 if ([DateTime]::UtcNow -ge $cleanupDeadline) {
-                    throw
+                    $cleanupError = $_
+                    break
                 }
                 Start-Sleep -Seconds 1
             } catch [System.UnauthorizedAccessException] {
                 if ([DateTime]::UtcNow -ge $cleanupDeadline) {
-                    throw
+                    $cleanupError = $_
+                    break
                 }
                 Start-Sleep -Seconds 1
             }
         }
     }
 }
+
+if ($null -ne $lifecycleError) {
+    if ($null -ne $cleanupError) {
+        Write-Warning "SANDBOX_CLEANUP_FAILED: $($cleanupError.Exception.Message)"
+    }
+    throw $lifecycleError
+}
+if ($null -ne $cleanupError) {
+    throw $cleanupError
+}
+Write-Output $lifecycleOutput
