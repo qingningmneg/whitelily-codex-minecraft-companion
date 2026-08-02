@@ -4,6 +4,9 @@ import { defineConfig } from "vite";
 export default defineConfig(({ mode }) => {
   if (mode === "main") {
     return {
+      ssr: {
+        noExternal: true,
+      },
       build: {
         emptyOutDir: true,
         outDir: "dist/main",
@@ -40,6 +43,7 @@ export default defineConfig(({ mode }) => {
     };
   }
   return {
+    base: "./",
     plugins: [react()],
     server: {
       host: "127.0.0.1",

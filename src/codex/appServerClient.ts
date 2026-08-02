@@ -33,6 +33,7 @@ const loginRefusal =
   "Codex must be signed in with ChatGPT. API-key billing is disabled for WhiteLily.";
 const MAX_MODEL_PAGES = 100;
 const MAX_MODEL_RECORDS = 256;
+const DEFAULT_ACCOUNT_READ_TIMEOUT_MS = 8_000;
 
 const wellFormedString = (maxCodePoints: number) =>
   z
@@ -115,12 +116,18 @@ interface PendingTurnStart {
   reject(reason: Error): void;
 }
 
+interface RetiringRpc {
+  rpc: JsonRpcProcess;
+  completion: Promise<void>;
+}
+
 export interface CodexAppServerClientDependencies {
   runLoginStatus?: (signal: AbortSignal) => Promise<LoginStatusResult>;
   createTransport?: () => Promise<JsonRpcLineTransport>;
   workspacePath?: string;
   loginTimeoutMs?: number;
   requestTimeoutMs?: number;
+  accountReadTimeoutMs?: number;
   turnTimeoutMs?: number;
   turnInterruptGraceMs?: number;
 }
@@ -193,6 +200,7 @@ export class CodexAppServerClient implements CodexPort, AccountAppServerPort {
   private defaultReasoningEffort: string;
   private readonly loginTimeoutMs: number;
   private readonly requestTimeoutMs: number;
+  private readonly accountReadTimeoutMs: number;
   private readonly turnTimeoutMs: number;
   private readonly turnInterruptGraceMs: number;
   private readonly hasInjectedLoginStatus: boolean;
@@ -205,6 +213,7 @@ export class CodexAppServerClient implements CodexPort, AccountAppServerPort {
   private readonly earlyTurnEvents = new Map<string, EarlyTurnEvents>();
   private rpc: JsonRpcProcess | undefined;
   private startingRpc: { generation: number; rpc: JsonRpcProcess } | undefined;
+  private retiringRpc: RetiringRpc | undefined;
   private startPromise: Promise<void> | undefined;
   private accountStartPromise: Promise<void> | undefined;
   private stopPromise: Promise<void> | undefined;
@@ -222,6 +231,10 @@ export class CodexAppServerClient implements CodexPort, AccountAppServerPort {
     this.requestTimeoutMs = positiveTimeout(
       dependencies.requestTimeoutMs ?? 30_000,
       "request timeout",
+    );
+    this.accountReadTimeoutMs = positiveTimeout(
+      dependencies.accountReadTimeoutMs ?? DEFAULT_ACCOUNT_READ_TIMEOUT_MS,
+      "account read timeout",
     );
     this.turnTimeoutMs = positiveTimeout(dependencies.turnTimeoutMs ?? 5 * 60_000, "turn timeout");
     this.turnInterruptGraceMs = positiveTimeout(
@@ -269,7 +282,13 @@ export class CodexAppServerClient implements CodexPort, AccountAppServerPort {
     const generation = ++this.lifecycleGeneration;
     const controller = new AbortController();
     this.startController = controller;
-    const connecting = this.startInternal(generation, controller.signal);
+    const connecting = (async (): Promise<void> => {
+      await this.awaitRetiringRpc();
+      if (!this.isCurrent(generation)) {
+        throw new Error("Codex app server stopped during startup");
+      }
+      await this.startInternal(generation, controller.signal);
+    })();
     this.accountStartPromise = connecting;
     try {
       await connecting;
@@ -363,6 +382,7 @@ export class CodexAppServerClient implements CodexPort, AccountAppServerPort {
         if (this.rpc === rpc) this.failActiveTurns(error);
         if (this.rpc === rpc) this.rpc = undefined;
         if (this.startingRpc?.rpc === rpc) this.startingRpc = undefined;
+        this.trackRetiringRpc(rpc);
       });
       this.startingRpc = { generation, rpc };
       await rpc.request<InitializeResponse>("initialize", params);
@@ -425,7 +445,13 @@ export class CodexAppServerClient implements CodexPort, AccountAppServerPort {
 
   async readAccount(): Promise<GetAccountResponse> {
     await this.startAccountSession();
-    return this.requireRpc().request<GetAccountResponse>("account/read", {});
+    return this.requireRpc().request<GetAccountResponse>(
+      "account/read",
+      {},
+      {
+        timeoutMs: this.accountReadTimeoutMs,
+      },
+    );
   }
 
   async startChatGptLogin(): Promise<LoginAccountResponse> {
@@ -552,11 +578,13 @@ export class CodexAppServerClient implements CodexPort, AccountAppServerPort {
     this.loginController?.abort();
     const readyRpc = this.rpc;
     const initializingRpc = this.startingRpc?.rpc;
-    const closeResults = await Promise.allSettled(
-      [...new Set([readyRpc, initializingRpc].filter((rpc) => rpc !== undefined))].map((rpc) =>
+    const retiringRpc = this.retiringRpc;
+    const closeResults = await Promise.allSettled([
+      ...[...new Set([readyRpc, initializingRpc].filter((rpc) => rpc !== undefined))].map((rpc) =>
         rpc.close(),
       ),
-    );
+      ...(retiringRpc ? [retiringRpc.completion] : []),
+    ]);
     const accountStarting = this.accountStartPromise;
     if (accountStarting) await accountStarting.catch(() => undefined);
     const starting = this.startPromise;
@@ -569,6 +597,7 @@ export class CodexAppServerClient implements CodexPort, AccountAppServerPort {
     if (closeFailure) throw closeFailure.reason;
     this.rpc = undefined;
     this.startingRpc = undefined;
+    this.retiringRpc = undefined;
     this.reasoningEfforts.clear();
     this.activeTurns.clear();
     this.pendingTurnStarts.clear();
@@ -581,6 +610,24 @@ export class CodexAppServerClient implements CodexPort, AccountAppServerPort {
     this.loginController = undefined;
     this.loginVerified = false;
     this.stopping = false;
+  }
+
+  private async awaitRetiringRpc(): Promise<void> {
+    const retiring = this.retiringRpc;
+    if (retiring) await retiring.completion;
+  }
+
+  private trackRetiringRpc(rpc: JsonRpcProcess): void {
+    if (this.retiringRpc?.rpc === rpc) return;
+    const completion = rpc.close();
+    const retiring = { rpc, completion };
+    this.retiringRpc = retiring;
+    void completion.then(
+      () => {
+        if (this.retiringRpc === retiring) this.retiringRpc = undefined;
+      },
+      () => undefined,
+    );
   }
 
   private isCurrent(generation: number): boolean {

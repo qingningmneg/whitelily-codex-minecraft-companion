@@ -259,6 +259,50 @@ export interface ElectronStartupOptions<TWindow extends StartupWindowPort> {
   diagnostic(message: string): void;
   closeToTray?: () => boolean;
   onLifecycleOwned?(): void;
+  onRendererReady?(window: TWindow): void;
+}
+
+const RENDERER_MOUNT_FAILURE_MESSAGE = "WhiteLily renderer did not mount";
+
+export async function waitForRendererReady(options: {
+  probe(): Promise<unknown>;
+  wait?(milliseconds: number): Promise<void>;
+  attempts?: number;
+  deadline?: Promise<void>;
+  timeoutMilliseconds?: number;
+}): Promise<void> {
+  const attempts = options.attempts ?? 120;
+  const wait =
+    options.wait ??
+    ((milliseconds: number) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds)));
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const deadline =
+    options.deadline ??
+    new Promise<void>((resolve) => {
+      timeout = setTimeout(resolve, options.timeoutMilliseconds ?? 30_000);
+    });
+  let stopped = false;
+  const poll = async (): Promise<void> => {
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      if (stopped) return;
+      const ready = await options.probe();
+      if (stopped) return;
+      if (ready === true) return;
+      if (attempt + 1 < attempts) await wait(250);
+    }
+    throw new Error(RENDERER_MOUNT_FAILURE_MESSAGE);
+  };
+  try {
+    await Promise.race([
+      poll(),
+      deadline.then(() => {
+        throw new Error(RENDERER_MOUNT_FAILURE_MESSAGE);
+      }),
+    ]);
+  } finally {
+    stopped = true;
+    if (timeout !== undefined) clearTimeout(timeout);
+  }
 }
 
 const STARTUP_FAILURE_MESSAGE = "WhiteLily Electron startup failed";
@@ -298,7 +342,6 @@ export async function startElectronComposition<TWindow extends StartupWindowPort
     mainWindow = options.createWindow();
     options.configureWindow(mainWindow);
     cleanupIpc = options.registerIpc(mainWindow);
-    tray = options.createTray(mainWindow, lifecycle);
     mainWindow.on(
       "close",
       createCloseToTrayHandler({
@@ -309,7 +352,9 @@ export async function startElectronComposition<TWindow extends StartupWindowPort
     );
     mainWindow.once("closed", cleanup);
     await options.loadWindow(mainWindow);
-    mainWindow.once("ready-to-show", () => mainWindow?.show());
+    options.onRendererReady?.(mainWindow);
+    tray = options.createTray(mainWindow, lifecycle);
+    mainWindow.show();
   } catch {
     try {
       options.diagnostic(STARTUP_FAILURE_MESSAGE);
@@ -407,10 +452,7 @@ export async function runElectronMain(): Promise<void> {
             await startElectronComposition({
               app,
               supervisor: primary.supervisor,
-              createWindow: () => {
-                mainWindow = new BrowserWindow(createMainWindowOptions(primary.preloadPath));
-                return mainWindow;
-              },
+              createWindow: () => new BrowserWindow(createMainWindowOptions(primary.preloadPath)),
               configureWindow: (window) => {
                 const externalUrlHandlers = createExternalUrlHandlers(externalUrlPolicy, (url) =>
                   shell.openExternal(url),
@@ -473,15 +515,25 @@ export async function runElectronMain(): Promise<void> {
                   showWindow: () => showExistingWindow(window),
                   supervisor: primary.supervisor,
                 }),
-              loadWindow: (window) => {
+              loadWindow: async (window) => {
                 if (primary.development) {
-                  return window.loadURL("http://127.0.0.1:5173");
+                  await window.loadURL("http://127.0.0.1:5173");
+                } else {
+                  await window.loadFile(resolve(primary.appPath, "dist-renderer", "index.html"));
                 }
-                return window.loadFile(resolve(primary.appPath, "dist-renderer", "index.html"));
+                await waitForRendererReady({
+                  probe: () =>
+                    window.webContents.executeJavaScript(
+                      'document.querySelector("#root")?.childElementCount > 0',
+                    ),
+                });
               },
               diagnostic: (message) => console.error(message),
               closeToTray: () => closeToTray.value.closeToTray,
               onLifecycleOwned: transferOwnership,
+              onRendererReady: (window) => {
+                mainWindow = window;
+              },
             });
           },
         },

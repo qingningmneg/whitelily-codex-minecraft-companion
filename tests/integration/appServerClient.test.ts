@@ -5,6 +5,7 @@ import {
   type CodexAppServerClientDependencies,
   type LoginStatusResult,
 } from "../../src/codex/appServerClient.js";
+import { AccountService } from "../../src/codex/accountService.js";
 import type { AppConfig } from "../../src/config/schema.js";
 import { createJsonRpcLineTransportHarness } from "../support/jsonRpcProcessHarness.js";
 
@@ -772,6 +773,266 @@ describe("CodexAppServerClient", () => {
     });
     expect(loginChecks).toBe(0);
     await client.stop();
+  });
+
+  it("closes a silent account read before the desktop request deadline", async () => {
+    vi.useFakeTimers();
+    try {
+      const harness = createJsonRpcLineTransportHarness();
+      const deps = dependencies(harness);
+      deps.requestTimeoutMs = 30_000;
+      deps.accountReadTimeoutMs = 8_000;
+      const client = new CodexAppServerClient(config, deps);
+
+      const starting = client.startAccountSession();
+      await expect(harness.nextSent()).resolves.toMatchObject({
+        id: 1,
+        method: "initialize",
+      });
+      harness.receive({ id: 1, result: initialized });
+      await starting;
+      await harness.nextSent();
+
+      const reading = client.readAccount();
+      await expect(harness.nextSent()).resolves.toMatchObject({
+        id: 2,
+        method: "account/read",
+      });
+      const outcome = reading.catch((error: unknown) => error);
+      await vi.advanceTimersByTimeAsync(7_999);
+      expect(harness.closed()).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+
+      await expect(outcome).resolves.toMatchObject({
+        message: expect.stringContaining("account/read"),
+      });
+      expect(harness.closed()).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("returns a pending login snapshot before a silent account read can reach the desktop deadline", async () => {
+    vi.useFakeTimers();
+    try {
+      const harness = createJsonRpcLineTransportHarness();
+      const deps = dependencies(harness);
+      deps.requestTimeoutMs = 1_000;
+      deps.accountReadTimeoutMs = 25;
+      const client = new CodexAppServerClient(config, deps);
+      const service = new AccountService(client, {
+        createAttemptId: () => "attempt-bounded-read",
+      });
+
+      const login = service.startChatGptLogin();
+      await expect(harness.nextSent()).resolves.toMatchObject({
+        id: 1,
+        method: "initialize",
+      });
+      harness.receive({ id: 1, result: initialized });
+      await expect(harness.nextSent()).resolves.toEqual({ method: "initialized", params: {} });
+      await expect(harness.nextSent()).resolves.toMatchObject({
+        id: 2,
+        method: "account/login/start",
+      });
+      harness.receive({
+        id: 2,
+        result: {
+          type: "chatgpt",
+          loginId: "server-login-bounded",
+          authUrl: "https://auth.openai.com/oauth/authorize?state=bounded",
+        },
+      });
+      await login;
+
+      let settled = false;
+      const reading = service.getAccount().finally(() => {
+        settled = true;
+      });
+      await expect(harness.nextSent()).resolves.toMatchObject({
+        id: 3,
+        method: "account/read",
+      });
+      await vi.advanceTimersByTimeAsync(24);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+
+      await expect(reading).resolves.toMatchObject({
+        status: "pending",
+        attemptId: "attempt-bounded-read",
+      });
+      expect(harness.closed()).toBe(true);
+      await service.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not reconnect until a timed-out app server has confirmed termination", async () => {
+    vi.useFakeTimers();
+    try {
+      const first = createJsonRpcLineTransportHarness();
+      const second = createJsonRpcLineTransportHarness();
+      let resolveClose!: () => void;
+      const closeFinished = new Promise<void>((resolve) => {
+        resolveClose = resolve;
+      });
+      first.transport.close = () => closeFinished;
+      const transports = [first, second];
+      let createCalls = 0;
+      const client = new CodexAppServerClient(config, {
+        ...dependencies(first),
+        accountReadTimeoutMs: 25,
+        createTransport: async () => transports[createCalls++]!.transport,
+      });
+
+      const starting = client.startAccountSession();
+      await expect(first.nextSent()).resolves.toMatchObject({ method: "initialize" });
+      first.receive({ id: 1, result: initialized });
+      await starting;
+      await first.nextSent();
+      const firstRead = client.readAccount();
+      await expect(first.nextSent()).resolves.toMatchObject({ method: "account/read" });
+      const firstOutcome = firstRead.catch((error: unknown) => error);
+      await vi.advanceTimersByTimeAsync(25);
+      await expect(firstOutcome).resolves.toMatchObject({
+        message: expect.stringContaining("account/read"),
+      });
+
+      const secondRead = client.readAccount();
+      await flushMicrotasks();
+      expect(createCalls).toBe(1);
+      expect(second.sent()).toHaveLength(0);
+
+      resolveClose();
+      await flushMicrotasks();
+      expect(createCalls).toBe(2);
+      await expect(second.nextSent()).resolves.toMatchObject({ method: "initialize" });
+      second.receive({ id: 1, result: initialized });
+      await expect(second.nextSent()).resolves.toEqual({ method: "initialized", params: {} });
+      await expect(second.nextSent()).resolves.toMatchObject({ method: "account/read" });
+      second.receive({
+        id: 2,
+        result: { account: null, requiresOpenaiAuth: true },
+      });
+      await expect(secondRead).resolves.toEqual({
+        account: null,
+        requiresOpenaiAuth: true,
+      });
+      await client.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("waits for timed-out app-server termination and reports a termination failure from stop", async () => {
+    vi.useFakeTimers();
+    try {
+      const harness = createJsonRpcLineTransportHarness();
+      let rejectClose!: (error: Error) => void;
+      const closeFinished = new Promise<void>((_resolve, reject) => {
+        rejectClose = reject;
+      });
+      harness.transport.close = () => closeFinished;
+      const client = new CodexAppServerClient(config, {
+        ...dependencies(harness),
+        accountReadTimeoutMs: 25,
+      });
+
+      const starting = client.startAccountSession();
+      await expect(harness.nextSent()).resolves.toMatchObject({ method: "initialize" });
+      harness.receive({ id: 1, result: initialized });
+      await starting;
+      await harness.nextSent();
+      const reading = client.readAccount();
+      await expect(harness.nextSent()).resolves.toMatchObject({ method: "account/read" });
+      const readOutcome = reading.catch((error: unknown) => error);
+      await vi.advanceTimersByTimeAsync(25);
+      await expect(readOutcome).resolves.toMatchObject({
+        message: expect.stringContaining("account/read"),
+      });
+
+      let stopSettled = false;
+      const stopping = client.stop().finally(() => {
+        stopSettled = true;
+      });
+      await flushMicrotasks();
+      expect(stopSettled).toBe(false);
+
+      rejectClose(new Error("cannot terminate old app server"));
+      await expect(stopping).rejects.toThrow("cannot terminate old app server");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not reconnect until an externally exited app server has confirmed termination", async () => {
+    const first = createJsonRpcLineTransportHarness();
+    const second = createJsonRpcLineTransportHarness();
+    let resolveClose!: () => void;
+    const closeFinished = new Promise<void>((resolve) => {
+      resolveClose = resolve;
+    });
+    first.transport.close = () => closeFinished;
+    const transports = [first, second];
+    let createCalls = 0;
+    const client = new CodexAppServerClient(config, {
+      ...dependencies(first),
+      createTransport: async () => transports[createCalls++]!.transport,
+    });
+
+    const starting = client.startAccountSession();
+    await expect(first.nextSent()).resolves.toMatchObject({ method: "initialize" });
+    first.receive({ id: 1, result: initialized });
+    await starting;
+    await first.nextSent();
+    first.exit(new Error("old app server exited"));
+
+    const reading = client.readAccount();
+    await flushMicrotasks();
+    expect(createCalls).toBe(1);
+    expect(second.sent()).toHaveLength(0);
+
+    resolveClose();
+    await flushMicrotasks();
+    expect(createCalls).toBe(2);
+    await expect(second.nextSent()).resolves.toMatchObject({ method: "initialize" });
+    second.receive({ id: 1, result: initialized });
+    await expect(second.nextSent()).resolves.toEqual({ method: "initialized", params: {} });
+    await expect(second.nextSent()).resolves.toMatchObject({ method: "account/read" });
+    second.receive({ id: 2, result: { account: null, requiresOpenaiAuth: true } });
+    await expect(reading).resolves.toEqual({
+      account: null,
+      requiresOpenaiAuth: true,
+    });
+    await client.stop();
+  });
+
+  it("reports external app-server termination failure from stop", async () => {
+    const harness = createJsonRpcLineTransportHarness();
+    let rejectClose!: (error: Error) => void;
+    const closeFinished = new Promise<void>((_resolve, reject) => {
+      rejectClose = reject;
+    });
+    harness.transport.close = () => closeFinished;
+    const client = new CodexAppServerClient(config, dependencies(harness));
+
+    const starting = client.startAccountSession();
+    await expect(harness.nextSent()).resolves.toMatchObject({ method: "initialize" });
+    harness.receive({ id: 1, result: initialized });
+    await starting;
+    await harness.nextSent();
+    harness.exit(new Error("old app server exited"));
+
+    let stopSettled = false;
+    const stopping = client.stop().finally(() => {
+      stopSettled = true;
+    });
+    await flushMicrotasks();
+    expect(stopSettled).toBe(false);
+
+    rejectClose(new Error("external app-server termination failed"));
+    await expect(stopping).rejects.toThrow("external app-server termination failed");
   });
 
   it("keeps concurrent account starts and account/model requests behind initialize", async () => {

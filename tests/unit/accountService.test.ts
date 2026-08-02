@@ -103,6 +103,62 @@ describe("AccountService", () => {
     await service.stop();
   });
 
+  it("reconciles saved ChatGPT authentication when the completion notification is missed", async () => {
+    let signedIn = false;
+    const port = createPort({
+      readAccount: vi.fn(async () => ({
+        account: signedIn
+          ? {
+              type: "chatgpt" as const,
+              email: null,
+              planType: "plus" as const,
+            }
+          : null,
+        requiresOpenaiAuth: true,
+      })),
+    });
+    const service = new AccountService(port, {
+      createAttemptId: () => "attempt-missed-notification",
+    });
+    await service.startChatGptLogin();
+
+    await expect(service.getAccount()).resolves.toMatchObject({ status: "pending" });
+    signedIn = true;
+
+    await expect(service.getAccount()).resolves.toEqual({
+      status: "signed_in",
+      auth: "chatgpt",
+    });
+    expect(port.readAccount).toHaveBeenCalledTimes(2);
+    await service.stop();
+  });
+
+  it("keeps a pending login retryable after account status is temporarily unavailable", async () => {
+    const readAccount = vi
+      .fn<AccountAppServerPort["readAccount"]>()
+      .mockRejectedValueOnce(new Error("transport timed out"))
+      .mockResolvedValueOnce({
+        account: {
+          type: "chatgpt" as const,
+          email: null,
+          planType: "plus" as const,
+        },
+        requiresOpenaiAuth: true,
+      });
+    const service = new AccountService(createPort({ readAccount }), {
+      createAttemptId: () => "attempt-transient-read",
+    });
+    await service.startChatGptLogin();
+
+    await expect(service.getAccount()).resolves.toMatchObject({ status: "pending" });
+    await expect(service.getAccount()).resolves.toEqual({
+      status: "signed_in",
+      auth: "chatgpt",
+    });
+    expect(readAccount).toHaveBeenCalledTimes(2);
+    await service.stop();
+  });
+
   it("cancels the current attempt idempotently", async () => {
     const port = createPort();
     const service = new AccountService(port, {

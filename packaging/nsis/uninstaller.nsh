@@ -173,7 +173,7 @@
     whitelily_delete_exact_root:
       ; GetFullPathName is lexical. Refuse real reparse points and then compare
       ; paths resolved from Windows directory handles before recursive deletion.
-      System::Call 'kernel32::GetFileAttributesW(w "$WhiteLilyCanonicalDeleteTarget") i.r0'
+      System::Call 'kernel32::GetFileAttributesW(w "$WhiteLilyCanonicalDeleteTarget") i.R0'
       ${If} $R0 == ${WHITE_LILY_INVALID_FILE_ATTRIBUTES}
         Return
       ${EndIf}
@@ -186,7 +186,7 @@
         Return
       ${EndIf}
 
-      System::Call 'kernel32::GetFileAttributesW(w "$LOCALAPPDATA") i.r0'
+      System::Call 'kernel32::GetFileAttributesW(w "$LOCALAPPDATA") i.R0'
       ${If} $R0 == ${WHITE_LILY_INVALID_FILE_ATTRIBUTES}
         Return
       ${EndIf}
@@ -199,13 +199,13 @@
         Return
       ${EndIf}
 
-      System::Call 'kernel32::CreateFileW(w "$WhiteLilyCanonicalDeleteTarget", i 0, i ${WHITE_LILY_FILE_SHARE_ALL}, p 0, i ${WHITE_LILY_OPEN_EXISTING}, i ${WHITE_LILY_FILE_FLAG_BACKUP_SEMANTICS}, p 0) p.r0'
+      System::Call 'kernel32::CreateFileW(w "$WhiteLilyCanonicalDeleteTarget", i 0, i ${WHITE_LILY_FILE_SHARE_ALL}, p 0, i ${WHITE_LILY_OPEN_EXISTING}, i ${WHITE_LILY_FILE_FLAG_BACKUP_SEMANTICS}, p 0) p.R0'
       StrCpy $WhiteLilyDirectoryHandle $R0
       ${If} $WhiteLilyDirectoryHandle == ${WHITE_LILY_INVALID_HANDLE_VALUE}
         Return
       ${EndIf}
-      System::Call 'kernel32::GetFinalPathNameByHandleW(p r0, w .r1, i ${NSIS_MAX_STRLEN}, i 0) i.r2'
-      System::Call 'kernel32::CloseHandle(p r0) i.r3'
+      System::Call 'kernel32::GetFinalPathNameByHandleW(p R0, w .R1, i ${NSIS_MAX_STRLEN}, i 0) i.R2'
+      System::Call 'kernel32::CloseHandle(p R0) i.R3'
       ${If} $R2 == 0
         Return
       ${EndIf}
@@ -214,13 +214,13 @@
       ${EndIf}
       StrCpy $WhiteLilyResolvedDeleteTarget "$R1"
 
-      System::Call 'kernel32::CreateFileW(w "$LOCALAPPDATA", i 0, i ${WHITE_LILY_FILE_SHARE_ALL}, p 0, i ${WHITE_LILY_OPEN_EXISTING}, i ${WHITE_LILY_FILE_FLAG_BACKUP_SEMANTICS}, p 0) p.r0'
+      System::Call 'kernel32::CreateFileW(w "$LOCALAPPDATA", i 0, i ${WHITE_LILY_FILE_SHARE_ALL}, p 0, i ${WHITE_LILY_OPEN_EXISTING}, i ${WHITE_LILY_FILE_FLAG_BACKUP_SEMANTICS}, p 0) p.R0'
       StrCpy $WhiteLilyDirectoryHandle $R0
       ${If} $WhiteLilyDirectoryHandle == ${WHITE_LILY_INVALID_HANDLE_VALUE}
         Return
       ${EndIf}
-      System::Call 'kernel32::GetFinalPathNameByHandleW(p r0, w .r1, i ${NSIS_MAX_STRLEN}, i 0) i.r2'
-      System::Call 'kernel32::CloseHandle(p r0) i.r3'
+      System::Call 'kernel32::GetFinalPathNameByHandleW(p R0, w .R1, i ${NSIS_MAX_STRLEN}, i 0) i.R2'
+      System::Call 'kernel32::CloseHandle(p R0) i.R3'
       ${If} $R2 == 0
         Return
       ${EndIf}

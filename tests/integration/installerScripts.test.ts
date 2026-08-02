@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { spawnSync, type SpawnSyncReturns } from "node:child_process";
+import { spawn, spawnSync, type SpawnSyncReturns } from "node:child_process";
 import { copyFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
@@ -108,6 +108,135 @@ async function createTemporaryRoot(prefix: string): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), prefix));
   temporaryRoots.push(root);
   return root;
+}
+
+async function createDelegatingSandboxLauncher(root: string): Promise<string> {
+  const system32 = join(root, "System32");
+  const sourcePath = join(root, "FakeWindowsSandbox.cs");
+  const compilerPath = join(root, "compile-fake-sandbox.ps1");
+  const executablePath = join(system32, "WindowsSandbox.exe");
+  await mkdir(system32, { recursive: true });
+  await writeFile(
+    sourcePath,
+    String.raw`
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Text.RegularExpressions;
+using System.Threading;
+using System.Xml.Linq;
+
+public static class FakeWindowsSandbox {
+    private static string Quote(string value) {
+        return "\"" + value.Replace("\"", "\\\"") + "\"";
+    }
+
+    public static int Main(string[] args) {
+        try {
+            if (args.Length == 4 && StringComparer.Ordinal.Equals(args[0], "--worker")) {
+                Thread.Sleep(5000);
+                var requestedError = Environment.GetEnvironmentVariable(
+                    "WHITELILY_FAKE_SANDBOX_REPORT_ERROR"
+                );
+                var report = String.IsNullOrWhiteSpace(requestedError)
+                    ? "{\"schemaVersion\":1,\"installerSha256\":\"" + args[3] +
+                        "\",\"success\":true,\"stages\":[\"isolated_path\",\"hash_verified\",\"installed\",\"launched_without_system_tooling\",\"keep_data\",\"reinstalled\",\"delete_data\"],\"error\":null}\n"
+                    : "{\"schemaVersion\":1,\"installerSha256\":\"" + args[3] +
+                        "\",\"success\":false,\"stages\":[],\"error\":\"" + requestedError + "\"}\n";
+                var holdMilliseconds = 0;
+                Int32.TryParse(
+                    Environment.GetEnvironmentVariable("WHITELILY_FAKE_SANDBOX_HOLD_MS"),
+                    out holdMilliseconds
+                );
+                using (var mappingLock = holdMilliseconds > 0
+                    ? new FileStream(
+                        Path.Combine(args[2], "guest-lifecycle.ps1"),
+                        FileMode.Open,
+                        FileAccess.Read,
+                        FileShare.Read
+                    )
+                    : null) {
+                    File.WriteAllText(Path.Combine(args[2], "sandbox-result.json"), report);
+                    if (holdMilliseconds > 0) {
+                        Thread.Sleep(holdMilliseconds);
+                    }
+                }
+                return 0;
+            }
+
+            var configuration = XDocument.Load(args[0]);
+            var reportRoot = configuration
+                .Descendants("MappedFolder")
+                .Select(folder => (string)folder.Element("HostFolder"))
+                .Last();
+            var command = configuration.Descendants("Command").Single().Value;
+            var hash = Regex.Match(
+                command,
+                "-InstallerSha256 \\\"(?<hash>[0-9a-f]{64})\\\"",
+                RegexOptions.CultureInvariant
+            ).Groups["hash"].Value;
+            if (String.IsNullOrWhiteSpace(reportRoot) || hash.Length != 64) {
+                return 2;
+            }
+            var capturePath = Environment.GetEnvironmentVariable(
+                "WHITELILY_FAKE_SANDBOX_CAPTURE_GUEST"
+            );
+            if (!String.IsNullOrWhiteSpace(capturePath)) {
+                File.Copy(
+                    Path.Combine(reportRoot, "guest-lifecycle.ps1"),
+                    capturePath,
+                    true
+                );
+            }
+
+            var executable = Path.Combine(
+                Path.GetDirectoryName(Process.GetCurrentProcess().MainModule.FileName),
+                "WindowsSandboxRemoteSession.exe"
+            );
+            Process.Start(new ProcessStartInfo {
+                FileName = executable,
+                Arguments = "--worker " + Quote(args[0]) + " " + Quote(reportRoot) + " " + hash,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                WindowStyle = ProcessWindowStyle.Hidden,
+            });
+            return 0;
+        } catch (Exception error) {
+            Console.Error.WriteLine(error);
+            return 1;
+        }
+    }
+}
+`,
+    "utf8",
+  );
+  await writeFile(
+    compilerPath,
+    [
+      "param(",
+      "    [Parameter(Mandatory = $true)][string]$SourcePath,",
+      "    [Parameter(Mandatory = $true)][string]$OutputPath",
+      ")",
+      "$ErrorActionPreference = 'Stop'",
+      "Add-Type -TypeDefinition ([IO.File]::ReadAllText($SourcePath)) -Language CSharp -ReferencedAssemblies @('System.Xml.dll', 'System.Xml.Linq.dll') -OutputAssembly $OutputPath -OutputType ConsoleApplication",
+      "",
+    ].join("\r\n"),
+    "utf8",
+  );
+  const compile = runPowerShell(compilerPath, [
+    "-SourcePath",
+    sourcePath,
+    "-OutputPath",
+    executablePath,
+  ]);
+  if (compile.status !== 0) {
+    throw new Error(
+      `could not compile fake Sandbox launcher:\n${compile.stdout}\n${compile.stderr}`,
+    );
+  }
+  await copyFile(executablePath, join(system32, "WindowsSandboxRemoteSession.exe"));
+  return executablePath;
 }
 
 async function writeFixtureFile(root: string, portablePath: string, value: string): Promise<void> {
@@ -425,7 +554,7 @@ describe("WhiteLily installer packaging scripts", () => {
 
     expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
     expect(result.stdout.trim()).toBe("0");
-  });
+  }, 20_000);
 
   it("rejects a non-canonical semantic version before invoking the build", async () => {
     const fixture = await createRepositoryFixture();
@@ -520,6 +649,816 @@ describe("WhiteLily installer inspection", () => {
 });
 
 describe("WhiteLily isolated installer lifecycle", () => {
+  it("requires a real WhiteLily window and rejects any Error window from the app process", async () => {
+    const root = await createTemporaryRoot("whitelily-smoke-window-");
+    const sourcePath = join(root, "SmokeWindowFixture.cs");
+    const compilerPath = join(root, "compile-smoke-window.ps1");
+    const fixturePath = join(root, "SmokeWindowFixture.exe");
+    await writeFile(
+      sourcePath,
+      String.raw`
+using System;
+using System.Windows.Forms;
+
+public static class SmokeWindowFixture {
+    [STAThread]
+    public static int Main(string[] args) {
+        var mode = args.Length == 0 ? "white" : args[0];
+        if (StringComparer.Ordinal.Equals(mode, "exit")) return 0;
+        Application.EnableVisualStyles();
+        var main = new Form {
+            Text = StringComparer.Ordinal.Equals(mode, "error")
+                ? "Error"
+                : StringComparer.Ordinal.Equals(mode, "blank") ? "" : "WhiteLily",
+            Width = 320,
+            Height = 200,
+            ShowInTaskbar = true
+        };
+        Form error = null;
+        if (StringComparer.Ordinal.Equals(mode, "both")) {
+            main.Shown += (sender, eventArgs) => {
+                error = new Form { Text = "Error", Width = 240, Height = 120 };
+                error.Show(main);
+            };
+        }
+        Application.Run(main);
+        if (error != null) error.Dispose();
+        return 0;
+    }
+}
+`,
+      "utf8",
+    );
+    await writeFile(
+      compilerPath,
+      [
+        "param(",
+        "    [Parameter(Mandatory = $true)][string]$SourcePath,",
+        "    [Parameter(Mandatory = $true)][string]$OutputPath",
+        ")",
+        "$ErrorActionPreference = 'Stop'",
+        "Add-Type -TypeDefinition ([IO.File]::ReadAllText($SourcePath)) -Language CSharp -ReferencedAssemblies @('System.Windows.Forms.dll', 'System.Drawing.dll') -OutputAssembly $OutputPath -OutputType WindowsApplication",
+        "",
+      ].join("\r\n"),
+      "utf8",
+    );
+    const compilation = runPowerShell(compilerPath, [
+      "-SourcePath",
+      sourcePath,
+      "-OutputPath",
+      fixturePath,
+    ]);
+    expect(compilation.status, `${compilation.stdout}\n${compilation.stderr}`).toBe(0);
+
+    const harness = join(root, "verify-smoke-window.ps1");
+    await writeFile(
+      harness,
+      [
+        "param(",
+        "    [Parameter(Mandatory = $true)][string]$LifecycleScript,",
+        "    [Parameter(Mandatory = $true)][string]$FixturePath",
+        ")",
+        "$ErrorActionPreference = 'Stop'",
+        "$scriptText = [IO.File]::ReadAllText($LifecycleScript)",
+        "$guestMatch = [regex]::Match($scriptText, \"(?s)\\$guestScript = @'\\r?\\n(?<guest>.*?)\\r?\\n'@\")",
+        "if (-not $guestMatch.Success) { throw 'GUEST_SCRIPT_MISSING' }",
+        "$guestText = $guestMatch.Groups['guest'].Value",
+        "$typeMatch = [regex]::Match($guestText, '(?s)Add-Type -TypeDefinition @\"\\r?\\n(?<code>.*?public static class WhiteLilySmokeWindows.*?)\\r?\\n\"@')",
+        "if (-not $typeMatch.Success) { throw 'SMOKE_WINDOW_ENUMERATOR_MISSING' }",
+        "Add-Type -TypeDefinition $typeMatch.Groups['code'].Value",
+        "$tokens = $null",
+        "$errors = $null",
+        "$ast = [Management.Automation.Language.Parser]::ParseInput($guestText, [ref]$tokens, [ref]$errors)",
+        "$functionAst = $ast.Find({",
+        "    param($node)",
+        "    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and",
+        "        $node.Name -eq 'Wait-WhiteLilyMainWindow'",
+        "}, $true)",
+        "if ($null -eq $functionAst) { throw 'SMOKE_WINDOW_WAIT_MISSING' }",
+        "Invoke-Expression $functionAst.Extent.Text",
+        "function Invoke-WindowCase {",
+        "    param([string]$Mode, [int]$TimeoutMilliseconds)",
+        "    $process = Start-Process -FilePath $FixturePath -ArgumentList @($Mode) -PassThru",
+        "    try {",
+        "        Wait-WhiteLilyMainWindow $process -TimeoutMilliseconds $TimeoutMilliseconds",
+        "        return 'success'",
+        "    } catch {",
+        "        return $_.Exception.Message",
+        "    } finally {",
+        "        if (-not $process.HasExited) { $process.Kill(); $process.WaitForExit() }",
+        "        $process.Dispose()",
+        "    }",
+        "}",
+        "$results = [ordered]@{",
+        "    white = Invoke-WindowCase 'white' 3000",
+        "    error = Invoke-WindowCase 'error' 3000",
+        "    both = Invoke-WindowCase 'both' 3000",
+        "    exit = Invoke-WindowCase 'exit' 3000",
+        "    blank = Invoke-WindowCase 'blank' 500",
+        "}",
+        "$results | ConvertTo-Json -Compress",
+        "",
+      ].join("\r\n"),
+      "utf8",
+    );
+
+    const verification = runPowerShell(harness, [
+      "-LifecycleScript",
+      lifecycleScript,
+      "-FixturePath",
+      fixturePath,
+    ]);
+    expect(verification.status, `${verification.stdout}\n${verification.stderr}`).toBe(0);
+    expect(JSON.parse(verification.stdout)).toEqual({
+      white: "success",
+      error: "installer smoke application displayed an error window",
+      both: "installer smoke application displayed an error window",
+      exit: "installer smoke application exited before opening its main window: 0",
+      blank: "installer smoke application did not open the WhiteLily main window",
+    });
+  }, 180_000);
+
+  it("requires stable identity before terminating a bound Sandbox remote session", async () => {
+    const root = await createTemporaryRoot("whitelily-session-identity-");
+    const harness = join(root, "verify-session-identity.ps1");
+    await writeFile(
+      harness,
+      [
+        "param([Parameter(Mandatory = $true)][string]$LifecycleScript)",
+        "$ErrorActionPreference = 'Stop'",
+        "$tokens = $null",
+        "$errors = $null",
+        "$ast = [Management.Automation.Language.Parser]::ParseFile($LifecycleScript, [ref]$tokens, [ref]$errors)",
+        "$functionAst = $ast.Find({",
+        "    param($node)",
+        "    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and",
+        "        $node.Name -eq 'Test-SandboxRemoteSessionIdentity'",
+        "}, $true)",
+        "if ($null -eq $functionAst) { throw 'SESSION_IDENTITY_CHECK_MISSING' }",
+        "Invoke-Expression $functionAst.Extent.Text",
+        "$configuration = 'C:\\build\\run\\WhiteLily-installer-lifecycle.wsb'",
+        "$expected = [pscustomobject]@{",
+        "    ProcessId = 1234",
+        "    Name = 'WindowsSandboxRemoteSession.exe'",
+        "    CreationDate = [datetime]'2026-08-02T12:00:00Z'",
+        "    ExecutablePath = 'C:\\Program Files\\WindowsApps\\WindowsSandboxRemoteSession.exe'",
+        "    CommandLine = '\"C:\\Program Files\\WindowsApps\\WindowsSandboxRemoteSession.exe\" ' + $configuration",
+        "}",
+        "$same = [pscustomobject]@{}",
+        "$expected.psobject.Properties | ForEach-Object { $same | Add-Member -NotePropertyName $_.Name -NotePropertyValue $_.Value }",
+        "$reusedPid = $same.psobject.Copy()",
+        "$reusedPid.CreationDate = [datetime]'2026-08-02T12:00:01Z'",
+        "$differentCommand = $same.psobject.Copy()",
+        "$differentCommand.CommandLine = '\"C:\\Program Files\\WindowsApps\\WindowsSandboxRemoteSession.exe\" C:\\other.wsb'",
+        "$differentExecutable = $same.psobject.Copy()",
+        "$differentExecutable.ExecutablePath = 'C:\\Temp\\WindowsSandboxRemoteSession.exe'",
+        "$values = @(",
+        "    Test-SandboxRemoteSessionIdentity -Expected $expected -Current $same -ConfigurationPath $configuration",
+        "    Test-SandboxRemoteSessionIdentity -Expected $expected -Current $reusedPid -ConfigurationPath $configuration",
+        "    Test-SandboxRemoteSessionIdentity -Expected $expected -Current $differentCommand -ConfigurationPath $configuration",
+        "    Test-SandboxRemoteSessionIdentity -Expected $expected -Current $differentExecutable -ConfigurationPath $configuration",
+        ")",
+        "[Console]::Out.WriteLine(($values -join ','))",
+        "",
+      ].join("\r\n"),
+      "utf8",
+    );
+
+    const result = runPowerShell(harness, ["-LifecycleScript", lifecycleScript]);
+
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(result.stdout.trim()).toBe("True,False,False,False");
+  });
+
+  it("waits for a delegated Sandbox session after the launcher exits successfully", async () => {
+    const fixture = await createRepositoryFixture();
+    const releaseInstaller = join(fixture.root, "release", installerName);
+    await mkdir(dirname(releaseInstaller), { recursive: true });
+    await copyFile(fixture.installer, releaseInstaller);
+    const fakeWindowsRoot = await createTemporaryRoot("whitelily-fake-windows-");
+    await createDelegatingSandboxLauncher(fakeWindowsRoot);
+
+    const result = runPowerShell(
+      join(fixture.root, "scripts", "test-installer.ps1"),
+      ["-InstallerPath", releaseInstaller],
+      {
+        cwd: fixture.root,
+        env: {
+          ...fixture.environment,
+          WINDIR: fakeWindowsRoot,
+        },
+        timeout: 120_000,
+      },
+    );
+
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    const report = JSON.parse(
+      await readFile(
+        join(fixture.root, "release", `WhiteLily-${version}-windows-x64-installer-lifecycle.json`),
+        "utf8",
+      ),
+    ) as { success?: boolean; stages?: string[] };
+    expect(report).toMatchObject({
+      success: true,
+      stages: [
+        "isolated_path",
+        "hash_verified",
+        "installed",
+        "launched_without_system_tooling",
+        "keep_data",
+        "reinstalled",
+        "delete_data",
+      ],
+    });
+  }, 180_000);
+
+  it("waits for the Sandbox mapping to close before removing lifecycle artifacts", async () => {
+    const fixture = await createRepositoryFixture();
+    const releaseInstaller = join(fixture.root, "release", installerName);
+    await mkdir(dirname(releaseInstaller), { recursive: true });
+    await copyFile(fixture.installer, releaseInstaller);
+    const fakeWindowsRoot = await createTemporaryRoot("whitelily-fake-windows-");
+    await createDelegatingSandboxLauncher(fakeWindowsRoot);
+    const lockerScript = join(fixture.root, "hold-sandbox-mapping.ps1");
+    const lockerReady = join(fixture.root, "sandbox-mapping-lock.ready");
+    await writeFile(
+      lockerScript,
+      [
+        "param(",
+        "    [Parameter(Mandatory = $true)][string]$BuildRoot,",
+        "    [Parameter(Mandatory = $true)][string]$ReadyPath",
+        ")",
+        "$ErrorActionPreference = 'Stop'",
+        "$deadline = [DateTime]::UtcNow.AddSeconds(30)",
+        "$target = $null",
+        "do {",
+        "    $target = Get-ChildItem -LiteralPath $BuildRoot -File -Recurse -Filter 'guest-lifecycle.ps1' -ErrorAction SilentlyContinue | Select-Object -First 1",
+        "    if ($null -ne $target) { break }",
+        "    Start-Sleep -Milliseconds 50",
+        "} while ([DateTime]::UtcNow -lt $deadline)",
+        "if ($null -eq $target) { throw 'LOCK_TARGET_NOT_FOUND' }",
+        "$stream = [IO.File]::Open($target.FullName, 'Open', 'Read', 'Read')",
+        "try {",
+        "    [IO.File]::WriteAllText($ReadyPath, $target.FullName)",
+        "    Start-Sleep -Seconds 12",
+        "} finally { $stream.Dispose() }",
+        "",
+      ].join("\r\n"),
+      "utf8",
+    );
+    const locker = spawn(
+      "powershell.exe",
+      [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        lockerScript,
+        "-BuildRoot",
+        join(fixture.root, "build"),
+        "-ReadyPath",
+        lockerReady,
+      ],
+      { windowsHide: true, stdio: "ignore" },
+    );
+    let result: CommandResult;
+    try {
+      result = runPowerShell(
+        join(fixture.root, "scripts", "test-installer.ps1"),
+        ["-InstallerPath", releaseInstaller],
+        {
+          cwd: fixture.root,
+          env: {
+            ...fixture.environment,
+            WINDIR: fakeWindowsRoot,
+          },
+          timeout: 120_000,
+        },
+      );
+    } finally {
+      locker.kill();
+    }
+
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    await expect(readFile(lockerReady, "utf8")).resolves.toContain("guest-lifecycle.ps1");
+    await expect(readdir(join(fixture.root, "build"))).resolves.not.toContainEqual(
+      expect.stringMatching(/^installer-sandbox-/u),
+    );
+  }, 180_000);
+
+  it("closes the remote Sandbox session bound to the lifecycle configuration", async () => {
+    const fixture = await createRepositoryFixture();
+    const releaseInstaller = join(fixture.root, "release", installerName);
+    await mkdir(dirname(releaseInstaller), { recursive: true });
+    await copyFile(fixture.installer, releaseInstaller);
+    const fakeWindowsRoot = await createTemporaryRoot("whitelily-fake-windows-");
+    await createDelegatingSandboxLauncher(fakeWindowsRoot);
+
+    const result = runPowerShell(
+      join(fixture.root, "scripts", "test-installer.ps1"),
+      ["-InstallerPath", releaseInstaller],
+      {
+        cwd: fixture.root,
+        env: {
+          ...fixture.environment,
+          WINDIR: fakeWindowsRoot,
+          WHITELILY_FAKE_SANDBOX_HOLD_MS: "35000",
+        },
+        timeout: 120_000,
+      },
+    );
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 6000));
+
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    await expect(readdir(join(fixture.root, "build"))).resolves.not.toContainEqual(
+      expect.stringMatching(/^installer-sandbox-/u),
+    );
+  }, 180_000);
+
+  it("does not close a Sandbox remote session bound to another configuration", async () => {
+    const fixture = await createRepositoryFixture();
+    const releaseInstaller = join(fixture.root, "release", installerName);
+    await mkdir(dirname(releaseInstaller), { recursive: true });
+    await copyFile(fixture.installer, releaseInstaller);
+    const fakeWindowsRoot = await createTemporaryRoot("whitelily-fake-windows-");
+    const sandboxLauncher = await createDelegatingSandboxLauncher(fakeWindowsRoot);
+    const unrelatedRoot = await createTemporaryRoot("whitelily-unrelated-sandbox-");
+    const unrelatedReportRoot = join(unrelatedRoot, "report");
+    const unrelatedConfiguration = join(unrelatedRoot, "Unrelated.wsb");
+    await mkdir(unrelatedReportRoot, { recursive: true });
+    await writeFile(join(unrelatedReportRoot, "guest-lifecycle.ps1"), "# unrelated\n", "utf8");
+    await writeFile(unrelatedConfiguration, "<Configuration />\n", "utf8");
+    const identityScript = join(unrelatedRoot, "get-process-identity.ps1");
+    await writeFile(
+      identityScript,
+      [
+        "param([Parameter(Mandatory = $true)][int]$ProcessId)",
+        "$ErrorActionPreference = 'Stop'",
+        "$deadline = [DateTime]::UtcNow.AddSeconds(5)",
+        "$current = $null",
+        "do {",
+        '    $current = Get-CimInstance Win32_Process -Filter "ProcessId = $ProcessId" -ErrorAction Stop',
+        "    if ($null -ne $current) { break }",
+        "    Start-Sleep -Milliseconds 50",
+        "} while ([DateTime]::UtcNow -lt $deadline)",
+        "if ($null -eq $current) { throw 'PROCESS_NOT_FOUND' }",
+        "[pscustomobject]@{",
+        "    ProcessId = [int]$current.ProcessId",
+        "    Name = [string]$current.Name",
+        "    CreationDate = $current.CreationDate",
+        "    ExecutablePath = [string]$current.ExecutablePath",
+        "    CommandLine = [string]$current.CommandLine",
+        "} | ConvertTo-Json -Compress",
+        "",
+      ].join("\r\n"),
+      "utf8",
+    );
+    const unrelated = spawn(
+      join(dirname(sandboxLauncher), "WindowsSandboxRemoteSession.exe"),
+      ["--worker", unrelatedConfiguration, unrelatedReportRoot, "a".repeat(64)],
+      {
+        env: {
+          ...fixture.environment,
+          WHITELILY_FAKE_SANDBOX_HOLD_MS: "30000",
+        },
+        windowsHide: true,
+        stdio: "ignore",
+      },
+    );
+
+    try {
+      const initialIdentityResult = runPowerShell(identityScript, [
+        "-ProcessId",
+        String(unrelated.pid),
+      ]);
+      expect(
+        initialIdentityResult.status,
+        `${initialIdentityResult.stdout}\n${initialIdentityResult.stderr}`,
+      ).toBe(0);
+      const initialIdentity = JSON.parse(initialIdentityResult.stdout) as Record<string, unknown>;
+      const result = runPowerShell(
+        join(fixture.root, "scripts", "test-installer.ps1"),
+        ["-InstallerPath", releaseInstaller],
+        {
+          cwd: fixture.root,
+          env: {
+            ...fixture.environment,
+            WINDIR: fakeWindowsRoot,
+          },
+          timeout: 120_000,
+        },
+      );
+
+      expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+      await new Promise<void>((resolvePromise) => setImmediate(resolvePromise));
+      const currentIdentityResult = runPowerShell(identityScript, [
+        "-ProcessId",
+        String(unrelated.pid),
+      ]);
+      expect(
+        currentIdentityResult.status,
+        `${currentIdentityResult.stdout}\n${currentIdentityResult.stderr}`,
+      ).toBe(0);
+      expect(JSON.parse(currentIdentityResult.stdout)).toEqual(initialIdentity);
+    } finally {
+      unrelated.kill();
+    }
+  }, 180_000);
+
+  it("preserves the guest lifecycle error when mapped-folder cleanup also fails", async () => {
+    const fixture = await createRepositoryFixture();
+    const releaseInstaller = join(fixture.root, "release", installerName);
+    await mkdir(dirname(releaseInstaller), { recursive: true });
+    await copyFile(fixture.installer, releaseInstaller);
+    const fakeWindowsRoot = await createTemporaryRoot("whitelily-fake-windows-");
+    await createDelegatingSandboxLauncher(fakeWindowsRoot);
+    const lockerScript = join(fixture.root, "hold-sandbox-artifact.ps1");
+    const lockerReady = join(fixture.root, "sandbox-artifact-lock.ready");
+    await writeFile(
+      lockerScript,
+      [
+        "param(",
+        "    [Parameter(Mandatory = $true)][string]$BuildRoot,",
+        "    [Parameter(Mandatory = $true)][string]$ReadyPath",
+        ")",
+        "$ErrorActionPreference = 'Stop'",
+        "$deadline = [DateTime]::UtcNow.AddSeconds(30)",
+        "$target = $null",
+        "do {",
+        "    $target = Get-ChildItem -LiteralPath $BuildRoot -File -Recurse -Filter 'guest-lifecycle.ps1' -ErrorAction SilentlyContinue | Select-Object -First 1",
+        "    if ($null -ne $target) { break }",
+        "    Start-Sleep -Milliseconds 50",
+        "} while ([DateTime]::UtcNow -lt $deadline)",
+        "if ($null -eq $target) { throw 'LOCK_TARGET_NOT_FOUND' }",
+        "$stream = [IO.File]::Open($target.FullName, 'Open', 'Read', 'Read')",
+        "try {",
+        "    [IO.File]::WriteAllText($ReadyPath, $target.FullName)",
+        "    Start-Sleep -Seconds 45",
+        "} finally { $stream.Dispose() }",
+        "",
+      ].join("\r\n"),
+      "utf8",
+    );
+    const locker = spawn(
+      "powershell.exe",
+      [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        lockerScript,
+        "-BuildRoot",
+        join(fixture.root, "build"),
+        "-ReadyPath",
+        lockerReady,
+      ],
+      { windowsHide: true, stdio: "ignore" },
+    );
+    let result: CommandResult;
+    try {
+      result = runPowerShell(
+        join(fixture.root, "scripts", "test-installer.ps1"),
+        ["-InstallerPath", releaseInstaller, "-WarningAction", "Stop"],
+        {
+          cwd: fixture.root,
+          env: {
+            ...fixture.environment,
+            WINDIR: fakeWindowsRoot,
+            WHITELILY_FAKE_SANDBOX_REPORT_ERROR: "forced guest failure",
+          },
+          timeout: 120_000,
+        },
+      );
+    } finally {
+      locker.kill();
+    }
+
+    expect(result.status).not.toBe(0);
+    await expect(readFile(lockerReady, "utf8")).resolves.toContain("guest-lifecycle.ps1");
+    expect(`${result.stdout}\n${result.stderr}`).toContain(
+      "SANDBOX_LIFECYCLE_FAILED: forced guest failure",
+    );
+    expect(`${result.stdout}\n${result.stderr}`).toContain("SANDBOX_CLEANUP_FAILED:");
+  }, 180_000);
+
+  it("embeds a working SHA-256 verifier in the guest lifecycle script", async () => {
+    const fixture = await createRepositoryFixture();
+    const releaseInstaller = join(fixture.root, "release", installerName);
+    await mkdir(dirname(releaseInstaller), { recursive: true });
+    await copyFile(fixture.installer, releaseInstaller);
+    const fakeWindowsRoot = await createTemporaryRoot("whitelily-fake-windows-");
+    await createDelegatingSandboxLauncher(fakeWindowsRoot);
+    const capturedGuest = join(fixture.root, "captured-guest-lifecycle.ps1");
+    const result = runPowerShell(
+      join(fixture.root, "scripts", "test-installer.ps1"),
+      ["-InstallerPath", releaseInstaller],
+      {
+        cwd: fixture.root,
+        env: {
+          ...fixture.environment,
+          WINDIR: fakeWindowsRoot,
+          WHITELILY_FAKE_SANDBOX_CAPTURE_GUEST: capturedGuest,
+        },
+        timeout: 120_000,
+      },
+    );
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    const guestSource = await readFile(capturedGuest, "utf8");
+    expect(guestSource).toContain("function Wait-WhiteLilyMainWindow");
+    expect(guestSource).toContain("Wait-WhiteLilyMainWindow $applicationProcess");
+
+    const target = join(fixture.root, "hash-probe.txt");
+    const expectedHash = createHash("sha256").update("guest hash probe\n").digest("hex");
+    await writeFile(target, "guest hash probe\n", "utf8");
+    const harness = join(fixture.root, "verify-guest-hash.ps1");
+    await writeFile(
+      harness,
+      [
+        "param(",
+        "    [Parameter(Mandatory = $true)][string]$GuestScript,",
+        "    [Parameter(Mandatory = $true)][string]$Target",
+        ")",
+        "$ErrorActionPreference = 'Stop'",
+        "$tokens = $null",
+        "$errors = $null",
+        "$ast = [Management.Automation.Language.Parser]::ParseFile($GuestScript, [ref]$tokens, [ref]$errors)",
+        "if ($errors.Count -ne 0) { throw 'GUEST_SCRIPT_PARSE_FAILED' }",
+        "$functionAst = $ast.Find({",
+        "    param($node)",
+        "    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and",
+        "        $node.Name -eq 'Get-Sha256Hex'",
+        "}, $true)",
+        "if ($null -eq $functionAst) { throw 'GUEST_SHA256_FUNCTION_MISSING' }",
+        "Invoke-Expression $functionAst.Extent.Text",
+        "[Console]::Out.WriteLine((Get-Sha256Hex $Target))",
+        "",
+      ].join("\r\n"),
+      "utf8",
+    );
+    const verification = runPowerShell(harness, ["-GuestScript", capturedGuest, "-Target", target]);
+
+    expect(verification.status, `${verification.stdout}\n${verification.stderr}`).toBe(0);
+    expect(verification.stdout.trim()).toBe(expectedHash);
+  }, 180_000);
+
+  it("discovers the delegated NSIS uninstaller process by its _?= marker", async () => {
+    const fixture = await createRepositoryFixture();
+    const releaseInstaller = join(fixture.root, "release", installerName);
+    await mkdir(dirname(releaseInstaller), { recursive: true });
+    await copyFile(fixture.installer, releaseInstaller);
+    const fakeWindowsRoot = await createTemporaryRoot("whitelily-fake-windows-");
+    await createDelegatingSandboxLauncher(fakeWindowsRoot);
+    const capturedGuest = join(fixture.root, "captured-guest-lifecycle.ps1");
+    const lifecycle = runPowerShell(
+      join(fixture.root, "scripts", "test-installer.ps1"),
+      ["-InstallerPath", releaseInstaller],
+      {
+        cwd: fixture.root,
+        env: {
+          ...fixture.environment,
+          WINDIR: fakeWindowsRoot,
+          WHITELILY_FAKE_SANDBOX_CAPTURE_GUEST: capturedGuest,
+        },
+        timeout: 120_000,
+      },
+    );
+    expect(lifecycle.status, `${lifecycle.stdout}\n${lifecycle.stderr}`).toBe(0);
+
+    const childScript = join(fixture.root, "delegated-uninstaller-child.ps1");
+    await writeFile(
+      childScript,
+      ["param([Parameter(Mandatory = $true)][string]$Marker)", "Start-Sleep -Seconds 30", ""].join(
+        "\r\n",
+      ),
+      "utf8",
+    );
+    const launcherScript = join(fixture.root, "delegating-uninstaller-launcher.ps1");
+    const intermediaryScript = join(fixture.root, "delegating-uninstaller-intermediary.ps1");
+    await writeFile(
+      intermediaryScript,
+      [
+        "param(",
+        "    [Parameter(Mandatory = $true)][string]$ProgramRoot,",
+        "    [Parameter(Mandatory = $true)][string]$ChildScript",
+        ")",
+        "$marker = '_?=' + $ProgramRoot.TrimEnd('\\') + '\\'",
+        "$powershell = Join-Path $env:SystemRoot 'System32\\WindowsPowerShell\\v1.0\\powershell.exe'",
+        "Start-Process -FilePath $powershell -ArgumentList @('-NoProfile', '-File', $ChildScript, '-Marker', $marker) -WindowStyle Hidden",
+        "",
+      ].join("\r\n"),
+      "utf8",
+    );
+    await writeFile(
+      launcherScript,
+      [
+        "param(",
+        "    [Parameter(Mandatory = $true)][string]$ProgramRoot,",
+        "    [Parameter(Mandatory = $true)][string]$ChildScript,",
+        "    [Parameter(Mandatory = $true)][string]$IntermediaryScript",
+        ")",
+        "$powershell = Join-Path $env:SystemRoot 'System32\\WindowsPowerShell\\v1.0\\powershell.exe'",
+        "$intermediary = Start-Process -FilePath $powershell -ArgumentList @('-NoProfile', '-File', $IntermediaryScript, '-ProgramRoot', $ProgramRoot, '-ChildScript', $ChildScript) -PassThru -WindowStyle Hidden",
+        "$intermediary.WaitForExit()",
+        "",
+      ].join("\r\n"),
+      "utf8",
+    );
+    const harness = join(fixture.root, "verify-uninstaller-process.ps1");
+    await writeFile(
+      harness,
+      [
+        "param(",
+        "    [Parameter(Mandatory = $true)][string]$GuestScript,",
+        "    [Parameter(Mandatory = $true)][string]$LauncherScript,",
+        "    [Parameter(Mandatory = $true)][string]$IntermediaryScript,",
+        "    [Parameter(Mandatory = $true)][string]$ChildScript,",
+        "    [Parameter(Mandatory = $true)][string]$ProgramRoot",
+        ")",
+        "$ErrorActionPreference = 'Stop'",
+        "$tokens = $null",
+        "$errors = $null",
+        "$ast = [Management.Automation.Language.Parser]::ParseFile($GuestScript, [ref]$tokens, [ref]$errors)",
+        "$functionAst = $ast.Find({",
+        "    param($node)",
+        "    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and",
+        "        $node.Name -eq 'Get-UninstallerUiProcessIds'",
+        "}, $true)",
+        "if ($null -eq $functionAst) { throw 'UNINSTALLER_PROCESS_DISCOVERY_MISSING' }",
+        "Invoke-Expression $functionAst.Extent.Text",
+        "$powershell = Join-Path $env:SystemRoot 'System32\\WindowsPowerShell\\v1.0\\powershell.exe'",
+        "$launcher = Start-Process -FilePath $powershell -ArgumentList @('-NoProfile', '-File', $LauncherScript, '-ProgramRoot', $ProgramRoot, '-ChildScript', $ChildScript, '-IntermediaryScript', $IntermediaryScript) -PassThru",
+        "$launcher.WaitForExit()",
+        "$deadline = [DateTime]::UtcNow.AddSeconds(10)",
+        "$childPid = $null",
+        "do {",
+        "    $childPid = @(",
+        "        Get-UninstallerUiProcessIds -LauncherPid $launcher.Id -ProgramRoot $ProgramRoot |",
+        "            Where-Object { $_ -ne $launcher.Id }",
+        "    ) | Select-Object -First 1",
+        "    if ($null -ne $childPid) { break }",
+        "    Start-Sleep -Milliseconds 100",
+        "} while ([DateTime]::UtcNow -lt $deadline)",
+        "if ($null -eq $childPid) { throw 'DELEGATED_UNINSTALLER_PROCESS_NOT_FOUND' }",
+        '$child = Get-CimInstance Win32_Process -Filter "ProcessId = $childPid"',
+        "if ([int]$child.ParentProcessId -eq $launcher.Id) { throw 'MARKER_FALLBACK_NOT_EXERCISED' }",
+        "try {",
+        "    [Console]::Out.WriteLine([int]$childPid)",
+        "} finally {",
+        "    Stop-Process -Id $childPid -Force -ErrorAction SilentlyContinue",
+        "}",
+        "",
+      ].join("\r\n"),
+      "utf8",
+    );
+    const verification = runPowerShell(harness, [
+      "-GuestScript",
+      capturedGuest,
+      "-LauncherScript",
+      launcherScript,
+      "-IntermediaryScript",
+      intermediaryScript,
+      "-ChildScript",
+      childScript,
+      "-ProgramRoot",
+      fixture.root,
+    ]);
+
+    expect(verification.status, `${verification.stdout}\n${verification.stderr}`).toBe(0);
+    expect(Number(verification.stdout.trim())).toBeGreaterThan(0);
+  }, 180_000);
+
+  it("advances every NSIS uninstaller page until the delegated process exits", async () => {
+    const fixture = await createRepositoryFixture();
+    const releaseInstaller = join(fixture.root, "release", installerName);
+    await mkdir(dirname(releaseInstaller), { recursive: true });
+    await copyFile(fixture.installer, releaseInstaller);
+    const fakeWindowsRoot = await createTemporaryRoot("whitelily-fake-windows-");
+    await createDelegatingSandboxLauncher(fakeWindowsRoot);
+    const capturedGuest = join(fixture.root, "captured-guest-lifecycle.ps1");
+    const lifecycle = runPowerShell(
+      join(fixture.root, "scripts", "test-installer.ps1"),
+      ["-InstallerPath", releaseInstaller],
+      {
+        cwd: fixture.root,
+        env: {
+          ...fixture.environment,
+          WINDIR: fakeWindowsRoot,
+          WHITELILY_FAKE_SANDBOX_CAPTURE_GUEST: capturedGuest,
+        },
+        timeout: 120_000,
+      },
+    );
+    expect(lifecycle.status, `${lifecycle.stdout}\n${lifecycle.stderr}`).toBe(0);
+
+    const wizardSource = join(fixture.root, "FakeUninstallerWizard.cs");
+    const wizardExecutable = join(fixture.root, "FakeUninstallerWizard.exe");
+    await writeFile(
+      wizardSource,
+      String.raw`
+using System;
+using System.Drawing;
+using System.Runtime.InteropServices;
+using System.Windows.Forms;
+
+public static class FakeUninstallerWizard {
+    [DllImport("user32.dll")]
+    private static extern int SetWindowLong(IntPtr handle, int index, int value);
+
+    [STAThread]
+    public static void Main() {
+        Application.EnableVisualStyles();
+        var form = new Form {
+            Text = "Fake WhiteLily Uninstaller",
+            ClientSize = new Size(420, 180),
+        };
+        var button = new Button {
+            Text = "Next",
+            Location = new Point(300, 120),
+            Size = new Size(90, 30),
+        };
+        var clicks = 0;
+        button.Click += (_, __) => {
+            clicks += 1;
+            button.Text = clicks < 2 ? "Next" : "Finish";
+            if (clicks >= 3) {
+                form.Close();
+            }
+        };
+        form.Controls.Add(button);
+        form.Shown += (_, __) => SetWindowLong(button.Handle, -12, 1);
+        Application.Run(form);
+    }
+}
+`,
+      "utf8",
+    );
+    const compileWizard = join(fixture.root, "compile-fake-wizard.ps1");
+    await writeFile(
+      compileWizard,
+      [
+        "param(",
+        "    [Parameter(Mandatory = $true)][string]$SourcePath,",
+        "    [Parameter(Mandatory = $true)][string]$OutputPath",
+        ")",
+        "$ErrorActionPreference = 'Stop'",
+        "Add-Type -TypeDefinition ([IO.File]::ReadAllText($SourcePath)) -Language CSharp -ReferencedAssemblies @('System.dll', 'System.Drawing.dll', 'System.Windows.Forms.dll') -OutputAssembly $OutputPath -OutputType WindowsApplication",
+        "",
+      ].join("\r\n"),
+      "utf8",
+    );
+    const compilation = runPowerShell(compileWizard, [
+      "-SourcePath",
+      wizardSource,
+      "-OutputPath",
+      wizardExecutable,
+    ]);
+    expect(compilation.status, `${compilation.stdout}\n${compilation.stderr}`).toBe(0);
+
+    const harness = join(fixture.root, "verify-uninstaller-completion.ps1");
+    await writeFile(
+      harness,
+      [
+        "param(",
+        "    [Parameter(Mandatory = $true)][string]$GuestScript,",
+        "    [Parameter(Mandatory = $true)][string]$WizardExecutable",
+        ")",
+        "$ErrorActionPreference = 'Stop'",
+        "$scriptText = [IO.File]::ReadAllText($GuestScript)",
+        "$typeMatches = @([regex]::Matches($scriptText, '(?s)Add-Type -TypeDefinition @\"\\r?\\n(?<code>.*?)\\r?\\n\"@') | Where-Object { $_.Groups['code'].Value.Contains('class WhiteLilyInstallerUi') })",
+        "if ($typeMatches.Count -ne 1) { throw 'INSTALLER_UI_TYPE_MISSING' }",
+        "Add-Type -TypeDefinition $typeMatches[0].Groups['code'].Value",
+        "$tokens = $null",
+        "$errors = $null",
+        "$ast = [Management.Automation.Language.Parser]::ParseFile($GuestScript, [ref]$tokens, [ref]$errors)",
+        "$functionAst = $ast.Find({",
+        "    param($node)",
+        "    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and",
+        "        $node.Name -eq 'Complete-UninstallerUi'",
+        "}, $true)",
+        "if ($null -eq $functionAst) { throw 'UNINSTALLER_UI_COMPLETION_MISSING' }",
+        "Invoke-Expression $functionAst.Extent.Text",
+        "$wizard = Start-Process -FilePath $WizardExecutable -PassThru",
+        "try {",
+        "    $exitCode = Complete-UninstallerUi -UiProcessId $wizard.Id -TimeoutMilliseconds 10000",
+        "    [Console]::Out.WriteLine($exitCode)",
+        "} finally {",
+        "    if (-not $wizard.HasExited) { Stop-Process -Id $wizard.Id -Force }",
+        "}",
+        "",
+      ].join("\r\n"),
+      "utf8",
+    );
+    const verification = runPowerShell(harness, [
+      "-GuestScript",
+      capturedGuest,
+      "-WizardExecutable",
+      wizardExecutable,
+    ]);
+
+    expect(verification.status, `${verification.stdout}\n${verification.stderr}`).toBe(0);
+    expect(verification.stdout.trim()).toBe("0");
+  }, 180_000);
+
   it("fails closed when Windows Sandbox is unavailable and never falls back to this profile", async () => {
     const fixture = await createRepositoryFixture();
     const releaseInstaller = join(fixture.root, "release", installerName);

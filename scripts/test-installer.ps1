@@ -38,6 +38,62 @@ function ConvertTo-XmlEscapedText {
     return [System.Security.SecurityElement]::Escape($Value)
 }
 
+function Test-SandboxRemoteSessionIdentity {
+    param(
+        [Parameter(Mandatory = $true)]$Expected,
+        [Parameter(Mandatory = $true)]$Current,
+        [Parameter(Mandatory = $true)][string]$ConfigurationPath
+    )
+
+    if ($null -eq $Expected -or $null -eq $Current) {
+        return $false
+    }
+    if ([uint32]$Expected.ProcessId -ne [uint32]$Current.ProcessId) {
+        return $false
+    }
+    if (
+        -not [StringComparer]::OrdinalIgnoreCase.Equals(
+            [string]$Expected.Name,
+            [string]$Current.Name
+        ) -or
+        -not [StringComparer]::OrdinalIgnoreCase.Equals(
+            [string]$Current.Name,
+            'WindowsSandboxRemoteSession.exe'
+        )
+    ) {
+        return $false
+    }
+    if (-not [object]::Equals($Expected.CreationDate, $Current.CreationDate)) {
+        return $false
+    }
+
+    $expectedExecutable = [string]$Expected.ExecutablePath
+    $currentExecutable = [string]$Current.ExecutablePath
+    if (
+        [string]::IsNullOrWhiteSpace($expectedExecutable) -or
+        [string]::IsNullOrWhiteSpace($currentExecutable) -or
+        -not [StringComparer]::OrdinalIgnoreCase.Equals($expectedExecutable, $currentExecutable)
+    ) {
+        return $false
+    }
+
+    $expectedCommandLine = [string]$Expected.CommandLine
+    $currentCommandLine = [string]$Current.CommandLine
+    if (
+        [string]::IsNullOrWhiteSpace($expectedCommandLine) -or
+        [string]::IsNullOrWhiteSpace($currentCommandLine) -or
+        -not [StringComparer]::Ordinal.Equals($expectedCommandLine, $currentCommandLine) -or
+        $currentCommandLine.IndexOf(
+            $ConfigurationPath,
+            [StringComparison]::OrdinalIgnoreCase
+        ) -lt 0
+    ) {
+        return $false
+    }
+
+    return $true
+}
+
 $repositoryRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $resolvedInstaller = Resolve-FullPath $InstallerPath (Get-Location).Path
 if (-not (Test-Path -LiteralPath $resolvedInstaller -PathType Leaf)) {
@@ -126,6 +182,18 @@ $result = [ordered]@{
     stages = [Collections.Generic.List[string]]::new()
     error = $null
 }
+function Get-Sha256Hex {
+    param([Parameter(Mandatory = $true)][string]$LiteralPath)
+
+    $stream = [System.IO.File]::OpenRead($LiteralPath)
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        return [System.BitConverter]::ToString($sha256.ComputeHash($stream)).Replace('-', '').ToLowerInvariant()
+    } finally {
+        $sha256.Dispose()
+        $stream.Dispose()
+    }
+}
 function Invoke-Process {
     param([Parameter(Mandatory = $true)][string]$Path, [string[]]$Arguments = @())
     $process = Start-Process -FilePath $Path -ArgumentList $Arguments -Wait -PassThru
@@ -133,11 +201,114 @@ function Invoke-Process {
         throw "process failed with exit code $($process.ExitCode): $Path"
     }
 }
+Add-Type -TypeDefinition @"
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Text;
+
+public static class WhiteLilySmokeWindows {
+    public delegate bool EnumWindowsProc(IntPtr window, IntPtr state);
+
+    [DllImport("user32.dll")]
+    private static extern bool EnumWindows(EnumWindowsProc callback, IntPtr state);
+
+    [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
+
+    [DllImport("user32.dll")]
+    private static extern bool IsWindowVisible(IntPtr window);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int GetWindowText(IntPtr window, StringBuilder text, int count);
+
+    [DllImport("user32.dll")]
+    private static extern int GetWindowTextLength(IntPtr window);
+
+    public static string[] Titles(uint expectedProcessId) {
+        var titles = new List<string>();
+        EnumWindows((window, state) => {
+            uint processId;
+            GetWindowThreadProcessId(window, out processId);
+            if (processId != expectedProcessId || !IsWindowVisible(window)) return true;
+            var length = GetWindowTextLength(window);
+            if (length <= 0) return true;
+            var title = new StringBuilder(length + 1);
+            GetWindowText(window, title, title.Capacity);
+            if (title.Length > 0) titles.Add(title.ToString());
+            return true;
+        }, IntPtr.Zero);
+        return titles.ToArray();
+    }
+}
+"@
+function Wait-WhiteLilyMainWindow {
+    param(
+        [Parameter(Mandatory = $true)]$Process,
+        [int]$TimeoutMilliseconds = 30000
+    )
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMilliseconds)
+    $stableWhiteLilyObservations = 0
+    while ([DateTime]::UtcNow -lt $deadline) {
+        $Process.Refresh()
+        if ($Process.HasExited) {
+            throw "installer smoke application exited before opening its main window: $($Process.ExitCode)"
+        }
+        $hasWhiteLilyWindow = $false
+        foreach ($title in @([WhiteLilySmokeWindows]::Titles([uint32]$Process.Id))) {
+            if ([StringComparer]::OrdinalIgnoreCase.Equals($title, 'Error')) {
+                throw 'installer smoke application displayed an error window'
+            }
+            if ([StringComparer]::Ordinal.Equals($title, 'WhiteLily')) {
+                $hasWhiteLilyWindow = $true
+            }
+        }
+        if ($hasWhiteLilyWindow) {
+            $stableWhiteLilyObservations += 1
+            if ($stableWhiteLilyObservations -ge 2) { return }
+        } else {
+            $stableWhiteLilyObservations = 0
+        }
+        if ($Process.WaitForExit(250)) {
+            throw "installer smoke application exited before opening its main window: $($Process.ExitCode)"
+        }
+    }
+    throw 'installer smoke application did not open the WhiteLily main window'
+}
 function Get-Uninstaller {
     param([Parameter(Mandatory = $true)][string]$ProgramRoot)
     $matches = @(Get-ChildItem -LiteralPath $ProgramRoot -File -Filter 'Uninstall*.exe')
     if ($matches.Count -ne 1) { throw 'installed uninstaller was not found' }
     return $matches[0].FullName
+}
+function Get-UninstallerUiProcessIds {
+    param(
+        [Parameter(Mandatory = $true)][int]$LauncherPid,
+        [Parameter(Mandatory = $true)][string]$ProgramRoot
+    )
+    $ids = [Collections.Generic.List[int]]::new()
+    $ids.Add($LauncherPid)
+    $nsisMarker = '_?=' + $ProgramRoot.TrimEnd('\') + '\'
+    $delegatedProcesses = @(
+        Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+            Where-Object {
+                [int]$_.ParentProcessId -eq $LauncherPid -or
+                (
+                    -not [string]::IsNullOrWhiteSpace([string]$_.CommandLine) -and
+                    ([string]$_.CommandLine).IndexOf(
+                        $nsisMarker,
+                        [StringComparison]::OrdinalIgnoreCase
+                    ) -ge 0
+                )
+            }
+    )
+    foreach ($delegatedProcess in $delegatedProcesses) {
+        $processId = [int]$delegatedProcess.ProcessId
+        if (-not $ids.Contains($processId)) {
+            $ids.Add($processId)
+        }
+    }
+    return $ids.ToArray()
 }
 try {
     $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
@@ -166,12 +337,9 @@ try {
     $result.stages.Add('installed')
 
     $applicationProcess = Start-Process -FilePath $application -ArgumentList @('--installer-smoke') -PassThru
-    Start-Sleep -Seconds 5
-    if ($applicationProcess.HasExited -and $applicationProcess.ExitCode -ne 0) {
-        throw "installer smoke launch failed with exit code $($applicationProcess.ExitCode)"
-    }
+    Wait-WhiteLilyMainWindow $applicationProcess
     if (-not $applicationProcess.HasExited) {
-        Stop-Process -Id $applicationProcess.Id -Force
+        $applicationProcess.Kill()
         $applicationProcess.WaitForExit()
     }
     $result.stages.Add('launched_without_system_tooling')
@@ -240,27 +408,68 @@ public static class WhiteLilyInstallerUi {
         SendMessage(found, BM_CLICK, IntPtr.Zero, IntPtr.Zero);
         return true;
     }
-}
+    }
 "@
-    $uninstaller = Get-Uninstaller $programRoot
-    $deleteProcess = Start-Process -FilePath $uninstaller -PassThru
-    Start-Sleep -Seconds 2
-    if (-not [WhiteLilyInstallerUi]::ClickId([uint32]$deleteProcess.Id, 1)) {
-        throw 'could not advance the interactive uninstaller welcome page'
-    }
-    Start-Sleep -Seconds 2
-    if (-not [WhiteLilyInstallerUi]::ClickContaining([uint32]$deleteProcess.Id, 'Delete WhiteLily data')) {
-        throw 'could not explicitly select Delete Data'
-    }
-    if (-not [WhiteLilyInstallerUi]::ClickId([uint32]$deleteProcess.Id, 1)) {
-        throw 'could not advance the interactive Delete Data page'
-    }
-    if (-not $deleteProcess.WaitForExit(120000)) {
-        Stop-Process -Id $deleteProcess.Id -Force
+    function Complete-UninstallerUi {
+        param(
+            [Parameter(Mandatory = $true)][int]$UiProcessId,
+            [int]$TimeoutMilliseconds = 120000
+        )
+        $process = Get-Process -Id $UiProcessId -ErrorAction SilentlyContinue
+        if ($null -eq $process) {
+            throw 'interactive Delete Data uninstall process was unavailable'
+        }
+        $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMilliseconds)
+        while ([DateTime]::UtcNow -lt $deadline) {
+            if ($process.HasExited) {
+                return [int]$process.ExitCode
+            }
+            [void][WhiteLilyInstallerUi]::ClickId([uint32]$UiProcessId, 1)
+            if ($process.WaitForExit(250)) {
+                return [int]$process.ExitCode
+            }
+            $process.Refresh()
+        }
+        if (-not $process.HasExited) {
+            Stop-Process -Id $UiProcessId -Force -ErrorAction SilentlyContinue
+        }
         throw 'interactive Delete Data uninstall timed out'
     }
-    if ($deleteProcess.ExitCode -ne 0) {
-        throw "interactive Delete Data uninstall failed with exit code $($deleteProcess.ExitCode)"
+    $uninstaller = Get-Uninstaller $programRoot
+    $deleteProcess = Start-Process -FilePath $uninstaller -PassThru
+    $uiProcessId = $null
+    $welcomeDeadline = [DateTime]::UtcNow.AddSeconds(30)
+    do {
+        foreach ($candidateId in @(Get-UninstallerUiProcessIds -LauncherPid $deleteProcess.Id -ProgramRoot $programRoot)) {
+            if ([WhiteLilyInstallerUi]::ClickId([uint32]$candidateId, 1)) {
+                $uiProcessId = [int]$candidateId
+                break
+            }
+        }
+        if ($null -ne $uiProcessId) { break }
+        Start-Sleep -Milliseconds 250
+    } while ([DateTime]::UtcNow -lt $welcomeDeadline)
+    if ($null -eq $uiProcessId) {
+        throw 'could not advance the interactive uninstaller welcome page'
+    }
+
+    $choiceDeadline = [DateTime]::UtcNow.AddSeconds(30)
+    $choiceSelected = $false
+    do {
+        $choiceSelected = [WhiteLilyInstallerUi]::ClickContaining(
+            [uint32]$uiProcessId,
+            'Delete WhiteLily data'
+        )
+        if ($choiceSelected) { break }
+        Start-Sleep -Milliseconds 250
+    } while ([DateTime]::UtcNow -lt $choiceDeadline)
+    if (-not $choiceSelected) {
+        throw 'could not explicitly select Delete Data'
+    }
+
+    $deleteExitCode = Complete-UninstallerUi -UiProcessId $uiProcessId
+    if ($deleteExitCode -ne 0) {
+        throw "interactive Delete Data uninstall failed with exit code $deleteExitCode"
     }
     if (Test-Path -LiteralPath $dataRoot) {
         throw 'explicit Delete Data uninstall preserved the data root'
@@ -311,6 +520,9 @@ $configuration = @"
 [System.IO.File]::WriteAllText($sandboxConfigurationPath, $configuration, $utf8)
 
 $sandboxProcess = $null
+$lifecycleError = $null
+$cleanupError = $null
+$lifecycleOutput = $null
 try {
     try {
         $sandboxProcess = Start-Process `
@@ -326,7 +538,7 @@ try {
         if ([DateTime]::UtcNow -ge $deadline) {
             throw 'SANDBOX_LIFECYCLE_TIMEOUT'
         }
-        if ($sandboxProcess.HasExited) {
+        if ($sandboxProcess.HasExited -and $sandboxProcess.ExitCode -ne 0) {
             throw 'SANDBOX_LIFECYCLE_REPORT_MISSING'
         }
         Start-Sleep -Seconds 2
@@ -352,15 +564,94 @@ try {
         throw "SANDBOX_LIFECYCLE_FAILED: $([string]$report.error)"
     }
     Copy-Item -LiteralPath $sandboxResultPath -Destination $resolvedReport -Force
-    Write-Output ($report | ConvertTo-Json -Compress)
+    $lifecycleOutput = $report | ConvertTo-Json -Compress
+} catch {
+    $lifecycleError = $_
 } finally {
-    if ($null -ne $sandboxProcess -and -not $sandboxProcess.HasExited) {
-        Stop-Process -Id $sandboxProcess.Id -Force -ErrorAction SilentlyContinue
-    }
-    if (
-        (Test-Path -LiteralPath $sandboxRoot) -and
-        $sandboxRoot.StartsWith($sandboxPrefix, [StringComparison]::OrdinalIgnoreCase)
-    ) {
-        Remove-Item -LiteralPath $sandboxRoot -Recurse -Force
+    try {
+        if ($null -ne $sandboxProcess -and -not $sandboxProcess.HasExited) {
+            try {
+                $sandboxProcess.Kill()
+                $sandboxProcess.WaitForExit()
+            } catch {
+                # The launcher may exit between HasExited and Kill.
+            }
+        }
+        $boundRemoteSessions = @(
+            Get-CimInstance Win32_Process `
+                -Filter "Name = 'WindowsSandboxRemoteSession.exe'" `
+                -ErrorAction SilentlyContinue |
+                Where-Object {
+                    -not [string]::IsNullOrWhiteSpace([string]$_.CommandLine) -and
+                    ([string]$_.CommandLine).IndexOf(
+                        $sandboxConfigurationPath,
+                        [StringComparison]::OrdinalIgnoreCase
+                    ) -ge 0
+                }
+        )
+        foreach ($expectedRemoteSession in $boundRemoteSessions) {
+            $remoteProcess = $null
+            try {
+                $remoteProcess = Get-Process -Id $expectedRemoteSession.ProcessId -ErrorAction Stop
+                # Opening Handle binds this object to the current OS process before identity is revalidated.
+                $remoteProcess.Handle | Out-Null
+                $currentRemoteSession = Get-CimInstance Win32_Process `
+                    -Filter "ProcessId = $($expectedRemoteSession.ProcessId)" `
+                    -ErrorAction Stop
+                if (
+                    Test-SandboxRemoteSessionIdentity `
+                        -Expected $expectedRemoteSession `
+                        -Current $currentRemoteSession `
+                        -ConfigurationPath $sandboxConfigurationPath
+                ) {
+                    $remoteProcess.Kill()
+                    $remoteProcess.WaitForExit()
+                }
+            } catch {
+                # A session may exit while the lifecycle report is being processed.
+            } finally {
+                if ($null -ne $remoteProcess) {
+                    $remoteProcess.Dispose()
+                }
+            }
+        }
+        if (
+            (Test-Path -LiteralPath $sandboxRoot) -and
+            $sandboxRoot.StartsWith($sandboxPrefix, [StringComparison]::OrdinalIgnoreCase)
+        ) {
+            $cleanupDeadline = [DateTime]::UtcNow.AddSeconds(30)
+            while (Test-Path -LiteralPath $sandboxRoot) {
+                try {
+                    Remove-Item -LiteralPath $sandboxRoot -Recurse -Force
+                } catch [System.IO.IOException] {
+                    if ([DateTime]::UtcNow -ge $cleanupDeadline) {
+                        $cleanupError = $_
+                        break
+                    }
+                    Start-Sleep -Seconds 1
+                } catch [System.UnauthorizedAccessException] {
+                    if ([DateTime]::UtcNow -ge $cleanupDeadline) {
+                        $cleanupError = $_
+                        break
+                    }
+                    Start-Sleep -Seconds 1
+                }
+            }
+        }
+    } catch {
+        $cleanupError = $_
     }
 }
+
+if ($null -ne $lifecycleError) {
+    if ($null -ne $cleanupError) {
+        Write-Warning `
+            "SANDBOX_CLEANUP_FAILED: $($cleanupError.Exception.Message)" `
+            -WarningAction Continue
+    }
+    throw $lifecycleError
+}
+if ($null -ne $cleanupError) {
+    throw $cleanupError
+}
+Write-Output $lifecycleOutput

@@ -331,7 +331,7 @@ describe("public release readiness", () => {
     },
   );
 
-  it("documents the future Windows installer workflow in Chinese and English", async () => {
+  it("documents the released Windows Public Beta workflow in Chinese and English", async () => {
     const [readme, readmeZh, installZh, installEn, smartScreenZh, smartScreenEn] =
       await Promise.all(
         [
@@ -358,7 +358,9 @@ describe("public release readiness", () => {
       expect(corpus).toMatch(/Node(?:\.js)?[\s\S]{0,160}npm[\s\S]{0,160}Git[\s\S]{0,160}Codex/u);
     }
 
-    expect(chinese).toMatch(/尚未发布|未发布/u);
+    expect(chinese).toMatch(/Public Beta/u);
+    expect(chinese).toMatch(/预发布/u);
+    expect(chinese).toMatch(/(?:隔离|Sandbox).{0,120}(?:安装|生命周期).{0,120}验收/u);
     expect(chinese).toMatch(/未签名/u);
     expect(chinese).toContain("SmartScreen");
     expect(chinese).toMatch(/用户自行.{0,80}(?:启动|操作).{0,80}PCL2/u);
@@ -369,7 +371,11 @@ describe("public release readiness", () => {
     expect(chinese).toContain("删除 WhiteLily 数据");
     expect(chinese).toMatch(/保留 WhiteLily 数据.{0,40}(?:默认|推荐)/u);
 
-    expect(english).toMatch(/not (?:yet )?published/i);
+    expect(english).toMatch(/Public Beta/i);
+    expect(english).toMatch(/prerelease/i);
+    expect(english).toMatch(
+      /(?:isolated|Sandbox).{0,120}(?:installer|lifecycle).{0,120}acceptance/is,
+    );
     expect(english).toMatch(/unsigned/i);
     expect(english).toContain("SmartScreen");
     expect(english).toMatch(/you (?:start|operate).{0,80}PCL2|PCL2.{0,80}under your control/is);

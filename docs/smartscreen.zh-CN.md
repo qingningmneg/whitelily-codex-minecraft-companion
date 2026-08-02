@@ -2,11 +2,11 @@
 
 [English](smartscreen.md)
 
-> `WhiteLily-0.2.0-beta.1-windows-x64-setup.exe` 正在构建和验证，尚未发布。本文只说明首个 Beta 通过验收并发布后应如何处理未签名提示。
+> `WhiteLily-0.2.0-beta.1-windows-x64-setup.exe` 已作为未签名 Public Beta 预发布。本文说明如何安全处理它的未签名提示。
 
 ## 为什么会出现警告
 
-首个 WhiteLily 桌面 Beta 计划以**未签名** EXE 发布，没有 Authenticode 代码签名证书。Windows SmartScreen 因此可能显示“Windows 已保护你的电脑”或“未知发布者”。未签名是公开的发布限制，不应被描述为已签名或已建立信誉。
+首个 WhiteLily 桌面 Beta 以**未签名** EXE 发布，没有 Authenticode 代码签名证书。Windows SmartScreen 因此可能显示“Windows 已保护你的电脑”或“未知发布者”。未签名是公开的发布限制，不应被描述为已签名或已建立信誉。
 
 SmartScreen 警告不证明文件有害，也不证明文件安全。确认文件的依据是：只从官方 Release 获取，并且本机计算的 SHA-256 与同一 Release 的 `.sha256` 完全一致。
 

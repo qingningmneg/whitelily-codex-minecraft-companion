@@ -160,6 +160,26 @@ describe("JsonRpcProcess", () => {
     }
   });
 
+  it("supports a shorter watchdog for a latency-sensitive request", async () => {
+    vi.useFakeTimers();
+    try {
+      const harness = createJsonRpcProcessHarness({ requestTimeoutMs: 1_000 });
+      const request = harness.process.request("account/read", {}, { timeoutMs: 25 });
+      const outcome = request.catch((error: unknown) => error);
+
+      await vi.advanceTimersByTimeAsync(24);
+      expect(harness.closed()).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+
+      await expect(outcome).resolves.toMatchObject({
+        message: expect.stringContaining("account/read"),
+      });
+      expect(harness.closed()).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("drains child stderr and fatally closes on an oversized stdout line", async () => {
     const child = Object.assign(new EventEmitter(), {
       pid: 42,
