@@ -4,6 +4,9 @@ import { defineConfig } from "vite";
 export default defineConfig(({ mode }) => {
   if (mode === "main") {
     return {
+      ssr: {
+        noExternal: true,
+      },
       build: {
         emptyOutDir: true,
         outDir: "dist/main",

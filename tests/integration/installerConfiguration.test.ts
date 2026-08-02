@@ -69,6 +69,7 @@ const uninstallerIncludePath = join(repositoryRoot, "packaging", "nsis", "uninst
 const svgPath = join(repositoryRoot, "assets", "branding", "whitelily-icon.svg");
 const icoPath = join(repositoryRoot, "apps", "desktop", "build", "icon.ico");
 const afterPackWrapperPath = join(repositoryRoot, "apps", "desktop", "build", "after-pack.cjs");
+const viteConfigPath = join(repositoryRoot, "apps", "desktop", "vite.config.ts");
 const electronBuilderNsisTemplateRoot = join(
   repositoryRoot,
   "node_modules",
@@ -215,6 +216,14 @@ describe("WhiteLily assisted Windows installer configuration", () => {
     expect(resolve(repositoryRoot, build?.afterPack ?? "")).toBe(afterPackWrapperPath);
     expect(wrapper).toBe(
       '"use strict";\n\nconst { resolve } = require("node:path");\nconst verifier = require("../../../packaging/electron/after-pack.cjs");\n\nmodule.exports = (context) =>\n  verifier.materializePreparedNodeModulesAndVerify(\n    context,\n    resolve(__dirname, "../../../build/electron-bundle"),\n  );\n',
+    );
+  });
+
+  it("bundles every non-Electron main-process runtime dependency into app.asar", async () => {
+    const viteConfig = await readFile(viteConfigPath, "utf8");
+
+    expect(viteConfig).toMatch(
+      /if \(mode === "main"\) \{[\s\S]*?ssr:\s*\{\s*noExternal:\s*true,?\s*\}[\s\S]*?build:/u,
     );
   });
 

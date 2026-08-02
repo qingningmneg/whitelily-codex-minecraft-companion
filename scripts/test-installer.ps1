@@ -201,6 +201,32 @@ function Invoke-Process {
         throw "process failed with exit code $($process.ExitCode): $Path"
     }
 }
+function Wait-WhiteLilyMainWindow {
+    param(
+        [Parameter(Mandatory = $true)]$Process,
+        [int]$TimeoutMilliseconds = 30000
+    )
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMilliseconds)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        $Process.Refresh()
+        if ($Process.HasExited) {
+            throw "installer smoke application exited before opening its main window: $($Process.ExitCode)"
+        }
+        if ($Process.MainWindowHandle -ne 0) {
+            $title = [string]$Process.MainWindowTitle
+            if ([StringComparer]::OrdinalIgnoreCase.Equals($title, 'Error')) {
+                throw 'installer smoke application displayed an error window'
+            }
+            if ([StringComparer]::Ordinal.Equals($title, 'WhiteLily')) {
+                return
+            }
+        }
+        if ($Process.WaitForExit(250)) {
+            throw "installer smoke application exited before opening its main window: $($Process.ExitCode)"
+        }
+    }
+    throw 'installer smoke application did not open the WhiteLily main window'
+}
 function Get-Uninstaller {
     param([Parameter(Mandatory = $true)][string]$ProgramRoot)
     $matches = @(Get-ChildItem -LiteralPath $ProgramRoot -File -Filter 'Uninstall*.exe')
@@ -263,12 +289,9 @@ try {
     $result.stages.Add('installed')
 
     $applicationProcess = Start-Process -FilePath $application -ArgumentList @('--installer-smoke') -PassThru
-    Start-Sleep -Seconds 5
-    if ($applicationProcess.HasExited -and $applicationProcess.ExitCode -ne 0) {
-        throw "installer smoke launch failed with exit code $($applicationProcess.ExitCode)"
-    }
+    Wait-WhiteLilyMainWindow $applicationProcess
     if (-not $applicationProcess.HasExited) {
-        Stop-Process -Id $applicationProcess.Id -Force
+        $applicationProcess.Kill()
         $applicationProcess.WaitForExit()
     }
     $result.stages.Add('launched_without_system_tooling')

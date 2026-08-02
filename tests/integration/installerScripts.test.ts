@@ -1034,6 +1034,9 @@ describe("WhiteLily isolated installer lifecycle", () => {
       },
     );
     expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    const guestSource = await readFile(capturedGuest, "utf8");
+    expect(guestSource).toContain("function Wait-WhiteLilyMainWindow");
+    expect(guestSource).toContain("Wait-WhiteLilyMainWindow $applicationProcess");
 
     const target = join(fixture.root, "hash-probe.txt");
     const expectedHash = createHash("sha256").update("guest hash probe\n").digest("hex");
