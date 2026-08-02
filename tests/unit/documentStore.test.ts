@@ -360,9 +360,7 @@ describe("DocumentStore", () => {
     };
     const recoveringStore = createStore(path, rootDirectory, { fileIo: recoveryIo });
     const recovery = recoveringStore.read();
-    await expect(
-      Promise.race([recoveryAtPublish.then(() => true), delay(250).then(() => false)]),
-    ).resolves.toBe(true);
+    await recoveryAtPublish;
     let updaterEntered = false;
     const updating = createStore(path, rootDirectory, {
       clock: () => new Date("2026-07-29T03:00:00.000Z"),

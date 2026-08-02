@@ -49,6 +49,13 @@ interface CurrentAttempt extends LoginAttempt {
   generation: number;
 }
 
+class AccountStatusUnavailableError extends Error {
+  constructor(cause: unknown) {
+    super("Account status is unavailable", { cause });
+    this.name = "AccountStatusUnavailableError";
+  }
+}
+
 export class AccountService {
   readonly #port: AccountAppServerPort;
   readonly #now: () => number;
@@ -87,12 +94,22 @@ export class AccountService {
   getAccount(): Promise<AccountSnapshot> {
     return this.#queueOperation(async (generation) => {
       await this.#expireIfNeeded(generation);
-      if (
-        this.#snapshot.status === "pending" ||
-        this.#snapshot.status === "cancelled" ||
-        this.#snapshot.status === "expired"
-      ) {
+      if (this.#snapshot.status === "cancelled" || this.#snapshot.status === "expired") {
         return this.#snapshot;
+      }
+      if (this.#snapshot.status === "pending") {
+        try {
+          return await this.#refreshAccount(generation);
+        } catch (error) {
+          this.#assertCurrentLifecycle(generation);
+          if (
+            error instanceof AccountStatusUnavailableError &&
+            this.#snapshot.status === "pending"
+          ) {
+            return this.#snapshot;
+          }
+          throw error;
+        }
       }
       return this.#refreshAccount(generation);
     });
@@ -192,12 +209,15 @@ export class AccountService {
   }
 
   async #refreshAccount(generation: number): Promise<AccountSnapshot> {
-    await this.#port.startAccountSession();
-    this.#assertCurrentLifecycle(generation);
-    const response = await this.#port.readAccount().catch(() => {
+    let response: GetAccountResponse;
+    try {
+      await this.#port.startAccountSession();
       this.#assertCurrentLifecycle(generation);
-      throw new Error("Account status is unavailable");
-    });
+      response = await this.#port.readAccount();
+    } catch (error) {
+      this.#assertCurrentLifecycle(generation);
+      throw new AccountStatusUnavailableError(error);
+    }
     this.#assertCurrentLifecycle(generation);
     if (response.account === null) {
       if (this.#snapshot.status === "pending") return this.#snapshot;

@@ -1216,6 +1216,146 @@ describe("ChildSupervisor", () => {
     expect(children[0]!.killCalls).toBe(0);
   });
 
+  it("accepts an idempotent owner update response at the current revision", async () => {
+    vi.useFakeTimers();
+    const { children, supervisor } = createHarness();
+    supervisor.start();
+
+    const outcome = supervisor.request({
+      kind: "update_owner_identity",
+      expectedRevision: 2,
+      ownerUsername: "NewOwner",
+    });
+    const request = children[0]!.requests()[0]!;
+    children[0]!.respond({
+      version: DESKTOP_PROTOCOL_VERSION,
+      id: request.id,
+      ok: true,
+      result: {
+        revision: 2,
+        ownerUsername: "NewOwner",
+        configured: true,
+        presence: "offline",
+      },
+    });
+
+    await expect(outcome).resolves.toMatchObject({
+      revision: 2,
+      ownerUsername: "NewOwner",
+    });
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(children[0]!.killCalls).toBe(0);
+  });
+
+  it("quarantines an idempotent response that contradicts a matching next-revision event", async () => {
+    const { children, supervisor } = createHarness();
+    supervisor.start();
+
+    const outcome = caught(
+      supervisor.request({
+        kind: "update_owner_identity",
+        expectedRevision: 2,
+        ownerUsername: "NewOwner",
+      }),
+    );
+    const request = children[0]!.requests()[0]!;
+    writeOwnerIdentityEvent(children[0]!, {
+      revision: 3,
+      ownerUsername: "NewOwner",
+      presence: "offline",
+    });
+    children[0]!.respond({
+      version: DESKTOP_PROTOCOL_VERSION,
+      id: request.id,
+      ok: true,
+      result: {
+        revision: 2,
+        ownerUsername: "NewOwner",
+        configured: true,
+        presence: "offline",
+      },
+    });
+
+    await expect(outcome).resolves.toMatchObject({
+      message: expect.stringContaining("malformed protocol"),
+    });
+    expect(children[0]!.killCalls).toBe(1);
+  });
+
+  it.each([
+    {
+      label: "a different owner at the next revision",
+      event: { revision: 3, ownerUsername: "OtherOwner", presence: "offline" as const },
+    },
+    {
+      label: "the requested owner beyond the next revision",
+      event: { revision: 4, ownerUsername: "NewOwner", presence: "offline" as const },
+    },
+  ])("quarantines a current-revision response after $label was observed", async ({ event }) => {
+    const { children, supervisor } = createHarness();
+    supervisor.start();
+
+    const outcome = caught(
+      supervisor.request({
+        kind: "update_owner_identity",
+        expectedRevision: 2,
+        ownerUsername: "NewOwner",
+      }),
+    );
+    const request = children[0]!.requests()[0]!;
+    writeOwnerIdentityEvent(children[0]!, event);
+    children[0]!.respond({
+      version: DESKTOP_PROTOCOL_VERSION,
+      id: request.id,
+      ok: true,
+      result: {
+        revision: 2,
+        ownerUsername: "NewOwner",
+        configured: true,
+        presence: "offline",
+      },
+    });
+
+    await expect(outcome).resolves.toMatchObject({
+      message: expect.stringContaining("malformed protocol"),
+    });
+    expect(children[0]!.killCalls).toBe(1);
+  });
+
+  it("accepts a next-revision response after its matching owner event", async () => {
+    const { children, supervisor } = createHarness();
+    supervisor.start();
+
+    const outcome = supervisor.request({
+      kind: "update_owner_identity",
+      expectedRevision: 2,
+      ownerUsername: "NewOwner",
+    });
+    const request = children[0]!.requests()[0]!;
+    writeOwnerIdentityEvent(children[0]!, {
+      revision: 3,
+      ownerUsername: "NewOwner",
+      presence: "offline",
+    });
+    children[0]!.respond({
+      version: DESKTOP_PROTOCOL_VERSION,
+      id: request.id,
+      ok: true,
+      result: {
+        revision: 3,
+        ownerUsername: "NewOwner",
+        configured: true,
+        presence: "offline",
+      },
+    });
+
+    await expect(outcome).resolves.toMatchObject({
+      revision: 3,
+      ownerUsername: "NewOwner",
+    });
+    expect(children[0]!.killCalls).toBe(0);
+  });
+
   it.each([
     {
       label: "a different username",

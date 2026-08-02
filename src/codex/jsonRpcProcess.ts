@@ -112,6 +112,10 @@ export interface JsonRpcProcessOptions {
   requestTimeoutMs?: number;
 }
 
+export interface JsonRpcRequestOptions {
+  timeoutMs?: number;
+}
+
 function cleanCodexEnvironment(environment: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const blocked = new Set(["OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN"]);
   return Object.fromEntries(
@@ -725,14 +729,18 @@ export class JsonRpcProcess {
     this.unsubscribeExit = transport.onExit((error) => this.handleExit(error));
   }
 
-  request<T>(method: string, params: unknown): Promise<T> {
+  request<T>(method: string, params: unknown, options: JsonRpcRequestOptions = {}): Promise<T> {
     if (this.stopped) return Promise.reject(new Error("Codex app server is stopped"));
+    const timeoutMs = options.timeoutMs ?? this.requestTimeoutMs;
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) {
+      return Promise.reject(new Error("invalid JSON-RPC request timeout"));
+    }
     const id = this.nextId++;
     return new Promise<T>((resolveResult, reject) => {
       const timer = setTimeout(() => {
         if (!this.pending.has(id)) return;
         this.failAndClose(new Error(`Codex app-server request timed out: ${method}`));
-      }, this.requestTimeoutMs);
+      }, timeoutMs);
       timer.unref?.();
       this.pending.set(id, { resolve: resolveResult, reject, timer });
       try {
@@ -762,8 +770,9 @@ export class JsonRpcProcess {
 
   close(): Promise<void> {
     if (this.closePromise) return this.closePromise;
-    if (this.stopped) return Promise.resolve();
-    this.closePromise = this.closeInternal();
+    this.closePromise = Promise.resolve().then(() =>
+      this.stopped ? this.transport.close() : this.closeInternal(),
+    );
     return this.closePromise;
   }
 
@@ -809,11 +818,11 @@ export class JsonRpcProcess {
 
   private failAndClose(error: Error): void {
     if (this.stopped) return;
+    const closing = Promise.resolve().then(() => this.transport.close());
+    this.closePromise = closing;
     this.handleExit(error);
     this.unsubscribeLine();
     this.unsubscribeExit();
-    const closing = Promise.resolve().then(() => this.transport.close());
-    this.closePromise = closing;
     void closing.catch(() => undefined);
   }
 

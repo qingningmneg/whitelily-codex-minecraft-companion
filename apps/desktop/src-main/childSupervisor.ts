@@ -100,6 +100,7 @@ interface PendingRequest {
   child: ManagedChild;
   readonly command: DesktopCommand;
   acknowledgementRequiredAfterDispatch: boolean;
+  ownerRevisionConflictAfterDispatch: boolean;
   restartOnContainmentFailure: boolean;
   resolve: (result: unknown) => void;
   reject: (error: Error) => void;
@@ -207,6 +208,7 @@ export class ChildSupervisor {
         child,
         command: intent,
         acknowledgementRequiredAfterDispatch: true,
+        ownerRevisionConflictAfterDispatch: false,
         restartOnContainmentFailure: true,
         resolve: (result) => resolve(result as DesktopCommandResult<typeof intent>),
         reject,
@@ -504,6 +506,7 @@ export class ChildSupervisor {
         child,
         command: validatedCommand,
         acknowledgementRequiredAfterDispatch,
+        ownerRevisionConflictAfterDispatch: false,
         restartOnContainmentFailure: !allowDuringShutdown,
         resolve: (result) => resolve(result as DesktopCommandResult<C>),
         reject,
@@ -566,7 +569,10 @@ export class ChildSupervisor {
           const result = parseDesktopCommandResult(pending.command, response.result);
           if (
             pending.command.kind === "update_owner_identity" &&
-            !ownerAcknowledgesUpdate(pending.command, result as OwnerIdentitySnapshot)
+            (pending.ownerRevisionConflictAfterDispatch ||
+              !(pending.acknowledgementRequiredAfterDispatch
+                ? ownerResponseAcknowledgesUpdate(pending.command, result as OwnerIdentitySnapshot)
+                : ownerAcknowledgesUpdate(pending.command, result as OwnerIdentitySnapshot)))
           ) {
             throw new Error("owner update response does not acknowledge the pending command");
           }
@@ -734,12 +740,11 @@ export class ChildSupervisor {
     owner: Extract<DesktopEvent["event"], { kind: "owner_identity" }>["owner"],
   ): void {
     for (const pending of this.#pending.values()) {
-      if (
-        pending.child === child &&
-        pending.command.kind === "update_owner_identity" &&
-        ownerAcknowledgesUpdate(pending.command, owner)
-      ) {
+      if (pending.child !== child || pending.command.kind !== "update_owner_identity") continue;
+      if (ownerAcknowledgesUpdate(pending.command, owner)) {
         pending.acknowledgementRequiredAfterDispatch = false;
+      } else if (owner.revision > pending.command.expectedRevision) {
+        pending.ownerRevisionConflictAfterDispatch = true;
       }
     }
   }
@@ -870,6 +875,19 @@ function ownerAcknowledgesUpdate(
     owner.configured &&
     owner.ownerUsername === command.ownerUsername &&
     owner.revision === command.expectedRevision + 1
+  );
+}
+
+function ownerResponseAcknowledgesUpdate(
+  command: Extract<DesktopCommand, { kind: "update_owner_identity" }>,
+  owner: OwnerIdentitySnapshot,
+): boolean {
+  return (
+    owner.configured &&
+    owner.ownerUsername === command.ownerUsername &&
+    (owner.revision === command.expectedRevision ||
+      (command.expectedRevision < Number.MAX_SAFE_INTEGER &&
+        owner.revision === command.expectedRevision + 1))
   );
 }
 

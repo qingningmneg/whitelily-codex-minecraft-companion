@@ -248,6 +248,7 @@ function Wait-WhiteLilyMainWindow {
         [int]$TimeoutMilliseconds = 30000
     )
     $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMilliseconds)
+    $stableWhiteLilyObservations = 0
     while ([DateTime]::UtcNow -lt $deadline) {
         $Process.Refresh()
         if ($Process.HasExited) {
@@ -262,7 +263,12 @@ function Wait-WhiteLilyMainWindow {
                 $hasWhiteLilyWindow = $true
             }
         }
-        if ($hasWhiteLilyWindow) { return }
+        if ($hasWhiteLilyWindow) {
+            $stableWhiteLilyObservations += 1
+            if ($stableWhiteLilyObservations -ge 2) { return }
+        } else {
+            $stableWhiteLilyObservations = 0
+        }
         if ($Process.WaitForExit(250)) {
             throw "installer smoke application exited before opening its main window: $($Process.ExitCode)"
         }
