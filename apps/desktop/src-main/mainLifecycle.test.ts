@@ -10,6 +10,7 @@ import {
   showExistingWindow,
   startElectronPrimary,
   startElectronComposition,
+  waitForRendererReady,
 } from "./main.js";
 import { resolveAppPaths } from "./appPaths.js";
 import type { RuntimeSnapshot } from "../../../src/runtime/runtimeEvents.js";
@@ -663,6 +664,110 @@ describe("native tray composition", () => {
 });
 
 describe("Electron startup composition", () => {
+  it("keeps the main window hidden until the verified renderer load completes", async () => {
+    const { app, diagnostic, supervisor } = createStartupHarness();
+    const mainWindow = new FakeWindow();
+    const createTray = vi.fn(() => ({ destroy: vi.fn() }));
+    const onRendererReady = vi.fn();
+    let finishLoad = (): void => undefined;
+    const load = new Promise<void>((resolve) => {
+      finishLoad = resolve;
+    });
+
+    const startup = startElectronComposition({
+      app,
+      supervisor,
+      createWindow: () => mainWindow,
+      configureWindow: vi.fn(),
+      registerIpc: () => () => undefined,
+      createTray,
+      loadWindow: () => load,
+      diagnostic,
+      onRendererReady,
+    });
+    await Promise.resolve();
+
+    expect(mainWindow.shown).toBe(false);
+    expect(createTray).not.toHaveBeenCalled();
+    expect(onRendererReady).not.toHaveBeenCalled();
+    finishLoad();
+    await startup;
+    expect(onRendererReady).toHaveBeenCalledWith(mainWindow);
+    expect(createTray).toHaveBeenCalledOnce();
+    expect(mainWindow.shown).toBe(true);
+  });
+
+  it("fails closed when the renderer never mounts visible application content", async () => {
+    const probe = vi.fn(async () => false);
+    const wait = vi.fn(async () => undefined);
+
+    await expect(
+      waitForRendererReady({
+        attempts: 3,
+        probe,
+        wait,
+      }),
+    ).rejects.toThrow("WhiteLily renderer did not mount");
+    expect(probe).toHaveBeenCalledTimes(3);
+    expect(wait).toHaveBeenCalledTimes(2);
+  });
+
+  it("applies the renderer deadline even when a probe never settles", async () => {
+    await expect(
+      waitForRendererReady({
+        deadline: Promise.resolve(),
+        probe: () => new Promise<never>(() => undefined),
+      }),
+    ).rejects.toThrow("WhiteLily renderer did not mount");
+  }, 1_000);
+
+  it("does not probe again when the renderer deadline wins during a polling wait", async () => {
+    let expire = (): void => undefined;
+    const deadline = new Promise<void>((resolve) => {
+      expire = resolve;
+    });
+    let releaseWait = (): void => undefined;
+    const wait = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          releaseWait = resolve;
+        }),
+    );
+    const probe = vi.fn(async () => false);
+    const readiness = waitForRendererReady({
+      attempts: 3,
+      deadline,
+      probe,
+      wait,
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(probe).toHaveBeenCalledOnce();
+    expect(wait).toHaveBeenCalledOnce();
+
+    expire();
+    await expect(readiness).rejects.toThrow("WhiteLily renderer did not mount");
+    releaseWait();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(probe).toHaveBeenCalledOnce();
+  });
+
+  it("accepts the renderer when application content mounts during the bounded wait", async () => {
+    const probe = vi.fn().mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+    const wait = vi.fn(async () => undefined);
+
+    await waitForRendererReady({
+      attempts: 3,
+      probe,
+      wait,
+    });
+
+    expect(probe).toHaveBeenCalledTimes(2);
+    expect(wait).toHaveBeenCalledOnce();
+  });
+
   it("installs the quit guard before a BrowserWindow construction failure", async () => {
     const { app, beforeQuit, diagnostic, supervisor } = createStartupHarness();
 
