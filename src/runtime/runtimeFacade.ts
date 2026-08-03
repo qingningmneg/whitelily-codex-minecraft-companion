@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { ResolvedModelSelection } from "../codex/modelCatalog.js";
+import { isModelId } from "../codex/modelId.js";
 import type { ActiveTask, TaskDisclosure } from "../companion/taskController.js";
 import { redactPublicText } from "../memory/redaction.js";
 import type { MinecraftEvent } from "../minecraft/minecraftPort.js";
@@ -403,13 +404,7 @@ export class RuntimeFacade {
 
   #readCodexModel(): string | null {
     const model = this.#dependencies.codex?.model() ?? null;
-    if (
-      model !== null &&
-      (typeof model !== "string" ||
-        model.length === 0 ||
-        model.length > 128 ||
-        !/^[A-Za-z0-9._-]+$/.test(model))
-    ) {
+    if (model !== null && !isModelId(model)) {
       throw new Error("Codex model state is unavailable");
     }
     return model;

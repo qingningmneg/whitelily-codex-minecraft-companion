@@ -1,6 +1,7 @@
 import { z } from "zod";
 import type { AccountSnapshot } from "../codex/accountService.js";
 import type { ModelCatalogSnapshot, ModelSelection } from "../codex/modelCatalog.js";
+import { MODEL_ID_PATTERN } from "../codex/modelId.js";
 import type { RuntimeEvent, RuntimeSnapshot } from "../runtime/runtimeEvents.js";
 import type { OwnerIdentitySnapshot } from "../identity/ownerIdentity.js";
 import {
@@ -42,7 +43,7 @@ const ownerUsernameSchema = z
   .string()
   .regex(/^[A-Za-z0-9_]{3,16}$/u)
   .refine((value) => value !== "YourMcName");
-const modelTokenSchema = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u);
+const modelTokenSchema = z.string().regex(MODEL_ID_PATTERN);
 const reasoningEffortSchema = z.string().regex(/^[A-Za-z][A-Za-z0-9_-]{0,63}$/u);
 const attemptIdSchema = z.string().regex(/^[A-Za-z0-9_-]{16,128}$/u);
 const connectionNonceSchema = z.string().regex(/^[A-Za-z0-9_-]{16,64}$/u);
@@ -114,7 +115,7 @@ const minecraftStateSchema = z
 const codexStateSchema = z
   .object({
     state: z.enum(["stopped", "starting", "ready", "failed"]),
-    model: safeTokenSchema.nullable(),
+    model: modelTokenSchema.nullable(),
   })
   .strict();
 

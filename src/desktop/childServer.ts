@@ -117,6 +117,11 @@ interface AcceptedConnectionAuthority {
   readonly generation: number;
 }
 
+interface RecoveryConnectionAuthority {
+  readonly connection: ConfirmedRuntimeConnection;
+  readonly explicitModelRecovery: boolean;
+}
+
 interface RuntimeReplacementOperation {
   readonly generation: number;
   retirementReason?: TaskStopReason;
@@ -128,6 +133,7 @@ interface AuthorityInvalidationPolicy {
   publicReason: ConnectionInvalidationReason;
   preserveWorldBinding: boolean;
   preserveConnectionAuthority: boolean;
+  explicitModelRecovery: boolean;
   finalized: boolean;
 }
 
@@ -318,7 +324,7 @@ export class DesktopChildServer {
   readonly #clearModelValidationTimer: (timer: ReturnType<typeof setTimeout>) => void;
   #acceptedConnectionAuthority: AcceptedConnectionAuthority | undefined;
   #activeRuntimeConnection: ConfirmedRuntimeConnection | undefined;
-  #recoveryConnectionAuthority: ConfirmedRuntimeConnection | undefined;
+  #recoveryConnectionAuthority: RecoveryConnectionAuthority | undefined;
   #currentConfirmedConnectionProof: ConfirmedConnectionProof | undefined;
   #activeWorldBinding: ConfirmedWorldBinding | undefined;
   #authorityContained = true;
@@ -433,7 +439,13 @@ export class DesktopChildServer {
     });
     this.#unsubscribeAccount = this.#account.subscribe((account) => {
       if (account.status !== "signed_in") {
-        void this.#invalidateDesktopAuthority("model_unavailable", "account_lost", true, true);
+        void this.#invalidateDesktopAuthority(
+          "model_unavailable",
+          "account_lost",
+          true,
+          true,
+          true,
+        );
       }
       const envelope: DesktopEvent = {
         version: DESKTOP_PROTOCOL_VERSION,
@@ -447,7 +459,7 @@ export class DesktopChildServer {
     });
     this.#unsubscribeModelInvalidation = this.#models.subscribe((event) => {
       if (event.kind !== "selection_invalidated") return;
-      void this.#invalidateDesktopAuthority("model_unavailable", event.reason, true, true);
+      void this.#invalidateDesktopAuthority("model_unavailable", event.reason, true, true, true);
     });
     this.#input.on("data", this.#onData);
     this.#input.once("end", this.#onEnd);
@@ -501,6 +513,7 @@ export class DesktopChildServer {
           "model_unavailable",
           true,
           "model_unavailable",
+          true,
           true,
           true,
           true,
@@ -1141,8 +1154,12 @@ export class DesktopChildServer {
         const preserveModelRecovery =
           request.command.kind === "start_runtime" &&
           this.#currentConfirmedConnectionProof !== undefined &&
-          this.#recoveryConnectionAuthority !== undefined;
-        this.#invalidateConnectionAuthority(preserveModelRecovery, preserveModelRecovery);
+          this.#recoveryConnectionAuthority?.explicitModelRecovery === true;
+        this.#invalidateConnectionAuthority(
+          preserveModelRecovery,
+          preserveModelRecovery,
+          preserveModelRecovery,
+        );
       }
       await this.#writeError(
         request.id,
@@ -1336,6 +1353,7 @@ export class DesktopChildServer {
     synchronousRuntimeStop = false,
     preserveWorldBinding = false,
     preserveConnectionAuthority = false,
+    explicitModelRecovery = false,
   ): Promise<void> {
     if (runtime !== this.#runtime) return Promise.resolve();
     return this.#beginAuthorityInvalidation(
@@ -1344,6 +1362,7 @@ export class DesktopChildServer {
       synchronousRuntimeStop,
       preserveWorldBinding,
       preserveConnectionAuthority,
+      explicitModelRecovery,
     );
   }
 
@@ -1353,6 +1372,7 @@ export class DesktopChildServer {
     synchronousRuntimeStop = true,
     preserveWorldBinding = false,
     preserveConnectionAuthority = false,
+    explicitModelRecovery = false,
   ): Promise<void> {
     const existing = this.#authorityInvalidationOperation;
     if (existing) {
@@ -1360,18 +1380,33 @@ export class DesktopChildServer {
       const tightenedWorldBinding = policy.preserveWorldBinding && preserveWorldBinding;
       const tightenedConnectionAuthority =
         policy.preserveConnectionAuthority && preserveConnectionAuthority;
+      const upgradedExplicitModelRecovery =
+        tightenedConnectionAuthority && explicitModelRecovery && !policy.explicitModelRecovery;
       if (
         tightenedWorldBinding !== policy.preserveWorldBinding ||
-        tightenedConnectionAuthority !== policy.preserveConnectionAuthority
+        tightenedConnectionAuthority !== policy.preserveConnectionAuthority ||
+        upgradedExplicitModelRecovery
       ) {
-        this.#interruptGeneration += 1;
-        this.#invalidateConnectionAuthority(tightenedWorldBinding, tightenedConnectionAuthority);
+        if (
+          tightenedWorldBinding !== policy.preserveWorldBinding ||
+          tightenedConnectionAuthority !== policy.preserveConnectionAuthority
+        ) {
+          this.#interruptGeneration += 1;
+        }
+        const effectiveExplicitModelRecovery =
+          tightenedConnectionAuthority && (policy.explicitModelRecovery || explicitModelRecovery);
+        this.#invalidateConnectionAuthority(
+          tightenedWorldBinding,
+          tightenedConnectionAuthority,
+          effectiveExplicitModelRecovery,
+        );
         this.#rebasePreservedConnectionAuthority(tightenedConnectionAuthority);
         if (policy.finalized) {
           const followUpPolicy: AuthorityInvalidationPolicy = {
             publicReason,
             preserveWorldBinding: tightenedWorldBinding,
             preserveConnectionAuthority: tightenedConnectionAuthority,
+            explicitModelRecovery: effectiveExplicitModelRecovery,
             finalized: false,
           };
           const followUp = existing.operation.then(async () => {
@@ -1379,6 +1414,7 @@ export class DesktopChildServer {
             this.#invalidateConnectionAuthority(
               followUpPolicy.preserveWorldBinding,
               followUpPolicy.preserveConnectionAuthority,
+              followUpPolicy.explicitModelRecovery,
             );
             this.#rebasePreservedConnectionAuthority(followUpPolicy.preserveConnectionAuthority);
             await this.#publishConnectionInvalidated(followUpPolicy.publicReason);
@@ -1391,6 +1427,7 @@ export class DesktopChildServer {
         }
         policy.preserveWorldBinding = tightenedWorldBinding;
         policy.preserveConnectionAuthority = tightenedConnectionAuthority;
+        policy.explicitModelRecovery = effectiveExplicitModelRecovery;
       }
       return existing.operation;
     }
@@ -1398,6 +1435,7 @@ export class DesktopChildServer {
       publicReason,
       preserveWorldBinding,
       preserveConnectionAuthority,
+      explicitModelRecovery: preserveConnectionAuthority && explicitModelRecovery,
       finalized: false,
     };
     const runtime = this.#runtime;
@@ -1414,6 +1452,7 @@ export class DesktopChildServer {
       this.#invalidateConnectionAuthority(
         policy.preserveWorldBinding,
         policy.preserveConnectionAuthority,
+        policy.explicitModelRecovery,
       );
       this.#rebasePreservedConnectionAuthority(policy.preserveConnectionAuthority);
       return Promise.resolve();
@@ -1424,6 +1463,7 @@ export class DesktopChildServer {
     this.#invalidateConnectionAuthority(
       policy.preserveWorldBinding,
       policy.preserveConnectionAuthority,
+      policy.explicitModelRecovery,
     );
     this.#rebasePreservedConnectionAuthority(policy.preserveConnectionAuthority);
     if (replacement && replacement.retirementReason === undefined) {
@@ -1462,6 +1502,7 @@ export class DesktopChildServer {
       this.#invalidateConnectionAuthority(
         policy.preserveWorldBinding,
         policy.preserveConnectionAuthority,
+        policy.explicitModelRecovery,
       );
       this.#rebasePreservedConnectionAuthority(policy.preserveConnectionAuthority);
       await this.#publishConnectionInvalidated(policy.publicReason, safeSnapshot);
@@ -1497,6 +1538,7 @@ export class DesktopChildServer {
     publicReason: ConnectionInvalidationReason = connectionInvalidationReason(reason),
     preserveWorldBinding = false,
     preserveConnectionAuthority = false,
+    explicitModelRecovery = false,
   ): Promise<void> {
     return this.#beginAuthorityInvalidation(
       reason,
@@ -1504,6 +1546,7 @@ export class DesktopChildServer {
       true,
       preserveWorldBinding,
       preserveConnectionAuthority,
+      explicitModelRecovery,
     );
   }
 
@@ -1602,7 +1645,13 @@ export class DesktopChildServer {
       return;
     }
     if (!valid) {
-      await this.#invalidateDesktopAuthority("model_unavailable", "model_unavailable", true, true);
+      await this.#invalidateDesktopAuthority(
+        "model_unavailable",
+        "model_unavailable",
+        true,
+        true,
+        true,
+      );
       return;
     }
     scheduleNext();
@@ -1789,8 +1838,8 @@ export class DesktopChildServer {
     if (!recovery) {
       throw new ConnectionOperationError("Minecraft connection is not confirmed");
     }
-    this.#activeRuntimeConnection = recovery;
-    return recovery;
+    this.#activeRuntimeConnection = recovery.connection;
+    return recovery.connection;
   }
 
   #assertConnectionGeneration(generation: number): void {
@@ -1802,9 +1851,24 @@ export class DesktopChildServer {
   #invalidateConnectionAuthority(
     preserveWorldBinding = false,
     preserveConnectionAuthority = false,
+    explicitModelRecovery = false,
   ): void {
     if (preserveConnectionAuthority) {
-      this.#recoveryConnectionAuthority ??= this.#activeRuntimeConnection;
+      const existing = this.#recoveryConnectionAuthority;
+      const connection =
+        existing?.connection ??
+        this.#activeRuntimeConnection ??
+        (explicitModelRecovery ? this.#acceptedConnectionAuthority?.connection : undefined);
+      if (connection) {
+        this.#recoveryConnectionAuthority = Object.freeze({
+          connection,
+          explicitModelRecovery: existing?.explicitModelRecovery === true || explicitModelRecovery,
+        });
+      }
+      if (explicitModelRecovery) {
+        this.#acceptedConnectionAuthority = undefined;
+        this.#activeRuntimeConnection = undefined;
+      }
     } else {
       this.#acceptedConnectionAuthority = undefined;
       this.#activeRuntimeConnection = undefined;

@@ -140,6 +140,31 @@ function createRuntimeFacadeHarness() {
 }
 
 describe("RuntimeFacade", () => {
+  it("accepts a bounded provider-qualified model ID during startup", async () => {
+    const events: RuntimeEvent[] = [];
+    const runtime = new RuntimeFacade({
+      initialRevision: 40,
+      lifecycle: { start: async () => undefined, stop: async () => undefined },
+      codex: { model: () => "provider:model" },
+    });
+    runtime.subscribe((event) => events.push(event));
+
+    await runtime.start();
+
+    expect(runtime.snapshot()).toMatchObject({
+      lifecycle: "running",
+      codex: { state: "ready", model: "provider:model" },
+    });
+    const revisions = events.map((event) => event.revision);
+    expect(revisions).toEqual(revisions.map((_revision, index) => 41 + index));
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        kind: "codex",
+        state: { state: "ready", model: "provider:model" },
+      }),
+    );
+  });
+
   it("publishes only the committed model after a live companion switch", async () => {
     const order: string[] = [];
     const selection: ResolvedModelSelection = {

@@ -1,13 +1,13 @@
 import { join, resolve } from "node:path";
 import { z } from "zod";
 import type { AtomicJsonFileIo } from "../storage/atomicJsonFile.js";
+import { MODEL_ID_PATTERN } from "./modelId.js";
 import {
   DocumentStore,
   DocumentStoreError,
   type DocumentEnvelope,
 } from "../storage/documentStore.js";
 
-const MODEL_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const REASONING_EFFORT_PATTERN = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/u;
 const MODEL_PREFERENCE_SCHEMA_VERSION = 1;
 const MODEL_PREFERENCE_FILENAME = "model-preference.json";

@@ -1,5 +1,6 @@
 import type { AccountSnapshot } from "./accountService.js";
 import type { Model } from "./generated/v2/Model.js";
+import { MODEL_ID_PATTERN } from "./modelId.js";
 import type {
   LegacyModelPreferenceCandidate,
   ModelPreferenceStore,
@@ -9,7 +10,6 @@ import type {
 } from "./modelPreferenceStore.js";
 import { DocumentStoreError, type DocumentEnvelope } from "../storage/documentStore.js";
 
-const MODEL_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const REASONING_EFFORT_PATTERN = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/u;
 const MAX_LIVE_MODELS = 256;
 const MAX_REASONING_EFFORTS = 32;

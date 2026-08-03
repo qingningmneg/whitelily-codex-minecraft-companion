@@ -4504,6 +4504,77 @@ describe("DesktopChildServer", () => {
     expect(connectionInvalidations(harness)).toEqual([]);
   });
 
+  it("publishes a provider-qualified live model through events, response, and later status", async () => {
+    const requested: ModelSelectionInput = {
+      mode: "explicit",
+      modelId: "provider:model",
+      reasoningEffort: "high",
+    };
+    const prepared: PreparedModelSelection = {
+      preferenceRevision: 14,
+      requested,
+      resolved: { modelId: "provider:model", reasoningEffort: "high" },
+    };
+    const runtime = new RuntimeFacade({
+      initialRevision: 25,
+      lifecycle: { start: async () => undefined, stop: async () => undefined },
+      codex: { model: () => "provider-old-model" },
+      switchModel: async (_selection, commitPreference) => commitPreference(),
+    });
+    await runtime.start();
+    const revisionBeforeSwitch = runtime.snapshot().revision;
+    const harness = createHarness({
+      runtime,
+      models: {
+        selectModel: async () => {
+          throw new Error("legacy single-phase selection must not run");
+        },
+        prepareSelection: async () => prepared,
+        commitSelection: async () => ({ ...requested, available: true }),
+      },
+    });
+
+    harness.send(
+      commandRequest("provider-model-select", { kind: "select_model", selection: requested }),
+    );
+    await expect(harness.nextResponse()).resolves.toMatchObject({
+      id: "provider-model-select",
+      ok: true,
+      result: { mode: "explicit", modelId: "provider:model", available: true },
+    });
+    const codexEventLine = harness
+      .lines()
+      .map((line) => JSON.parse(line) as unknown)
+      .find(
+        (line) =>
+          typeof line === "object" &&
+          line !== null &&
+          (line as { event?: { kind?: string; state?: { model?: string } } }).event?.kind ===
+            "codex" &&
+          (line as { event?: { state?: { model?: string } } }).event?.state?.model ===
+            "provider:model",
+      );
+    expect(codexEventLine).toBeDefined();
+    const codexEvent = parseDesktopEvent(codexEventLine!).event;
+    expect(codexEvent).toEqual({
+      kind: "codex",
+      revision: revisionBeforeSwitch + 1,
+      state: { state: "ready", model: "provider:model" },
+    });
+
+    harness.send(request("provider-model-status", "get_status"));
+    await expect(harness.nextResponse()).resolves.toMatchObject({
+      id: "provider-model-status",
+      ok: true,
+      result: {
+        revision: revisionBeforeSwitch + 1,
+        lifecycle: "running",
+        codex: { state: "ready", model: "provider:model" },
+      },
+    });
+    expect(connectionInvalidations(harness)).toEqual([]);
+  });
+
   it("commits an idle model selection without asking the runtime to switch", async () => {
     const order: string[] = [];
     const requested: ModelSelectionInput = {
@@ -4809,6 +4880,173 @@ describe("DesktopChildServer", () => {
       { requestedPreset: "standard", compatibilityVerified: true },
     ]);
     expect(runtimeCreations).toBe(2);
+  });
+
+  it("retains explicit model recovery before connection consumption and beyond proof TTL", async () => {
+    let now = 100;
+    let modelAvailable = true;
+    let modelListener: ((event: ModelCatalogEvent) => void) | undefined;
+    const resolveEntered = deferred<void>();
+    const releaseResolve = deferred<void>();
+    let resolveCalls = 0;
+    let profile: WorldProfile | null = null;
+    let revision = 0;
+    const safetyConfigurations: RuntimeSafetyConfiguration[] = [];
+    const proof: ConfirmedConnectionProof = {
+      nonce: "preconsume_model_recovery_01",
+      port: 25565,
+      issuedAt: 100,
+      expiresAt: 10_100,
+    };
+    const binding: ConfirmedWorldBinding = {
+      canonicalInstancePath: "C:/Minecraft/PreconsumeRecovery",
+      javaSession: {
+        pid: 8642,
+        processStartedAt: 30,
+        port: 25565,
+        version: "1.21.5",
+      },
+      ownerUsername: "HarnessOwner",
+      proof,
+    };
+    const worlds: DesktopChildWorldProfileStore = {
+      read: async () => ({
+        schemaVersion: 1,
+        revision,
+        updatedAt: "2026-08-03T00:00:00.000Z",
+        value: profile,
+      }),
+      bindConfirmedWorld: async (_expectedRevision, confirmed, label) => {
+        revision += 1;
+        profile = {
+          id: "be176ae1-a4b4-4fd6-b04c-89634cd74a99",
+          label,
+          instanceFingerprint: fingerprintConfirmedWorld(
+            confirmed.canonicalInstancePath,
+            confirmed.javaSession,
+          ),
+          ownerUsername: confirmed.ownerUsername,
+          safetyPreset: "standard",
+        };
+        return {
+          schemaVersion: 1,
+          revision,
+          updatedAt: "2026-08-03T00:00:01.000Z",
+          value: profile,
+        };
+      },
+      updateSafetyProfile: async () => {
+        throw new Error("unused");
+      },
+    };
+    const harness = createHarness({
+      lazyRuntime: true,
+      now: () => now,
+      worldProfiles: worlds,
+      models: {
+        resolveRuntimeSelection: async () => {
+          resolveCalls += 1;
+          if (resolveCalls === 1) {
+            resolveEntered.resolve();
+            await releaseResolve.promise;
+          }
+          if (!modelAvailable) throw new Error("Selected model is unavailable");
+          return { modelId: "gpt-5.6-terra", reasoningEffort: "medium" };
+        },
+        subscribe: (listener) => {
+          modelListener = listener;
+          return () => {
+            modelListener = undefined;
+          };
+        },
+      },
+      createRuntime: async (_connection, initialRevision, _selection, safety) => {
+        safetyConfigurations.push(safety);
+        return new RuntimeFacade({
+          initialRevision,
+          lifecycle: { start: async () => undefined, stop: async () => undefined },
+        });
+      },
+    });
+    harness.send(
+      commandRequest("preconsume-recovery-confirm", {
+        kind: "set_confirmed_connection",
+        proof,
+      }),
+    );
+    await expect(harness.nextResponse()).resolves.toMatchObject({
+      id: "preconsume-recovery-confirm",
+      ok: true,
+    });
+    harness.sendRaw(privateWorldBindRequest("preconsume-recovery-bind", binding));
+    await expect(harness.nextResponse()).resolves.toMatchObject({
+      id: "preconsume-recovery-bind",
+      ok: true,
+    });
+
+    harness.send(request("preconsume-recovery-first-start", "start_runtime"));
+    await resolveEntered.promise;
+    modelAvailable = false;
+    modelListener?.({ kind: "selection_invalidated", reason: "model_unavailable" });
+    await vi.waitFor(() => expect(connectionInvalidations(harness)).toContain("model_unavailable"));
+    releaseResolve.resolve();
+    await expect(harness.nextResponse()).resolves.toMatchObject({
+      id: "preconsume-recovery-first-start",
+      ok: false,
+      error: { code: "RUNTIME_START_FAILED" },
+    });
+
+    now = 20_000;
+    modelAvailable = true;
+    harness.send(request("preconsume-recovery-restored", "start_runtime"));
+    await expect(harness.nextResponse()).resolves.toMatchObject({
+      id: "preconsume-recovery-restored",
+      ok: true,
+      result: { lifecycle: "running" },
+    });
+    expect(safetyConfigurations).toEqual([
+      { requestedPreset: "standard", compatibilityVerified: true },
+    ]);
+  });
+
+  it("consumes one-shot confirmation after an ordinary pre-consumption resolve failure", async () => {
+    let resolveCalls = 0;
+    const harness = createHarness({
+      lazyRuntime: true,
+      now: () => 100,
+      models: {
+        resolveRuntimeSelection: async () => {
+          resolveCalls += 1;
+          if (resolveCalls === 1) throw new Error("ordinary model lookup failure");
+          return { modelId: "gpt-5.6-terra", reasoningEffort: "medium" };
+        },
+      },
+    });
+    harness.send(
+      commandRequest("ordinary-resolve-confirm", {
+        kind: "set_confirmed_connection",
+        proof: {
+          nonce: "ordinary_resolve_failure_01",
+          port: 25565,
+          issuedAt: 100,
+          expiresAt: 10_100,
+        },
+      }),
+    );
+    await harness.nextResponse();
+
+    harness.send(request("ordinary-resolve-first", "start_runtime"));
+    await expect(harness.nextResponse()).resolves.toMatchObject({
+      id: "ordinary-resolve-first",
+      ok: false,
+      error: { code: "RUNTIME_START_FAILED" },
+    });
+    harness.send(request("ordinary-resolve-retry", "start_runtime"));
+    await expect(harness.nextResponse()).resolves.toMatchObject({
+      id: "ordinary-resolve-retry",
+      ok: false,
+      error: { code: "CONNECTION_OPERATION_FAILED" },
+    });
   });
 
   it("serves account state before a Minecraft runtime can be composed", async () => {
