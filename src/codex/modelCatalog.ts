@@ -137,6 +137,7 @@ export class ModelCatalog {
       const generation = this.#accountGeneration;
       const normalized = await this.#fetchModels();
       let preference = await this.#readPreference();
+      let pendingMigrationUpdate: RecoverableModelPreferenceUpdate | undefined;
       await this.#assertCurrentAccount(generation);
       if (!preference.value.legacyMigrationCompleted) {
         if (this.#persistence) {
@@ -152,6 +153,7 @@ export class ModelCatalog {
             );
             await this.#verifyDurableUpdate(generation, migrated);
             preference = migrated.envelope;
+            pendingMigrationUpdate = migrated;
           } catch (error) {
             if (!(error instanceof DocumentStoreError) || error.code !== "DOCUMENT_CONFLICT") {
               throw error;
@@ -170,7 +172,14 @@ export class ModelCatalog {
           preference = this.#volatilePreference(migrated, true);
         }
       }
-      return this.#applyRefresh(normalized, preference, true, generation);
+      return this.#applyRefresh(
+        normalized,
+        preference,
+        true,
+        generation,
+        undefined,
+        pendingMigrationUpdate,
+      );
     });
   }
 
@@ -285,8 +294,13 @@ export class ModelCatalog {
     notifyInvalidation: boolean,
     generation: number,
     signal?: AbortSignal,
+    pendingUpdate?: RecoverableModelPreferenceUpdate,
   ): Promise<ModelCatalogSnapshot> {
-    await this.#assertCurrentAccount(generation, signal);
+    if (pendingUpdate) {
+      await this.#verifyDurableUpdate(generation, pendingUpdate, signal);
+    } else {
+      await this.#assertCurrentAccount(generation, signal);
+    }
     const previousAutomatic = this.#automaticSelection;
     const previousSelection = this.#selection;
     let preference = initialPreference;

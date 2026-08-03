@@ -571,6 +571,63 @@ describe("ModelCatalog", () => {
     });
   });
 
+  it("restores migration when logout occurs after durable verification but before state application", async () => {
+    let snapshot: AccountSnapshot = { status: "signed_in", auth: "chatgpt" };
+    const listeners = new Set<(next: AccountSnapshot) => void>();
+    const finalApplyEntered = gate();
+    const allowFinalApply = gate();
+    let accountReads = 0;
+    const account: ModelCatalogAccountPort = {
+      getAccount: async () => {
+        accountReads += 1;
+        if (accountReads === 5) {
+          finalApplyEntered.release();
+          await allowFinalApply.promise;
+        }
+        return snapshot;
+      },
+      subscribe: (listener) => {
+        listeners.add(listener);
+        return () => listeners.delete(listener);
+      },
+    };
+    const store = await preferenceStore();
+    const catalog = new ModelCatalog(
+      { listModelRecords: async () => [model("legacy-ui", "Legacy UI", ["high"])] },
+      account,
+      {
+        store,
+        legacyConfigCandidate: {
+          mode: "explicit",
+          modelId: "legacy-config",
+          reasoningEffort: "medium",
+        },
+      },
+    );
+    const events: ModelCatalogEvent[] = [];
+    catalog.subscribe((event) => events.push(event));
+
+    const migrating = catalog.migrateLegacyPreference({
+      mode: "explicit",
+      modelId: "legacy-ui",
+      reasoningEffort: "high",
+    });
+    await finalApplyEntered.promise;
+    snapshot = { status: "signed_out" };
+    for (const listener of listeners) listener(snapshot);
+    allowFinalApply.release();
+
+    await expect(migrating).rejects.toThrow("ChatGPT authentication is required");
+    expect(events).toEqual([]);
+    await expect(store.read()).resolves.toMatchObject({
+      revision: 2,
+      value: {
+        selection: { mode: "automatic" },
+        legacyMigrationCompleted: false,
+      },
+    });
+  });
+
   it("does not apply a prepared selection whose persistence finishes after logout", async () => {
     const account = signedInAccount();
     const store = await preferenceStore();
