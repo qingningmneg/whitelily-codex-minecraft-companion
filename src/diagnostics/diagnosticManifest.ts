@@ -1,4 +1,5 @@
 import { redactPublicTextWithCount } from "../memory/redaction.js";
+import type { RuntimeSnapshot } from "../runtime/runtimeEvents.js";
 
 export const DIAGNOSTIC_ENTRY_NAMES = [
   "app-version.json",
@@ -23,8 +24,66 @@ export type DiagnosticLogicalName = (typeof DIAGNOSTIC_ENTRY_NAMES)[number];
 
 export interface DiagnosticPreview {
   exportId: string;
+  actionCapability: DiagnosticActionCapability;
   files: Array<{ logicalName: DiagnosticLogicalName; size: number; redactions: number }>;
   omitted: Array<(typeof DIAGNOSTIC_OMISSIONS)[number]>;
+}
+
+export interface DiagnosticActionCapability {
+  workspaceVersion: string | null;
+  state: "starting" | "ready" | "failed";
+  mcpListening: boolean;
+  discoveredToolCount: number;
+  errorCode: string | null;
+}
+
+const workspaceVersionPattern = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u;
+const actionErrorCodePattern = /^[a-z][a-z0-9_]{0,63}$/u;
+
+export function snapshotDiagnosticActionCapability(
+  actions: RuntimeSnapshot["actions"],
+): DiagnosticActionCapability {
+  if (actions === null) {
+    return Object.freeze({
+      workspaceVersion: null,
+      state: "starting",
+      mcpListening: false,
+      discoveredToolCount: 0,
+      errorCode: null,
+    });
+  }
+  const workspaceVersion = workspaceVersionPattern.test(actions.workspaceVersion ?? "")
+    ? actions.workspaceVersion
+    : null;
+  if (actions.state === "starting") {
+    return Object.freeze({
+      workspaceVersion,
+      state: "starting",
+      mcpListening: false,
+      discoveredToolCount: 0,
+      errorCode: null,
+    });
+  }
+  if (actions.state === "ready") {
+    return Object.freeze({
+      workspaceVersion,
+      state: "ready",
+      mcpListening: true,
+      discoveredToolCount: boundedToolCount(actions.discoveredToolCount),
+      errorCode: null,
+    });
+  }
+  return Object.freeze({
+    workspaceVersion,
+    state: "failed",
+    mcpListening: actions.mcpListening === true,
+    discoveredToolCount: boundedToolCount(actions.discoveredToolCount),
+    errorCode: actionErrorCodePattern.test(actions.errorCode) ? actions.errorCode : null,
+  });
+}
+
+function boundedToolCount(value: number): number {
+  return Number.isSafeInteger(value) && value >= 0 ? value : 0;
 }
 
 export interface DiagnosticManifestValues {

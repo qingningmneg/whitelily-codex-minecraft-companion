@@ -552,6 +552,13 @@ describe("desktop protocol v1", () => {
 
     const preview = {
       exportId: "diagnostic_1234567890",
+      actionCapability: {
+        workspaceVersion: "workspace-1",
+        state: "ready" as const,
+        mcpListening: true,
+        discoveredToolCount: 16,
+        errorCode: null,
+      },
       files: [
         { logicalName: "app-version.json", size: 20, redactions: 0 },
         { logicalName: "os-summary.json", size: 20, redactions: 0 },

@@ -11,12 +11,14 @@ import { LanCandidateCard } from "../components/LanCandidateCard";
 import { ModelPicker } from "../components/ModelPicker";
 import type { WhiteLilyDesktopApi } from "../desktopApi";
 import { ONBOARDING_STORAGE_KEY, OnboardingPage, safeOnboardingErrorKey } from "./OnboardingPage";
+import { translate } from "../i18n/translator";
 
 const stoppedSnapshot: RuntimeSnapshot = {
   revision: 10,
   lifecycle: "stopped",
   minecraft: { state: "disconnected", sessionId: null },
   codex: { state: "stopped", model: null },
+  actions: null,
   task: null,
   lastError: null,
 };
@@ -26,6 +28,12 @@ const runningSnapshot: RuntimeSnapshot = {
   lifecycle: "running",
   minecraft: { state: "connected", sessionId: "private-session" },
   codex: { state: "ready", model: "gpt-live" },
+  actions: {
+    state: "ready",
+    workspaceVersion: "workspace-1",
+    mcpListening: true,
+    discoveredToolCount: 15,
+  },
   task: null,
   lastError: null,
 };
@@ -107,7 +115,7 @@ function createApiHarness(
     pcl2?: readonly Pcl2Candidate[];
     lan?: readonly LanCandidate[] | readonly (readonly LanCandidate[])[];
     confirm?: ConfirmedLanSession | Error;
-    start?: RuntimeSnapshot | Error;
+    start?: RuntimeSnapshot | Error | readonly (RuntimeSnapshot | Error)[];
     owner?: Awaited<ReturnType<WhiteLilyDesktopApi["readOwnerIdentity"]>> | Error;
     ownerUpdate?: Error;
   } = {},
@@ -177,9 +185,14 @@ function createApiHarness(
       }
     );
   });
+  const startResults = Array.isArray(options.start)
+    ? [...options.start]
+    : [options.start ?? runningSnapshot];
+  const finalStart = startResults.at(-1) ?? runningSnapshot;
   const start = vi.fn<WhiteLilyDesktopApi["start"]>(async () => {
-    if (options.start instanceof Error) throw options.start;
-    return options.start ?? runningSnapshot;
+    const result = startResults.shift() ?? finalStart;
+    if (result instanceof Error) throw result;
+    return result;
   });
   const readOwnerIdentity = vi.fn<WhiteLilyDesktopApi["readOwnerIdentity"]>(async () => {
     if (options.owner instanceof Error) throw options.owner;
@@ -1607,6 +1620,32 @@ describe("first-run onboarding", () => {
     expect(document.body.textContent).not.toContain("private://config");
   });
 
+  it("preserves the confirmed LAN candidate and retries action readiness with a fresh runtime", async () => {
+    const secret = String.raw`C:\Users\Private\codex-workspace token=secret raw MCP body`;
+    const harness = createApiHarness({
+      status: [stoppedSnapshot, runningSnapshot],
+      pcl2: [pcl2Candidate],
+      lan: [lanCandidate],
+      start: [new Error(`MCP_READINESS_TIMEOUT ${secret}`), runningSnapshot],
+    });
+    const user = userEvent.setup();
+    await reachLan(harness);
+
+    await user.click(await screen.findByRole("button", { name: /确认并连接.*51321/u }));
+
+    expect(await screen.findByText("Minecraft 动作组件响应超时。")).toBeTruthy();
+    expect(screen.getByText("端口 51321")).toBeTruthy();
+    expect(harness.confirmLanCandidate).toHaveBeenCalledTimes(1);
+    expect(harness.detectLanCandidates).toHaveBeenCalledTimes(1);
+    expect(document.body.textContent).not.toContain(secret);
+
+    await user.click(screen.getByRole("button", { name: "重试动作组件" }));
+
+    expect(harness.start).toHaveBeenCalledTimes(2);
+    expect(harness.confirmLanCandidate).toHaveBeenCalledTimes(1);
+    expect(await screen.findByRole("heading", { name: "运行概览" })).toBeTruthy();
+  });
+
   it("moves focus to each new step heading for keyboard and screen-reader users", async () => {
     const harness = createApiHarness();
     render(<App api={harness.api} />);
@@ -1770,6 +1809,20 @@ describe("model picker concurrency", () => {
 
 describe("safe onboarding error mapping", () => {
   it.each([
+    ["WORKSPACE_RESOURCE_INVALID", "安装资源损坏，建议重新安装 WhiteLily；"],
+    ["WORKSPACE_DEPLOY_FAILED", "工作区修复失败，建议关闭相关占用后重试；"],
+    ["MCP_PORT_UNAVAILABLE", "本地动作端口被占用；"],
+    ["MCP_TOOL_CATALOG_INVALID", "Minecraft 动作组件不完整；"],
+    ["MCP_READINESS_TIMEOUT", "Minecraft 动作组件响应超时。"],
+  ] as const)("renders bounded Chinese-first recovery copy for %s", (code, expected) => {
+    const key = safeOnboardingErrorKey(
+      new Error(`${code} raw response ${String.raw`C:\private\token`}`),
+    );
+    expect(translate("zh-CN", key)).toBe(expected);
+    expect(translate("zh-CN", key)).not.toMatch(/raw response|C:\\private|token/iu);
+  });
+
+  it.each([
     ["CODEX_NOT_LOGGED_IN", "onboarding.error.CODEX_NOT_LOGGED_IN"],
     ["MODEL_UNAVAILABLE", "onboarding.error.MODEL_UNAVAILABLE"],
     ["PCL2_NOT_FOUND", "onboarding.error.PCL2_NOT_FOUND"],
@@ -1777,6 +1830,11 @@ describe("safe onboarding error mapping", () => {
     ["LAN_CANDIDATE_EXPIRED", "onboarding.error.LAN_CANDIDATE_EXPIRED"],
     ["MINECRAFT_VERSION_UNVERIFIED", "onboarding.error.MINECRAFT_VERSION_UNVERIFIED"],
     ["MINECRAFT_CONNECT_FAILED", "onboarding.error.MINECRAFT_CONNECT_FAILED"],
+    ["WORKSPACE_RESOURCE_INVALID", "onboarding.error.WORKSPACE_RESOURCE_INVALID"],
+    ["WORKSPACE_DEPLOY_FAILED", "onboarding.error.WORKSPACE_DEPLOY_FAILED"],
+    ["MCP_PORT_UNAVAILABLE", "onboarding.error.MCP_PORT_UNAVAILABLE"],
+    ["MCP_TOOL_CATALOG_INVALID", "onboarding.error.MCP_TOOL_CATALOG_INVALID"],
+    ["MCP_READINESS_TIMEOUT", "onboarding.error.MCP_READINESS_TIMEOUT"],
   ] as const)("maps %s without returning raw error text", (code, expected) => {
     expect(safeOnboardingErrorKey(new Error(`${code} ${String.raw`C:\private\token`}`))).toBe(
       expected,

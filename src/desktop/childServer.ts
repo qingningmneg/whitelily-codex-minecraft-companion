@@ -56,6 +56,7 @@ import type {
 } from "../diagnostics/diagnosticExporter.js";
 import type { DiagnosticPreview } from "../diagnostics/diagnosticManifest.js";
 import { OwnerIdentityError, type OwnerIdentityAccess } from "../identity/ownerIdentity.js";
+import { ActionCapabilityError } from "../app.js";
 
 export interface DesktopChildRuntime {
   start(): Promise<void>;
@@ -215,7 +216,7 @@ export interface DesktopChildMemoryStore {
 }
 
 export interface DesktopChildDiagnostics {
-  preview(): Promise<DiagnosticPreview>;
+  preview(actions: RuntimeSnapshot["actions"]): Promise<DiagnosticPreview>;
   createArchive(exportId: string): Promise<PreparedDiagnosticArchive>;
   dispose(): Promise<void>;
 }
@@ -246,6 +247,9 @@ type RetainedMemoryMigration =
 type DesktopErrorCode =
   | "INVALID_REQUEST"
   | "RUNTIME_START_FAILED"
+  | "MCP_PORT_UNAVAILABLE"
+  | "MCP_TOOL_CATALOG_INVALID"
+  | "MCP_READINESS_TIMEOUT"
   | "RUNTIME_STOP_FAILED"
   | "EMERGENCY_STOP_FAILED"
   | "ACCOUNT_OPERATION_FAILED"
@@ -271,6 +275,9 @@ class ProfileRuntimeContainmentError extends Error {
 const errorMessages = {
   INVALID_REQUEST: "Invalid desktop request",
   RUNTIME_START_FAILED: "Runtime failed to start",
+  MCP_PORT_UNAVAILABLE: "Minecraft action port is unavailable",
+  MCP_TOOL_CATALOG_INVALID: "Minecraft action tool catalog is invalid",
+  MCP_READINESS_TIMEOUT: "Minecraft action readiness timed out",
   RUNTIME_STOP_FAILED: "Runtime failed to stop",
   EMERGENCY_STOP_FAILED: "Emergency stop failed",
   ACCOUNT_OPERATION_FAILED: "Account operation failed",
@@ -338,6 +345,8 @@ export class DesktopChildServer {
   #started = false;
   #stopping: Promise<void> | undefined;
   #replacementOperation: RuntimeReplacementOperation | undefined;
+  #runtimeStartInFlight: DesktopChildRuntime | undefined;
+  #actionFailureDuringRuntimeStart: DesktopChildRuntime | undefined;
   #authorityInvalidationOperation: AuthorityInvalidationOperation | undefined;
   #runtimeSelection: ResolvedModelSelection | undefined;
   #modelValidationGeneration = 0;
@@ -480,7 +489,20 @@ export class DesktopChildServer {
         return;
       }
       this.#publicRuntimeRevision = event.revision;
-      if (isConnectionInvalidatingRuntimeEvent(event)) {
+      if (
+        runtime === this.#runtimeStartInFlight &&
+        event.kind === "error" &&
+        isActionRecoveryRuntimeError(event.error.code)
+      ) {
+        this.#actionFailureDuringRuntimeStart = runtime;
+      }
+      if (
+        isConnectionInvalidatingRuntimeEvent(event) &&
+        !(
+          runtime === this.#runtimeStartInFlight &&
+          runtime === this.#actionFailureDuringRuntimeStart
+        )
+      ) {
         this.#beginRuntimeInvalidation(
           runtime,
           event.kind === "minecraft"
@@ -821,7 +843,16 @@ export class DesktopChildServer {
           }
           if (!selection) throw new Error("Runtime model selection is unavailable");
           const runtime = this.#requireRuntime();
-          await runtime.start();
+          this.#runtimeStartInFlight = runtime;
+          this.#actionFailureDuringRuntimeStart = undefined;
+          try {
+            await runtime.start();
+          } finally {
+            if (this.#runtimeStartInFlight === runtime) this.#runtimeStartInFlight = undefined;
+            if (this.#actionFailureDuringRuntimeStart === runtime) {
+              this.#actionFailureDuringRuntimeStart = undefined;
+            }
+          }
           if (
             this.#shutdownRequested ||
             interruptGeneration !== this.#interruptGeneration ||
@@ -965,7 +996,10 @@ export class DesktopChildServer {
           );
           return;
         case "preview_diagnostics":
-          await this.#writeCommandResult(request, await this.#requireDiagnostics().preview());
+          await this.#writeCommandResult(
+            request,
+            await this.#requireDiagnostics().preview(this.#snapshot().actions),
+          );
           return;
         case "prepare_diagnostic_archive": {
           const prepared = await this.#requireDiagnostics().createArchive(request.command.exportId);
@@ -1166,18 +1200,30 @@ export class DesktopChildServer {
         await this.#writeProfileRuntimeContainmentError(request.id, error.committed);
         return;
       }
+      const actionRecoveryError =
+        request.command.kind === "start_runtime" ? actionRecoveryDesktopError(error) : undefined;
+      const preserveModelRecovery =
+        request.command.kind === "start_runtime" &&
+        this.#currentConfirmedConnectionProof !== undefined &&
+        this.#recoveryConnectionAuthority?.explicitModelRecovery === true;
+      const preserveTrustedInitialRecovery =
+        request.command.kind === "start_runtime" &&
+        this.#currentConfirmedConnectionProof === undefined &&
+        this.#activeRuntimeConnection !== undefined;
       if (
         (request.command.kind === "start_runtime" || request.command.kind === "stop_runtime") &&
         !(error instanceof OwnerIdentityError)
       ) {
         this.#needsFreshRuntime = true;
-        const preserveModelRecovery =
+        const preserveActionRecovery =
           request.command.kind === "start_runtime" &&
           this.#currentConfirmedConnectionProof !== undefined &&
-          this.#recoveryConnectionAuthority?.explicitModelRecovery === true;
+          actionRecoveryError !== undefined;
+        const preserveRecovery =
+          preserveModelRecovery || preserveActionRecovery || preserveTrustedInitialRecovery;
         this.#invalidateConnectionAuthority(
-          preserveModelRecovery,
-          preserveModelRecovery,
+          preserveRecovery,
+          preserveRecovery,
           preserveModelRecovery,
         );
       }
@@ -1185,13 +1231,14 @@ export class DesktopChildServer {
         request.id,
         error instanceof OwnerIdentityError
           ? error.code
-          : request.command.kind === "select_model"
-            ? "MODEL_OPERATION_FAILED"
-            : error instanceof DocumentStoreError && error.code === "DOCUMENT_CONFLICT"
-              ? "DOCUMENT_CONFLICT"
-              : error instanceof ConnectionOperationError
-                ? "CONNECTION_OPERATION_FAILED"
-                : errorCodeFor(request.command.kind),
+          : (actionRecoveryError ??
+              (request.command.kind === "select_model"
+                ? "MODEL_OPERATION_FAILED"
+                : error instanceof DocumentStoreError && error.code === "DOCUMENT_CONFLICT"
+                  ? "DOCUMENT_CONFLICT"
+                  : error instanceof ConnectionOperationError
+                    ? "CONNECTION_OPERATION_FAILED"
+                    : errorCodeFor(request.command.kind))),
       );
     }
   }
@@ -2210,6 +2257,36 @@ export class DesktopChildServer {
       },
     });
   }
+}
+
+function actionRecoveryDesktopError(error: unknown): DesktopErrorCode | undefined {
+  if (!(error instanceof ActionCapabilityError)) return undefined;
+  switch (error.code) {
+    case "port_conflict":
+    case "server_start_failed":
+      return "MCP_PORT_UNAVAILABLE";
+    case "missing_tools":
+    case "extra_tools":
+    case "duplicate_tools":
+    case "invalid_tool_name":
+      return "MCP_TOOL_CATALOG_INVALID";
+    case "invalid_url":
+    case "invalid_timeout":
+    case "connection_failed":
+    case "timeout":
+    case "aborted":
+    case "server_closed":
+    case "startup_stopped":
+      return "MCP_READINESS_TIMEOUT";
+  }
+}
+
+function isActionRecoveryRuntimeError(errorCode: string): boolean {
+  return (
+    errorCode === "MCP_PORT_UNAVAILABLE" ||
+    errorCode === "MCP_TOOL_CATALOG_INVALID" ||
+    errorCode === "MCP_READINESS_TIMEOUT"
+  );
 }
 
 function isConnectionInvalidatingRuntimeEvent(event: RuntimeEvent): boolean {

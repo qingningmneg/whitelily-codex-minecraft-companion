@@ -370,7 +370,7 @@ export class RuntimeFacade {
       this.#setCodex("ready", model);
       if (this.#terminal || this.#snapshot.lifecycle !== "starting") return;
       this.#setLifecycle("running");
-    } catch {
+    } catch (error) {
       if (this.#terminal) throw new Error("Runtime startup was stopped");
       this.#terminal = true;
       try {
@@ -381,11 +381,18 @@ export class RuntimeFacade {
       this.#taskEventsFenced = true;
       this.#clearTask(false);
       await this.#dependencies.lifecycle.stop().catch(() => undefined);
+      const actionErrorCode = boundedActionRuntimeErrorCode(error);
+      if (actionErrorCode !== undefined) {
+        this.#recordError(actionErrorCode, "Minecraft action capability is unavailable");
+      }
       this.#setMinecraft("disconnected");
       this.#setCodex("failed", null);
-      this.#recordError("RUNTIME_START_FAILED", "Runtime failed to start");
+      if (actionErrorCode === undefined) {
+        this.#recordError("RUNTIME_START_FAILED", "Runtime failed to start");
+      }
       this.#setLifecycle("failed");
       this.#teardownObservers();
+      if (isBoundedActionCapabilityError(error)) throw error;
       throw new Error("Runtime failed to start");
     }
   }
@@ -759,6 +766,49 @@ export class RuntimeFacade {
       .then(() => this.#dependencies.lifecycle.stop())
       .catch(() => undefined);
     this.#teardownObservers();
+  }
+}
+
+function isBoundedActionCapabilityError(
+  error: unknown,
+): error is Error & { readonly code: string } {
+  if (!(error instanceof Error) || error.name !== "ActionCapabilityError") return false;
+  const code = (error as Error & { readonly code?: unknown }).code;
+  return (
+    typeof code === "string" &&
+    [
+      "invalid_url",
+      "invalid_timeout",
+      "connection_failed",
+      "timeout",
+      "aborted",
+      "missing_tools",
+      "extra_tools",
+      "duplicate_tools",
+      "invalid_tool_name",
+      "port_conflict",
+      "server_start_failed",
+      "server_closed",
+      "startup_stopped",
+    ].includes(code)
+  );
+}
+
+function boundedActionRuntimeErrorCode(
+  error: unknown,
+): "MCP_PORT_UNAVAILABLE" | "MCP_TOOL_CATALOG_INVALID" | "MCP_READINESS_TIMEOUT" | undefined {
+  if (!isBoundedActionCapabilityError(error)) return undefined;
+  switch (error.code) {
+    case "port_conflict":
+    case "server_start_failed":
+      return "MCP_PORT_UNAVAILABLE";
+    case "missing_tools":
+    case "extra_tools":
+    case "duplicate_tools":
+    case "invalid_tool_name":
+      return "MCP_TOOL_CATALOG_INVALID";
+    default:
+      return "MCP_READINESS_TIMEOUT";
   }
 }
 

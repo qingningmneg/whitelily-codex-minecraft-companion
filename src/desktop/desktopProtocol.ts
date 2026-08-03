@@ -432,9 +432,22 @@ const diagnosticOmissions = [
   "raw-chat",
 ] as const;
 const diagnosticSha256Schema = z.string().regex(/^[a-f0-9]{64}$/u);
+const diagnosticActionCapabilitySchema = z
+  .object({
+    workspaceVersion: workspaceVersionSchema.nullable(),
+    state: z.enum(["starting", "ready", "failed"]),
+    mcpListening: z.boolean(),
+    discoveredToolCount: finiteNonnegativeInteger,
+    errorCode: z
+      .string()
+      .regex(/^[a-z][a-z0-9_]{0,63}$/u)
+      .nullable(),
+  })
+  .strict();
 export const diagnosticPreviewSchema = z
   .object({
     exportId: z.string().regex(/^[A-Za-z0-9_-]{16,64}$/u),
+    actionCapability: diagnosticActionCapabilitySchema,
     files: z
       .array(
         z
@@ -692,6 +705,9 @@ const desktopErrorSchema = z.union([
       code: z.enum([
         "INVALID_REQUEST",
         "RUNTIME_START_FAILED",
+        "MCP_PORT_UNAVAILABLE",
+        "MCP_TOOL_CATALOG_INVALID",
+        "MCP_READINESS_TIMEOUT",
         "RUNTIME_STOP_FAILED",
         "EMERGENCY_STOP_FAILED",
         "ACCOUNT_OPERATION_FAILED",
@@ -893,6 +909,9 @@ export type DesktopResponse =
             code:
               | "INVALID_REQUEST"
               | "RUNTIME_START_FAILED"
+              | "MCP_PORT_UNAVAILABLE"
+              | "MCP_TOOL_CATALOG_INVALID"
+              | "MCP_READINESS_TIMEOUT"
               | "RUNTIME_STOP_FAILED"
               | "EMERGENCY_STOP_FAILED"
               | "ACCOUNT_OPERATION_FAILED"

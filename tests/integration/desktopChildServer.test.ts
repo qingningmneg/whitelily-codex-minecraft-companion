@@ -16,6 +16,7 @@ import {
 } from "../../src/desktop/desktopProtocol.js";
 import { runDesktopChild, type DesktopChildServices } from "../../src/desktop/childMain.js";
 import { RuntimeFacade } from "../../src/runtime/runtimeFacade.js";
+import { ActionCapabilityError } from "../../src/app.js";
 import type { AccountSnapshot } from "../../src/codex/accountService.js";
 import type { Model } from "../../src/codex/generated/v2/Model.js";
 import {
@@ -605,6 +606,13 @@ describe("DesktopChildServer", () => {
   it("keeps diagnostic preview authority in the child and returns no archive path", async () => {
     const preview = vi.fn(async () => ({
       exportId: "diagnostic_1234567890",
+      actionCapability: {
+        workspaceVersion: "workspace-1",
+        state: "ready" as const,
+        mcpListening: true,
+        discoveredToolCount: 15,
+        errorCode: null,
+      },
       files: [
         { logicalName: "app-version.json" as const, size: 20, redactions: 0 },
         { logicalName: "os-summary.json" as const, size: 20, redactions: 0 },
@@ -631,6 +639,10 @@ describe("DesktopChildServer", () => {
     }));
     const harness = createHarness({
       diagnostics: { preview, createArchive, dispose: async () => undefined },
+    });
+    harness.runtime.snapshot = () => ({
+      ...idleSnapshot,
+      actions: readyActions,
     });
 
     harness.send(commandRequest("diagnostic-preview", { kind: "preview_diagnostics" }));
@@ -659,6 +671,7 @@ describe("DesktopChildServer", () => {
     });
     expect(JSON.stringify(response)).not.toContain("C:\\private");
     expect(preview).toHaveBeenCalledOnce();
+    expect(preview).toHaveBeenCalledWith(readyActions);
     expect(createArchive).toHaveBeenCalledWith("diagnostic_1234567890");
   });
 
@@ -675,6 +688,13 @@ describe("DesktopChildServer", () => {
     const diagnostics = {
       preview: async () => ({
         exportId: "diagnostic_1234567890",
+        actionCapability: {
+          workspaceVersion: null,
+          state: "starting" as const,
+          mcpListening: false,
+          discoveredToolCount: 0,
+          errorCode: null,
+        },
         files: [
           { logicalName: "app-version.json" as const, size: 20, redactions: 0 },
           { logicalName: "os-summary.json" as const, size: 20, redactions: 0 },
@@ -3481,7 +3501,6 @@ describe("DesktopChildServer", () => {
       error: { code: "RUNTIME_START_FAILED" },
     });
     harness.send(request("start-retry", "start_runtime"));
-
     await expect(harness.nextResponse()).resolves.toMatchObject({
       id: "start-retry",
       ok: true,
@@ -5928,6 +5947,54 @@ describe("DesktopChildServer", () => {
       result: { lifecycle: "running" },
     });
     expect(harness.runtimeCreations()).toBe(2);
+  });
+
+  it("preserves confirmed LAN authority and creates a fresh runtime after readiness timeout", async () => {
+    let creations = 0;
+    const harness = createHarness({
+      lazyRuntime: true,
+      now: () => 1_000,
+      createRuntime: async (_connection, initialRevision) => {
+        creations += 1;
+        const failReadiness = creations === 1;
+        return new RuntimeFacade({
+          initialRevision,
+          lifecycle: {
+            start: async () => {
+              if (failReadiness) throw new ActionCapabilityError("timeout");
+            },
+            stop: async () => undefined,
+          },
+        });
+      },
+    });
+    harness.send(
+      commandRequest("action-readiness-confirm", {
+        kind: "set_confirmed_connection",
+        proof: {
+          nonce: "proof_nonce_action_readiness",
+          port: 51_321,
+          issuedAt: 1_000,
+          expiresAt: 11_000,
+        },
+      }),
+    );
+    await expect(harness.nextResponse()).resolves.toMatchObject({ ok: true });
+
+    harness.send(request("action-readiness-first", "start_runtime"));
+    await expect(harness.nextResponse()).resolves.toMatchObject({
+      id: "action-readiness-first",
+      ok: false,
+      error: { code: "MCP_READINESS_TIMEOUT" },
+    });
+
+    harness.send(request("action-readiness-retry", "start_runtime"));
+    await expect(harness.nextResponse()).resolves.toMatchObject({
+      id: "action-readiness-retry",
+      ok: true,
+      result: { lifecycle: "running" },
+    });
+    expect(creations).toBe(2);
   });
 
   it("consumes authority even when terminal runtime startup fails", async () => {

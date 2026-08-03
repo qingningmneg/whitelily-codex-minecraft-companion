@@ -198,6 +198,56 @@ describe("DiagnosticExporter", () => {
     ).toBe(true);
   });
 
+  it("snapshots only the five bounded action capability fields at preview invocation", async () => {
+    const dataRoot = await fixture();
+    const exporter = createExporter(dataRoot, () => 1_000);
+    const privatePath = ["C:", "Users", "Private", "codex-workspace"].join("\\");
+    const actions = {
+      state: "failed",
+      workspaceVersion: "workspace-1",
+      mcpListening: true,
+      discoveredToolCount: 14,
+      errorCode: "missing_tools",
+      responseBody: "raw MCP response with bearer-secret",
+      absolutePath: privatePath,
+      prompt: "private model prompt",
+      chat: "private chat transcript",
+      credentials: "Bearer private-token",
+    };
+
+    const previewPromise = exporter.preview(actions as never);
+    actions.workspaceVersion = "mutated-after-call";
+    actions.errorCode = "mutated_after_call";
+    const preview = await previewPromise;
+
+    expect(preview.actionCapability).toEqual({
+      workspaceVersion: "workspace-1",
+      state: "failed",
+      mcpListening: true,
+      discoveredToolCount: 14,
+      errorCode: "missing_tools",
+    });
+    expect(Object.keys(preview.actionCapability).sort()).toEqual([
+      "discoveredToolCount",
+      "errorCode",
+      "mcpListening",
+      "state",
+      "workspaceVersion",
+    ]);
+    const serialized = JSON.stringify(preview);
+    for (const secret of [
+      "raw MCP response",
+      privatePath,
+      "private model prompt",
+      "private chat transcript",
+      "private-token",
+      "mutated-after-call",
+      "mutated_after_call",
+    ]) {
+      expect(serialized).not.toContain(secret);
+    }
+  });
+
   it("requires the one active unexpired preview ID and bounds replacement lifecycle", async () => {
     const dataRoot = await fixture();
     let now = 1_000;

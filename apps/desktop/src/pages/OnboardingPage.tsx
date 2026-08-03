@@ -84,6 +84,8 @@ export function OnboardingPage({ api, locale, active, onReady }: OnboardingPageP
   const [ownerMessageKey, setOwnerMessageKey] = useState<MessageKey | null>(null);
   const [ownerMessageIsAlert, setOwnerMessageIsAlert] = useState(false);
   const [connectingCandidate, setConnectingCandidate] = useState<string | null>(null);
+  const [actionRecoveryAvailable, setActionRecoveryAvailable] = useState(false);
+  const [actionRetryPending, setActionRetryPending] = useState(false);
   const [errorKey, setErrorKey] = useState<MessageKey | null>(null);
   const mounted = useRef(true);
   const flowGeneration = useRef(0);
@@ -274,6 +276,8 @@ export function OnboardingPage({ api, locale, active, onReady }: OnboardingPageP
       setOwnerPending(false);
       invalidateCatalogLoad();
       setStep("environment");
+      setActionRecoveryAvailable(false);
+      setActionRetryPending(false);
       return;
     }
     invalidateCatalogLoad();
@@ -281,6 +285,8 @@ export function OnboardingPage({ api, locale, active, onReady }: OnboardingPageP
     activeOwnerUpdate.current = null;
     setOwnerPending(false);
     setStep("environment");
+    setActionRecoveryAvailable(false);
+    setActionRetryPending(false);
     setErrorKey(null);
     void api.getAccount().then(
       async (account) => {
@@ -488,6 +494,7 @@ export function OnboardingPage({ api, locale, active, onReady }: OnboardingPageP
 
   const refreshLan = useCallback(async (): Promise<void> => {
     const generation = flowGeneration.current;
+    setActionRecoveryAvailable(false);
     setLanLoading(true);
     setErrorKey(null);
     try {
@@ -515,6 +522,7 @@ export function OnboardingPage({ api, locale, active, onReady }: OnboardingPageP
     const generation = flowGeneration.current;
     let candidateConfirmed = false;
     setConnectingCandidate(candidateId);
+    setActionRecoveryAvailable(false);
     setErrorKey(null);
     try {
       await api.confirmLanCandidate(candidateId);
@@ -530,7 +538,9 @@ export function OnboardingPage({ api, locale, active, onReady }: OnboardingPageP
       if (!mounted.current || generation !== flowGeneration.current) return;
       const key = safeOnboardingErrorKey(asStableError(error, "MINECRAFT_CONNECT_FAILED"));
       setErrorKey(key);
-      if (key === "onboarding.error.LAN_CANDIDATE_EXPIRED" || candidateConfirmed) {
+      if (candidateConfirmed && isActionRecoveryErrorKey(key)) {
+        setActionRecoveryAvailable(true);
+      } else if (key === "onboarding.error.LAN_CANDIDATE_EXPIRED" || candidateConfirmed) {
         setLanCandidates([]);
         await refreshLan();
         if (mounted.current && generation === flowGeneration.current) {
@@ -541,6 +551,34 @@ export function OnboardingPage({ api, locale, active, onReady }: OnboardingPageP
       if (mounted.current && generation === flowGeneration.current) {
         setConnectingCandidate(null);
       }
+    }
+  };
+
+  const retryActionCapability = async (): Promise<void> => {
+    if (!actionRecoveryAvailable || actionRetryPending || connectingCandidate !== null) return;
+    const generation = flowGeneration.current;
+    setActionRetryPending(true);
+    setErrorKey(null);
+    try {
+      const snapshot = await api.start();
+      if (!mounted.current || generation !== flowGeneration.current) return;
+      if (snapshot.lifecycle !== "running") throw new Error("MINECRAFT_CONNECT_FAILED");
+      setActionRecoveryAvailable(false);
+      setStep("ready");
+      persist({ progressHint: "ready" });
+      onReady(snapshot);
+    } catch (error) {
+      if (!mounted.current || generation !== flowGeneration.current) return;
+      const key = safeOnboardingErrorKey(asStableError(error, "MINECRAFT_CONNECT_FAILED"));
+      setErrorKey(key);
+      if (!isActionRecoveryErrorKey(key)) {
+        setActionRecoveryAvailable(false);
+        setLanCandidates([]);
+        await refreshLan();
+        if (mounted.current && generation === flowGeneration.current) setErrorKey(key);
+      }
+    } finally {
+      if (mounted.current && generation === flowGeneration.current) setActionRetryPending(false);
     }
   };
 
@@ -772,7 +810,9 @@ export function OnboardingPage({ api, locale, active, onReady }: OnboardingPageP
                     candidate={candidate}
                     locale={locale}
                     pending={connectingCandidate === candidate.id}
-                    disabled={connectingCandidate !== null}
+                    disabled={
+                      connectingCandidate !== null || actionRecoveryAvailable || actionRetryPending
+                    }
                     onConfirm={(id) => void confirmAndConnect(id)}
                     key={candidate.id}
                   />
@@ -782,11 +822,26 @@ export function OnboardingPage({ api, locale, active, onReady }: OnboardingPageP
             <button
               className="secondary-button"
               type="button"
-              disabled={lanLoading || connectingCandidate !== null}
+              disabled={
+                lanLoading ||
+                connectingCandidate !== null ||
+                actionRecoveryAvailable ||
+                actionRetryPending
+              }
               onClick={() => void refreshLan()}
             >
               {translate(locale, lanLoading ? "onboarding.refreshing" : "onboarding.refresh")}
             </button>
+            {actionRecoveryAvailable ? (
+              <button
+                className="primary-button"
+                type="button"
+                disabled={actionRetryPending}
+                onClick={() => void retryActionCapability()}
+              >
+                {translate(locale, "onboarding.action.retry")}
+              </button>
+            ) : null}
           </>
         ) : null}
 
@@ -834,8 +889,23 @@ export function safeOnboardingErrorKey(error: unknown): MessageKey {
     ["LAN_CANDIDATE_CHANGED", "onboarding.error.LAN_CANDIDATE_EXPIRED"],
     ["MINECRAFT_VERSION_UNVERIFIED", "onboarding.error.MINECRAFT_VERSION_UNVERIFIED"],
     ["MINECRAFT_CONNECT_FAILED", "onboarding.error.MINECRAFT_CONNECT_FAILED"],
+    ["WORKSPACE_RESOURCE_INVALID", "onboarding.error.WORKSPACE_RESOURCE_INVALID"],
+    ["WORKSPACE_DEPLOY_FAILED", "onboarding.error.WORKSPACE_DEPLOY_FAILED"],
+    ["MCP_PORT_UNAVAILABLE", "onboarding.error.MCP_PORT_UNAVAILABLE"],
+    ["MCP_TOOL_CATALOG_INVALID", "onboarding.error.MCP_TOOL_CATALOG_INVALID"],
+    ["MCP_READINESS_TIMEOUT", "onboarding.error.MCP_READINESS_TIMEOUT"],
   ];
   return mappings.find(([code]) => message.includes(code))?.[1] ?? "onboarding.error.UNKNOWN";
+}
+
+function isActionRecoveryErrorKey(key: MessageKey): boolean {
+  return (
+    key === "onboarding.error.WORKSPACE_RESOURCE_INVALID" ||
+    key === "onboarding.error.WORKSPACE_DEPLOY_FAILED" ||
+    key === "onboarding.error.MCP_PORT_UNAVAILABLE" ||
+    key === "onboarding.error.MCP_TOOL_CATALOG_INVALID" ||
+    key === "onboarding.error.MCP_READINESS_TIMEOUT"
+  );
 }
 
 function ownerValidationErrorKey(value: string): MessageKey | null {

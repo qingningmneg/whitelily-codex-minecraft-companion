@@ -361,6 +361,13 @@ describe("IPC registry", () => {
       if (command.kind === "preview_diagnostics") {
         return {
           exportId: "diagnostic_1234567890",
+          actionCapability: {
+            workspaceVersion: "workspace-1",
+            state: "ready",
+            mcpListening: true,
+            discoveredToolCount: 16,
+            errorCode: null,
+          },
           files: [
             { logicalName: "app-version.json", size: 20, redactions: 0 },
             { logicalName: "os-summary.json", size: 20, redactions: 0 },

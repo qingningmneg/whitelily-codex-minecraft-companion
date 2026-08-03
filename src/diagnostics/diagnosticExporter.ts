@@ -6,9 +6,11 @@ import { Transform } from "node:stream";
 import {
   createDiagnosticEntries,
   DIAGNOSTIC_OMISSIONS,
+  snapshotDiagnosticActionCapability,
   type DiagnosticEntry,
   type DiagnosticPreview,
 } from "./diagnosticManifest.js";
+import type { RuntimeSnapshot } from "../runtime/runtimeEvents.js";
 
 export const DIAGNOSTIC_PREVIEW_TTL_MS = 10 * 60 * 1_000;
 export const MAX_DIAGNOSTIC_ARCHIVE_BYTES = 4 * 1024 * 1024;
@@ -86,7 +88,8 @@ export class DiagnosticExporter {
     };
   }
 
-  async preview(): Promise<DiagnosticPreview> {
+  async preview(actions: RuntimeSnapshot["actions"] = null): Promise<DiagnosticPreview> {
+    const actionCapability = snapshotDiagnosticActionCapability(actions);
     await this.#releaseRetained();
     const exportId = this.#createExportId();
     if (!exportIdPattern.test(exportId)) throw new Error("diagnostic export id is invalid");
@@ -115,6 +118,7 @@ export class DiagnosticExporter {
     };
     return Object.freeze({
       exportId,
+      actionCapability,
       files: entries.map((entry) =>
         Object.freeze({
           logicalName: entry.logicalName,
