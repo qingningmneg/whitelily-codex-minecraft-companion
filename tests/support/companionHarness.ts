@@ -362,6 +362,8 @@ class FakeCodexPort implements CodexPort {
     this.interruptions.push({ threadId, turnId });
   }
 
+  async closeThread(_threadId: string): Promise<void> {}
+
   async stop(): Promise<void> {
     this.stopCalls += 1;
     this.threadPairRevision += 1;

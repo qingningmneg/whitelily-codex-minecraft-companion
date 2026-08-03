@@ -448,6 +448,112 @@ describe("CodexAppServerClient", () => {
     await client.stop();
   });
 
+  it("archives one thread without retiring the app server and clears its reasoning effort", async () => {
+    const harness = createJsonRpcLineTransportHarness();
+    const client = new CodexAppServerClient(config, dependencies(harness));
+    const starting = client.start();
+    await harness.nextSent();
+    harness.receive({ id: 1, result: initialized });
+    await starting;
+    await harness.nextSent();
+
+    const thread = client.startThread({
+      cwd: "C:/ignored",
+      model: "gpt-5.6-terra",
+      reasoningEffort: "high",
+    });
+    await expect(harness.nextSent()).resolves.toMatchObject({ id: 2, method: "thread/start" });
+    harness.receive({ id: 2, result: { thread: { id: "thread-2" } } });
+    await thread;
+
+    const closing = client.closeThread("thread-2");
+    await expect(harness.nextSent()).resolves.toEqual({
+      id: 3,
+      method: "thread/archive",
+      params: { threadId: "thread-2" },
+    });
+    harness.receive({ id: 3, result: {} });
+    await expect(closing).resolves.toBeUndefined();
+
+    expect(() =>
+      client.configureRuntime({ workspacePath: "C:/other-workspace", reasoningEffort: "low" }),
+    ).toThrow("active session");
+    expect(harness.closed()).toBe(false);
+
+    const turn = client.sendTurn("thread-2", "after archive");
+    await expect(harness.nextSent()).resolves.toEqual({
+      id: 4,
+      method: "turn/start",
+      params: {
+        threadId: "thread-2",
+        input: [{ type: "text", text: "after archive", text_elements: [] }],
+        effort: "medium",
+      },
+    });
+    harness.receive({ id: 4, result: { turn: { id: "turn-1" } } });
+    harness.receive({
+      method: "turn/completed",
+      params: { threadId: "thread-2", turn: { id: "turn-1", status: "completed" } },
+    });
+    await turn;
+    await client.stop();
+  });
+
+  it("retains thread effort when archiving fails so the archive can be retried", async () => {
+    const harness = createJsonRpcLineTransportHarness();
+    const client = new CodexAppServerClient(config, dependencies(harness));
+    const starting = client.start();
+    await harness.nextSent();
+    harness.receive({ id: 1, result: initialized });
+    await starting;
+    await harness.nextSent();
+
+    const thread = client.startThread({
+      cwd: "C:/ignored",
+      model: "gpt-5.6-terra",
+      reasoningEffort: "high",
+    });
+    await harness.nextSent();
+    harness.receive({ id: 2, result: { thread: { id: "thread-2" } } });
+    await thread;
+
+    const failedClosing = client.closeThread("thread-2");
+    await expect(harness.nextSent()).resolves.toEqual({
+      id: 3,
+      method: "thread/archive",
+      params: { threadId: "thread-2" },
+    });
+    harness.receive({ id: 3, error: { code: -32_000, message: "archive failed" } });
+    await expect(failedClosing).rejects.toThrow("Codex app-server request failed");
+
+    const turn = client.sendTurn("thread-2", "after failed archive");
+    await expect(harness.nextSent()).resolves.toEqual({
+      id: 4,
+      method: "turn/start",
+      params: {
+        threadId: "thread-2",
+        input: [{ type: "text", text: "after failed archive", text_elements: [] }],
+        effort: "high",
+      },
+    });
+    harness.receive({ id: 4, result: { turn: { id: "turn-1" } } });
+    harness.receive({
+      method: "turn/completed",
+      params: { threadId: "thread-2", turn: { id: "turn-1", status: "completed" } },
+    });
+    await turn;
+
+    const retry = client.closeThread("thread-2");
+    await expect(harness.nextSent()).resolves.toEqual({
+      id: 5,
+      method: "thread/archive",
+      params: { threadId: "thread-2" },
+    });
+    harness.receive({ id: 5, result: {} });
+    await expect(retry).resolves.toBeUndefined();
+    await client.stop();
+  });
+
   it("settles an active turn when the app-server child exits", async () => {
     const harness = createJsonRpcLineTransportHarness();
     const client = new CodexAppServerClient(config, dependencies(harness));

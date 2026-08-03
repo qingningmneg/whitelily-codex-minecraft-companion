@@ -9,6 +9,8 @@ import type { LoginAccountResponse } from "./generated/v2/LoginAccountResponse.j
 import type { Model } from "./generated/v2/Model.js";
 import type { ModelListResponse } from "./generated/v2/ModelListResponse.js";
 import type { ModelListParams } from "./generated/v2/ModelListParams.js";
+import type { ThreadArchiveParams } from "./generated/v2/ThreadArchiveParams.js";
+import type { ThreadArchiveResponse } from "./generated/v2/ThreadArchiveResponse.js";
 import type { ThreadStartParams } from "./generated/v2/ThreadStartParams.js";
 import type { ThreadStartResponse } from "./generated/v2/ThreadStartResponse.js";
 import type { TurnCompletedNotification } from "./generated/v2/TurnCompletedNotification.js";
@@ -498,6 +500,12 @@ export class CodexAppServerClient implements CodexPort, AccountAppServerPort {
     } finally {
       this.threadStarting = false;
     }
+  }
+
+  async closeThread(threadId: string): Promise<void> {
+    const params: ThreadArchiveParams = { threadId };
+    await this.requireRpc().request<ThreadArchiveResponse>("thread/archive", params);
+    this.reasoningEfforts.delete(threadId);
   }
 
   sendTurn(

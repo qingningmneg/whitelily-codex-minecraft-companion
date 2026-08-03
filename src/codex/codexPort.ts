@@ -16,5 +16,6 @@ export interface CodexPort {
     onStarted?: (turnId: string) => void,
   ): Promise<CodexTurnResult>;
   interrupt(threadId: string, turnId: string): Promise<void>;
+  closeThread(threadId: string): Promise<void>;
   stop(): Promise<void>;
 }
