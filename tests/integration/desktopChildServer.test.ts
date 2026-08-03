@@ -1,5 +1,5 @@
 import { PassThrough } from "node:stream";
-import { mkdtemp, readFile } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -18,7 +18,7 @@ import { runDesktopChild, type DesktopChildServices } from "../../src/desktop/ch
 import { RuntimeFacade } from "../../src/runtime/runtimeFacade.js";
 import type { AccountSnapshot } from "../../src/codex/accountService.js";
 import type { Model } from "../../src/codex/generated/v2/Model.js";
-import { ModelCatalog } from "../../src/codex/modelCatalog.js";
+import { ModelCatalog, type ModelCatalogEvent } from "../../src/codex/modelCatalog.js";
 import type { MinecraftEvent } from "../../src/minecraft/minecraftPort.js";
 import type { RuntimeEvent, RuntimeSnapshot } from "../../src/runtime/runtimeEvents.js";
 import type { TaskStopReason } from "../../src/safety/taskBudget.js";
@@ -38,6 +38,7 @@ import {
   type DesktopChildHarness,
   type DesktopRuntime,
 } from "../support/desktopChildHarness.js";
+import { validConfig } from "../support/appHarness.js";
 import {
   OwnerIdentityError,
   type OwnerIdentityAccess,
@@ -144,13 +145,17 @@ function inertDesktopChildServices(): DesktopChildServices {
       stop: async () => undefined,
     },
     models: {
-      listModels: async () => ({ models: [], selection: { mode: "automatic" } }),
+      listModels: async () => ({
+        models: [],
+        selection: { mode: "automatic" },
+        legacyMigrationCompleted: false,
+      }),
       selectModel: async () => ({ mode: "automatic" }),
       resolveRuntimeSelection: async () => ({
         modelId: "inert-live-model",
         reasoningEffort: "medium",
       }),
-      subscribeInvalidation: () => () => undefined,
+      subscribe: () => () => undefined,
       stop: () => undefined,
     },
     createRuntime: async (_connection, initialRevision) =>
@@ -486,6 +491,11 @@ describe("DesktopChildServer", () => {
 
   it("uses one default owner service for child reads, updates, and events", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "whitelily-owner-child-"));
+    await writeFile(
+      join(cwd, "config.toml"),
+      validConfig.replace('owner_username = "TestOwner"', 'owner_username = "YourMcName"'),
+      "utf8",
+    );
     const input = new PassThrough();
     const output = new PassThrough();
     let rawOutput = "";
@@ -2322,6 +2332,7 @@ describe("DesktopChildServer", () => {
     const listModels = vi.fn(async () => ({
       models: [],
       selection: { mode: "automatic" as const },
+      legacyMigrationCompleted: false,
     }));
     const selectModel = vi.fn(async () => ({ mode: "automatic" as const }));
     const resolveRuntimeSelection = vi.fn(async () => ({
@@ -3088,13 +3099,17 @@ describe("DesktopChildServer", () => {
             stop: stopAccount,
           },
           models: {
-            listModels: async () => ({ models: [], selection: { mode: "automatic" } }),
+            listModels: async () => ({
+              models: [],
+              selection: { mode: "automatic" },
+              legacyMigrationCompleted: false,
+            }),
             selectModel: async () => ({ mode: "automatic" }),
             resolveRuntimeSelection: async () => ({
               modelId: "lazy-live-model",
               reasoningEffort: "medium",
             }),
-            subscribeInvalidation: () => () => undefined,
+            subscribe: () => () => undefined,
             stop: stopModels,
           },
           createRuntime: async () => {
@@ -3931,7 +3946,7 @@ describe("DesktopChildServer", () => {
     "uses first-wins reason and one contained signal for $label against an in-flight replacement",
     async ({ first, second, stopReason, publicReason }) => {
       let accountListener: ((snapshot: AccountSnapshot) => void) | undefined;
-      let modelListener: (() => void) | undefined;
+      let modelListener: ((event: ModelCatalogEvent) => void) | undefined;
       let releaseFactory = (): void => undefined;
       const factoryGate = new Promise<void>((resolve) => {
         releaseFactory = resolve;
@@ -3972,7 +3987,7 @@ describe("DesktopChildServer", () => {
           },
         },
         models: {
-          subscribeInvalidation: (listener) => {
+          subscribe: (listener) => {
             modelListener = listener;
             return () => {
               modelListener = undefined;
@@ -4000,7 +4015,7 @@ describe("DesktopChildServer", () => {
             );
             break;
           case "model":
-            modelListener?.();
+            modelListener?.({ kind: "selection_invalidated", reason: "model_unavailable" });
             break;
           case "account":
             accountListener?.({ status: "signed_out" });
@@ -4256,6 +4271,7 @@ describe("DesktopChildServer", () => {
   });
 
   it("dispatches the five account and model commands through separate services", async () => {
+    let modelListener: ((event: ModelCatalogEvent) => void) | undefined;
     const harness = createHarness({
       account: {
         getAccount: async () => ({ status: "signed_in", auth: "chatgpt" }),
@@ -4279,11 +4295,22 @@ describe("DesktopChildServer", () => {
             },
           ],
           selection: { mode: "automatic" },
+          legacyMigrationCompleted: false,
         }),
-        selectModel: async (selection) =>
-          selection.mode === "automatic"
-            ? { mode: "automatic" }
-            : { ...selection, available: true as const },
+        selectModel: async (selection) => {
+          const selected =
+            selection.mode === "automatic"
+              ? ({ mode: "automatic" } as const)
+              : ({ ...selection, available: true as const } as const);
+          modelListener?.({ kind: "selection_changed", selection: selected });
+          return selected;
+        },
+        subscribe: (listener) => {
+          modelListener = listener;
+          return () => {
+            modelListener = undefined;
+          };
+        },
       },
     });
 
@@ -4319,6 +4346,12 @@ describe("DesktopChildServer", () => {
       ok: true,
       result: { models: [{ id: "live-model" }], selection: { mode: "automatic" } },
     });
+    harness.send(request("model-start", "start_runtime"));
+    await expect(harness.nextResponse()).resolves.toMatchObject({
+      id: "model-start",
+      ok: true,
+      result: { lifecycle: "running" },
+    });
     harness.send(
       commandRequest("model-select", {
         kind: "select_model",
@@ -4334,6 +4367,9 @@ describe("DesktopChildServer", () => {
       ok: true,
       result: { mode: "explicit", modelId: "live-model", available: true },
     });
+    await Promise.resolve();
+    expect(connectionInvalidations(harness)).toEqual([]);
+    expect(harness.stopReasons).toEqual([]);
   });
 
   it("serves account state before a Minecraft runtime can be composed", async () => {
@@ -4784,7 +4820,7 @@ describe("DesktopChildServer", () => {
         listModels: () => catalog.listModels(),
         selectModel: (selection) => catalog.selectModel(selection),
         resolveRuntimeSelection: (options) => catalog.resolveRuntimeSelection(options),
-        subscribeInvalidation: (listener) => catalog.subscribeInvalidation(listener),
+        subscribe: (listener) => catalog.subscribe(listener),
         stop: () => catalog.stop(),
       },
     });

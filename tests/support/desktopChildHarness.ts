@@ -9,6 +9,7 @@ import { parseDesktopEvent, parseDesktopResponse } from "../../src/desktop/deskt
 import type { AccountSnapshot, LoginAttempt } from "../../src/codex/accountService.js";
 import type {
   ModelCatalogSnapshot,
+  ModelCatalogEvent,
   ModelSelection,
   ModelSelectionInput,
   ResolvedModelSelection,
@@ -92,7 +93,7 @@ export function createDesktopChildHarness(
       listModels(): Promise<ModelCatalogSnapshot>;
       selectModel(selection: ModelSelectionInput): Promise<ModelSelection>;
       resolveRuntimeSelection(options?: { signal?: AbortSignal }): Promise<ResolvedModelSelection>;
-      subscribeInvalidation(listener: () => void): () => void;
+      subscribe(listener: (event: ModelCatalogEvent) => void): () => void;
       stop(): void;
     }>;
     profiles?: Partial<{
@@ -236,6 +237,7 @@ export function createDesktopChildHarness(
     listModels: async (): Promise<ModelCatalogSnapshot> => ({
       models: [],
       selection: { mode: "automatic" },
+      legacyMigrationCompleted: false,
     }),
     selectModel: async (selection: ModelSelectionInput): Promise<ModelSelection> =>
       selection.mode === "automatic" ? { mode: "automatic" } : { ...selection, available: true },
@@ -243,7 +245,7 @@ export function createDesktopChildHarness(
       modelId: "harness-live-model",
       reasoningEffort: "medium",
     }),
-    subscribeInvalidation: (_listener: () => void) => () => undefined,
+    subscribe: (_listener: (event: ModelCatalogEvent) => void) => () => undefined,
     stop: () => undefined,
     ...options.models,
   };

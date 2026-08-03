@@ -25,6 +25,7 @@ import type { TaskStopReason } from "../safety/taskBudget.js";
 import type { AccountSnapshot, LoginAttempt } from "../codex/accountService.js";
 import type {
   ModelCatalogSnapshot,
+  ModelCatalogEvent,
   ModelSelection,
   ModelSelectionInput,
   ResolvedModelSelection,
@@ -142,7 +143,7 @@ export interface DesktopChildModelCatalog {
   listModels(): Promise<ModelCatalogSnapshot>;
   selectModel(selection: ModelSelectionInput): Promise<ModelSelection>;
   resolveRuntimeSelection(options?: { signal?: AbortSignal }): Promise<ResolvedModelSelection>;
-  subscribeInvalidation(listener: () => void): () => void;
+  subscribe(listener: (event: ModelCatalogEvent) => void): () => void;
   stop(): void;
 }
 
@@ -434,8 +435,9 @@ export class DesktopChildServer {
         // Account state never bypasses the strict desktop event schema.
       }
     });
-    this.#unsubscribeModelInvalidation = this.#models.subscribeInvalidation(() => {
-      void this.#invalidateDesktopAuthority("model_unavailable", "model_unavailable");
+    this.#unsubscribeModelInvalidation = this.#models.subscribe((event) => {
+      if (event.kind !== "selection_invalidated") return;
+      void this.#invalidateDesktopAuthority("model_unavailable", event.reason);
     });
     this.#input.on("data", this.#onData);
     this.#input.once("end", this.#onEnd);

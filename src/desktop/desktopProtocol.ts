@@ -253,6 +253,7 @@ const modelCatalogSnapshotSchema = z
   .object({
     models: z.array(availableModelSchema).max(256),
     selection: modelSelectionSchema,
+    legacyMigrationCompleted: z.boolean(),
   })
   .strict();
 

@@ -1409,9 +1409,22 @@ describe("desktop protocol v1", () => {
             },
           ],
           selection: { mode: "automatic" },
+          legacyMigrationCompleted: true,
         },
       ),
-    ).toMatchObject({ models: [{ id: "live-model" }] });
+    ).toMatchObject({
+      models: [{ id: "live-model" }],
+      legacyMigrationCompleted: true,
+    });
+    expect(() =>
+      parseDesktopCommandResult(
+        { kind: "list_models" },
+        {
+          models: [],
+          selection: { mode: "automatic" },
+        },
+      ),
+    ).toThrow("invalid desktop command result");
     expect(
       parseDesktopCommandResult(
         {

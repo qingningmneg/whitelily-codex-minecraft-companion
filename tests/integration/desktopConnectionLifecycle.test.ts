@@ -5,6 +5,7 @@ import type { Model } from "../../src/codex/generated/v2/Model.js";
 import {
   ModelCatalog,
   type ModelCatalogAccountPort,
+  type ModelCatalogEvent,
   type ResolvedModelSelection,
 } from "../../src/codex/modelCatalog.js";
 import { DesktopChildServer } from "../../src/desktop/childServer.js";
@@ -96,7 +97,7 @@ function createProtocolHarness(options: {
     initialRevision: number,
   ): Promise<{ runtime: RuntimeFacade; stopReasons: TaskStopReason[] }>;
   subscribeAccount?(listener: (snapshot: AccountSnapshot) => void): () => void;
-  subscribeModelInvalidation?(listener: () => void): () => void;
+  subscribeModel?(listener: (event: ModelCatalogEvent) => void): () => void;
 }) {
   const input = new PassThrough();
   const output = new PassThrough();
@@ -158,10 +159,14 @@ function createProtocolHarness(options: {
       stop: async () => undefined,
     },
     models: {
-      listModels: async () => ({ models: [], selection: { mode: "automatic" } }),
+      listModels: async () => ({
+        models: [],
+        selection: { mode: "automatic" },
+        legacyMigrationCompleted: false,
+      }),
       selectModel: async () => ({ mode: "automatic" }),
       resolveRuntimeSelection: options.resolveSelection,
-      subscribeInvalidation: options.subscribeModelInvalidation ?? (() => () => undefined),
+      subscribe: options.subscribeModel ?? (() => () => undefined),
       stop: () => undefined,
     },
     createRuntime: async (_connection, initialRevision, selection) => {
@@ -390,15 +395,15 @@ describe("desktop connection lifecycle", () => {
   });
 
   it("fences a running runtime when the selected live model or effort becomes unavailable", async () => {
-    let invalidateModel: (() => void) | undefined;
+    let publishModelEvent: ((event: ModelCatalogEvent) => void) | undefined;
     const harness = createProtocolHarness({
       resolveSelection: async () => ({ modelId: "live-runtime", reasoningEffort: "minimal" }),
       createRuntime: async (selection, initialRevision) =>
         createTrackedRuntime(selection.modelId, initialRevision),
-      subscribeModelInvalidation: (listener) => {
-        invalidateModel = listener;
+      subscribeModel: (listener) => {
+        publishModelEvent = listener;
         return () => {
-          invalidateModel = undefined;
+          publishModelEvent = undefined;
         };
       },
     });
@@ -413,7 +418,7 @@ describe("desktop connection lifecycle", () => {
     });
     await harness.send("start-model", { kind: "start_runtime" });
 
-    invalidateModel?.();
+    publishModelEvent?.({ kind: "selection_invalidated", reason: "model_unavailable" });
     await vi.waitFor(() =>
       expect(harness.runtimes[0]?.runtime.snapshot().lifecycle).toBe("stopped"),
     );

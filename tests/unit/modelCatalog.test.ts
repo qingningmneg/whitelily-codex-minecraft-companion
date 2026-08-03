@@ -1,11 +1,28 @@
-import { describe, expect, it, vi } from "vitest";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AccountSnapshot } from "../../src/codex/accountService.js";
 import type { Model } from "../../src/codex/generated/v2/Model.js";
+import { ModelPreferenceStore } from "../../src/codex/modelPreferenceStore.js";
 import {
   ModelCatalog,
   type ModelCatalogAccountPort,
   type ModelCatalogAppServerPort,
+  type ModelCatalogEvent,
 } from "../../src/codex/modelCatalog.js";
+
+const cleanups: Array<() => Promise<void>> = [];
+
+async function preferenceStore(): Promise<ModelPreferenceStore> {
+  const rootDirectory = await mkdtemp(join(tmpdir(), "whitelily-model-catalog-"));
+  cleanups.push(() => rm(rootDirectory, { recursive: true, force: true }));
+  return new ModelPreferenceStore({ rootDirectory });
+}
+
+afterEach(async () => {
+  await Promise.allSettled(cleanups.splice(0).map((cleanup) => cleanup()));
+});
 
 function model(
   id: string,
@@ -55,6 +72,14 @@ function signedInAccount(): ModelCatalogAccountPort & {
   };
 }
 
+function gate(): { promise: Promise<void>; release(): void } {
+  let release = (): void => undefined;
+  const promise = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  return { promise, release };
+}
+
 describe("ModelCatalog", () => {
   it("preserves live order while safely deduplicating model IDs and efforts", async () => {
     const account = signedInAccount();
@@ -81,6 +106,7 @@ describe("ModelCatalog", () => {
         },
       ],
       selection: { mode: "automatic" },
+      legacyMigrationCompleted: false,
     });
   });
 
@@ -136,6 +162,7 @@ describe("ModelCatalog", () => {
         },
       ],
       selection: { mode: "automatic" },
+      legacyMigrationCompleted: false,
     });
   });
 
@@ -166,14 +193,25 @@ describe("ModelCatalog", () => {
     expect(snapshot.models.at(-1)?.id).toBe("live-255");
   });
 
-  it("selects an available live model and service-provided reasoning effort", async () => {
+  it("emits only selection_changed for an available explicit selection", async () => {
     const account = signedInAccount();
+    const store = await preferenceStore();
     const catalog = new ModelCatalog(
       {
         listModelRecords: async () => [model("live-choice", "Live Choice", ["minimal", "medium"])],
       },
       account,
+      {
+        store,
+        legacyConfigCandidate: {
+          mode: "explicit",
+          modelId: "legacy-config",
+          reasoningEffort: "medium",
+        },
+      },
     );
+    const events: ModelCatalogEvent[] = [];
+    catalog.subscribe((event) => events.push(event));
 
     await expect(
       catalog.selectModel({
@@ -187,6 +225,186 @@ describe("ModelCatalog", () => {
       reasoningEffort: "minimal",
       available: true,
     });
+    expect(events).toEqual([
+      {
+        kind: "selection_changed",
+        selection: {
+          mode: "explicit",
+          modelId: "live-choice",
+          reasoningEffort: "minimal",
+          available: true,
+        },
+      },
+    ]);
+    await expect(store.read()).resolves.toMatchObject({
+      revision: 1,
+      value: {
+        selection: {
+          mode: "explicit",
+          modelId: "live-choice",
+          reasoningEffort: "minimal",
+        },
+        legacyMigrationCompleted: false,
+      },
+    });
+  });
+
+  it("prepares without side effects and commits exactly once at the captured revision", async () => {
+    const account = signedInAccount();
+    const store = await preferenceStore();
+    const catalog = new ModelCatalog(
+      { listModelRecords: async () => [model("live-choice", "Live Choice", ["medium"])] },
+      account,
+      {
+        store,
+        legacyConfigCandidate: {
+          mode: "explicit",
+          modelId: "legacy-config",
+          reasoningEffort: "medium",
+        },
+      },
+    );
+    const events: ModelCatalogEvent[] = [];
+    catalog.subscribe((event) => events.push(event));
+
+    const prepared = await catalog.prepareSelection({
+      mode: "explicit",
+      modelId: "live-choice",
+      reasoningEffort: "medium",
+    });
+
+    expect(prepared).toEqual({
+      preferenceRevision: 0,
+      requested: {
+        mode: "explicit",
+        modelId: "live-choice",
+        reasoningEffort: "medium",
+      },
+      resolved: { modelId: "live-choice", reasoningEffort: "medium" },
+    });
+    await expect(store.read()).resolves.toMatchObject({
+      revision: 0,
+      value: { selection: { mode: "automatic" } },
+    });
+    await expect(catalog.listModels()).resolves.toMatchObject({
+      selection: { mode: "automatic" },
+    });
+    expect(events).toEqual([]);
+
+    await expect(catalog.commitSelection(prepared)).resolves.toEqual({
+      mode: "explicit",
+      modelId: "live-choice",
+      reasoningEffort: "medium",
+      available: true,
+    });
+    await expect(store.read()).resolves.toMatchObject({
+      revision: 1,
+      value: {
+        selection: {
+          mode: "explicit",
+          modelId: "live-choice",
+          reasoningEffort: "medium",
+        },
+      },
+    });
+    expect(events).toHaveLength(1);
+
+    const duplicate = await catalog.prepareSelection({
+      mode: "explicit",
+      modelId: "live-choice",
+      reasoningEffort: "medium",
+    });
+    await catalog.commitSelection(duplicate);
+    expect(events).toHaveLength(1);
+  });
+
+  it("rejects a prepared selection after another writer advances the preference revision", async () => {
+    const account = signedInAccount();
+    const store = await preferenceStore();
+    const catalog = new ModelCatalog(
+      { listModelRecords: async () => [model("live-choice", "Live Choice", ["medium"])] },
+      account,
+      {
+        store,
+        legacyConfigCandidate: {
+          mode: "explicit",
+          modelId: "legacy-config",
+          reasoningEffort: "medium",
+        },
+      },
+    );
+    const prepared = await catalog.prepareSelection({
+      mode: "explicit",
+      modelId: "live-choice",
+      reasoningEffort: "medium",
+    });
+    await store.replace(0, {
+      selection: { mode: "automatic" },
+      legacyMigrationCompleted: true,
+    });
+
+    await expect(catalog.commitSelection(prepared)).rejects.toMatchObject({
+      code: "DOCUMENT_CONFLICT",
+    });
+    await expect(catalog.listModels()).resolves.toMatchObject({
+      selection: { mode: "automatic" },
+      legacyMigrationCompleted: true,
+    });
+  });
+
+  it("migrates the first valid legacy preference once and returns the persisted backend value later", async () => {
+    const account = signedInAccount();
+    const store = await preferenceStore();
+    const catalog = new ModelCatalog(
+      {
+        listModelRecords: async () => [
+          model("legacy-config", "Legacy Config", ["medium"]),
+          model("legacy-ui", "Legacy UI", ["high"]),
+        ],
+      },
+      account,
+      {
+        store,
+        legacyConfigCandidate: {
+          mode: "explicit",
+          modelId: "legacy-config",
+          reasoningEffort: "medium",
+        },
+      },
+    );
+
+    await expect(
+      catalog.migrateLegacyPreference({
+        mode: "explicit",
+        modelId: "legacy-ui",
+        reasoningEffort: "high",
+      }),
+    ).resolves.toMatchObject({
+      selection: {
+        mode: "explicit",
+        modelId: "legacy-ui",
+        reasoningEffort: "high",
+        available: true,
+      },
+      legacyMigrationCompleted: true,
+    });
+
+    await expect(
+      catalog.migrateLegacyPreference({
+        mode: "explicit",
+        modelId: "legacy-config",
+        reasoningEffort: "medium",
+      }),
+    ).resolves.toMatchObject({
+      selection: {
+        mode: "explicit",
+        modelId: "legacy-ui",
+        reasoningEffort: "high",
+        available: true,
+      },
+      legacyMigrationCompleted: true,
+    });
+    await expect(store.read()).resolves.toMatchObject({ revision: 1 });
   });
 
   it("rejects a model or effort that the current live catalog did not provide", async () => {
@@ -214,7 +432,7 @@ describe("ModelCatalog", () => {
     ).rejects.toThrow("Selected reasoning effort is unavailable");
   });
 
-  it("falls back deterministically to automatic when the selected model disappears", async () => {
+  it("emits only model_unavailable when the selected model disappears", async () => {
     const account = signedInAccount();
     let records = [model("temporary", "Temporary", ["low"])];
     const catalog = new ModelCatalog({ listModelRecords: async () => records }, account);
@@ -223,6 +441,8 @@ describe("ModelCatalog", () => {
       modelId: "temporary",
       reasoningEffort: "low",
     });
+    const events: ModelCatalogEvent[] = [];
+    catalog.subscribe((event) => events.push(event));
 
     records = [model("replacement", "Replacement", ["medium"])];
 
@@ -235,7 +455,143 @@ describe("ModelCatalog", () => {
         },
       ],
       selection: { mode: "automatic" },
+      legacyMigrationCompleted: false,
     });
+    expect(events).toEqual([{ kind: "selection_invalidated", reason: "model_unavailable" }]);
+  });
+
+  it("emits only account_lost when logout removes model authority", async () => {
+    const account = signedInAccount();
+    const catalog = new ModelCatalog(
+      { listModelRecords: async () => [model("live", "Live", ["medium"])] },
+      account,
+    );
+    await catalog.selectModel({ mode: "explicit", modelId: "live", reasoningEffort: "medium" });
+    const events: ModelCatalogEvent[] = [];
+    catalog.subscribe((event) => events.push(event));
+
+    account.set({ status: "signed_out" });
+
+    expect(events).toEqual([{ kind: "selection_invalidated", reason: "account_lost" }]);
+  });
+
+  it("does not apply a model-unavailable repair that finishes after logout", async () => {
+    const account = signedInAccount();
+    const store = await preferenceStore();
+    let records = [model("temporary", "Temporary", ["low"])];
+    const catalog = new ModelCatalog({ listModelRecords: async () => records }, account, {
+      store,
+      legacyConfigCandidate: {
+        mode: "explicit",
+        modelId: "legacy-config",
+        reasoningEffort: "medium",
+      },
+    });
+    await catalog.selectModel({
+      mode: "explicit",
+      modelId: "temporary",
+      reasoningEffort: "low",
+    });
+    records = [model("replacement", "Replacement", ["medium"])];
+    const replacementEntered = gate();
+    const allowReplacement = gate();
+    const replace = store.replace.bind(store);
+    vi.spyOn(store, "replace").mockImplementation(async (revision, value) => {
+      replacementEntered.release();
+      await allowReplacement.promise;
+      return replace(revision, value);
+    });
+    const events: ModelCatalogEvent[] = [];
+    catalog.subscribe((event) => events.push(event));
+
+    const listing = catalog.listModels();
+    await replacementEntered.promise;
+    account.set({ status: "signed_out" });
+    allowReplacement.release();
+
+    await expect(listing).rejects.toThrow("ChatGPT authentication is required");
+    expect(events).toEqual([{ kind: "selection_invalidated", reason: "account_lost" }]);
+  });
+
+  it("does not apply a legacy migration that finishes after logout", async () => {
+    const account = signedInAccount();
+    const store = await preferenceStore();
+    const catalog = new ModelCatalog(
+      { listModelRecords: async () => [model("legacy-ui", "Legacy UI", ["high"])] },
+      account,
+      {
+        store,
+        legacyConfigCandidate: {
+          mode: "explicit",
+          modelId: "legacy-config",
+          reasoningEffort: "medium",
+        },
+      },
+    );
+    await catalog.listModels();
+    const migrationEntered = gate();
+    const allowMigration = gate();
+    const migrateLegacyOnce = store.migrateLegacyOnce.bind(store);
+    vi.spyOn(store, "migrateLegacyOnce").mockImplementation(async (revision, input) => {
+      migrationEntered.release();
+      await allowMigration.promise;
+      return migrateLegacyOnce(revision, input);
+    });
+    const events: ModelCatalogEvent[] = [];
+    catalog.subscribe((event) => events.push(event));
+
+    const migrating = catalog.migrateLegacyPreference({
+      mode: "explicit",
+      modelId: "legacy-ui",
+      reasoningEffort: "high",
+    });
+    await migrationEntered.promise;
+    account.set({ status: "signed_out" });
+    allowMigration.release();
+
+    await expect(migrating).rejects.toThrow("ChatGPT authentication is required");
+    expect(events).toEqual([{ kind: "selection_invalidated", reason: "account_lost" }]);
+  });
+
+  it("does not apply a prepared selection whose persistence finishes after logout", async () => {
+    const account = signedInAccount();
+    const store = await preferenceStore();
+    const catalog = new ModelCatalog(
+      { listModelRecords: async () => [model("live", "Live", ["medium"])] },
+      account,
+      {
+        store,
+        legacyConfigCandidate: {
+          mode: "explicit",
+          modelId: "legacy-config",
+          reasoningEffort: "medium",
+        },
+      },
+    );
+    await catalog.listModels();
+    const prepared = await catalog.prepareSelection({
+      mode: "explicit",
+      modelId: "live",
+      reasoningEffort: "medium",
+    });
+    const replacementEntered = gate();
+    const allowReplacement = gate();
+    const replace = store.replace.bind(store);
+    vi.spyOn(store, "replace").mockImplementation(async (revision, value) => {
+      replacementEntered.release();
+      await allowReplacement.promise;
+      return replace(revision, value);
+    });
+    const events: ModelCatalogEvent[] = [];
+    catalog.subscribe((event) => events.push(event));
+
+    const committing = catalog.commitSelection(prepared);
+    await replacementEntered.promise;
+    account.set({ status: "signed_out" });
+    allowReplacement.release();
+
+    await expect(committing).rejects.toThrow("ChatGPT authentication is required");
+    expect(events).toEqual([{ kind: "selection_invalidated", reason: "account_lost" }]);
   });
 
   it("supports an explicit return to automatic selection", async () => {
@@ -292,8 +648,8 @@ describe("ModelCatalog", () => {
       modelId: "selected",
       reasoningEffort: "xhigh",
     });
-    const invalidations: string[] = [];
-    catalog.subscribeInvalidation(() => invalidations.push("invalidated"));
+    const events: ModelCatalogEvent[] = [];
+    catalog.subscribe((event) => events.push(event));
     const controller = new AbortController();
 
     const resolving = catalog.resolveRuntimeSelection({ signal: controller.signal });
@@ -302,7 +658,7 @@ describe("ModelCatalog", () => {
     releaseLate([model("replacement", "Replacement", ["medium"])]);
 
     await expect(resolving).rejects.toMatchObject({ name: "AbortError" });
-    expect(invalidations).toEqual([]);
+    expect(events).toEqual([]);
     await expect(catalog.listModels()).resolves.toMatchObject({
       selection: {
         mode: "explicit",
@@ -310,6 +666,6 @@ describe("ModelCatalog", () => {
         reasoningEffort: "xhigh",
       },
     });
-    expect(invalidations).toEqual([]);
+    expect(events).toEqual([]);
   });
 });
