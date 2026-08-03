@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
+import { McpLifecycle, WhiteLilyAppLifecycle, type AppRuntime } from "../../src/app.js";
 import type { ActiveTask } from "../../src/companion/taskController.js";
 import type { ResolvedModelSelection } from "../../src/codex/modelCatalog.js";
+import { snapshotDiagnosticActionCapability } from "../../src/diagnostics/diagnosticManifest.js";
+import type { McpReadinessSnapshot } from "../../src/mcp/mcpReadiness.js";
+import type { RunningMcpServer } from "../../src/mcp/mcpServer.js";
 import { RuntimeFacade } from "../../src/runtime/runtimeFacade.js";
 import type { RuntimeEvent } from "../../src/runtime/runtimeEvents.js";
 import type { ActionCapabilitySnapshot } from "../../src/runtime/runtimeEvents.js";
@@ -66,6 +70,68 @@ const readyActionAccess = {
   }),
   subscribe: () => () => undefined,
 };
+
+function realActionRuntime(readiness: McpReadinessSnapshot) {
+  let closeServer!: () => void;
+  const closed = new Promise<void>((resolve) => {
+    closeServer = resolve;
+  });
+  let serverStops = 0;
+  const server: RunningMcpServer = {
+    host: "127.0.0.1",
+    port: 32123,
+    url: "http://127.0.0.1:32123/mcp",
+    closed,
+    stop: async () => {
+      serverStops += 1;
+      closeServer();
+    },
+  };
+  const mcp = new McpLifecycle({} as never, {
+    workspaceVersion: "workspace-1",
+    startServer: async () => server,
+    verify: async () => readiness,
+  });
+  let modelSwitches = 0;
+  const appRuntime: AppRuntime = {
+    preferredModel: "gpt-5.6-terra",
+    minecraft: { connect: async () => undefined, disconnect: async () => undefined },
+    mcp,
+    codex: {
+      assertChatGptLogin: async () => undefined,
+      start: async () => undefined,
+      listModels: async () => ["gpt-5.6-terra"],
+      stop: async () => undefined,
+    },
+    selectModel: () => "gpt-5.6-terra",
+    switchModel: async (_selection, commitPreference) => {
+      modelSwitches += 1;
+      await commitPreference();
+    },
+    companion: {
+      start: async () => undefined,
+      switchModel: async (_selection, commitPreference) => commitPreference(),
+      stop: async () => undefined,
+    },
+    executor: { stopAll: () => undefined },
+  };
+  const lifecycle = new WhiteLilyAppLifecycle(appRuntime);
+  const runtime = new RuntimeFacade({
+    lifecycle,
+    actions: {
+      snapshot: () => mcp.snapshot(),
+      subscribe: (listener) => mcp.subscribe(listener),
+    },
+    codex: { model: () => "gpt-5.6-terra" },
+    switchModel: (selection, commitPreference) =>
+      appRuntime.switchModel(selection, commitPreference),
+  });
+  return {
+    runtime,
+    serverStops: () => serverStops,
+    modelSwitches: () => modelSwitches,
+  };
+}
 
 let minecraftAccessorReads = 0;
 const accessorBackedOwnerOffline = { kind: "owner_offline" };
@@ -151,6 +217,78 @@ function createRuntimeFacadeHarness() {
 }
 
 describe("RuntimeFacade", () => {
+  it("retains a real MCP readiness failure for diagnostics until a fresh runtime starts", async () => {
+    const failed = realActionRuntime({
+      state: "failed",
+      listening: true,
+      discoveredToolCount: 14,
+      errorCode: "missing_tools",
+    });
+    const events: RuntimeEvent[] = [];
+    failed.runtime.subscribe((event) => events.push(event));
+
+    await expect(failed.runtime.start()).rejects.toMatchObject({
+      name: "ActionCapabilityError",
+      code: "missing_tools",
+    });
+
+    const failedSnapshot = failed.runtime.snapshot();
+    expect(failedSnapshot).toMatchObject({
+      lifecycle: "failed",
+      minecraft: { state: "disconnected", sessionId: null },
+      codex: { state: "failed", model: null },
+      actions: {
+        state: "failed",
+        workspaceVersion: "workspace-1",
+        mcpListening: false,
+        discoveredToolCount: 14,
+        errorCode: "missing_tools",
+      },
+      task: null,
+      lastError: { code: "MCP_TOOL_CATALOG_INVALID" },
+    });
+    expect(snapshotDiagnosticActionCapability(failedSnapshot.actions)).toEqual({
+      workspaceVersion: "workspace-1",
+      state: "failed",
+      mcpListening: false,
+      discoveredToolCount: 14,
+      errorCode: "missing_tools",
+    });
+    const actionEvents = events.filter((event) => event.kind === "actions");
+    expect(actionEvents.map((event) => event.state?.state ?? null)).toEqual(["starting", "failed"]);
+    expect(actionEvents.map((event) => event.revision)).toEqual(
+      actionEvents.map((_event, index) => actionEvents[0]!.revision + index),
+    );
+    await failed.runtime.stop("process_exit");
+    expect(failed.runtime.snapshot().actions).toEqual(failedSnapshot.actions);
+    await expect(
+      failed.runtime.switchModel(
+        { modelId: "gpt-5.6-luna", reasoningEffort: "medium" },
+        async () => undefined,
+      ),
+    ).rejects.toThrow("Runtime is not running");
+    expect(failed.modelSwitches()).toBe(0);
+    expect(failed.serverStops()).toBe(1);
+
+    const fresh = realActionRuntime({
+      state: "ready",
+      listening: true,
+      discoveredToolCount: 15,
+      errorCode: null,
+    });
+    const freshEvents: RuntimeEvent[] = [];
+    fresh.runtime.subscribe((event) => freshEvents.push(event));
+    expect(fresh.runtime.snapshot().actions).toBeNull();
+
+    await fresh.runtime.start();
+    expect(
+      freshEvents.filter((event) => event.kind === "actions").map((event) => event.state?.state),
+    ).toEqual(["starting", "ready"]);
+    await fresh.runtime.stop("process_exit");
+    expect(fresh.runtime.snapshot()).toMatchObject({ lifecycle: "stopped", actions: null });
+    expect(fresh.serverStops()).toBe(1);
+  });
+
   it("publishes starting and ready action capability transitions while starting", async () => {
     let actions: ActionCapabilitySnapshot | null = null;
     let publishActions: ((snapshot: ActionCapabilitySnapshot | null) => void) | undefined;

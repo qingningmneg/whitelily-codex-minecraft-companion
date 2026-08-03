@@ -248,6 +248,25 @@ describe("DiagnosticExporter", () => {
     }
   });
 
+  it.each(["bearer_private_token", "users_private_codex_workspace", "raw_mcp_response_body"])(
+    "drops the unrecognized credential-like diagnostic action code %s",
+    async (errorCode) => {
+      const dataRoot = await fixture();
+      const exporter = createExporter(dataRoot, () => 1_000);
+
+      const preview = await exporter.preview({
+        state: "failed",
+        workspaceVersion: "workspace-1",
+        mcpListening: false,
+        discoveredToolCount: 0,
+        errorCode,
+      });
+
+      expect(preview.actionCapability.errorCode).toBeNull();
+      expect(JSON.stringify(preview)).not.toContain(errorCode);
+    },
+  );
+
   it("requires the one active unexpired preview ID and bounds replacement lifecycle", async () => {
     const dataRoot = await fixture();
     let now = 1_000;

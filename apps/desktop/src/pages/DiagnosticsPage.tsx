@@ -162,7 +162,6 @@ function actionDiagnosticRecovery(errorCode: string | null): ActionDiagnosticRec
     case "extra_tools":
     case "duplicate_tools":
     case "invalid_tool_name":
-    case "invalid_response":
       return {
         code: "MCP_TOOL_CATALOG_INVALID",
         messageKey: "diagnostics.action.error.MCP_TOOL_CATALOG_INVALID",

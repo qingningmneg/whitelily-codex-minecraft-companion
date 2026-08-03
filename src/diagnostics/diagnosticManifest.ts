@@ -20,7 +20,24 @@ export const DIAGNOSTIC_OMISSIONS = [
   "raw-chat",
 ] as const;
 
+export const DIAGNOSTIC_ACTION_ERROR_CODES = Object.freeze([
+  "invalid_url",
+  "invalid_timeout",
+  "connection_failed",
+  "timeout",
+  "aborted",
+  "missing_tools",
+  "extra_tools",
+  "duplicate_tools",
+  "invalid_tool_name",
+  "port_conflict",
+  "server_start_failed",
+  "server_closed",
+  "startup_stopped",
+] as const);
+
 export type DiagnosticLogicalName = (typeof DIAGNOSTIC_ENTRY_NAMES)[number];
+export type DiagnosticActionErrorCode = (typeof DIAGNOSTIC_ACTION_ERROR_CODES)[number];
 
 export interface DiagnosticPreview {
   exportId: string;
@@ -34,11 +51,10 @@ export interface DiagnosticActionCapability {
   state: "starting" | "ready" | "failed";
   mcpListening: boolean;
   discoveredToolCount: number;
-  errorCode: string | null;
+  errorCode: DiagnosticActionErrorCode | null;
 }
 
 const workspaceVersionPattern = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u;
-const actionErrorCodePattern = /^[a-z][a-z0-9_]{0,63}$/u;
 
 export function snapshotDiagnosticActionCapability(
   actions: RuntimeSnapshot["actions"],
@@ -78,8 +94,15 @@ export function snapshotDiagnosticActionCapability(
     state: "failed",
     mcpListening: actions.mcpListening === true,
     discoveredToolCount: boundedToolCount(actions.discoveredToolCount),
-    errorCode: actionErrorCodePattern.test(actions.errorCode) ? actions.errorCode : null,
+    errorCode: diagnosticActionErrorCode(actions.errorCode),
   });
+}
+
+function diagnosticActionErrorCode(value: unknown): DiagnosticActionErrorCode | null {
+  if (typeof value !== "string") return null;
+  return DIAGNOSTIC_ACTION_ERROR_CODES.includes(value as DiagnosticActionErrorCode)
+    ? (value as DiagnosticActionErrorCode)
+    : null;
 }
 
 function boundedToolCount(value: number): number {

@@ -578,6 +578,18 @@ describe("desktop protocol v1", () => {
       ],
     };
     expect(parseDesktopCommandResult(previewCommand, preview)).toEqual(preview);
+    for (const errorCode of [
+      "bearer_private_token",
+      "users_private_codex_workspace",
+      "raw_mcp_response_body",
+    ]) {
+      expect(() =>
+        parseDesktopCommandResult(previewCommand, {
+          ...preview,
+          actionCapability: { ...preview.actionCapability, state: "failed", errorCode },
+        }),
+      ).toThrow("invalid desktop command result");
+    }
     expect(() =>
       parseDesktopCommandResult(previewCommand, {
         exportId: preview.exportId,

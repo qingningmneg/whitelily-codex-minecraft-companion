@@ -77,7 +77,7 @@ describe("DiagnosticsPage", () => {
   it.each([
     ["server_start_failed", "MCP_PORT_UNAVAILABLE", "The local action port is already in use."],
     [
-      "invalid_response",
+      "duplicate_tools",
       "MCP_TOOL_CATALOG_INVALID",
       "The Minecraft action component is incomplete.",
     ],

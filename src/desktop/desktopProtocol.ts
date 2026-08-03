@@ -18,6 +18,7 @@ import {
   worldProfileSchema,
   type WorldProfile,
 } from "../world/worldProfileSchema.js";
+import { DIAGNOSTIC_ACTION_ERROR_CODES } from "../diagnostics/diagnosticManifest.js";
 
 export const DESKTOP_PROTOCOL_VERSION = 1 as const;
 export const MAX_DESKTOP_LINE_BYTES = 1_048_576;
@@ -438,10 +439,7 @@ const diagnosticActionCapabilitySchema = z
     state: z.enum(["starting", "ready", "failed"]),
     mcpListening: z.boolean(),
     discoveredToolCount: finiteNonnegativeInteger,
-    errorCode: z
-      .string()
-      .regex(/^[a-z][a-z0-9_]{0,63}$/u)
-      .nullable(),
+    errorCode: z.enum(DIAGNOSTIC_ACTION_ERROR_CODES).nullable(),
   })
   .strict();
 export const diagnosticPreviewSchema = z

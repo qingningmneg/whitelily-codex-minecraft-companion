@@ -155,6 +155,13 @@ export class RuntimeFacade {
       this.#unsubscribeActions = dependencies.actions?.subscribe((snapshot) => {
         if (this.#terminal) return;
         if (this.#snapshot.lifecycle === "idle" && snapshot !== null) return;
+        if (
+          this.#snapshot.lifecycle === "starting" &&
+          this.#snapshot.actions?.state === "failed" &&
+          snapshot === null
+        ) {
+          return;
+        }
         try {
           this.#setActions(snapshot, true);
         } catch {

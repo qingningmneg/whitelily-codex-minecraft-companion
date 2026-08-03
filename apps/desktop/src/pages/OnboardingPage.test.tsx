@@ -107,6 +107,10 @@ function deferred<T>(): {
   return { promise, resolve, reject };
 }
 
+function privateWindowsPath(...segments: string[]): string {
+  return ["C:", "Users", ...segments].join("\\");
+}
+
 function createApiHarness(
   options: {
     status?: RuntimeSnapshot | readonly RuntimeSnapshot[];
@@ -1351,42 +1355,48 @@ describe("first-run onboarding", () => {
     [
       "pcl2",
       "config-invalid",
-      new Error("OWNER_IDENTITY_CONFIG_INVALID: C:\\Users\\PrivateOwner\\config.toml"),
+      new Error(
+        `OWNER_IDENTITY_CONFIG_INVALID: ${privateWindowsPath("PrivateOwner", "config.toml")}`,
+      ),
       "Who should WhiteLily listen to?",
       "WhiteLily's owner configuration is invalid. Repair the config, then try again.",
     ],
     [
       "lan",
       "config-invalid",
-      new Error("OWNER_IDENTITY_CONFIG_INVALID: C:\\Users\\PrivateOwner\\config.toml"),
+      new Error(
+        `OWNER_IDENTITY_CONFIG_INVALID: ${privateWindowsPath("PrivateOwner", "config.toml")}`,
+      ),
       "Who should WhiteLily listen to?",
       "WhiteLily's owner configuration is invalid. Repair the config, then try again.",
     ],
     [
       "ready",
       "config-invalid",
-      new Error("OWNER_IDENTITY_CONFIG_INVALID: C:\\Users\\PrivateOwner\\config.toml"),
+      new Error(
+        `OWNER_IDENTITY_CONFIG_INVALID: ${privateWindowsPath("PrivateOwner", "config.toml")}`,
+      ),
       "Who should WhiteLily listen to?",
       "WhiteLily's owner configuration is invalid. Repair the config, then try again.",
     ],
     [
       "pcl2",
       "rejected",
-      new Error("ECONNREFUSED: C:\\Users\\PrivateOwner\\owner-name"),
+      new Error(`ECONNREFUSED: ${privateWindowsPath("PrivateOwner", "owner-name")}`),
       "Who should WhiteLily listen to?",
       "The WhiteLily core is unavailable. Restart WhiteLily, then try again.",
     ],
     [
       "lan",
       "rejected",
-      new Error("ECONNREFUSED: C:\\Users\\PrivateOwner\\owner-name"),
+      new Error(`ECONNREFUSED: ${privateWindowsPath("PrivateOwner", "owner-name")}`),
       "Who should WhiteLily listen to?",
       "The WhiteLily core is unavailable. Restart WhiteLily, then try again.",
     ],
     [
       "ready",
       "rejected",
-      new Error("ECONNREFUSED: C:\\Users\\PrivateOwner\\owner-name"),
+      new Error(`ECONNREFUSED: ${privateWindowsPath("PrivateOwner", "owner-name")}`),
       "Who should WhiteLily listen to?",
       "The WhiteLily core is unavailable. Restart WhiteLily, then try again.",
     ],
@@ -1621,7 +1631,7 @@ describe("first-run onboarding", () => {
   });
 
   it("preserves the confirmed LAN candidate and retries action readiness with a fresh runtime", async () => {
-    const secret = String.raw`C:\Users\Private\codex-workspace token=secret raw MCP body`;
+    const secret = `${privateWindowsPath("Private", "codex-workspace")} token=secret raw MCP body`;
     const harness = createApiHarness({
       status: [stoppedSnapshot, runningSnapshot],
       pcl2: [pcl2Candidate],
