@@ -74,24 +74,42 @@ describe("TaskController", () => {
     );
   });
 
-  it.each(["emergency_stop", "disconnect", "world_changed", "model_unavailable"] as const)(
-    "invalidates tool work on %s",
-    (reason) => {
-      const controller = fixedController();
-      const task = controller.start(disclosure);
+  it.each([
+    "emergency_stop",
+    "disconnect",
+    "world_changed",
+    "model_unavailable",
+    "model_changed",
+  ] as const)("invalidates tool work on %s", (reason) => {
+    const controller = fixedController();
+    const task = controller.start(disclosure);
 
-      controller.stop(reason);
+    controller.stop(reason);
 
-      expect(
-        controller.consume({
-          leaseId: task.lease.id,
-          kind: "say",
-          now: Date.parse("2026-07-27T08:00:01.000Z"),
-        }),
-      ).toEqual({ ok: false, reason: "task lease is invalid" });
-      expect(controller.current()).toBeNull();
-    },
-  );
+    expect(
+      controller.consume({
+        leaseId: task.lease.id,
+        kind: "say",
+        now: Date.parse("2026-07-27T08:00:01.000Z"),
+      }),
+    ).toEqual({ ok: false, reason: "task lease is invalid" });
+    expect(controller.current()).toBeNull();
+  });
+
+  it("records model_changed as the final audit while revoking the active lease", () => {
+    const audit = vi.fn<TaskAuditCallback>();
+    const controller = fixedController(audit);
+    const task = controller.start(disclosure);
+
+    controller.stop("model_changed");
+
+    expect(controller.isLeaseLive(task.lease)).toBe(false);
+    expect(controller.current()).toBeNull();
+    expect(audit).toHaveBeenLastCalledWith(
+      "task_stopped",
+      expect.objectContaining({ reason: "model_changed" }),
+    );
+  });
 
   it("matches only the complete currently live task capability", () => {
     const controller = fixedController();

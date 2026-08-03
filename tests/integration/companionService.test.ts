@@ -233,6 +233,361 @@ describe("CompanionService lifecycle", () => {
     expect(value.codex.startedThreadIds.intent).not.toBe(value.codex.startedThreadIds.execution);
   });
 
+  it("stages both replacement threads before committing and retiring the old authority", async () => {
+    const value = await harness({
+      intentThreadIds: ["terra-intent", "luna-intent"],
+      threadIds: ["terra-execution", "luna-execution"],
+    });
+    await value.service.start("gpt-5.6-terra");
+    const authority = value.service as unknown as {
+      intentThreadId: string;
+      executionThreadId: string;
+      selectedModel: string;
+      selectedReasoningEffort: string;
+    };
+    const commitPreference = vi.fn(async () => {
+      expect(value.codex.startedThreads.slice(2)).toEqual([
+        expect.objectContaining({ model: "gpt-5.6-luna", reasoningEffort: "high" }),
+        expect.objectContaining({ model: "gpt-5.6-luna", reasoningEffort: "high" }),
+      ]);
+      expect(value.codex.closedThreads).toEqual([]);
+      expect(authority).toMatchObject({
+        intentThreadId: "terra-intent",
+        executionThreadId: "terra-execution",
+        selectedModel: "gpt-5.6-terra",
+        selectedReasoningEffort: "low",
+      });
+    });
+
+    await value.service.switchModel(
+      { modelId: "gpt-5.6-luna", reasoningEffort: "high" },
+      commitPreference,
+    );
+
+    expect(commitPreference).toHaveBeenCalledTimes(1);
+    expect(authority).toMatchObject({
+      intentThreadId: "luna-intent",
+      executionThreadId: "luna-execution",
+      selectedModel: "gpt-5.6-luna",
+      selectedReasoningEffort: "high",
+    });
+    expect(value.codex.threadLifecycle).toEqual([
+      "start:terra-intent",
+      "start:terra-execution",
+      "start:luna-intent",
+      "start:luna-execution",
+      "close:terra-intent",
+      "close:terra-execution",
+    ]);
+  });
+
+  it.each([
+    ["a stopped service", "running"],
+    ["unhealthy Codex", "codexHealthy"],
+  ] as const)(
+    "rejects switching for %s before opening replacement threads",
+    async (_label, key) => {
+      const value = await harness({
+        intentThreadIds: ["terra-intent", "must-not-start-intent"],
+        threadIds: ["terra-execution", "must-not-start-execution"],
+      });
+      await value.service.start("gpt-5.6-terra");
+      (value.service as unknown as Record<typeof key, boolean>)[key] = false;
+      const commitPreference = vi.fn(async () => undefined);
+
+      await expect(
+        value.service.switchModel(
+          { modelId: "gpt-5.6-luna", reasoningEffort: "high" },
+          commitPreference,
+        ),
+      ).rejects.toThrow();
+
+      expect(value.codex.startedThreads).toHaveLength(2);
+      expect(value.codex.closedThreads).toEqual([]);
+      expect(commitPreference).not.toHaveBeenCalled();
+    },
+  );
+
+  it("stops active model work with model_changed and keeps the connection healthy", async () => {
+    const value = await harness({
+      intentResponses: [
+        taskDecision({
+          naturalReply: null,
+          goal: "old model task",
+          allowedActions: ["say"],
+        }),
+      ],
+      executionResponses: [taskExecutionOutcome("old model work", "active")],
+      deferredTurns: [0],
+      intentThreadIds: ["terra-intent", "luna-intent"],
+      threadIds: ["terra-execution", "luna-execution"],
+    });
+    await value.service.start("gpt-5.6-terra");
+    await value.emitOwnerText("start old model work");
+    await value.untilCodexTurns(1);
+    const task = value.taskController.current();
+    const turnLease = value.budgetLeases[0];
+    if (!task || !turnLease) throw new Error("expected active task and turn leases");
+
+    await value.service.switchModel(
+      { modelId: "gpt-5.6-luna", reasoningEffort: "medium" },
+      async () => undefined,
+    );
+
+    expect(value.taskController.current()).toBeNull();
+    expect(value.taskController.isLeaseLive(task.lease)).toBe(false);
+    expect(value.budget.consume("say", turnLease)).toEqual({
+      ok: false,
+      reason: "tool turn has ended",
+    });
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:model_changed"]);
+    expect(value.taskTerminalReasons).toContain("model_changed");
+    expect(value.codex.interruptions).toContainEqual({
+      threadId: "terra-execution",
+      turnId: "turn-1",
+    });
+    expect(value.codex.stopCalls).toBe(0);
+    expect(value.mode.snapshot().paused).toBe(false);
+    expect(value.service).toMatchObject({ running: true, codexHealthy: true });
+  });
+
+  it("archives a staged intent thread when replacement execution creation fails", async () => {
+    const value = await harness({
+      intentThreadIds: ["terra-intent", "failed-luna-intent"],
+      threadIds: ["terra-execution", "failed-luna-execution"],
+      codexThreadStartErrors: [undefined, undefined, undefined, new Error("luna failed")],
+    });
+    await value.service.start("gpt-5.6-terra");
+    const authority = value.service as unknown as {
+      intentThreadId: string;
+      executionThreadId: string;
+      selectedModel: string;
+      selectedReasoningEffort: string;
+    };
+    const commitPreference = vi.fn(async () => undefined);
+
+    await expect(
+      value.service.switchModel(
+        { modelId: "gpt-5.6-luna", reasoningEffort: "high" },
+        commitPreference,
+      ),
+    ).rejects.toThrow("luna failed");
+
+    expect(commitPreference).not.toHaveBeenCalled();
+    expect(value.codex.closedThreads).toEqual(["failed-luna-intent"]);
+    expect(authority).toMatchObject({
+      intentThreadId: "terra-intent",
+      executionThreadId: "terra-execution",
+      selectedModel: "gpt-5.6-terra",
+      selectedReasoningEffort: "low",
+    });
+  });
+
+  it("surfaces a staged intent rollback failure while preserving the old authority", async () => {
+    const value = await harness({
+      intentThreadIds: ["terra-intent", "failed-luna-intent"],
+      threadIds: ["terra-execution", "failed-luna-execution"],
+      codexThreadStartErrors: [undefined, undefined, undefined, new Error("luna failed")],
+      codexThreadCloseErrors: [new Error("PRIVATE_staged_intent_close_failure")],
+    });
+    await value.service.start("gpt-5.6-terra");
+
+    await expect(
+      value.service.switchModel(
+        { modelId: "gpt-5.6-luna", reasoningEffort: "high" },
+        async () => undefined,
+      ),
+    ).rejects.toMatchObject({
+      name: "AggregateError",
+      message: "Companion model switch rollback failed",
+    });
+
+    expect(value.codex.closedThreads).toEqual(["failed-luna-intent"]);
+    expect(value.service).toMatchObject({
+      intentThreadId: "terra-intent",
+      executionThreadId: "terra-execution",
+      selectedModel: "gpt-5.6-terra",
+      selectedReasoningEffort: "low",
+    });
+  });
+
+  it("archives both replacement threads when preference persistence fails", async () => {
+    const value = await harness({
+      intentThreadIds: ["terra-intent", "luna-intent"],
+      threadIds: ["terra-execution", "luna-execution"],
+    });
+    await value.service.start("gpt-5.6-terra");
+    const authority = value.service as unknown as {
+      intentThreadId: string;
+      executionThreadId: string;
+      selectedModel: string;
+      selectedReasoningEffort: string;
+    };
+
+    await expect(
+      value.service.switchModel({ modelId: "gpt-5.6-luna", reasoningEffort: "high" }, async () => {
+        throw new Error("preference persistence failed");
+      }),
+    ).rejects.toThrow("preference persistence failed");
+
+    expect(value.codex.closedThreads).toEqual(["luna-intent", "luna-execution"]);
+    expect(authority).toMatchObject({
+      intentThreadId: "terra-intent",
+      executionThreadId: "terra-execution",
+      selectedModel: "gpt-5.6-terra",
+      selectedReasoningEffort: "low",
+    });
+  });
+
+  it("surfaces replacement-pair rollback failure after preference persistence fails", async () => {
+    const value = await harness({
+      intentThreadIds: ["terra-intent", "luna-intent"],
+      threadIds: ["terra-execution", "luna-execution"],
+      codexThreadCloseErrors: [new Error("PRIVATE_staged_pair_close_failure"), undefined],
+    });
+    await value.service.start("gpt-5.6-terra");
+
+    await expect(
+      value.service.switchModel({ modelId: "gpt-5.6-luna", reasoningEffort: "high" }, async () => {
+        throw new Error("preference persistence failed");
+      }),
+    ).rejects.toMatchObject({
+      name: "AggregateError",
+      message: "Companion model switch rollback failed",
+    });
+
+    expect(value.codex.closedThreads).toEqual(["luna-intent", "luna-execution"]);
+    expect(value.service).toMatchObject({
+      intentThreadId: "terra-intent",
+      executionThreadId: "terra-execution",
+      selectedModel: "gpt-5.6-terra",
+      selectedReasoningEffort: "low",
+    });
+  });
+
+  it("keeps the new authority when old thread archival fails and logs only redacted data", async () => {
+    const privateFailure = "PRIVATE_terra-intent_archive_failure";
+    const archiveFailure = new Error(privateFailure);
+    archiveFailure.name = "PRIVATE_ArchiveFailureName";
+    const value = await harness({
+      intentThreadIds: ["terra-intent", "luna-intent"],
+      threadIds: ["terra-execution", "luna-execution"],
+      codexThreadCloseErrors: [archiveFailure, undefined],
+    });
+    await value.service.start("gpt-5.6-terra");
+    const authority = value.service as unknown as {
+      intentThreadId: string;
+      executionThreadId: string;
+      selectedModel: string;
+    };
+
+    await expect(
+      value.service.switchModel(
+        { modelId: "gpt-5.6-luna", reasoningEffort: "medium" },
+        async () => undefined,
+      ),
+    ).resolves.toBeUndefined();
+
+    expect(authority).toMatchObject({
+      intentThreadId: "luna-intent",
+      executionThreadId: "luna-execution",
+      selectedModel: "gpt-5.6-luna",
+    });
+    expect(value.codex.closedThreads).toEqual(["terra-intent", "terra-execution"]);
+    expect(value.diagnostics).toContainEqual({
+      event: "codex_thread_retire_failed",
+      fields: { code: "thread_archive_failed" },
+    });
+    expect(JSON.stringify(value.diagnostics)).not.toContain(privateFailure);
+    expect(JSON.stringify(value.diagnostics)).not.toContain(archiveFailure.name);
+    expect(JSON.stringify(value.diagnostics)).not.toContain("terra-intent");
+  });
+
+  it("serializes rapid switches so the final successful request owns both threads", async () => {
+    const value = await harness({
+      intentThreadIds: ["terra-intent", "luna-intent", "final-intent"],
+      threadIds: ["terra-execution", "luna-execution", "final-execution"],
+      gatedThreadStarts: [2],
+    });
+    await value.service.start("gpt-5.6-terra");
+    const firstCommit = vi.fn(async () => undefined);
+    const finalCommit = vi.fn(async () => undefined);
+
+    const first = value.service.switchModel(
+      { modelId: "gpt-5.6-luna", reasoningEffort: "medium" },
+      firstCommit,
+    );
+    await value.untilThreadStart(2);
+    const final = value.service.switchModel(
+      { modelId: "gpt-5.6-final", reasoningEffort: "high" },
+      finalCommit,
+    );
+
+    expect(value.codex.startedThreads).toHaveLength(2);
+    expect(firstCommit).not.toHaveBeenCalled();
+    expect(finalCommit).not.toHaveBeenCalled();
+    value.releaseThreadStart(2);
+    await Promise.all([first, final]);
+
+    expect(firstCommit).toHaveBeenCalledTimes(1);
+    expect(finalCommit).toHaveBeenCalledTimes(1);
+    expect(value.service).toMatchObject({
+      intentThreadId: "final-intent",
+      executionThreadId: "final-execution",
+      selectedModel: "gpt-5.6-final",
+      selectedReasoningEffort: "high",
+    });
+    expect(value.codex.threadLifecycle).toEqual([
+      "start:terra-intent",
+      "start:terra-execution",
+      "start:luna-intent",
+      "start:luna-execution",
+      "close:terra-intent",
+      "close:terra-execution",
+      "start:final-intent",
+      "start:final-execution",
+      "close:luna-intent",
+      "close:luna-execution",
+    ]);
+  });
+
+  it("holds owner task dispatch behind the switch tail and uses one replacement pair", async () => {
+    const value = await harness({
+      intentResponses: [
+        taskDecision({
+          naturalReply: null,
+          goal: "new model task",
+          allowedActions: ["get_state"],
+        }),
+      ],
+      executionResponses: [taskExecutionOutcome("new pair ready")],
+      intentThreadIds: ["terra-intent", "luna-intent"],
+      threadIds: ["terra-execution", "luna-execution"],
+      gatedThreadStarts: [3],
+    });
+    await value.service.start("gpt-5.6-terra");
+    const switching = value.service.switchModel(
+      { modelId: "gpt-5.6-luna", reasoningEffort: "medium" },
+      async () => undefined,
+    );
+    await value.untilThreadStart(3);
+
+    const ownerTurn = value.emitOwnerText("start on the new model");
+    await value.untilMergeTimer();
+    expect(value.codex.turnsFor("intent")).toEqual([]);
+    value.releaseThreadStart(3);
+    await switching;
+    await ownerTurn;
+    await value.untilCodexTurns(1);
+
+    expect(value.codex.turnsFor("intent")).toEqual([
+      expect.objectContaining({ threadId: "luna-intent" }),
+    ]);
+    expect(value.codex.turnsFor("execution")).toEqual([
+      expect.objectContaining({ threadId: "luna-execution" }),
+    ]);
+  });
+
   it("recovery recreates two independent threads before its execution handshake", async () => {
     const value = await harness({
       persistedState: {
@@ -4492,6 +4847,7 @@ describe("CompanionService output and commands", () => {
     "disconnect",
     "world_changed",
     "model_unavailable",
+    "model_changed",
     "process_exit",
   ] as const)(
     "invalidates a waiting game capability when the task ends with %s",

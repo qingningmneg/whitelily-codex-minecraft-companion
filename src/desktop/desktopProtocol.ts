@@ -60,6 +60,7 @@ const taskStopReasonSchema = z.enum([
   "world_changed",
   "owner_changed",
   "model_unavailable",
+  "model_changed",
   "process_exit",
 ]);
 

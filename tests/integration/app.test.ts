@@ -895,6 +895,7 @@ describe("WhiteLilyApp composition", () => {
     "disconnect",
     "world_changed",
     "model_unavailable",
+    "model_changed",
     "process_exit",
   ] as const)("persists exactly one start and one %s terminal audit", async (reason) => {
     const harness = await createAppHarness();

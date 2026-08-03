@@ -105,6 +105,8 @@ class FakeCodexPort implements CodexPort {
   readonly turns: Array<{ threadId: string; text: string }> = [];
   readonly interruptions: Array<{ threadId: string; turnId: string }> = [];
   readonly startedThreads: Array<{ cwd: string; model: string; reasoningEffort: string }> = [];
+  readonly closedThreads: string[] = [];
+  readonly threadLifecycle: string[] = [];
   readonly pendingTurns: PendingTurn[] = [];
   startCalls = 0;
   stopCalls = 0;
@@ -142,6 +144,7 @@ class FakeCodexPort implements CodexPort {
   private readonly threadStartGates = new Map<number, Deferred<void>>();
   private readonly threadStartReached = new Map<number, Deferred<void>>();
   private readonly threadStartErrors: Array<Error | undefined>;
+  private readonly threadCloseErrors: Array<Error | undefined>;
   private readonly startGates = new Map<number, Deferred<void>>();
   private readonly startReached = new Map<number, Deferred<void>>();
   private readonly startErrors: Array<Error | undefined>;
@@ -175,6 +178,7 @@ class FakeCodexPort implements CodexPort {
     }
     this.startErrors = [...(options.codexStartErrors ?? [])];
     this.threadStartErrors = [...(options.codexThreadStartErrors ?? [])];
+    this.threadCloseErrors = [...(options.codexThreadCloseErrors ?? [])];
     this.modelResults = [...(options.modelResults ?? [])];
     this.selectionAvailability = [...(options.selectionAvailability ?? [])];
   }
@@ -265,6 +269,7 @@ class FakeCodexPort implements CodexPort {
     this.startedThreads.push(options);
     this.threadRoles.set(threadId, role);
     this.currentThreadIds[role] = threadId;
+    this.threadLifecycle.push(`start:${threadId}`);
     this.nextThreadRole = role === "intent" ? "execution" : "intent";
     return threadId;
   }
@@ -362,7 +367,15 @@ class FakeCodexPort implements CodexPort {
     this.interruptions.push({ threadId, turnId });
   }
 
-  async closeThread(_threadId: string): Promise<void> {}
+  async closeThread(threadId: string): Promise<void> {
+    this.closedThreads.push(threadId);
+    this.threadLifecycle.push(`close:${threadId}`);
+    const error = this.threadCloseErrors.shift();
+    if (error) throw error;
+    const role = this.threadRoles.get(threadId);
+    if (role && this.currentThreadIds[role] === threadId) this.currentThreadIds[role] = undefined;
+    this.threadRoles.delete(threadId);
+  }
 
   async stop(): Promise<void> {
     this.stopCalls += 1;
@@ -438,6 +451,7 @@ export interface CompanionHarnessOptions {
   gatedThreadStarts?: number[];
   codexStartErrors?: Array<Error | undefined>;
   codexThreadStartErrors?: Array<Error | undefined>;
+  codexThreadCloseErrors?: Array<Error | undefined>;
   modelResults?: Array<string[] | Error>;
   selectionAvailability?: boolean[];
   persistedState?: StateToPersist;
@@ -621,6 +635,7 @@ export async function createCompanionHarness(options: CompanionHarnessOptions = 
   const budgetLeases: Array<string | undefined> = [];
   const budgetTaskLeaseIds: Array<string | undefined> = [];
   const errors: string[] = [];
+  const diagnostics: Array<{ event: string; fields: Record<string, unknown> }> = [];
   const begin = budget.begin.bind(budget);
   const end = budget.end.bind(budget);
   budget.begin = (taskLease?: TaskLease, authorization = {}) => {
@@ -670,8 +685,9 @@ export async function createCompanionHarness(options: CompanionHarnessOptions = 
     taskController,
     autonomy,
     logger: {
-      error: async (_event: string, fields: Record<string, unknown>) => {
+      error: async (event: string, fields: Record<string, unknown>) => {
         errors.push(String(fields.code));
+        diagnostics.push({ event, fields: structuredClone(fields) });
       },
     },
     safetyContextProvider: async () => ({
@@ -759,6 +775,7 @@ export async function createCompanionHarness(options: CompanionHarnessOptions = 
     budgetTaskLeaseIds,
     autonomy,
     errors,
+    diagnostics,
     service,
     tools,
     setOwnerIdentitySnapshot: (snapshot: OwnerIdentitySnapshot) => {

@@ -1245,7 +1245,7 @@ export class DesktopChildServer {
 
   #beginRuntimeInvalidation(
     runtime: DesktopChildRuntime,
-    reason: Exclude<TaskStopReason, "owner_changed">,
+    reason: Exclude<TaskStopReason, "owner_changed" | "model_changed">,
     _interrupt: boolean,
     publicReason: ConnectionInvalidationReason = connectionInvalidationReason(reason),
     synchronousRuntimeStop = false,
@@ -1398,7 +1398,7 @@ export class DesktopChildServer {
   }
 
   #invalidateDesktopAuthority(
-    reason: Exclude<TaskStopReason, "owner_changed">,
+    reason: Exclude<TaskStopReason, "owner_changed" | "model_changed">,
     publicReason: ConnectionInvalidationReason = connectionInvalidationReason(reason),
   ): Promise<void> {
     return this.#beginAuthorityInvalidation(reason, publicReason);
@@ -1993,7 +1993,7 @@ function isConnectionInvalidatingRuntimeEvent(event: RuntimeEvent): boolean {
 }
 
 function connectionInvalidationReason(
-  reason: Exclude<TaskStopReason, "owner_changed">,
+  reason: Exclude<TaskStopReason, "owner_changed" | "model_changed">,
 ): ConnectionInvalidationReason {
   switch (reason) {
     case "owner_stop":

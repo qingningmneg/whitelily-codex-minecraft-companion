@@ -276,18 +276,21 @@ describe("RuntimeFacade", () => {
     expect(harness.stopReasons).toEqual(["emergency_stop"]);
   });
 
-  it("accepts owner_changed as a terminal task-budget reason", () => {
-    const runtime = new RuntimeFacade({
-      lifecycle: { start: async () => undefined, stop: async () => undefined },
-      task: {
-        current: () => null,
-        budget: () => ({ ...inactiveBudget(), stopReason: "owner_changed" }),
-        stop: () => undefined,
-      },
-    });
+  it.each(["owner_changed", "model_changed"] as const)(
+    "accepts %s as a terminal task-budget reason",
+    (reason) => {
+      const runtime = new RuntimeFacade({
+        lifecycle: { start: async () => undefined, stop: async () => undefined },
+        task: {
+          current: () => null,
+          budget: () => ({ ...inactiveBudget(), stopReason: reason }),
+          stop: () => undefined,
+        },
+      });
 
-    expect(runtime.snapshot()).toMatchObject({ task: null, lastError: null });
-  });
+      expect(runtime.snapshot()).toMatchObject({ task: null, lastError: null });
+    },
+  );
 
   it("shares a concurrent start and emits one startup transition", async () => {
     const gate = deferred();

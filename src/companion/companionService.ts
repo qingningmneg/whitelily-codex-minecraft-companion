@@ -2,6 +2,7 @@ import { ActionExecutor } from "../actions/actionExecutor.js";
 import type { AutonomyReason } from "../autonomy/autonomyScheduler.js";
 import type { LocalCommand } from "../commands/commandParser.js";
 import type { CodexPort, CodexTurnResult } from "../codex/codexPort.js";
+import type { ResolvedModelSelection } from "../codex/modelCatalog.js";
 import { selectModel } from "../codex/modelSelector.js";
 import type { CompanionMode } from "../domain/types.js";
 import { SafeLogger } from "../logging/safeLogger.js";
@@ -320,12 +321,18 @@ interface ActiveTurn {
   cancel(): void;
 }
 
+interface CodexThreadPair {
+  readonly intentThreadId: string;
+  readonly executionThreadId: string;
+}
+
 interface IntentStamp {
   readonly generation: number;
   readonly messageSequence: number;
   readonly ownerRevision: number;
   readonly worldGeneration: number;
   readonly taskLeaseAtDispatch: Readonly<TaskLease> | null;
+  readonly threadPair: CodexThreadPair;
 }
 
 const noOpLogger: Pick<SafeLogger, "error"> = { error: async () => undefined };
@@ -388,6 +395,7 @@ export class CompanionService {
   private intentThreadId: string | undefined;
   private executionThreadId: string | undefined;
   private selectedModel: string | undefined;
+  private selectedReasoningEffort: string | undefined;
   private codexHealthy = true;
   private consecutiveTransportFailures = 0;
   private readonly activeIntentTurns = new Set<ActiveTurn>();
@@ -395,6 +403,7 @@ export class CompanionService {
   private intentTurnTail: Promise<void> = Promise.resolve();
   private executionTurnTail: Promise<void> = Promise.resolve();
   private confirmationTail: Promise<void> = Promise.resolve();
+  private modelSwitchTail: Promise<void> = Promise.resolve();
   private recoveryFlight: Promise<void> | undefined;
   private unfinishedTaskSummary: string | null = null;
   private readonly startupEvents: MinecraftEvent[] = [];
@@ -451,36 +460,85 @@ export class CompanionService {
       : memories.search(query);
   }
 
-  private async createThreadPair(generation: number, selectedModel: string): Promise<boolean> {
-    this.intentThreadId = undefined;
-    this.executionThreadId = undefined;
+  private async startThreadPair(selection: ResolvedModelSelection): Promise<CodexThreadPair> {
+    let intentThreadId: string | undefined;
     try {
-      const intentThreadId = await this.dependencies.codex.startThread({
+      intentThreadId = await this.dependencies.codex.startThread({
         cwd: this.dependencies.cwd,
-        model: selectedModel,
-        reasoningEffort: this.dependencies.reasoningEffort,
+        model: selection.modelId,
+        reasoningEffort: selection.reasoningEffort,
       });
-      if (generation !== this.generation) {
-        await this.closeStaleCodex(generation);
-        return false;
-      }
       const executionThreadId = await this.dependencies.codex.startThread({
         cwd: this.dependencies.cwd,
-        model: selectedModel,
-        reasoningEffort: this.dependencies.reasoningEffort,
+        model: selection.modelId,
+        reasoningEffort: selection.reasoningEffort,
       });
-      if (generation !== this.generation) {
-        await this.closeStaleCodex(generation);
-        return false;
-      }
-      this.intentThreadId = intentThreadId;
-      this.executionThreadId = executionThreadId;
-      return true;
+      return Object.freeze({ intentThreadId, executionThreadId });
     } catch (error) {
-      this.intentThreadId = undefined;
-      this.executionThreadId = undefined;
+      if (intentThreadId !== undefined) {
+        await this.rollbackStagedThreads([intentThreadId], error);
+      }
       throw error;
     }
+  }
+
+  private async rollbackStagedThreadPair(pair: CodexThreadPair, cause: unknown): Promise<never> {
+    return this.rollbackStagedThreads([pair.intentThreadId, pair.executionThreadId], cause);
+  }
+
+  private async rollbackStagedThreads(
+    threadIds: readonly string[],
+    cause: unknown,
+  ): Promise<never> {
+    const results = await Promise.allSettled(
+      threadIds.map(async (threadId) => this.dependencies.codex.closeThread(threadId)),
+    );
+    const cleanupFailures = results
+      .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+      .map((result) => result.reason as unknown);
+    if (cleanupFailures.length > 0) {
+      throw new AggregateError(
+        [cause, ...cleanupFailures],
+        "Companion model switch rollback failed",
+      );
+    }
+    throw cause;
+  }
+
+  private async retireThreadPair(pair: CodexThreadPair): Promise<void> {
+    await Promise.all([
+      this.retireThread(pair.intentThreadId),
+      this.retireThread(pair.executionThreadId),
+    ]);
+  }
+
+  private async retireThread(threadId: string): Promise<void> {
+    try {
+      await this.dependencies.codex.closeThread(threadId);
+    } catch (error) {
+      try {
+        await this.logger.error("codex_thread_retire_failed", {
+          code: "thread_archive_failed",
+        });
+      } catch {
+        // Thread retirement diagnostics cannot change the active authority.
+      }
+    }
+  }
+
+  private currentThreadPair(): CodexThreadPair | undefined {
+    if (!this.intentThreadId || !this.executionThreadId) return undefined;
+    return Object.freeze({
+      intentThreadId: this.intentThreadId,
+      executionThreadId: this.executionThreadId,
+    });
+  }
+
+  private publishThreadPair(pair: CodexThreadPair, selection: ResolvedModelSelection): void {
+    this.intentThreadId = pair.intentThreadId;
+    this.executionThreadId = pair.executionThreadId;
+    this.selectedModel = selection.modelId;
+    this.selectedReasoningEffort = selection.reasoningEffort;
   }
 
   async start(preselectedModel?: string): Promise<void> {
@@ -519,7 +577,17 @@ export class CompanionService {
       } else {
         this.selectedModel = preselectedModel;
       }
-      if (!(await this.createThreadPair(generation, this.selectedModel))) return;
+      const selection = Object.freeze({
+        modelId: this.selectedModel,
+        reasoningEffort: this.dependencies.reasoningEffort,
+      });
+      const pair = await this.startThreadPair(selection);
+      if (generation !== this.generation) {
+        await this.retireThreadPair(pair);
+        await this.closeStaleCodex(generation);
+        return;
+      }
+      this.publishThreadPair(pair, selection);
       this.consecutiveTransportFailures = 0;
       this.codexHealthy = this.unfinishedTaskSummary === null;
       this.running = true;
@@ -567,6 +635,58 @@ export class CompanionService {
       this.starting = false;
       this.ownerChangedDuringStartup = false;
     }
+  }
+
+  switchModel(
+    selection: ResolvedModelSelection,
+    commitPreference: () => Promise<void>,
+  ): Promise<void> {
+    const queued = this.modelSwitchTail.then(() =>
+      this.performModelSwitch(selection, commitPreference),
+    );
+    this.modelSwitchTail = queued.then(
+      () => undefined,
+      () => undefined,
+    );
+    return queued;
+  }
+
+  private async performModelSwitch(
+    selection: ResolvedModelSelection,
+    commitPreference: () => Promise<void>,
+  ): Promise<void> {
+    if (!this.running) throw new Error("CompanionService is not running");
+    if (!this.codexHealthy) throw new Error("Codex is unavailable");
+    const previousPair = this.currentThreadPair();
+    if (!previousPair || !this.selectedModel || !this.selectedReasoningEffort) {
+      throw new Error("Companion model authority is unavailable");
+    }
+
+    this.dependencies.taskController.stop("model_changed");
+    this.invalidateCurrentTurn();
+    this.dependencies.budget.end();
+    const generation = this.generation;
+    const stagedPair = await this.startThreadPair(selection);
+    if (!this.isCurrent(generation) || !this.codexHealthy) {
+      await this.rollbackStagedThreadPair(
+        stagedPair,
+        new Error("Companion model authority changed during switch"),
+      );
+    }
+    try {
+      await commitPreference();
+    } catch (error) {
+      await this.rollbackStagedThreadPair(stagedPair, error);
+    }
+    if (!this.isCurrent(generation) || !this.codexHealthy) {
+      await this.rollbackStagedThreadPair(
+        stagedPair,
+        new Error("Companion model authority changed during switch"),
+      );
+    }
+
+    this.publishThreadPair(stagedPair, selection);
+    await this.retireThreadPair(previousPair);
   }
 
   async stop(): Promise<void> {
@@ -839,6 +959,7 @@ export class CompanionService {
         false,
         undefined,
         () => this.isIntentCurrent(stamp),
+        stamp.threadPair,
       );
       if (!result || !this.isIntentCurrent(stamp)) return undefined;
       try {
@@ -887,6 +1008,9 @@ export class CompanionService {
   }
 
   private async captureIntentStamp(): Promise<IntentStamp> {
+    await this.modelSwitchTail;
+    const threadPair = this.currentThreadPair();
+    if (!threadPair) throw new Error("Companion model authority is unavailable");
     const taskLease = this.dependencies.taskController.current()?.lease ?? null;
     return Object.freeze({
       generation: this.generation,
@@ -897,6 +1021,7 @@ export class CompanionService {
         taskLease === null
           ? null
           : Object.freeze({ id: taskLease.id, startedAt: taskLease.startedAt }),
+      threadPair,
     });
   }
 
@@ -1056,6 +1181,7 @@ export class CompanionService {
           true,
           decision.task.allowedActions,
           () => this.isIntentCurrent(stamp),
+          stamp.threadPair,
         );
         if (!result || !this.isIntentCurrent(stamp)) return;
         const parsed = companionTaskExecutionOutcomeSchema.safeParse(this.parseJson(result.text));
@@ -1105,7 +1231,10 @@ export class CompanionService {
   }
 
   async requestAutonomousTurn(reason: AutonomyReason): Promise<void> {
+    await this.modelSwitchTail;
     if (!this.running) return;
+    const threadPair = this.currentThreadPair();
+    if (!threadPair) return;
     const state = this.dependencies.mode.snapshot();
     if (state.mode === "friend" || state.paused) return;
     if (this.autonomousRequestCount > 0 || this.hasActiveTask()) return;
@@ -1113,7 +1242,7 @@ export class CompanionService {
     this.autonomousRequestCount += 1;
     const queued = this.executionTurnTail
       .catch(() => undefined)
-      .then(() => this.performAutonomousTurn(reason, generation))
+      .then(() => this.performAutonomousTurn(reason, generation, threadPair))
       .catch((error: unknown) =>
         this.logger.error("companion_autonomous_turn_failed", { code: String(error) }),
       );
@@ -1139,7 +1268,11 @@ export class CompanionService {
     );
   }
 
-  private async performAutonomousTurn(reason: AutonomyReason, generation: number): Promise<void> {
+  private async performAutonomousTurn(
+    reason: AutonomyReason,
+    generation: number,
+    threadPair: CodexThreadPair,
+  ): Promise<void> {
     this.turnWorkCount += 1;
     try {
       if (!this.isCurrent(generation) || !this.executionThreadId) return;
@@ -1208,16 +1341,23 @@ export class CompanionService {
         await this.failTaskOnly(generation, error, taskFailureMessage);
         return;
       }
-      const outcome = await this.resolveOutcome(prompt, generation, undefined, disclosure, {
-        toolsEnabled: permitsTools,
-        taskForbidden: true,
-        repairPrompt:
-          state.mode === "balanced"
-            ? balancedRepairPrompt(allowedProactiveKinds)
-            : autonomousRepairPrompt,
-        ...(state.mode === "balanced" ? { allowedProactiveKinds } : {}),
-        ...(permitsTools ? { allowedToolActions: autonomousMicroToolActions } : {}),
-      });
+      const outcome = await this.resolveOutcome(
+        prompt,
+        generation,
+        undefined,
+        disclosure,
+        {
+          toolsEnabled: permitsTools,
+          taskForbidden: true,
+          repairPrompt:
+            state.mode === "balanced"
+              ? balancedRepairPrompt(allowedProactiveKinds)
+              : autonomousRepairPrompt,
+          ...(state.mode === "balanced" ? { allowedProactiveKinds } : {}),
+          ...(permitsTools ? { allowedToolActions: autonomousMicroToolActions } : {}),
+        },
+        threadPair,
+      );
       if (!outcome || !this.isCurrent(generation)) return;
       await this.persistOutcome(outcome, generation);
       if (!this.isCurrent(generation)) return;
@@ -1239,6 +1379,7 @@ export class CompanionService {
       readonly repairPrompt?: string;
       readonly allowedProactiveKinds?: readonly ProactiveKind[];
     } = {},
+    threadPair?: CodexThreadPair,
   ): Promise<CompanionTurnOutcome | undefined> {
     let outcome: CompanionTurnOutcome | undefined;
     let task: ActiveTask | undefined;
@@ -1262,6 +1403,8 @@ export class CompanionService {
           task,
           options.toolsEnabled ?? true,
           options.allowedToolActions,
+          undefined,
+          threadPair,
         );
         if (!result) return undefined;
         const parsed = companionTurnOutcomeSchema.safeParse(this.parseJson(result.text));
@@ -1342,11 +1485,13 @@ export class CompanionService {
     toolsEnabled: boolean,
     allowedToolActions?: readonly ToolActionKind[],
     isApplicable: () => boolean = () => true,
+    threadPair?: CodexThreadPair,
   ): Promise<CodexTurnResult | undefined> {
     if (role === "intent" && toolsEnabled) {
       throw new Error("intent turns cannot enable tools");
     }
-    const threadId = role === "intent" ? this.intentThreadId : this.executionThreadId;
+    const pair = threadPair ?? this.currentThreadPair();
+    const threadId = role === "intent" ? pair?.intentThreadId : pair?.executionThreadId;
     const isAttemptCurrent = () => this.isCurrent(generation) && isApplicable();
     if (!threadId || !isAttemptCurrent()) return undefined;
     let cancel!: () => void;
@@ -1544,11 +1689,13 @@ export class CompanionService {
       }
       if (this.externallyManagedCodex) {
         const selectedModel = this.selectedModel;
+        const selectedReasoningEffort = this.selectedReasoningEffort;
         const available =
           selectedModel !== undefined &&
+          selectedReasoningEffort !== undefined &&
           (await this.dependencies.codex.validateModelSelection({
             modelId: selectedModel,
-            reasoningEffort: this.dependencies.reasoningEffort,
+            reasoningEffort: selectedReasoningEffort,
           }));
         if (!available) {
           this.reportModelAuthorityLoss(generation);
@@ -1557,11 +1704,24 @@ export class CompanionService {
       } else {
         const models = await this.dependencies.codex.listModels();
         this.selectedModel = selectModel(models, this.dependencies.preferredModel);
+        this.selectedReasoningEffort = this.dependencies.reasoningEffort;
       }
       if (!this.isCurrent(generation)) return;
       const selectedModel = this.selectedModel;
-      if (!selectedModel) throw new Error("Selected live model is unavailable");
-      if (!(await this.createThreadPair(generation, selectedModel))) return;
+      const selectedReasoningEffort = this.selectedReasoningEffort;
+      if (!selectedModel || !selectedReasoningEffort) {
+        throw new Error("Selected live model is unavailable");
+      }
+      const selection = Object.freeze({
+        modelId: selectedModel,
+        reasoningEffort: selectedReasoningEffort,
+      });
+      const pair = await this.startThreadPair(selection);
+      if (!this.isCurrent(generation)) {
+        await this.retireThreadPair(pair);
+        return;
+      }
+      this.publishThreadPair(pair, selection);
       const summary = this.unfinishedTaskSummary ?? "Codex session recovery handshake";
       const prompt = buildCompanionRecoveryTurn({
         mode: this.dependencies.mode.getMode(),
@@ -1991,7 +2151,7 @@ export class CompanionService {
     } catch (error) {
       void this.logger.error("task_terminal_confirmation_clear_failed", { code: String(error) });
     }
-    const taskOnlyStop = reason === "owner_stop";
+    const taskOnlyStop = reason === "owner_stop" || reason === "model_changed";
     if (!taskOnlyStop && !forceCleanup && reason !== "timeout" && reason !== "budget_exhausted") {
       return;
     }

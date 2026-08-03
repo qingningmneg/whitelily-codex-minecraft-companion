@@ -1321,6 +1321,16 @@ describe("desktop protocol v1", () => {
     const snapshot = { ...idleSnapshot, revision: 7, lifecycle: "running", task } as const;
 
     expect(parseDesktopCommandResult({ kind: "get_status" }, snapshot)).toEqual(snapshot);
+    const modelChangedSnapshot = {
+      ...snapshot,
+      task: {
+        ...task,
+        budget: { ...budget, active: false, stopReason: "model_changed", startedAt: null },
+      },
+    } as const;
+    expect(parseDesktopCommandResult({ kind: "get_status" }, modelChangedSnapshot)).toEqual(
+      modelChangedSnapshot,
+    );
     expect(JSON.stringify(snapshot.task)).not.toContain("lease");
     expect(JSON.stringify(snapshot.task)).not.toContain("ownerUsername");
     expect(JSON.stringify(snapshot.task)).not.toContain("prompt");
