@@ -181,6 +181,11 @@ describe("WhiteLily assisted Windows installer configuration", () => {
       extraResources: [
         { from: "../../build/electron-bundle/core", to: "core", filter: ["**/*"] },
         { from: "../../build/electron-bundle/codex", to: "codex", filter: ["**/*"] },
+        {
+          from: "../../build/electron-bundle/codex-workspace",
+          to: "codex-workspace",
+          filter: ["**/*"],
+        },
         { from: "../../build/electron-bundle/licenses", to: "licenses", filter: ["**/*"] },
         {
           from: "../../build/electron-bundle/runtime-manifest.json",
@@ -207,6 +212,19 @@ describe("WhiteLily assisted Windows installer configuration", () => {
       to: "codex",
       filter: ["**/*"],
     });
+    expect(
+      build?.extraResources?.filter(
+        (entry) =>
+          entry.from === "../../build/electron-bundle/codex-workspace" ||
+          entry.to === "codex-workspace",
+      ),
+    ).toEqual([
+      {
+        from: "../../build/electron-bundle/codex-workspace",
+        to: "codex-workspace",
+        filter: ["**/*"],
+      },
+    ]);
   });
 
   it("loads the committed verifier through one fixed project-local afterPack wrapper", async () => {
