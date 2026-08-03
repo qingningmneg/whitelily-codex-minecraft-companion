@@ -9,6 +9,7 @@ import type { CompanionProfile } from "../profile/profileSchema.js";
 import type { MemoryContextScope } from "../memory/scopedMemoryStore.js";
 import type {
   PublicTaskSnapshot,
+  ActionCapabilitySnapshot,
   RuntimeEvent,
   RuntimeEventPayload,
   RuntimeAuthorityLoss,
@@ -49,6 +50,10 @@ export interface RuntimeFacadeDependencies {
   };
   authority?: {
     subscribe(listener: (event: RuntimeAuthorityLoss) => void): () => void;
+  };
+  actions?: {
+    snapshot(): ActionCapabilitySnapshot | null;
+    subscribe(listener: (snapshot: ActionCapabilitySnapshot | null) => void): () => void;
   };
   profile?: {
     apply(profile: CompanionProfile): void;
@@ -120,12 +125,14 @@ export class RuntimeFacade {
   #unsubscribeTask: (() => void) | undefined;
   #unsubscribeMinecraft: (() => void) | undefined;
   #unsubscribeAuthority: (() => void) | undefined;
+  #unsubscribeActions: (() => void) | undefined;
   #taskEventsFenced = false;
   #snapshot: RuntimeSnapshot = {
     revision: 0,
     lifecycle: "idle",
     minecraft: { state: "disconnected", sessionId: null },
     codex: { state: "stopped", model: null },
+    actions: null,
     task: null,
     lastError: null,
   };
@@ -143,6 +150,28 @@ export class RuntimeFacade {
     this.#dependencies = dependencies;
     this.#snapshot = { ...this.#snapshot, revision: initialRevision };
     this.#refreshTask(false);
+    if (this.#terminal) return;
+    try {
+      this.#unsubscribeActions = dependencies.actions?.subscribe((snapshot) => {
+        if (this.#terminal) return;
+        if (this.#snapshot.lifecycle === "idle" && snapshot !== null) return;
+        try {
+          this.#setActions(snapshot, true);
+        } catch {
+          this.#failOperationalState(
+            "ACTION_STATE_UNKNOWN",
+            "Minecraft action state is unavailable",
+            true,
+          );
+        }
+      });
+    } catch {
+      this.#failOperationalState(
+        "ACTION_STATE_UNKNOWN",
+        "Minecraft action state is unavailable",
+        false,
+      );
+    }
     if (this.#terminal) return;
     try {
       this.#unsubscribeTask = dependencies.task?.subscribe?.(() => {
@@ -239,6 +268,7 @@ export class RuntimeFacade {
       this.#setLifecycle("stopping");
       this.#setMinecraft("disconnected");
       this.#setCodex("stopped", null);
+      this.#setActions(null, true);
     } catch (error) {
       beginOperation({ run: false, error });
       return operation;
@@ -302,6 +332,9 @@ export class RuntimeFacade {
       if (this.#terminal || this.#snapshot.lifecycle !== "running") {
         throw new Error("Runtime is not running");
       }
+      if (this.#snapshot.actions?.state !== "ready") {
+        throw new Error("Minecraft actions are unavailable");
+      }
       const switchModel = this.#dependencies.switchModel;
       if (!switchModel) throw new Error("Runtime model switching is unavailable");
       await switchModel(selection, commitPreference);
@@ -326,6 +359,11 @@ export class RuntimeFacade {
     if (this.#terminal || this.#snapshot.lifecycle !== "starting") return;
     try {
       await this.#dependencies.lifecycle.start();
+      if (this.#terminal || this.#snapshot.lifecycle !== "starting") return;
+      if (this.#snapshot.actions === null) {
+        const actions = this.#dependencies.actions?.snapshot() ?? null;
+        if (actions !== null) this.#setActions(actions, true);
+      }
       if (this.#terminal || this.#snapshot.lifecycle !== "starting") return;
       const model = this.#readCodexModel();
       if (this.#terminal || this.#snapshot.lifecycle !== "starting") return;
@@ -400,6 +438,12 @@ export class RuntimeFacade {
     const codex = { state, model };
     this.#snapshot = { ...this.#snapshot, codex };
     this.#publish({ kind: "codex", state: codex });
+  }
+
+  #setActions(snapshot: ActionCapabilitySnapshot | null, publish: boolean): void {
+    const actions = cloneActionCapabilitySnapshot(snapshot);
+    this.#snapshot = { ...this.#snapshot, actions };
+    if (publish) this.#publish({ kind: "actions", state: actions });
   }
 
   #readCodexModel(): string | null {
@@ -564,6 +608,7 @@ export class RuntimeFacade {
       lifecycle: "failed",
       minecraft: { state: "disconnected", sessionId: null },
       codex: { state: "stopped", model: null },
+      actions: null,
       task: null,
       lastError: error,
     };
@@ -641,9 +686,15 @@ export class RuntimeFacade {
     } catch {
       // Authority observer teardown cannot affect lifecycle cleanup.
     }
+    try {
+      this.#unsubscribeActions?.();
+    } catch {
+      // Action observer teardown cannot affect lifecycle cleanup.
+    }
     this.#unsubscribeTask = undefined;
     this.#unsubscribeMinecraft = undefined;
     this.#unsubscribeAuthority = undefined;
+    this.#unsubscribeActions = undefined;
     this.#authorityLossListeners.clear();
   }
 
@@ -684,6 +735,7 @@ export class RuntimeFacade {
       lifecycle: "failed",
       minecraft: { state: "disconnected", sessionId: null },
       codex: { state: "stopped", model: null },
+      actions: null,
       task: null,
       lastError: {
         code: "RUNTIME_REVISION_EXHAUSTED",
@@ -1115,6 +1167,12 @@ function cloneRuntimeEvent(event: RuntimeEvent): RuntimeEvent {
           model: event.state.model,
         },
       };
+    case "actions":
+      return {
+        kind: "actions",
+        revision: event.revision,
+        state: cloneActionCapabilitySnapshot(event.state),
+      };
     case "task":
       return {
         kind: "task",
@@ -1147,6 +1205,7 @@ function cloneRuntimeSnapshot(snapshot: RuntimeSnapshot): RuntimeSnapshot {
       state: snapshot.codex.state,
       model: snapshot.codex.model,
     },
+    actions: cloneActionCapabilitySnapshot(snapshot.actions),
     task: snapshot.task === null ? null : clonePublicTask(snapshot.task),
     lastError:
       snapshot.lastError === null
@@ -1156,6 +1215,54 @@ function cloneRuntimeSnapshot(snapshot: RuntimeSnapshot): RuntimeSnapshot {
             message: snapshot.lastError.message,
           },
   });
+}
+
+function cloneActionCapabilitySnapshot(
+  snapshot: ActionCapabilitySnapshot | null,
+): ActionCapabilitySnapshot | null {
+  if (snapshot === null) return null;
+  if (snapshot.state === "starting") {
+    if (!validWorkspaceVersion(snapshot.workspaceVersion)) {
+      throw new Error("Action capability state is invalid");
+    }
+    return { state: "starting", workspaceVersion: snapshot.workspaceVersion };
+  }
+  if (
+    (snapshot.state === "ready"
+      ? !validWorkspaceVersion(snapshot.workspaceVersion)
+      : snapshot.workspaceVersion !== null && !validWorkspaceVersion(snapshot.workspaceVersion)) ||
+    !Number.isSafeInteger(snapshot.discoveredToolCount) ||
+    snapshot.discoveredToolCount < 0
+  ) {
+    throw new Error("Action capability state is invalid");
+  }
+  if (snapshot.state === "ready") {
+    if (snapshot.mcpListening !== true) throw new Error("Action capability state is invalid");
+    return {
+      state: "ready",
+      workspaceVersion: snapshot.workspaceVersion,
+      mcpListening: true,
+      discoveredToolCount: snapshot.discoveredToolCount,
+    };
+  }
+  if (
+    snapshot.state !== "failed" ||
+    typeof snapshot.mcpListening !== "boolean" ||
+    !/^[a-z][a-z0-9_]{0,63}$/u.test(snapshot.errorCode)
+  ) {
+    throw new Error("Action capability state is invalid");
+  }
+  return {
+    state: "failed",
+    workspaceVersion: snapshot.workspaceVersion,
+    mcpListening: snapshot.mcpListening,
+    discoveredToolCount: snapshot.discoveredToolCount,
+    errorCode: snapshot.errorCode,
+  };
+}
+
+function validWorkspaceVersion(value: string | null): value is string {
+  return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u.test(value);
 }
 
 function assertNever(value: never): never {

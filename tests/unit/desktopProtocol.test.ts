@@ -14,11 +14,52 @@ const idleSnapshot = {
   lifecycle: "idle",
   minecraft: { state: "disconnected", sessionId: null },
   codex: { state: "stopped", model: null },
+  actions: null,
   task: null,
   lastError: null,
 } as const;
 
 describe("desktop protocol v1", () => {
+  it("parses only exact action capability snapshots and events", () => {
+    const ready = {
+      state: "ready",
+      workspaceVersion: "workspace-1",
+      mcpListening: true,
+      discoveredToolCount: 15,
+    } as const;
+    const snapshot = {
+      ...idleSnapshot,
+      revision: 4,
+      lifecycle: "running",
+      actions: ready,
+    } as const;
+    const event = { kind: "actions", revision: 5, state: ready } as const;
+
+    expect(parseDesktopCommandResult({ kind: "get_status" }, snapshot)).toEqual(snapshot);
+    expect(parseDesktopEvent({ version: DESKTOP_PROTOCOL_VERSION, event })).toEqual({
+      version: DESKTOP_PROTOCOL_VERSION,
+      event,
+    });
+
+    for (const actions of [
+      { ...ready, mcpListening: false },
+      { ...ready, discoveredToolCount: -1 },
+      { ...ready, workspaceVersion: "../private" },
+      {
+        state: "failed",
+        workspaceVersion: "workspace-1",
+        mcpListening: false,
+        discoveredToolCount: 15,
+        errorCode: "SERVER CLOSED",
+      },
+      { state: "starting", workspaceVersion: "workspace-1", listening: true },
+    ]) {
+      expect(() =>
+        parseDesktopCommandResult({ kind: "get_status" }, { ...idleSnapshot, actions }),
+      ).toThrow("invalid desktop command result");
+    }
+  });
+
   it("parses only strict owner identity read and revision-checked update commands", () => {
     const read = { kind: "read_owner_identity" as const };
     const update = {
@@ -1218,6 +1259,12 @@ describe("desktop protocol v1", () => {
         event: { ...signal, snapshot: { ...signal.snapshot, revision: 7 } },
       }),
     ).toThrow("invalid desktop event");
+    expect(
+      parseDesktopEvent({
+        version: DESKTOP_PROTOCOL_VERSION,
+        event: { ...signal, reason: "action_unavailable" },
+      }),
+    ).toMatchObject({ event: { reason: "action_unavailable" } });
     expect(() =>
       parseDesktopEvent({
         version: DESKTOP_PROTOCOL_VERSION,

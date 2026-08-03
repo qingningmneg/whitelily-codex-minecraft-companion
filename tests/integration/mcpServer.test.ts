@@ -276,6 +276,26 @@ describe("loopback MCP server", () => {
     await replacement.stop();
   });
 
+  it("publishes a closed signal only after the listening server closes", async () => {
+    const harness = createToolRegistryHarness();
+    const server = await startMcpServer({
+      host: "127.0.0.1",
+      port: 0,
+      dependencies: harness.dependencies,
+    });
+    let closed = false;
+    void server.closed.then(() => {
+      closed = true;
+    });
+
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(closed).toBe(false);
+
+    await server.stop();
+    await server.closed;
+    expect(closed).toBe(true);
+  });
+
   it("waits for an active stateless transport to close during stop", async () => {
     const harness = createToolRegistryHarness();
     let actionStarted!: () => void;

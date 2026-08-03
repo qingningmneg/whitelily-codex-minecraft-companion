@@ -651,6 +651,26 @@ export class CompanionService {
     return queued;
   }
 
+  actionCapabilityLost(): void {
+    if (!this.running || !this.codexHealthy) return;
+    const failedTask = this.dependencies.taskController.current();
+    if (failedTask) this.locallyContainedTaskLeaseKey = taskLeaseKey(failedTask.lease);
+    this.codexHealthy = false;
+    this.dependencies.taskController.stop("failed");
+    this.dependencies.confirmations.clear();
+    this.dependencies.executor.stopAll();
+    this.dependencies.budget.end();
+    this.dependencies.mode.pause();
+    this.dependencies.autonomy.stop();
+    this.invalidateCurrentTurn();
+    this.intentThreadId = undefined;
+    this.executionThreadId = undefined;
+    this.unfinishedTaskSummary = null;
+    void this.persist().catch((error: unknown) =>
+      this.logger.error("action_authority_state_save_failed", { code: errorName(error) }),
+    );
+  }
+
   private async performModelSwitch(
     selection: ResolvedModelSelection,
     commitPreference: () => Promise<void>,
@@ -858,6 +878,7 @@ export class CompanionService {
   }
 
   private onOwnerMessage(message: string): void {
+    if (!this.codexHealthy || this.currentThreadPair() === undefined) return;
     this.mergedMessages.push(message);
     if (this.mergeTimer !== undefined) return;
     const expectedGeneration = this.generation;

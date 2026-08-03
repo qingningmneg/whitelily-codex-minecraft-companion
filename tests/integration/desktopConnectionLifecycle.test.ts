@@ -72,6 +72,7 @@ const idleRuntime: RuntimeSnapshot = {
   lifecycle: "idle",
   minecraft: { state: "disconnected", sessionId: null },
   codex: { state: "stopped", model: null },
+  actions: null,
   task: null,
   lastError: null,
 };

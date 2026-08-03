@@ -351,6 +351,50 @@ describe("CompanionService lifecycle", () => {
     expect(value.service).toMatchObject({ running: true, codexHealthy: true });
   });
 
+  it("revokes active action authority and refuses new dispatch after MCP loss", async () => {
+    const value = await harness({
+      intentResponses: [
+        taskDecision({
+          naturalReply: null,
+          goal: "active action task",
+          allowedActions: ["say"],
+        }),
+      ],
+      executionResponses: [taskExecutionOutcome("working", "active")],
+      deferredTurns: [0],
+    });
+    await value.service.start("gpt-5.6-terra");
+    await value.emitOwnerText("start action task");
+    await value.untilCodexTurns(1);
+    const task = value.taskController.current();
+    const turnLease = value.budgetLeases[0];
+    if (!task || !turnLease) throw new Error("expected active task and turn leases");
+    const turnsBeforeLoss = value.codex.turns.length;
+
+    value.service.actionCapabilityLost();
+
+    expect(value.taskController.current()).toBeNull();
+    expect(value.taskController.isLeaseLive(task.lease)).toBe(false);
+    expect(value.budget.consume("say", turnLease)).toEqual({
+      ok: false,
+      reason: "tool turn has ended",
+    });
+    expect(value.codex.interruptions).toContainEqual({
+      threadId: value.codex.startedThreadIds.execution,
+      turnId: "turn-1",
+    });
+    expect(value.service).toMatchObject({ codexHealthy: false });
+
+    value.minecraft.emit({
+      kind: "chat",
+      username: "TestOwner",
+      message: "start another task",
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(value.codex.turns).toHaveLength(turnsBeforeLoss);
+    expect(value.pendingMergeTimers()).toBe(0);
+  });
+
   it("archives a staged intent thread when replacement execution creation fails", async () => {
     const value = await harness({
       intentThreadIds: ["terra-intent", "failed-luna-intent"],

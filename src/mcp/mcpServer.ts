@@ -16,6 +16,7 @@ export interface RunningMcpServer {
   host: "127.0.0.1";
   port: number;
   url: string;
+  closed: Promise<void>;
   stop(): Promise<void>;
 }
 
@@ -154,6 +155,9 @@ export async function startMcpServer(options: StartMcpServerOptions): Promise<Ru
   app.use(bodyErrorHandler);
 
   const httpServer = createServer(app);
+  const closed = new Promise<void>((resolve) => {
+    httpServer.once("close", resolve);
+  });
   httpServer.on("connection", (socket) => {
     sockets.add(socket);
     socket.once("close", () => sockets.delete(socket));
@@ -182,6 +186,7 @@ export async function startMcpServer(options: StartMcpServerOptions): Promise<Ru
     host,
     port,
     url: `http://${host}:${port}/mcp`,
+    closed,
     stop(): Promise<void> {
       if (stopping) return stopping;
       isStopping = true;

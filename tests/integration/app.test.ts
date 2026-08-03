@@ -6,6 +6,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   createApp,
   createRuntimeFacade,
+  McpLifecycle,
+  WhiteLilyAppLifecycle,
   type AppCompositionContext,
   type AppPaths,
   type OwnerIdentityProvider,
@@ -15,6 +17,8 @@ import { CodexAppServerClient } from "../../src/codex/appServerClient.js";
 import type { AppConfig } from "../../src/config/schema.js";
 import { isMainModule, runCli, type CliDependencies } from "../../src/index.js";
 import { TurnToolBudget } from "../../src/mcp/toolBudget.js";
+import type { RunningMcpServer } from "../../src/mcp/mcpServer.js";
+import type { McpReadinessSnapshot } from "../../src/mcp/mcpReadiness.js";
 import { createToolRegistry, createTrustedSnapshotStore } from "../../src/mcp/toolRegistry.js";
 import { FakeMinecraftPort } from "../../src/minecraft/fakeMinecraftPort.js";
 import { ConfirmationStore } from "../../src/safety/confirmationStore.js";
@@ -94,6 +98,183 @@ afterEach(async () => {
 });
 
 describe("WhiteLilyApp composition", () => {
+  it.each([
+    {
+      label: "port conflict",
+      expectedCode: "port_conflict",
+      startError: Object.assign(new Error("busy"), { code: "EADDRINUSE" }),
+    },
+    {
+      label: "probe timeout",
+      expectedCode: "timeout",
+      readiness: {
+        state: "failed",
+        listening: true,
+        discoveredToolCount: 0,
+        errorCode: "timeout",
+      } satisfies McpReadinessSnapshot,
+    },
+    {
+      label: "missing tool",
+      expectedCode: "missing_tools",
+      readiness: {
+        state: "failed",
+        listening: true,
+        discoveredToolCount: 14,
+        errorCode: "missing_tools",
+      } satisfies McpReadinessSnapshot,
+    },
+    {
+      label: "extra tool",
+      expectedCode: "extra_tools",
+      readiness: {
+        state: "failed",
+        listening: true,
+        discoveredToolCount: 16,
+        errorCode: "extra_tools",
+      } satisfies McpReadinessSnapshot,
+    },
+    {
+      label: "probe exception",
+      expectedCode: "connection_failed",
+      verifyError: new Error("private probe failure"),
+    },
+  ])(
+    "gates all Codex and task startup on $label action readiness failure",
+    async ({ expectedCode, startError, readiness, verifyError }) => {
+      let resolveClosed!: () => void;
+      const closed = new Promise<void>((resolve) => {
+        resolveClosed = resolve;
+      });
+      const serverStop = vi.fn(async () => {
+        resolveClosed();
+      });
+      const server: RunningMcpServer = {
+        host: "127.0.0.1",
+        port: 32123,
+        url: "http://127.0.0.1:32123/mcp",
+        closed,
+        stop: serverStop,
+      };
+      const actionStates: unknown[] = [];
+      const lifecycleEvents: string[] = [];
+      const codexStart = vi.fn(async () => undefined);
+      const companionStart = vi.fn(async () => undefined);
+      const task = { current: null as unknown };
+      const mcp = new McpLifecycle({} as never, {
+        workspaceVersion: "workspace-1",
+        startServer: async () => {
+          if (startError) throw startError;
+          return server;
+        },
+        verify: async () => {
+          if (verifyError) throw verifyError;
+          return readiness!;
+        },
+      });
+      mcp.subscribe((snapshot) => actionStates.push(snapshot));
+      const app = new WhiteLilyAppLifecycle({
+        preferredModel: "gpt-5.6-terra",
+        minecraft: {
+          connect: async () => {
+            lifecycleEvents.push("minecraft:connect");
+          },
+          disconnect: async () => {
+            lifecycleEvents.push("minecraft:disconnect");
+          },
+        },
+        mcp: {
+          start: () => mcp.start(),
+          stop: async () => {
+            lifecycleEvents.push("mcp:stop");
+            await mcp.stop();
+          },
+        },
+        codex: {
+          assertChatGptLogin: async () => undefined,
+          start: codexStart,
+          listModels: async () => ["gpt-5.6-terra"],
+          stop: async () => {
+            lifecycleEvents.push("codex:stop");
+          },
+        },
+        selectModel: () => "gpt-5.6-terra",
+        switchModel: async (_selection, commitPreference) => commitPreference(),
+        companion: {
+          start: companionStart,
+          switchModel: async (_selection, commitPreference) => commitPreference(),
+          stop: async () => {
+            lifecycleEvents.push("companion:stop");
+          },
+        },
+        executor: { stopAll: () => undefined },
+      });
+
+      await expect(app.start()).rejects.toMatchObject({
+        name: "ActionCapabilityError",
+        code: expectedCode,
+      });
+
+      expect(codexStart).not.toHaveBeenCalled();
+      expect(companionStart).not.toHaveBeenCalled();
+      expect(task.current).toBeNull();
+      expect(lifecycleEvents).toEqual(["minecraft:connect", "mcp:stop", "minecraft:disconnect"]);
+      expect(actionStates).toEqual([
+        { state: "starting", workspaceVersion: "workspace-1" },
+        expect.objectContaining({ state: "failed", errorCode: expectedCode }),
+        null,
+      ]);
+      expect(serverStop).toHaveBeenCalledTimes(startError ? 0 : 1);
+    },
+  );
+
+  it("reports action authority loss only for an unexpected close after readiness", async () => {
+    let resolveClosed!: () => void;
+    const closed = new Promise<void>((resolve) => {
+      resolveClosed = resolve;
+    });
+    const actionUnavailable = vi.fn(() => {
+      throw new Error("private containment observer failed");
+    });
+    const authorityLost = vi.fn();
+    const server: RunningMcpServer = {
+      host: "127.0.0.1",
+      port: 32123,
+      url: "http://127.0.0.1:32123/mcp",
+      closed,
+      stop: async () => {
+        resolveClosed();
+      },
+    };
+    const mcp = new McpLifecycle({} as never, {
+      workspaceVersion: "workspace-1",
+      startServer: async () => server,
+      verify: async () => ({
+        state: "ready",
+        listening: true,
+        discoveredToolCount: 15,
+        errorCode: null,
+      }),
+      onActionUnavailable: actionUnavailable,
+      reportAuthorityLoss: authorityLost,
+    });
+
+    await mcp.start();
+    resolveClosed();
+    await closed;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(mcp.snapshot()).toEqual({
+      state: "failed",
+      workspaceVersion: "workspace-1",
+      mcpListening: false,
+      discoveredToolCount: 15,
+      errorCode: "server_closed",
+    });
+    expect(actionUnavailable).toHaveBeenCalledTimes(1);
+    expect(authorityLost).toHaveBeenCalledWith({ reason: "action_unavailable" });
+  });
+
   it("protects authoritative nonzero and changing world spawn through the real tool chain", async () => {
     const appModule = await import("../../src/app.js");
     const createProvider = (
@@ -189,12 +370,12 @@ describe("WhiteLilyApp composition", () => {
 
     await harness.app.start();
     expect(harness.events).toEqual([
+      "minecraft:connect",
       "mcp:start",
       "codex:auth-check",
       "codex:start",
       "codex:model-list",
       "codex:model-select:gpt-5.6-terra",
-      "minecraft:connect",
       "companion:start:gpt-5.6-terra",
     ]);
 
@@ -202,9 +383,9 @@ describe("WhiteLilyApp composition", () => {
     expect(harness.events.slice(-5)).toEqual([
       "companion:stop",
       "actions:stop",
-      "minecraft:disconnect",
       "codex:stop",
       "mcp:stop",
+      "minecraft:disconnect",
     ]);
   });
 
@@ -241,10 +422,9 @@ describe("WhiteLilyApp composition", () => {
     await expect(starting).resolves.toMatchObject({ message: "WhiteLily startup was stopped" });
     await stopping;
     expect(harness.events).not.toContain("companion:start:gpt-5.6-terra");
-    expect(harness.events.slice(-4)).toEqual([
+    expect(harness.events).toEqual([
+      "minecraft:connect",
       "minecraft:disconnect",
-      "codex:stop",
-      "mcp:stop",
       "minecraft:disconnect",
     ]);
   });
@@ -353,36 +533,59 @@ describe("WhiteLilyApp composition", () => {
     expect(stopOutcome).toBe("stopped");
     expect(transport.closed()).toBe(true);
     expect(transport.sent()).toEqual([]);
-    expect(harness.events).not.toContain("minecraft:connect");
+    expect(harness.events).toContain("minecraft:connect");
+    expect(harness.events).toContain("minecraft:disconnect");
+    expect(harness.events).not.toContain("companion:start:gpt-5.6-terra");
   });
 
   it.each<{
     boundary: StartupBoundary;
     expected: string[];
   }>([
-    { boundary: "mcp", expected: ["mcp:start", "mcp:stop"] },
+    {
+      boundary: "mcp",
+      expected: ["minecraft:connect", "mcp:start", "mcp:stop", "minecraft:disconnect"],
+    },
     {
       boundary: "auth",
-      expected: ["mcp:start", "codex:auth-check", "codex:stop", "mcp:stop"],
+      expected: [
+        "minecraft:connect",
+        "mcp:start",
+        "codex:auth-check",
+        "codex:stop",
+        "mcp:stop",
+        "minecraft:disconnect",
+      ],
     },
     {
       boundary: "codex",
-      expected: ["mcp:start", "codex:auth-check", "codex:start", "codex:stop", "mcp:stop"],
+      expected: [
+        "minecraft:connect",
+        "mcp:start",
+        "codex:auth-check",
+        "codex:start",
+        "codex:stop",
+        "mcp:stop",
+        "minecraft:disconnect",
+      ],
     },
     {
       boundary: "models",
       expected: [
+        "minecraft:connect",
         "mcp:start",
         "codex:auth-check",
         "codex:start",
         "codex:model-list",
         "codex:stop",
         "mcp:stop",
+        "minecraft:disconnect",
       ],
     },
     {
       boundary: "selection",
       expected: [
+        "minecraft:connect",
         "mcp:start",
         "codex:auth-check",
         "codex:start",
@@ -390,37 +593,28 @@ describe("WhiteLilyApp composition", () => {
         "codex:model-select:gpt-5.6-terra",
         "codex:stop",
         "mcp:stop",
+        "minecraft:disconnect",
       ],
     },
     {
       boundary: "minecraft",
-      expected: [
-        "mcp:start",
-        "codex:auth-check",
-        "codex:start",
-        "codex:model-list",
-        "codex:model-select:gpt-5.6-terra",
-        "minecraft:connect",
-        "minecraft:disconnect",
-        "codex:stop",
-        "mcp:stop",
-      ],
+      expected: ["minecraft:connect", "minecraft:disconnect"],
     },
     {
       boundary: "companion",
       expected: [
+        "minecraft:connect",
         "mcp:start",
         "codex:auth-check",
         "codex:start",
         "codex:model-list",
         "codex:model-select:gpt-5.6-terra",
-        "minecraft:connect",
         "companion:start:gpt-5.6-terra",
         "companion:stop",
         "actions:stop",
-        "minecraft:disconnect",
         "codex:stop",
         "mcp:stop",
+        "minecraft:disconnect",
       ],
     },
   ])(
@@ -448,9 +642,9 @@ describe("WhiteLilyApp composition", () => {
     expect(harness.events.slice(-5)).toEqual([
       "companion:stop",
       "actions:stop",
-      "minecraft:disconnect",
       "codex:stop",
       "mcp:stop",
+      "minecraft:disconnect",
     ]);
   });
 
@@ -977,9 +1171,9 @@ describe("WhiteLilyApp composition", () => {
       expect(harness.events.slice(-5)).toEqual([
         "companion:stop",
         "actions:stop",
-        "minecraft:disconnect",
         "codex:stop",
         "mcp:stop",
+        "minecraft:disconnect",
       ]);
       await new Promise<void>((resolve) => setImmediate(resolve));
       expect(unhandled).toEqual([]);
@@ -1115,9 +1309,9 @@ describe("WhiteLilyApp composition", () => {
     expect(events.slice(-5)).toEqual([
       "companion:stop",
       "actions:stop",
-      "minecraft:disconnect",
       "codex:stop",
       "mcp:stop",
+      "minecraft:disconnect",
     ]);
     expect(runtime.snapshot()).toMatchObject({
       lifecycle: "stopped",
@@ -1251,7 +1445,17 @@ describe("WhiteLilyApp composition", () => {
       },
       runtimeFactory: (context) => ({
         preferredModel: context.config.codex.preferredModel,
-        mcp: { start: async () => undefined, stop: async () => undefined },
+        mcp: {
+          start: async () => undefined,
+          stop: async () => undefined,
+          snapshot: () => ({
+            state: "ready" as const,
+            workspaceVersion: "workspace-1",
+            mcpListening: true as const,
+            discoveredToolCount: 15,
+          }),
+          subscribe: () => () => undefined,
+        },
         codex: {
           assertChatGptLogin: async () => undefined,
           start: async () => undefined,
@@ -1521,9 +1725,9 @@ describe("WhiteLilyApp composition", () => {
       "task:stopped",
       "companion:stop",
       "actions:stop",
-      "minecraft:disconnect",
       "codex:stop",
       "mcp:stop",
+      "minecraft:disconnect",
     ]);
     expect(runtime.snapshot()).toMatchObject({
       lifecycle: "failed",

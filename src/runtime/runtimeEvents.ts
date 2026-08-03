@@ -15,6 +15,22 @@ export interface PublicTaskSnapshot {
   readonly budget: TaskBudgetSnapshot;
 }
 
+export type ActionCapabilitySnapshot =
+  | { readonly state: "starting"; readonly workspaceVersion: string }
+  | {
+      readonly state: "ready";
+      readonly workspaceVersion: string;
+      readonly mcpListening: true;
+      readonly discoveredToolCount: number;
+    }
+  | {
+      readonly state: "failed";
+      readonly workspaceVersion: string | null;
+      readonly mcpListening: boolean;
+      readonly discoveredToolCount: number;
+      readonly errorCode: string;
+    };
+
 export interface RuntimeSnapshot {
   readonly revision: number;
   readonly lifecycle: "idle" | "starting" | "running" | "stopping" | "stopped" | "failed";
@@ -26,6 +42,7 @@ export interface RuntimeSnapshot {
     readonly state: "stopped" | "starting" | "ready" | "failed";
     readonly model: string | null;
   };
+  readonly actions: ActionCapabilitySnapshot | null;
   readonly task: PublicTaskSnapshot | null;
   readonly lastError: { readonly code: string; readonly message: string } | null;
 }
@@ -34,6 +51,7 @@ export type RuntimeEventPayload =
   | { readonly kind: "lifecycle"; readonly state: RuntimeSnapshot["lifecycle"] }
   | { readonly kind: "minecraft"; readonly state: RuntimeSnapshot["minecraft"] }
   | { readonly kind: "codex"; readonly state: RuntimeSnapshot["codex"] }
+  | { readonly kind: "actions"; readonly state: RuntimeSnapshot["actions"] }
   | { readonly kind: "task"; readonly task: PublicTaskSnapshot | null }
   | { readonly kind: "error"; readonly error: { readonly code: string; readonly message: string } };
 
@@ -44,5 +62,5 @@ export type RuntimeEvent = RuntimeEventPayload extends infer Event
   : never;
 
 export interface RuntimeAuthorityLoss {
-  readonly reason: "model_unavailable";
+  readonly reason: "model_unavailable" | "action_unavailable";
 }

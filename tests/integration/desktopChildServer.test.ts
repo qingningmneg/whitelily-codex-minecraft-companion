@@ -60,8 +60,21 @@ const idleSnapshot: RuntimeSnapshot = {
   lifecycle: "idle",
   minecraft: { state: "disconnected", sessionId: null },
   codex: { state: "stopped", model: null },
+  actions: null,
   task: null,
   lastError: null,
+};
+
+const readyActions = {
+  state: "ready",
+  workspaceVersion: "workspace-1",
+  mcpListening: true,
+  discoveredToolCount: 15,
+} as const;
+
+const readyActionAccess = {
+  snapshot: () => readyActions,
+  subscribe: () => () => undefined,
 };
 
 const stopNoTask = async (): Promise<void> => undefined;
@@ -2544,6 +2557,7 @@ describe("DesktopChildServer", () => {
         lifecycle: "running",
         minecraft: { state: "connected", sessionId: "profile-runtime-session" },
         codex: { state: "ready", model: "live-authority-model" },
+        actions: readyActions,
         task: {
           id: "profile-runtime-task",
           goal: "stale authority",
@@ -2582,6 +2596,7 @@ describe("DesktopChildServer", () => {
           lifecycle: "failed",
           minecraft: { state: "disconnected", sessionId: null },
           codex: { state: "failed", model: null },
+          actions: null,
           task: null,
           lastError: { code: "PROFILE_APPLY_FAILED", message: "Runtime contained" },
         };
@@ -2690,6 +2705,7 @@ describe("DesktopChildServer", () => {
           lifecycle: "running",
           minecraft: { state: "connected", sessionId: "stale-runtime-session" },
           codex: { state: "ready", model: "stale-model" },
+          actions: readyActions,
           task: null,
           lastError: null,
         }),
@@ -3644,6 +3660,7 @@ describe("DesktopChildServer", () => {
       lifecycle: "running",
       minecraft: { state: "connected", sessionId: null },
       codex: { state: "ready", model: "gpt-5.6" },
+      actions: readyActions,
       task: {
         id: "task_urgent_stop",
         goal: "走到主人身边",
@@ -3733,6 +3750,7 @@ describe("DesktopChildServer", () => {
       lifecycle: "running",
       minecraft: { state: "connected", sessionId: null },
       codex: { state: "ready", model: "gpt-5.6" },
+      actions: readyActions,
       task: {
         id: "task_missing_stop_capability",
         goal: "Keep the task contained",
@@ -4419,6 +4437,7 @@ describe("DesktopChildServer", () => {
     const harness = createHarness({
       runtime: new RuntimeFacade({
         lifecycle: { start: async () => undefined, stop: async () => undefined },
+        actions: readyActionAccess,
         switchModel: async (_selection, commitPreference) => commitPreference(),
       }),
       account: {
@@ -4573,6 +4592,7 @@ describe("DesktopChildServer", () => {
       lifecycle: "running",
       minecraft: { state: "connected", sessionId: "lan-session-1" },
       codex: { state: "ready", model: "gpt-5.6-terra" },
+      actions: readyActions,
       task: null,
       lastError: null,
     };
@@ -4584,6 +4604,7 @@ describe("DesktopChildServer", () => {
           lifecycle: "stopped",
           minecraft: { state: "disconnected", sessionId: null },
           codex: { state: "stopped", model: null },
+          actions: null,
         };
       },
       stopTask: async () => undefined,
@@ -4650,6 +4671,7 @@ describe("DesktopChildServer", () => {
       initialRevision: 25,
       lifecycle: { start: async () => undefined, stop: async () => undefined },
       codex: { model: () => "provider-old-model" },
+      actions: readyActionAccess,
       switchModel: async (_selection, commitPreference) => commitPreference(),
     });
     await runtime.start();
@@ -4772,6 +4794,7 @@ describe("DesktopChildServer", () => {
       lifecycle: "running",
       minecraft: { state: "connected", sessionId: "lan-session-stale" },
       codex: { state: "ready", model: "gpt-5.6-terra" },
+      actions: readyActions,
       task: null,
       lastError: null,
     };
@@ -4785,6 +4808,7 @@ describe("DesktopChildServer", () => {
           lifecycle: "stopped",
           minecraft: { state: "disconnected", sessionId: null },
           codex: { state: "stopped", model: null },
+          actions: null,
         };
       },
       stopTask: async () => undefined,
@@ -4842,6 +4866,7 @@ describe("DesktopChildServer", () => {
       lifecycle: "running",
       minecraft: { state: "connected", sessionId: "lan-session-late" },
       codex: { state: "ready", model: "gpt-5.6-terra" },
+      actions: readyActions,
       task: null,
       lastError: null,
     };
@@ -4853,6 +4878,7 @@ describe("DesktopChildServer", () => {
           lifecycle: "stopped",
           minecraft: { state: "disconnected", sessionId: null },
           codex: { state: "stopped", model: null },
+          actions: null,
         };
       },
       stopTask: async () => undefined,
@@ -5840,6 +5866,67 @@ describe("DesktopChildServer", () => {
     await Promise.resolve();
     await Promise.resolve();
     expect(connectionInvalidations(harness)).toEqual(invalidationsBeforeLateOldSignal);
+    expect(harness.runtimeCreations()).toBe(2);
+  });
+
+  it("preserves LAN authority and creates a fresh runtime after action authority loss", async () => {
+    let reportAuthorityLoss:
+      | ((event: import("../../src/runtime/runtimeEvents.js").RuntimeAuthorityLoss) => void)
+      | undefined;
+    const stopReasons: TaskStopReason[] = [];
+    const runtime = new RuntimeFacade({
+      lifecycle: {
+        start: async () => undefined,
+        stop: async () => undefined,
+      },
+      task: {
+        current: () => null,
+        budget: () => ({
+          active: false,
+          stopReason: null,
+          limits: {
+            maxToolCalls: 64,
+            maxBlockChanges: 256,
+            maxHorizontalTravel: 1_024,
+            maxDurationMs: 600_000,
+            maxDangerousOperations: 8,
+          },
+          toolCalls: 0,
+          blockChanges: 0,
+          horizontalTravel: 0,
+          dangerousOperations: 0,
+          startedAt: null,
+        }),
+        stop: (reason) => stopReasons.push(reason),
+      },
+      authority: {
+        subscribe: (listener) => {
+          reportAuthorityLoss = listener;
+          return () => {
+            reportAuthorityLoss = undefined;
+          };
+        },
+      },
+    });
+    const harness = createHarness({ runtime });
+    harness.send(request("action-loss-start", "start_runtime"));
+    await expect(harness.nextResponse()).resolves.toMatchObject({
+      id: "action-loss-start",
+      ok: true,
+    });
+
+    reportAuthorityLoss?.({ reason: "action_unavailable" });
+    await vi.waitFor(() =>
+      expect(connectionInvalidations(harness)).toEqual(["action_unavailable"]),
+    );
+
+    expect(stopReasons).toEqual(["process_exit"]);
+    harness.send(request("action-loss-fresh-start", "start_runtime"));
+    await expect(harness.nextResponse()).resolves.toMatchObject({
+      id: "action-loss-fresh-start",
+      ok: true,
+      result: { lifecycle: "running" },
+    });
     expect(harness.runtimeCreations()).toBe(2);
   });
 

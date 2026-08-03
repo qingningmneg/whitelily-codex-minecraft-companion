@@ -26,9 +26,15 @@ export type { AppPaths } from "./config/schema.js";
 import { AuditLogger, type AuditEvent } from "./logging/auditLogger.js";
 import { SafeLogger } from "./logging/safeLogger.js";
 import { startMcpServer, type RunningMcpServer } from "./mcp/mcpServer.js";
+import {
+  verifyMinecraftMcp,
+  type McpReadinessErrorCode,
+  type McpReadinessSnapshot,
+} from "./mcp/mcpReadiness.js";
 import { TurnToolBudget } from "./mcp/toolBudget.js";
 import {
   createTrustedSnapshotStore,
+  MINECRAFT_TOOL_NAMES,
   type ToolRegistryDependencies,
   type TrustedSnapshotStore,
 } from "./mcp/toolRegistry.js";
@@ -44,7 +50,7 @@ import type { CompanionProfile } from "./profile/profileSchema.js";
 import { OwnerIdentityError, type OwnerIdentitySnapshot } from "./identity/ownerIdentity.js";
 import { OwnerIdentityService } from "./identity/ownerIdentityService.js";
 import { RuntimeFacade, type RuntimeTaskProjection } from "./runtime/runtimeFacade.js";
-import type { RuntimeAuthorityLoss } from "./runtime/runtimeEvents.js";
+import type { ActionCapabilitySnapshot, RuntimeAuthorityLoss } from "./runtime/runtimeEvents.js";
 import { ConfirmationStore } from "./safety/confirmationStore.js";
 import { SafetyEngine, type SafetyContext } from "./safety/safetyEngine.js";
 import { TaskControllerBudget } from "./safety/taskBudget.js";
@@ -61,6 +67,8 @@ export interface WhiteLilyApp {
 interface ManagedMcp {
   start(): Promise<void>;
   stop(): Promise<void>;
+  snapshot?(): ActionCapabilitySnapshot | null;
+  subscribe?(listener: (snapshot: ActionCapabilitySnapshot | null) => void): () => void;
 }
 
 interface ManagedCodex {
@@ -117,6 +125,7 @@ export interface AppCompositionContext {
   taskController: TaskController;
   ownerIdentity: OwnerIdentityProvider;
   logger: Pick<SafeLogger, "info" | "error">;
+  workspaceVersion: string;
   reportAuthorityLoss(event: RuntimeAuthorityLoss): void;
   worldSafety: RuntimeSafetyConfiguration;
 }
@@ -139,6 +148,7 @@ export interface CreateAppOptions {
   confirmedMinecraftConnection?: ConfirmedRuntimeConnection;
   runtimeInitialRevision?: number;
   runtimeModelSelection?: ResolvedModelSelection;
+  workspaceVersion?: string;
   worldSafety?: RuntimeSafetyConfiguration;
   ownerIdentity?: OwnerIdentityProvider;
   runtimeFactory?: (context: AppCompositionContext) => AppRuntime | Promise<AppRuntime>;
@@ -334,12 +344,77 @@ export function createTrustedSafetyContextProvider(
   };
 }
 
-class McpLifecycle implements ManagedMcp {
+export type ActionCapabilityErrorCode =
+  | McpReadinessErrorCode
+  | "port_conflict"
+  | "server_start_failed"
+  | "server_closed"
+  | "startup_stopped";
+
+export class ActionCapabilityError extends Error {
+  constructor(readonly code: ActionCapabilityErrorCode) {
+    super("Minecraft action capability is unavailable");
+    this.name = "ActionCapabilityError";
+  }
+}
+
+export interface McpLifecycleOptions {
+  readonly workspaceVersion: string;
+  readonly readinessTimeoutMs?: number;
+  readonly startServer?: typeof startMcpServer;
+  readonly verify?: (options: {
+    readonly url: string;
+    readonly expectedToolNames: readonly string[];
+    readonly timeoutMs: number;
+  }) => Promise<McpReadinessSnapshot>;
+  readonly onActionUnavailable?: () => void;
+  readonly reportAuthorityLoss?: (event: RuntimeAuthorityLoss) => void;
+}
+
+export class McpLifecycle implements ManagedMcp {
   private server: RunningMcpServer | undefined;
   private starting: { generation: number; operation: Promise<void> } | undefined;
   private generation = 0;
+  private actionSnapshot: ActionCapabilitySnapshot | null = null;
+  private readonly listeners = new Set<(snapshot: ActionCapabilitySnapshot | null) => void>();
+  private readonly options: Required<
+    Pick<McpLifecycleOptions, "workspaceVersion" | "readinessTimeoutMs" | "startServer" | "verify">
+  > &
+    Pick<McpLifecycleOptions, "onActionUnavailable" | "reportAuthorityLoss">;
 
-  constructor(private readonly dependencies: ToolRegistryDependencies) {}
+  constructor(
+    private readonly dependencies: ToolRegistryDependencies,
+    options: McpLifecycleOptions,
+  ) {
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u.test(options.workspaceVersion)) {
+      throw new Error("Workspace version is invalid");
+    }
+    const readinessTimeoutMs = options.readinessTimeoutMs ?? 5_000;
+    if (!Number.isSafeInteger(readinessTimeoutMs) || readinessTimeoutMs <= 0) {
+      throw new Error("MCP readiness timeout is invalid");
+    }
+    this.options = {
+      workspaceVersion: options.workspaceVersion,
+      readinessTimeoutMs,
+      startServer: options.startServer ?? startMcpServer,
+      verify: options.verify ?? verifyMinecraftMcp,
+      ...(options.onActionUnavailable === undefined
+        ? {}
+        : { onActionUnavailable: options.onActionUnavailable }),
+      ...(options.reportAuthorityLoss === undefined
+        ? {}
+        : { reportAuthorityLoss: options.reportAuthorityLoss }),
+    };
+  }
+
+  snapshot(): ActionCapabilitySnapshot | null {
+    return this.actionSnapshot === null ? null : structuredClone(this.actionSnapshot);
+  }
+
+  subscribe(listener: (snapshot: ActionCapabilitySnapshot | null) => void): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
 
   async start(): Promise<void> {
     if (this.server) return;
@@ -349,16 +424,75 @@ class McpLifecycle implements ManagedMcp {
     }
     const generation = ++this.generation;
     const operation = (async (): Promise<void> => {
-      const server = await startMcpServer({
-        host: MCP_HOST,
-        port: MCP_PORT,
-        dependencies: this.dependencies,
+      this.publish({
+        state: "starting",
+        workspaceVersion: this.options.workspaceVersion,
       });
-      if (generation !== this.generation) {
-        await server.stop();
-        throw new Error("MCP server stopped during startup");
+      let server: RunningMcpServer;
+      try {
+        server = await this.options.startServer({
+          host: MCP_HOST,
+          port: MCP_PORT,
+          dependencies: this.dependencies,
+        });
+      } catch (error) {
+        if (generation !== this.generation) {
+          throw new ActionCapabilityError("startup_stopped");
+        }
+        const code =
+          typeof error === "object" &&
+          error !== null &&
+          "code" in error &&
+          error.code === "EADDRINUSE"
+            ? "port_conflict"
+            : "server_start_failed";
+        this.publishFailed(code, false, 0);
+        throw new ActionCapabilityError(code);
       }
       this.server = server;
+      void server.closed.then(() => this.handleServerClosed(server, generation));
+      if (generation !== this.generation) {
+        this.server = undefined;
+        await server.stop().catch(() => undefined);
+        throw new ActionCapabilityError("startup_stopped");
+      }
+      let readiness: McpReadinessSnapshot;
+      try {
+        readiness = await this.options.verify({
+          url: server.url,
+          expectedToolNames: MINECRAFT_TOOL_NAMES,
+          timeoutMs: this.options.readinessTimeoutMs,
+        });
+      } catch {
+        this.server = undefined;
+        await server.stop().catch(() => undefined);
+        if (generation !== this.generation) {
+          throw new ActionCapabilityError("startup_stopped");
+        }
+        this.publishFailed("connection_failed", false, 0);
+        throw new ActionCapabilityError("connection_failed");
+      }
+      if (generation !== this.generation) {
+        this.server = undefined;
+        await server.stop().catch(() => undefined);
+        throw new ActionCapabilityError("startup_stopped");
+      }
+      if (readiness.state === "failed") {
+        this.server = undefined;
+        await server.stop().catch(() => undefined);
+        this.publishFailed(
+          readiness.errorCode ?? "connection_failed",
+          false,
+          readiness.discoveredToolCount,
+        );
+        throw new ActionCapabilityError(readiness.errorCode ?? "connection_failed");
+      }
+      this.publish({
+        state: "ready",
+        workspaceVersion: this.options.workspaceVersion,
+        mcpListening: true,
+        discoveredToolCount: readiness.discoveredToolCount,
+      });
     })();
     this.starting = { generation, operation };
     try {
@@ -373,6 +507,55 @@ class McpLifecycle implements ManagedMcp {
     const server = this.server;
     this.server = undefined;
     await server?.stop();
+    if (this.actionSnapshot !== null) this.publish(null);
+  }
+
+  private handleServerClosed(server: RunningMcpServer, generation: number): void {
+    if (
+      this.server !== server ||
+      generation !== this.generation ||
+      this.actionSnapshot?.state !== "ready"
+    ) {
+      return;
+    }
+    const discoveredToolCount = this.actionSnapshot.discoveredToolCount;
+    this.server = undefined;
+    this.publishFailed("server_closed", false, discoveredToolCount);
+    try {
+      this.options.onActionUnavailable?.();
+    } catch {
+      // The failed action state remains authoritative if local containment reports an error.
+    }
+    try {
+      this.options.reportAuthorityLoss?.({ reason: "action_unavailable" });
+    } catch {
+      // Authority-loss reporting cannot weaken local action containment.
+    }
+  }
+
+  private publishFailed(
+    errorCode: ActionCapabilityErrorCode,
+    mcpListening: boolean,
+    discoveredToolCount: number,
+  ): void {
+    this.publish({
+      state: "failed",
+      workspaceVersion: this.options.workspaceVersion,
+      mcpListening,
+      discoveredToolCount,
+      errorCode,
+    });
+  }
+
+  private publish(snapshot: ActionCapabilitySnapshot | null): void {
+    this.actionSnapshot = snapshot === null ? null : structuredClone(snapshot);
+    for (const listener of [...this.listeners]) {
+      try {
+        listener(snapshot === null ? null : structuredClone(snapshot));
+      } catch {
+        // Action-state observers cannot affect the MCP lifecycle.
+      }
+    }
   }
 }
 
@@ -485,9 +668,15 @@ export function createProductionRuntime(
     observeSnapshot: trustedSnapshots.publish,
   };
 
+  const mcp = new McpLifecycle(toolDependencies, {
+    workspaceVersion: context.workspaceVersion,
+    onActionUnavailable: () => companion!.actionCapabilityLost(),
+    reportAuthorityLoss: context.reportAuthorityLoss,
+  });
+
   return {
     preferredModel,
-    mcp: new McpLifecycle(toolDependencies),
+    mcp,
     codex,
     selectModel,
     switchModel: (selection, commitPreference) =>
@@ -506,7 +695,7 @@ export function createProductionRuntime(
   };
 }
 
-class WhiteLilyAppLifecycle implements WhiteLilyApp {
+export class WhiteLilyAppLifecycle implements WhiteLilyApp {
   #state: "idle" | "starting" | "running" | "terminal" = "idle";
   #attempt: StartupAttempt | undefined;
   #startPromise: Promise<void> | undefined;
@@ -567,6 +756,10 @@ class WhiteLilyAppLifecycle implements WhiteLilyApp {
 
   async #startInternal(attempt: StartupAttempt): Promise<void> {
     try {
+      attempt.phases.minecraft = true;
+      await this.#runtime.minecraft.connect();
+      await this.#finishBoundary(attempt, "minecraft");
+
       attempt.phases.mcp = true;
       await this.#runtime.mcp.start();
       await this.#finishBoundary(attempt, "mcp");
@@ -580,10 +773,6 @@ class WhiteLilyAppLifecycle implements WhiteLilyApp {
       await this.#finishBoundary(attempt, "codex");
       const model = await this.#runtime.selectModel(available, this.#runtime.preferredModel);
       await this.#finishBoundary(attempt);
-
-      attempt.phases.minecraft = true;
-      await this.#runtime.minecraft.connect();
-      await this.#finishBoundary(attempt, "minecraft");
 
       attempt.phases.companion = true;
       await this.#runtime.companion.start(model);
@@ -676,9 +865,9 @@ class WhiteLilyAppLifecycle implements WhiteLilyApp {
       await attempt(() => this.#runtime.companion.stop());
       await attempt(() => this.#runtime.executor.stopAll());
     }
-    if (attempted.minecraft) await attempt(() => this.#runtime.minecraft.disconnect());
     if (attempted.codex) await attempt(() => this.#runtime.codex.stop());
     if (attempted.mcp) await attempt(() => this.#runtime.mcp.stop());
+    if (attempted.minecraft) await attempt(() => this.#runtime.minecraft.disconnect());
     if (firstError !== undefined) throw firstError;
   }
 }
@@ -728,6 +917,8 @@ export async function createRuntimeFacade(
           composition.runtime.minecraft.onEvent!(listener),
       }
     : undefined;
+  const actionSnapshot = composition.runtime.mcp.snapshot;
+  const subscribeActions = composition.runtime.mcp.subscribe;
   return new RuntimeFacade({
     ...(options.runtimeInitialRevision === undefined
       ? {}
@@ -753,6 +944,15 @@ export async function createRuntimeFacade(
       },
     },
     ...(minecraft ? { minecraft } : {}),
+    ...(actionSnapshot && subscribeActions
+      ? {
+          actions: {
+            snapshot: () => actionSnapshot.call(composition.runtime.mcp),
+            subscribe: (listener: (snapshot: ActionCapabilitySnapshot | null) => void) =>
+              subscribeActions.call(composition.runtime.mcp, listener),
+          },
+        }
+      : {}),
     codex: { model: () => selectedModel },
     authority: {
       subscribe: (listener) => {
@@ -829,6 +1029,8 @@ async function composeApp(
     taskController,
     ownerIdentity,
     logger,
+    workspaceVersion:
+      options.workspaceVersion ?? process.env.WHITELILY_WORKSPACE_VERSION ?? "development",
     reportAuthorityLoss: (event) => observers.authorityLost?.(event),
     worldSafety: options.worldSafety ?? { compatibilityVerified: false },
   };

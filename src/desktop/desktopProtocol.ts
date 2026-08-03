@@ -119,6 +119,33 @@ const codexStateSchema = z
   })
   .strict();
 
+const workspaceVersionSchema = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u);
+const actionCapabilitySnapshotSchema = z.discriminatedUnion("state", [
+  z
+    .object({
+      state: z.literal("starting"),
+      workspaceVersion: workspaceVersionSchema,
+    })
+    .strict(),
+  z
+    .object({
+      state: z.literal("ready"),
+      workspaceVersion: workspaceVersionSchema,
+      mcpListening: z.literal(true),
+      discoveredToolCount: finiteNonnegativeInteger,
+    })
+    .strict(),
+  z
+    .object({
+      state: z.literal("failed"),
+      workspaceVersion: workspaceVersionSchema.nullable(),
+      mcpListening: z.boolean(),
+      discoveredToolCount: finiteNonnegativeInteger,
+      errorCode: z.string().regex(/^[a-z][a-z0-9_]{0,63}$/u),
+    })
+    .strict(),
+]);
+
 const publicErrorSchema = z
   .object({
     code: z.string().regex(/^[A-Z0-9_]{1,64}$/u),
@@ -132,6 +159,7 @@ const runtimeSnapshotSchema = z
     lifecycle: z.enum(["idle", "starting", "running", "stopping", "stopped", "failed"]),
     minecraft: minecraftStateSchema,
     codex: codexStateSchema,
+    actions: actionCapabilitySnapshotSchema.nullable(),
     task: publicTaskSnapshotSchema.nullable(),
     lastError: publicErrorSchema.nullable(),
   })
@@ -171,6 +199,13 @@ const runtimeEventSchema = z.discriminatedUnion("kind", [
       kind: z.literal("codex"),
       revision: runtimeRevisionSchema,
       state: codexStateSchema,
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("actions"),
+      revision: runtimeRevisionSchema,
+      state: actionCapabilitySnapshotSchema.nullable(),
     })
     .strict(),
   z
@@ -705,6 +740,7 @@ const connectionInvalidatedEventSchema = z
     reason: z.enum([
       "account_lost",
       "model_unavailable",
+      "action_unavailable",
       "lan_changed",
       "minecraft_disconnect",
       "world_changed",
@@ -726,6 +762,7 @@ export function isAuthorityFreeTerminalRuntimeSnapshot(snapshot: RuntimeSnapshot
     snapshot.minecraft.sessionId === null &&
     (snapshot.codex.state === "stopped" || snapshot.codex.state === "failed") &&
     snapshot.codex.model === null &&
+    snapshot.actions === null &&
     snapshot.task === null
   );
 }

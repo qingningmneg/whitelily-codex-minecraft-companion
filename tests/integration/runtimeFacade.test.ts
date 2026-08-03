@@ -3,6 +3,7 @@ import type { ActiveTask } from "../../src/companion/taskController.js";
 import type { ResolvedModelSelection } from "../../src/codex/modelCatalog.js";
 import { RuntimeFacade } from "../../src/runtime/runtimeFacade.js";
 import type { RuntimeEvent } from "../../src/runtime/runtimeEvents.js";
+import type { ActionCapabilitySnapshot } from "../../src/runtime/runtimeEvents.js";
 import type { TaskBudgetSnapshot, TaskStopReason } from "../../src/safety/taskBudget.js";
 
 function deferred<T = void>() {
@@ -55,6 +56,16 @@ function activeBudgetFixture(): TaskBudgetSnapshot {
     startedAt: 1_700_000_000_000,
   };
 }
+
+const readyActionAccess = {
+  snapshot: () => ({
+    state: "ready" as const,
+    workspaceVersion: "workspace-1",
+    mcpListening: true as const,
+    discoveredToolCount: 15,
+  }),
+  subscribe: () => () => undefined,
+};
 
 let minecraftAccessorReads = 0;
 const accessorBackedOwnerOffline = { kind: "owner_offline" };
@@ -140,6 +151,121 @@ function createRuntimeFacadeHarness() {
 }
 
 describe("RuntimeFacade", () => {
+  it("publishes starting and ready action capability transitions while starting", async () => {
+    let actions: ActionCapabilitySnapshot | null = null;
+    let publishActions: ((snapshot: ActionCapabilitySnapshot | null) => void) | undefined;
+    const runtime = new RuntimeFacade({
+      lifecycle: {
+        start: async () => {
+          actions = { state: "starting", workspaceVersion: "workspace-1" };
+          publishActions?.(actions);
+          actions = {
+            state: "ready",
+            workspaceVersion: "workspace-1",
+            mcpListening: true,
+            discoveredToolCount: 15,
+          };
+          publishActions?.(actions);
+        },
+        stop: async () => undefined,
+      },
+      actions: {
+        snapshot: () => actions,
+        subscribe: (listener) => {
+          publishActions = listener;
+          return () => {
+            publishActions = undefined;
+          };
+        },
+      },
+    });
+    const events: RuntimeEvent[] = [];
+    runtime.subscribe((event) => events.push(event));
+
+    expect(runtime.snapshot().actions).toBeNull();
+    await runtime.start();
+
+    expect(runtime.snapshot().actions).toEqual({
+      state: "ready",
+      workspaceVersion: "workspace-1",
+      mcpListening: true,
+      discoveredToolCount: 15,
+    });
+    expect(events.filter((event) => event.kind === "actions")).toEqual([
+      expect.objectContaining({
+        kind: "actions",
+        state: { state: "starting", workspaceVersion: "workspace-1" },
+      }),
+      expect.objectContaining({
+        kind: "actions",
+        state: {
+          state: "ready",
+          workspaceVersion: "workspace-1",
+          mcpListening: true,
+          discoveredToolCount: 15,
+        },
+      }),
+    ]);
+  });
+
+  it("keeps a pre-existing action source hidden while idle and adopts it on start", async () => {
+    const runtime = new RuntimeFacade({
+      lifecycle: { start: async () => undefined, stop: async () => undefined },
+      actions: readyActionAccess,
+    });
+
+    expect(runtime.snapshot().actions).toBeNull();
+    await runtime.start();
+    expect(runtime.snapshot().actions).toEqual(readyActionAccess.snapshot());
+  });
+
+  it("requires ready actions for a model switch and preserves the ready snapshot", async () => {
+    let actions: ActionCapabilitySnapshot | null = null;
+    let publishActions: ((snapshot: ActionCapabilitySnapshot | null) => void) | undefined;
+    let delegated = 0;
+    const runtime = new RuntimeFacade({
+      lifecycle: { start: async () => undefined, stop: async () => undefined },
+      actions: {
+        snapshot: () => actions,
+        subscribe: (listener) => {
+          publishActions = listener;
+          return () => {
+            publishActions = undefined;
+          };
+        },
+      },
+      switchModel: async (_selection, commitPreference) => {
+        delegated += 1;
+        await commitPreference();
+      },
+    });
+    await runtime.start();
+
+    await expect(
+      runtime.switchModel(
+        { modelId: "gpt-5.6-luna", reasoningEffort: "medium" },
+        async () => undefined,
+      ),
+    ).rejects.toThrow("Minecraft actions are unavailable");
+    expect(delegated).toBe(0);
+
+    actions = {
+      state: "ready",
+      workspaceVersion: "workspace-1",
+      mcpListening: true,
+      discoveredToolCount: 15,
+    };
+    publishActions?.(actions);
+    const before = runtime.snapshot().actions;
+    await runtime.switchModel(
+      { modelId: "gpt-5.6-luna", reasoningEffort: "medium" },
+      async () => undefined,
+    );
+
+    expect(delegated).toBe(1);
+    expect(runtime.snapshot().actions).toEqual(before);
+  });
+
   it("accepts a bounded provider-qualified model ID during startup", async () => {
     const events: RuntimeEvent[] = [];
     const runtime = new RuntimeFacade({
@@ -174,6 +300,7 @@ describe("RuntimeFacade", () => {
     const runtime = new RuntimeFacade({
       lifecycle: { start: async () => undefined, stop: async () => undefined },
       codex: { model: () => "gpt-5.6-terra" },
+      actions: readyActionAccess,
       switchModel: async (next, commitPreference) => {
         order.push(`switch:${next.modelId}:${next.reasoningEffort}`);
         await commitPreference();
@@ -209,6 +336,7 @@ describe("RuntimeFacade", () => {
     const runtime = new RuntimeFacade({
       lifecycle: { start: async () => undefined, stop: async () => undefined },
       codex: { model: () => "gpt-5.6-terra" },
+      actions: readyActionAccess,
       switchModel: async (_selection, commitPreference) => commitPreference(),
     });
     await runtime.start();

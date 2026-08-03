@@ -519,6 +519,19 @@ export class DesktopChildServer {
           true,
           true,
         ).catch(() => undefined);
+        return;
+      }
+      if (event.reason === "action_unavailable") {
+        void this.#beginRuntimeInvalidation(
+          runtime,
+          "process_exit",
+          true,
+          "action_unavailable",
+          true,
+          true,
+          true,
+          false,
+        ).catch(() => undefined);
       }
     });
     return () => {
@@ -1576,6 +1589,7 @@ export class DesktopChildServer {
       snapshot.minecraft.sessionId !== null ||
       (snapshot.codex.state !== "stopped" && snapshot.codex.state !== "failed") ||
       snapshot.codex.model !== null ||
+      snapshot.actions !== null ||
       snapshot.task !== null
     ) {
       throw new Error("Runtime invalidation cleanup did not reach a safe state");
@@ -2349,6 +2363,7 @@ const idleRuntimeSnapshot: RuntimeSnapshot = {
   lifecycle: "idle",
   minecraft: { state: "disconnected", sessionId: null },
   codex: { state: "stopped", model: null },
+  actions: null,
   task: null,
   lastError: null,
 };
