@@ -1,4 +1,6 @@
-import { access, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { pathToFileURL } from "node:url";
@@ -17,17 +19,23 @@ import { CodexAppServerClient } from "../../src/codex/appServerClient.js";
 import type { AppConfig } from "../../src/config/schema.js";
 import { isMainModule, runCli, type CliDependencies } from "../../src/index.js";
 import { TurnToolBudget } from "../../src/mcp/toolBudget.js";
-import type { RunningMcpServer } from "../../src/mcp/mcpServer.js";
-import type { McpReadinessSnapshot } from "../../src/mcp/mcpReadiness.js";
-import { createToolRegistry, createTrustedSnapshotStore } from "../../src/mcp/toolRegistry.js";
+import { startMcpServer, type RunningMcpServer } from "../../src/mcp/mcpServer.js";
+import { verifyMinecraftMcp, type McpReadinessSnapshot } from "../../src/mcp/mcpReadiness.js";
+import {
+  createToolRegistry,
+  createTrustedSnapshotStore,
+  MINECRAFT_TOOL_NAMES,
+} from "../../src/mcp/toolRegistry.js";
 import { FakeMinecraftPort } from "../../src/minecraft/fakeMinecraftPort.js";
 import { ConfirmationStore } from "../../src/safety/confirmationStore.js";
 import { SafetyEngine } from "../../src/safety/safetyEngine.js";
 import { createCompanionHarness } from "../support/companionHarness.js";
 import { TaskController } from "../../src/companion/taskController.js";
+import { TaskControllerBudget } from "../../src/safety/taskBudget.js";
 import { ProfileStore } from "../../src/profile/profileStore.js";
 import { createJsonRpcLineTransportHarness } from "../support/jsonRpcProcessHarness.js";
 import type { OwnerIdentitySnapshot } from "../../src/identity/ownerIdentity.js";
+import { provisionCodexWorkspace } from "../../apps/desktop/src-main/codexWorkspaceProvisioner.js";
 import {
   createAppHarness,
   createCliHarness,
@@ -94,11 +102,200 @@ const realCodexConfig: AppConfig = {
   },
 };
 
+async function createAttestedWorkspaceFixture() {
+  const root = await mkdtemp(join(tmpdir(), "whitelily-real-action-workspace-"));
+  const resourceDirectory = join(root, "resources", "codex-workspace");
+  const dataRoot = join(root, "data");
+  await Promise.all([
+    mkdir(join(resourceDirectory, ".codex"), { recursive: true }),
+    mkdir(dataRoot),
+  ]);
+  const payloads = [
+    [".codex/config.toml", await readFile("codex-workspace/.codex/config.toml")],
+    ["AGENTS.md", await readFile("codex-workspace/AGENTS.md")],
+  ] as const;
+  for (const [portablePath, bytes] of payloads) {
+    await writeFile(join(resourceDirectory, ...portablePath.split("/")), bytes);
+  }
+  await writeFile(
+    join(resourceDirectory, "workspace-manifest.json"),
+    `${JSON.stringify(
+      {
+        schemaVersion: 1,
+        contentVersion: "task-6-real-mcp",
+        files: payloads.map(([path, bytes]) => ({
+          path,
+          bytes: bytes.byteLength,
+          sha256: createHash("sha256").update(bytes).digest("hex"),
+        })),
+      },
+      null,
+      2,
+    )}\n`,
+    "utf8",
+  );
+  return { root, resourceDirectory, dataRoot };
+}
+
 afterEach(async () => {
   await Promise.allSettled(cleanups.splice(0).map((cleanup) => cleanup()));
 });
 
 describe("WhiteLilyApp composition", () => {
+  it("provisions the attested workspace and creates both Codex threads only after real MCP discovery", async () => {
+    const fixture = await createAttestedWorkspaceFixture();
+    cleanups.push(() => rm(fixture.root, { recursive: true, force: true }));
+    const provisioned = await provisionCodexWorkspace(fixture);
+    const events: string[] = [];
+    const minecraft = new FakeMinecraftPort();
+    minecraft.ownerOnline = true;
+    const taskBudget = new TaskControllerBudget();
+    const taskController = new TaskController(taskBudget);
+    const turnBudget = new TurnToolBudget(taskBudget);
+    const confirmations = new ConfirmationStore();
+    const executor = new ActionExecutor(
+      minecraft,
+      new SafetyEngine(confirmations, undefined, (lease) => taskController.isLeaseLive(lease)),
+      confirmations,
+      () => "TestOwner",
+    );
+    const mcp = new McpLifecycle(
+      {
+        minecraft,
+        executor,
+        budget: turnBudget,
+        safetyContextProvider: async () => ({
+          spawn: { x: 0, y: 64, z: 0 },
+          owner: { x: 0, y: 64, z: 0 },
+        }),
+        ownerUsername: () => "TestOwner",
+      },
+      {
+        workspaceVersion: provisioned.contentVersion,
+        startServer: async (options) => {
+          const server = await startMcpServer(options);
+          events.push("mcp:listening");
+          return server;
+        },
+        verify: async (options) => {
+          const snapshot = await verifyMinecraftMcp(options);
+          if (snapshot.state === "ready") events.push("mcp:tools/list:ready");
+          return snapshot;
+        },
+      },
+    );
+    const transport = createJsonRpcLineTransportHarness();
+    const codex = new CodexAppServerClient(realCodexConfig, {
+      runLoginStatus: async () => ({
+        stdout: "Logged in using ChatGPT\n",
+        stderr: "",
+        exitCode: 0,
+      }),
+      createTransport: async () => transport.transport,
+      workspacePath: provisioned.targetDirectory,
+    });
+    codex.configureRuntime({ workspacePath: provisioned.targetDirectory, reasoningEffort: "low" });
+    const threadIds: string[] = [];
+    const app = new WhiteLilyAppLifecycle({
+      preferredModel: "gpt-5.6-terra",
+      minecraft: {
+        connect: async () => {
+          events.push("minecraft:connected");
+        },
+        disconnect: async () => {
+          events.push("minecraft:disconnected");
+        },
+      },
+      mcp,
+      codex,
+      selectModel: (models, preferred) => {
+        if (!models.includes(preferred)) throw new Error("preferred model unavailable");
+        return preferred;
+      },
+      switchModel: async (_selection, commitPreference) => commitPreference(),
+      companion: {
+        start: async (model) => {
+          for (const role of ["intent", "execution"] as const) {
+            events.push(`thread:${role}:requested`);
+            threadIds.push(
+              await codex.startThread({
+                cwd: "C:/caller-must-not-win",
+                model,
+                reasoningEffort: "low",
+              }),
+            );
+          }
+        },
+        switchModel: async (_selection, commitPreference) => commitPreference(),
+        stop: async () => undefined,
+      },
+      executor,
+    });
+
+    try {
+      const starting = app.start();
+      const initialize = await transport.nextSent();
+      expect(events).toContain("mcp:tools/list:ready");
+      expect(initialize).toMatchObject({ id: 1, method: "initialize" });
+      transport.receive({
+        id: 1,
+        result: {
+          userAgent: "codex/0.145.0",
+          codexHome: "D:/codex-home",
+          platformFamily: "windows",
+          platformOs: "windows",
+        },
+      });
+      await transport.nextSent();
+      await expect(transport.nextSent()).resolves.toEqual({
+        id: 2,
+        method: "model/list",
+        params: {},
+      });
+      transport.receive({
+        id: 2,
+        result: { data: [{ model: "gpt-5.6-terra" }], nextCursor: null },
+      });
+      for (const [id, role] of [
+        [3, "intent"],
+        [4, "execution"],
+      ] as const) {
+        const request = await transport.nextSent();
+        expect(events.indexOf("mcp:tools/list:ready")).toBeLessThan(
+          events.indexOf(`thread:${role}:requested`),
+        );
+        expect(request).toEqual({
+          id,
+          method: "thread/start",
+          params: {
+            model: "gpt-5.6-terra",
+            cwd: provisioned.targetDirectory,
+            sandbox: "read-only",
+            approvalPolicy: "never",
+          },
+        });
+        transport.receive({ id, result: { thread: { id: `thread-${role}` } } });
+      }
+      await starting;
+
+      expect(threadIds).toEqual(["thread-intent", "thread-execution"]);
+      await expect(readFile(join(provisioned.targetDirectory, "AGENTS.md"), "utf8")).resolves.toBe(
+        await readFile("codex-workspace/AGENTS.md", "utf8"),
+      );
+      await expect(
+        readFile(join(provisioned.targetDirectory, ".codex", "config.toml"), "utf8"),
+      ).resolves.toContain('url = "http://127.0.0.1:32123/mcp"');
+      expect(mcp.snapshot()).toEqual({
+        state: "ready",
+        workspaceVersion: "task-6-real-mcp",
+        mcpListening: true,
+        discoveredToolCount: MINECRAFT_TOOL_NAMES.length,
+      });
+    } finally {
+      await app.stop();
+    }
+  });
+
   it.each([
     {
       label: "port conflict",

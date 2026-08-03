@@ -104,6 +104,48 @@ describe("companion harness teardown", () => {
 });
 
 describe("simulated WhiteLily lifecycle", () => {
+  it("projects a non-zero action budget after bounded owner-follow execution", async () => {
+    const value = await harness({
+      deferredTurns: [0],
+      intentResponses: [
+        JSON.stringify({
+          kind: "start_task",
+          naturalReply: null,
+          task: {
+            goal: "走到主人身边",
+            allowedActions: ["follow_owner", "move_to"],
+            requestedLimits: { maxToolCalls: 2, maxHorizontalTravel: 16 },
+          },
+          memoryCandidates: [],
+        }),
+      ],
+      executionResponses: [
+        JSON.stringify({ reply: "已到达", status: "completed", memoryCandidates: [] }),
+      ],
+    });
+    value.minecraft.world.ownerPosition = { x: 4, y: 64, z: 3 };
+    await value.start();
+    await value.emitOwnerText("走到我身边来");
+    await value.untilCodexTurns(1);
+
+    const result = await value.executeRawTool("minecraft_follow_owner", {
+      distance: 3,
+      turnLease: value.budgetLeases[0],
+    });
+
+    expect(result).toEqual({ text: '{"status":"completed"}' });
+    expect(value.minecraft.calls).toContainEqual({ method: "followOwner", args: ["TestOwner", 3] });
+    expect(value.budget.snapshot()).toMatchObject({
+      totalCalls: 1,
+      cumulativeHorizontalTravel: 5,
+    });
+    expect(value.taskAuditEvents).toEqual(["task_started"]);
+
+    value.codex.releaseTurnResult(0);
+    await value.untilTurnSettled();
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:completed"]);
+  });
+
   it("runs the companion through the reusable runtime boundary without exposing its lease", async () => {
     const value = await harness();
     let budget: TaskBudgetSnapshot = {

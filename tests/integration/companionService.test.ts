@@ -360,7 +360,7 @@ describe("CompanionService lifecycle", () => {
           allowedActions: ["say"],
         }),
       ],
-      executionResponses: [taskExecutionOutcome("working", "active")],
+      executionResponses: [taskExecutionOutcome("这条成功消息绝不能出现", "completed")],
       deferredTurns: [0],
     });
     await value.service.start("gpt-5.6-terra");
@@ -384,6 +384,23 @@ describe("CompanionService lifecycle", () => {
       turnId: "turn-1",
     });
     expect(value.service).toMatchObject({ codexHealthy: false });
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:failed"]);
+    expect(value.taskTerminalReasons).toEqual(["failed"]);
+    expect(value.budget.snapshot()).toMatchObject({ active: false, ended: true });
+
+    const rejectedAfterLoss = await value.executeRawTool("minecraft_say", {
+      message: "must not reach Minecraft",
+      turnLease,
+    });
+    expect(rejectedAfterLoss).toEqual({
+      text: '{"error":"tool turn has ended"}',
+      isError: true,
+    });
+    expect(value.minecraft.calls).toEqual([]);
+
+    value.codex.releaseTurnResult(0);
+    await value.untilTurnSettled();
+    expect(value.minecraft.chatLog).not.toContain("这条成功消息绝不能出现");
 
     value.minecraft.emit({
       kind: "chat",
@@ -393,6 +410,7 @@ describe("CompanionService lifecycle", () => {
     await new Promise<void>((resolve) => setImmediate(resolve));
     expect(value.codex.turns).toHaveLength(turnsBeforeLoss);
     expect(value.pendingMergeTimers()).toBe(0);
+    expect(value.minecraft.calls).toEqual([]);
   });
 
   it("archives a staged intent thread when replacement execution creation fails", async () => {
@@ -1660,6 +1678,88 @@ describe("CompanionService lifecycle", () => {
         expect(value.minecraft.chatLog.join("\n")).not.toContain("任务披露");
       },
     );
+  });
+
+  describe("installed action outcome contract", () => {
+    it("uses minecraft_get_state for 查看一下你现在的位置 and accounts the tool call", async () => {
+      const value = await harness({
+        deferredTurns: [0],
+        intentResponses: [
+          taskDecision({
+            naturalReply: null,
+            goal: "查看当前位置",
+            allowedActions: ["get_state"],
+            requestedLimits: { maxToolCalls: 2 },
+          }),
+        ],
+        executionResponses: [taskExecutionOutcome("位置已确认")],
+      });
+      await value.start();
+
+      await startPlayerTurn(value, "查看一下你现在的位置");
+      const result = await value.executeRawTool("minecraft_get_state", {
+        turnLease: value.budgetLeases[0],
+      });
+
+      expect(result.isError).not.toBe(true);
+      expect(JSON.parse(result.text)).toMatchObject({ botPosition: { x: 0, y: 64, z: 0 } });
+      expect(value.budget.snapshot()).toMatchObject({ active: true, totalCalls: 1 });
+      expect(value.taskAuditEvents).toEqual(["task_started"]);
+
+      value.codex.releaseTurnResult(0);
+      await value.untilTurnSettled();
+
+      expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:completed"]);
+      expect(value.taskAuditPayloads).toHaveLength(2);
+    });
+
+    it("executes bounded follow movement for 走到我身边来 with matching budget and audit counts", async () => {
+      const value = await harness({
+        deferredTurns: [0],
+        intentResponses: [
+          taskDecision({
+            naturalReply: null,
+            goal: "走到主人身边",
+            allowedActions: ["follow_owner", "move_to"],
+            requestedLimits: { maxToolCalls: 2, maxHorizontalTravel: 16 },
+          }),
+        ],
+        executionResponses: [taskExecutionOutcome("已到达")],
+      });
+      value.minecraft.world.ownerPosition = { x: 6, y: 64, z: 0 };
+      const executorResults: unknown[] = [];
+      value.executor.onResult((result) => executorResults.push(result));
+      await value.start();
+
+      await startPlayerTurn(value, "走到我身边来");
+      const result = await value.executeRawTool("minecraft_follow_owner", {
+        distance: 3,
+        turnLease: value.budgetLeases[0],
+      });
+
+      expect(result).toEqual({ text: '{"status":"completed"}' });
+      expect(value.minecraft.calls).toContainEqual({
+        method: "followOwner",
+        args: ["TestOwner", 3],
+      });
+      expect(executorResults).toEqual([{ status: "completed" }]);
+      expect(value.budget.snapshot()).toMatchObject({
+        active: true,
+        totalCalls: 1,
+        cumulativeHorizontalTravel: 6,
+      });
+      expect(value.taskAuditEvents).toHaveLength(1);
+
+      value.codex.releaseTurnResult(0);
+      await value.untilTurnSettled();
+
+      expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:completed"]);
+      expect(value.taskAuditPayloads).toHaveLength(2);
+      expect(value.taskAuditPayloads[1]).toMatchObject({
+        event: "task_stopped",
+        data: { reason: "completed", expectedActionCategoryCount: 2 },
+      });
+    });
   });
 
   it.each(["friend", "balanced", "autonomous"] as const)(

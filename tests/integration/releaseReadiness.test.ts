@@ -289,6 +289,30 @@ describe("public release readiness", () => {
     expect(smokeTest).not.toContain("回到安全的朋友模式");
   });
 
+  it("documents the installed Minecraft action acceptance and rollback evidence", async () => {
+    const smokeTest = await readFile("docs/windows-smoke-test.md", "utf8");
+
+    for (const evidence of [
+      String.raw`%LOCALAPPDATA%\WhiteLily\codex-workspace\AGENTS.md`,
+      String.raw`%LOCALAPPDATA%\WhiteLily\codex-workspace\.codex\config.toml`,
+      String.raw`%LOCALAPPDATA%\WhiteLily\codex-workspace\workspace-manifest.json`,
+      "127.0.0.1:32123",
+      "workspaceVersion",
+      "mcpListening",
+      "discoveredToolCount",
+      "toolCalls >= 1",
+      "查看一下你现在的位置",
+      "走到我身边来",
+      "Minecraft Java 1.21.5",
+      "可丢弃",
+      "重启",
+      "回滚",
+    ]) {
+      expect(smokeTest).toContain(evidence);
+    }
+    expect(smokeTest).toMatch(/实际移动[\s\S]{0,120}(?:预算|审计)/u);
+  });
+
   it("documents the first release as same-machine only", async () => {
     await expect(readFile("README.md", "utf8")).resolves.toContain(
       "cross-device deployment is not supported",
