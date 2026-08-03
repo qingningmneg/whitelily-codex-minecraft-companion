@@ -6,6 +6,26 @@ import { classifyActionRisk } from "../safety/actionRisk.js";
 import type { SafetyContext } from "../safety/safetyEngine.js";
 import { TurnToolBudget, type ToolActionKind, type TrustedToolConsumption } from "./toolBudget.js";
 
+export const MINECRAFT_TOOL_NAMES = Object.freeze([
+  "minecraft_get_state",
+  "minecraft_find_block",
+  "minecraft_say",
+  "minecraft_move_to",
+  "minecraft_follow_owner",
+  "minecraft_look_at",
+  "minecraft_jump",
+  "minecraft_dig_block",
+  "minecraft_place_block",
+  "minecraft_craft_item",
+  "minecraft_smelt_item",
+  "minecraft_collect_dropped",
+  "minecraft_equip_item",
+  "minecraft_attack_hostile",
+  "minecraft_wait",
+] as const);
+
+export type MinecraftToolName = (typeof MINECRAFT_TOOL_NAMES)[number];
+
 export interface ToolResult {
   text: string;
   isError?: boolean;
@@ -556,6 +576,8 @@ export function createToolRegistry(dependencies: ToolRegistryDependencies) {
         turnLease: string;
       }): Promise<ToolResult> => runAction({ kind: "wait", milliseconds }, lease),
     },
+  } satisfies Record<MinecraftToolName, unknown>;
+  return Object.fromEntries(MINECRAFT_TOOL_NAMES.map((name) => [name, registry[name]])) as {
+    [Name in MinecraftToolName]: (typeof registry)[Name];
   };
-  return registry;
 }

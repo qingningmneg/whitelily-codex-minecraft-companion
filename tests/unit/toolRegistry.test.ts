@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createToolRegistry } from "../../src/mcp/toolRegistry.js";
+import { createToolRegistry, MINECRAFT_TOOL_NAMES } from "../../src/mcp/toolRegistry.js";
 import type { ActionSafety } from "../../src/actions/actionExecutor.js";
 import type { GameAction, WorldSnapshot } from "../../src/domain/types.js";
 import { TurnToolBudget } from "../../src/mcp/toolBudget.js";
@@ -38,23 +38,9 @@ describe("Minecraft MCP tools", () => {
 
   it("exports only the reviewed allowlist", () => {
     const harness = createToolRegistryHarness();
-    expect(Object.keys(createToolRegistry(harness.dependencies)).sort()).toEqual([
-      "minecraft_attack_hostile",
-      "minecraft_collect_dropped",
-      "minecraft_craft_item",
-      "minecraft_dig_block",
-      "minecraft_equip_item",
-      "minecraft_find_block",
-      "minecraft_follow_owner",
-      "minecraft_get_state",
-      "minecraft_jump",
-      "minecraft_look_at",
-      "minecraft_move_to",
-      "minecraft_place_block",
-      "minecraft_say",
-      "minecraft_smelt_item",
-      "minecraft_wait",
-    ]);
+    expect(Object.keys(createToolRegistry(harness.dependencies)).sort()).toEqual(
+      [...MINECRAFT_TOOL_NAMES].sort(),
+    );
   });
 
   it("does not expose generic shell, script, command, or arbitrary entity attack tools", () => {

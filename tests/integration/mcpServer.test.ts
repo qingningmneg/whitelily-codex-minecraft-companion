@@ -5,7 +5,9 @@ import { connect } from "node:net";
 import type { Socket } from "node:net";
 import { afterEach, describe, expect, it } from "vitest";
 import type { WorldSnapshot } from "../../src/domain/types.js";
+import { verifyMinecraftMcp } from "../../src/mcp/mcpReadiness.js";
 import { startMcpServer, type RunningMcpServer } from "../../src/mcp/mcpServer.js";
+import { MINECRAFT_TOOL_NAMES } from "../../src/mcp/toolRegistry.js";
 import { createToolRegistryHarness } from "../support/toolRegistryHarness.js";
 
 interface RawResponse {
@@ -92,6 +94,31 @@ describe("loopback MCP server", () => {
 
   afterEach(async () => {
     await Promise.all(running.splice(0).map((server) => server.stop()));
+  });
+
+  it("passes an independent exact-catalog readiness probe without executing tools", async () => {
+    const harness = createToolRegistryHarness();
+    const server = await startMcpServer({
+      host: "127.0.0.1",
+      port: 0,
+      dependencies: harness.dependencies,
+    });
+    running.push(server);
+
+    await expect(
+      verifyMinecraftMcp({
+        url: server.url,
+        expectedToolNames: MINECRAFT_TOOL_NAMES,
+        timeoutMs: 1_000,
+      }),
+    ).resolves.toEqual({
+      state: "ready",
+      listening: true,
+      discoveredToolCount: 15,
+      errorCode: null,
+    });
+    expect(harness.minecraft.calls).toEqual([]);
+    expect(harness.budget.snapshot().totalCalls).toBe(0);
   });
 
   it("serves the reviewed registry over a real stateless MCP client", async () => {
