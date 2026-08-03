@@ -13,13 +13,15 @@ interface ModelPageProps {
   locale: Locale;
 }
 
+type ModelPageMessage = { kind: "success"; selection: ModelSelection } | { kind: "error" };
+
 export function ModelPage({ api, locale }: ModelPageProps) {
   const [catalog, setCatalog] = useState<ModelCatalogSnapshot | null>(null);
   const [modelId, setModelId] = useState("automatic");
   const [effort, setEffort] = useState("");
   const [pending, setPending] = useState(false);
   const [retrySelection, setRetrySelection] = useState<ModelSelectionInput | null>(null);
-  const [message, setMessage] = useState<{ kind: "success" | "error"; text: string } | null>(null);
+  const [message, setMessage] = useState<ModelPageMessage | null>(null);
 
   const load = useCallback(async () => {
     setMessage(null);
@@ -35,9 +37,9 @@ export function ModelPage({ api, locale }: ModelPageProps) {
         setEffort(live.selection.reasoningEffort);
       }
     } catch {
-      setMessage({ kind: "error", text: translate(locale, "model.error") });
+      setMessage({ kind: "error" });
     }
-  }, [api, locale]);
+  }, [api]);
 
   useEffect(() => {
     void load();
@@ -71,11 +73,11 @@ export function ModelPage({ api, locale }: ModelPageProps) {
       setCatalog((current) => (current ? { ...current, selection: confirmed } : current));
       setDraftFromSelection(confirmed);
       setRetrySelection(null);
-      setMessage({ kind: "success", text: successMessage(locale, catalog, confirmed) });
+      setMessage({ kind: "success", selection: confirmed });
     } catch {
       setDraftFromSelection(previous);
       setRetrySelection(requested);
-      setMessage({ kind: "error", text: translate(locale, "model.error") });
+      setMessage({ kind: "error" });
     } finally {
       setPending(false);
     }
@@ -100,7 +102,9 @@ export function ModelPage({ api, locale }: ModelPageProps) {
       </header>
       {message ? (
         <p className="page-message" role={message.kind === "error" ? "alert" : "status"}>
-          {message.text}
+          {message.kind === "error"
+            ? translate(locale, "model.error")
+            : successMessage(locale, catalog, message.selection)}
         </p>
       ) : null}
       {!catalog ? (
@@ -164,11 +168,11 @@ export function ModelPage({ api, locale }: ModelPageProps) {
 
 function successMessage(
   locale: Locale,
-  catalog: ModelCatalogSnapshot,
+  catalog: ModelCatalogSnapshot | null,
   selection: ModelSelection,
 ): string {
   if (selection.mode === "automatic") return translate(locale, "model.successAutomatic");
-  const model = catalog.models.find((candidate) => candidate.id === selection.modelId);
+  const model = catalog?.models.find((candidate) => candidate.id === selection.modelId);
   return translate(locale, "model.success", {
     model: model?.displayName ?? selection.modelId,
     effort: selection.reasoningEffort,
