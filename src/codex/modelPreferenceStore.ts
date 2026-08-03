@@ -90,7 +90,15 @@ export class ModelPreferenceStore {
     expectedRevision: number,
     value: PersistedModelPreference,
   ): Promise<DocumentEnvelope<PersistedModelPreference>> {
-    return this.#document.replace(expectedRevision, value);
+    return this.#document.update(expectedRevision, (current) => {
+      if (current.legacyMigrationCompleted && !value.legacyMigrationCompleted) {
+        throw new DocumentStoreError(
+          "DOCUMENT_VALUE_INVALID",
+          "legacy model preference migration cannot be reopened",
+        );
+      }
+      return value;
+    });
   }
 
   migrateLegacyOnce(

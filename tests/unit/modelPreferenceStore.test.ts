@@ -86,6 +86,23 @@ describe("ModelPreferenceStore", () => {
     });
   });
 
+  it("rejects a current-revision replace that reopens completed legacy migration", async () => {
+    const { store } = await fixture();
+    const first = await store.read();
+    const migrated = await store.migrateLegacyOnce(first.revision, {
+      ui: { mode: "explicit", modelId: "gpt-5.5", reasoningEffort: "low" },
+      validate: async () => true,
+    });
+
+    await expect(
+      store.replace(migrated.revision, {
+        selection: { mode: "automatic" },
+        legacyMigrationCompleted: false,
+      }),
+    ).rejects.toMatchObject({ code: "DOCUMENT_VALUE_INVALID" });
+    await expect(store.read()).resolves.toEqual(migrated);
+  });
+
   it("runs legacy migration once, rejects stale revisions, and persists across store instances", async () => {
     const { rootDirectory, store } = await fixture();
     const first = await store.read();
