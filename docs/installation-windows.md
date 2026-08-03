@@ -80,6 +80,12 @@ The installer is designed to bundle Electron, the compiled WhiteLily child runti
 
 Authentication files stay under the controlled `%LOCALAPPDATA%\WhiteLily` data root. WhiteLily does not ask you to paste an API key into configuration and has no API Key fallback.
 
+### Switch models later
+
+After first-run setup, open **AI model** at any time, choose a model and reasoning effort from the current ChatGPT session's live catalog, then select **Apply model**. A successful switch stops the active task and revokes its pending actions without disconnecting the confirmed Minecraft LAN session. WhiteLily saves and displays the new selection only after the model is ready, and keeps using it after either the child runtime or desktop app restarts.
+
+If switching fails, WhiteLily keeps the previous model selection and connection. Do not work around the failure by repeatedly restarting, editing local authentication files, or pasting an API key. Retry once, then save a redacted diagnostic and report the problem if it continues.
+
 ## 7. Enter Minecraft with PCL2
 
 1. You start and operate PCL2 yourself.

@@ -80,6 +80,12 @@ if ($actual -ne $expected) { throw "SHA-256 mismatch. Do not run the installer."
 
 认证文件保存在 `%LOCALAPPDATA%\WhiteLily` 下的受控本机数据目录。WhiteLily 不要求把 API 密钥粘贴进配置，也不提供 API Key 回退。
 
+### 后续切换模型
+
+首次设置完成后，可以随时打开左侧“智能模型”，从当前 ChatGPT 会话的实时列表中重新选择模型和推理强度，再点“应用模型”。成功切换会停止当前活动任务并撤销该任务尚未执行的动作，但不会断开已经确认的 Minecraft LAN 会话。新选择只有在模型准备成功后才会保存并显示，并会在 WhiteLily 后台或桌面应用重启后继续使用。
+
+如果切换失败，WhiteLily 会保留原来的模型选择和连接。不要通过反复重启、手工编辑本机认证文件或粘贴 API Key 绕过失败；先直接重试，仍然失败时保存脱敏诊断并报告问题。
+
 ## 7. 用 PCL2 进入 Minecraft
 
 1. 用户自行启动和操作 PCL2。

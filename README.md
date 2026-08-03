@@ -79,8 +79,11 @@ PCL2 始终由用户自行启动和操作。WhiteLily 不会启动、控制、�
 4. 用户自行打开 PCL2，启动 Minecraft Java 1.21.5，进入可丢弃的单人世界并选择“对局域网开放”。
 5. 回到 WhiteLily，核对并确认应用检测到的本机 LAN 会话；不需要手工抄写端口。
 6. 以后要更换主人时，在 WhiteLily 的“设置”→“主人身份”中完成确认，不需要让机器人退出或重新连接。
+7. 以后要更换模型时，打开“智能模型”，从当前 ChatGPT 会话的实时列表中选择模型和推理强度，再点“应用模型”。
 
 运行中切换主人会立即撤销旧主人的命令权限，并取消旧主人授权的活动任务，尚未执行的动作不会继续。WhiteLily、Mineflayer 连接和本机 Codex 服务保持连接；如果新主人离线，界面会显示“正在等待新主人上线”，且不会恢复旧主人的权限。
+
+成功切换模型会停止当前活动任务并撤销该任务尚未执行的动作，但不会断开已确认的 Minecraft LAN 会话。新选择只有在模型准备成功后才会保存并显示，并会在 WhiteLily 后台或桌面应用重启后继续使用；如果切换失败，WhiteLily 会保留原来的模型选择和连接，可直接重试。
 
 #### 高级故障排查：手工配置主人
 
@@ -237,8 +240,11 @@ The following workflow applies to the `v0.2.0-beta.1` desktop installer, not the
 4. Open PCL2 yourself, start Minecraft Java 1.21.5, enter a disposable single-player world, and choose Open to LAN.
 5. Return to WhiteLily, review the detected local LAN session, and confirm it. You do not need to copy the port manually.
 6. To change the owner later, use WhiteLily Settings → Owner identity and confirm the change without disconnecting or reconnecting the bot.
+7. To change the model later, open **AI model**, choose a model and reasoning effort from the current ChatGPT session's live catalog, then select **Apply model**.
 
 A live owner change immediately revokes the old owner's command authority and cancels any active task authorized by that owner, so pending actions do not continue. WhiteLily, the Mineflayer connection, and the local Codex service remain connected. If the new owner is offline, the UI waits for the new owner and does not restore the old owner's authority.
+
+A successful model switch stops the active task and revokes its pending actions without disconnecting the confirmed Minecraft LAN session. WhiteLily saves and displays the new selection only after the model is ready, and keeps using it after either the child runtime or desktop app restarts. If switching fails, the previous model selection and connection remain in place so you can retry.
 
 #### Advanced troubleshooting: manual owner configuration
 
