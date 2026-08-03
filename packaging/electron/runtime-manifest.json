@@ -18,6 +18,12 @@
     "codexExecutable": "codex/native/vendor/x86_64-pc-windows-msvc/bin/codex.exe",
     "licenses": "licenses"
   },
+  "managedWorkspace": {
+    "root": "codex-workspace",
+    "manifest": "codex-workspace/workspace-manifest.json",
+    "payloads": [".codex/config.toml", "AGENTS.md"],
+    "mcpUrl": "http://127.0.0.1:32123/mcp"
+  },
   "allowlist": {
     "generatedRoots": [
       {
@@ -152,6 +158,9 @@
       "licenses/OpenAI-Codex-NOTICE.txt"
     ],
     "requiredFiles": [
+      "codex-workspace/.codex/config.toml",
+      "codex-workspace/AGENTS.md",
+      "codex-workspace/workspace-manifest.json",
       "core/childMain.js",
       "desktop/main/main.js",
       "desktop/preload/preload.cjs",

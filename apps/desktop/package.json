@@ -66,6 +66,13 @@
         ]
       },
       {
+        "from": "../../build/electron-bundle/codex-workspace",
+        "to": "codex-workspace",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
         "from": "../../build/electron-bundle/licenses",
         "to": "licenses",
         "filter": [

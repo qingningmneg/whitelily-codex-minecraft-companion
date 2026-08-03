@@ -152,6 +152,16 @@ function Copy-AllowlistedDirectory {
 }
 
 try {
+    $managedWorkspaceRoot = Join-Path $staging ([string]$sourceManifest.managedWorkspace.root)
+    New-Item -ItemType Directory -Path $managedWorkspaceRoot | Out-Null
+    & node `
+        (Join-Path $PSScriptRoot 'build-codex-workspace.mjs') `
+        (Join-Path $repositoryRoot 'codex-workspace') `
+        $managedWorkspaceRoot
+    if ($LASTEXITCODE -ne 0) {
+        throw "managed Codex workspace build failed with exit code $LASTEXITCODE"
+    }
+
     $coreRoot = Join-Path $staging 'core'
     foreach ($rule in $sourceManifest.allowlist.generatedRoots) {
         Copy-AllowlistedDirectory `
@@ -255,6 +265,7 @@ Package metadata and upstream notices are preserved under codex/package and code
         target = $sourceManifest.target
         versions = $sourceManifest.versions
         paths = $sourceManifest.paths
+        managedWorkspace = $sourceManifest.managedWorkspace
         allowlist = $sourceManifest.allowlist
         policySha256 = $policySha256
         resources = $resources

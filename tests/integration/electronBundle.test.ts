@@ -1,9 +1,10 @@
 import { createHash } from "node:crypto";
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve, sep } from "node:path";
+import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 import { validConfig } from "../support/appHarness.js";
 
@@ -34,6 +35,12 @@ interface RuntimeManifest {
     requiredFiles: string[];
     executableFiles: string[];
   };
+  managedWorkspace?: {
+    root: string;
+    manifest: string;
+    payloads: string[];
+    mcpUrl: string;
+  };
   policySha256?: string;
   resources?: Array<{ path: string; bytes: number; sha256: string }>;
 }
@@ -43,6 +50,9 @@ const sourceManifestPath = join(repositoryRoot, "packaging", "electron", "runtim
 const bundleRoot = join(repositoryRoot, "build", "electron-bundle");
 const bundleManifestPath = join(bundleRoot, "runtime-manifest.json");
 const prepareScriptPath = join(repositoryRoot, "scripts", "prepare-electron-bundle.ps1");
+const workspaceBuilderPath = join(repositoryRoot, "scripts", "build-codex-workspace.mjs");
+const workspaceBundleRoot = join(bundleRoot, "codex-workspace");
+const execFileAsync = promisify(execFile);
 const require = createRequire(import.meta.url);
 const asar = require("@electron/asar") as {
   createPackage: (source: string, destination: string) => Promise<void>;
@@ -107,6 +117,124 @@ async function writeTree(root: string, files: Record<string, Buffer | string>): 
     await mkdir(dirname(path), { recursive: true });
     await writeFile(path, contents);
   }
+}
+
+const workspaceConfig = '[mcp_servers.minecraft]\nurl = "http://127.0.0.1:32123/mcp"\n';
+const workspaceAgents = [
+  "# codex-workspace/AGENTS.md",
+  "",
+  "You are the conversational and planning brain for the Minecraft companion 白百合.",
+  "",
+  "- Use only tools whose names start with `minecraft_` for game actions.",
+  "- Do not run shell commands, edit files, write scripts, or inspect credentials.",
+  "- Never attempt to bypass a denied or confirmation-required action.",
+  "- Return concise Chinese chat suitable for Minecraft.",
+  "- Do not add a `[白百合]` prefix.",
+  "- Stop after the player-facing response and any necessary bounded tool calls.",
+  "",
+].join("\n");
+const workspacePayloadPaths = [".codex/config.toml", "AGENTS.md"] as const;
+const workspaceLoosePaths = [
+  "codex-workspace/.codex/config.toml",
+  "codex-workspace/AGENTS.md",
+  "codex-workspace/workspace-manifest.json",
+] as const;
+
+function workspaceInnerManifest(
+  payloads: Record<(typeof workspacePayloadPaths)[number], Buffer | string> = {
+    ".codex/config.toml": workspaceConfig,
+    "AGENTS.md": workspaceAgents,
+  },
+): {
+  schemaVersion: 1;
+  contentVersion: "1";
+  files: Array<{ path: string; bytes: number; sha256: string }>;
+} {
+  return {
+    schemaVersion: 1,
+    contentVersion: "1",
+    files: workspacePayloadPaths.map((path) => resource(path, Buffer.from(payloads[path]))),
+  };
+}
+
+async function runWorkspaceBuilder(sourceRoot: string, stagingRoot: string): Promise<void> {
+  await execFileAsync(process.execPath, [workspaceBuilderPath, sourceRoot, stagingRoot], {
+    cwd: repositoryRoot,
+    windowsHide: true,
+  });
+}
+
+async function createWorkspaceSource(root: string): Promise<string> {
+  const sourceRoot = join(root, "source");
+  await mkdir(sourceRoot);
+  await writeTree(sourceRoot, {
+    ".codex/config.toml": workspaceConfig,
+    "AGENTS.md": workspaceAgents,
+  });
+  return sourceRoot;
+}
+
+async function createManagedWorkspaceVerifierFixture(options?: {
+  payloads?: Partial<Record<(typeof workspacePayloadPaths)[number], Buffer | string>>;
+  innerManifest?: Record<string, unknown>;
+  extraFiles?: Record<string, Buffer | string>;
+  omitActual?: string;
+  omitOuter?: string;
+}): Promise<{ root: string; resources: string; sourcePath: string }> {
+  const payloads = {
+    ".codex/config.toml": workspaceConfig,
+    "AGENTS.md": workspaceAgents,
+    ...options?.payloads,
+  };
+  const innerManifest = options?.innerManifest ?? workspaceInnerManifest(payloads);
+  const workspaceFiles: Record<string, Buffer | string> = {
+    "codex-workspace/.codex/config.toml": payloads[".codex/config.toml"],
+    "codex-workspace/AGENTS.md": payloads["AGENTS.md"],
+    "codex-workspace/workspace-manifest.json": `${JSON.stringify(innerManifest, null, 2)}\n`,
+    ...options?.extraFiles,
+  };
+  if (options?.omitActual !== undefined) delete workspaceFiles[options.omitActual];
+  const root = await mkdtemp(join(tmpdir(), "whitelily-managed-workspace-"));
+  const resources = join(root, "resources");
+  const asarSource = join(root, "asar-source");
+  await mkdir(resources);
+  await mkdir(asarSource);
+  await writeTree(resources, workspaceFiles);
+  await writeTree(asarSource, {
+    "package.json": JSON.stringify(desktopAsarPolicy.packageJson),
+  });
+  await asar.createPackage(asarSource, join(resources, "app.asar"));
+
+  const sourceManifest = {
+    schemaVersion: 1,
+    productVersion: "0.2.0-beta.1",
+    managedWorkspace: {
+      root: "codex-workspace",
+      manifest: "codex-workspace/workspace-manifest.json",
+      payloads: [...workspacePayloadPaths],
+      mcpUrl: "http://127.0.0.1:32123/mcp",
+    },
+    allowlist: {
+      requiredFiles: [...workspaceLoosePaths],
+      executableFiles: [],
+      scriptFiles: [],
+      afterPackFiles: ["app.asar"],
+    },
+  };
+  const sourcePath = join(root, "source-manifest.json");
+  await writeFile(sourcePath, JSON.stringify(sourceManifest));
+  const resourcesManifest = Object.entries(workspaceFiles)
+    .filter(([path]) => path !== options?.omitOuter)
+    .map(([path, contents]) => resource(path, Buffer.from(contents)));
+  await writeFile(
+    join(resources, "runtime-manifest.json"),
+    JSON.stringify({
+      ...sourceManifest,
+      policySha256: await sha256(sourcePath),
+      resources: resourcesManifest,
+    }),
+  );
+  return { root, resources, sourcePath };
 }
 
 async function createVerifierFixture(options?: {
@@ -222,6 +350,231 @@ async function createMaterializationFixture(options?: {
 }
 
 describe("deterministic Electron resources", () => {
+  it("stages exactly the two reviewed workspace payloads and a deterministic manifest", async () => {
+    const root = await mkdtemp(join(tmpdir(), "whitelily-workspace-builder-"));
+    try {
+      const sourceRoot = await createWorkspaceSource(root);
+      const stagingA = join(root, "staging-a");
+      const stagingB = join(root, "staging-b");
+      await mkdir(stagingA);
+      await mkdir(stagingB);
+
+      await runWorkspaceBuilder(sourceRoot, stagingA);
+      await runWorkspaceBuilder(sourceRoot, stagingB);
+
+      expect(await filesUnder(stagingA)).toEqual([
+        ".codex/config.toml",
+        "AGENTS.md",
+        "workspace-manifest.json",
+      ]);
+      const manifestText = await readFile(join(stagingA, "workspace-manifest.json"), "utf8");
+      expect(manifestText).toBe(`${JSON.stringify(workspaceInnerManifest(), null, 2)}\n`);
+      expect(await readFile(join(stagingB, "workspace-manifest.json"), "utf8")).toBe(manifestText);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a workspace source with a missing reviewed payload", async () => {
+    const root = await mkdtemp(join(tmpdir(), "whitelily-workspace-builder-"));
+    try {
+      const sourceRoot = await createWorkspaceSource(root);
+      const stagingRoot = join(root, "staging");
+      await mkdir(stagingRoot);
+      await rm(join(sourceRoot, "AGENTS.md"));
+
+      await expect(runWorkspaceBuilder(sourceRoot, stagingRoot)).rejects.toThrow(
+        /missing.*AGENTS|AGENTS.*missing/iu,
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a workspace source with an extra file", async () => {
+    const root = await mkdtemp(join(tmpdir(), "whitelily-workspace-builder-"));
+    try {
+      const sourceRoot = await createWorkspaceSource(root);
+      const stagingRoot = join(root, "staging");
+      await mkdir(stagingRoot);
+      await writeFile(join(sourceRoot, "rogue.txt"), "rogue");
+
+      await expect(runWorkspaceBuilder(sourceRoot, stagingRoot)).rejects.toThrow(
+        /unexpected|allowlist|extra/iu,
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a symlink or reparse point in the workspace source", async () => {
+    const root = await mkdtemp(join(tmpdir(), "whitelily-workspace-builder-"));
+    try {
+      const sourceRoot = await createWorkspaceSource(root);
+      const stagingRoot = join(root, "staging");
+      const outside = join(root, "outside-codex");
+      await mkdir(stagingRoot);
+      await mkdir(outside);
+      await writeFile(join(outside, "config.toml"), workspaceConfig);
+      await rm(join(sourceRoot, ".codex"), { recursive: true, force: true });
+      await symlink(outside, join(sourceRoot, ".codex"), "junction");
+
+      await expect(runWorkspaceBuilder(sourceRoot, stagingRoot)).rejects.toThrow(
+        /link|reparse|real file/iu,
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a missing managed workspace payload after packing", async () => {
+    const fixture = await createManagedWorkspaceVerifierFixture({
+      omitActual: "codex-workspace/AGENTS.md",
+    });
+    try {
+      await expect(
+        verifier.verifyResourceDirectory?.(fixture.resources, fixture.sourcePath),
+      ).rejects.toThrow(/workspace|AGENTS|required|missing/iu);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects an extra file in the managed workspace after packing", async () => {
+    const fixture = await createManagedWorkspaceVerifierFixture({
+      extraFiles: { "codex-workspace/rogue.txt": "rogue" },
+    });
+    try {
+      await expect(
+        verifier.verifyResourceDirectory?.(fixture.resources, fixture.sourcePath),
+      ).rejects.toThrow(/workspace|unexpected|extra/iu);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["../AGENTS.md", "C:/AGENTS.md"])(
+    "rejects the unsafe managed workspace manifest path %s",
+    async (unsafePath) => {
+      const innerManifest = workspaceInnerManifest();
+      innerManifest.files[1] = { ...innerManifest.files[1]!, path: unsafePath };
+      const fixture = await createManagedWorkspaceVerifierFixture({ innerManifest });
+      try {
+        await expect(
+          verifier.verifyResourceDirectory?.(fixture.resources, fixture.sourcePath),
+        ).rejects.toThrow(/workspace|manifest|path|absolute|escape/iu);
+      } finally {
+        await rm(fixture.root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("rejects a non-loopback Minecraft MCP URL after packing", async () => {
+    const unsafeConfig = '[mcp_servers.minecraft]\nurl = "http://0.0.0.0:32123/mcp"\n';
+    const payloads = {
+      ".codex/config.toml": unsafeConfig,
+      "AGENTS.md": workspaceAgents,
+    };
+    const fixture = await createManagedWorkspaceVerifierFixture({
+      payloads,
+      innerManifest: workspaceInnerManifest(payloads),
+    });
+    try {
+      await expect(
+        verifier.verifyResourceDirectory?.(fixture.resources, fixture.sourcePath),
+      ).rejects.toThrow(/workspace|loopback|127\.0\.0\.1|MCP/iu);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a managed workspace payload hash changed inside its manifest", async () => {
+    const innerManifest = workspaceInnerManifest();
+    innerManifest.files[1] = { ...innerManifest.files[1]!, sha256: "0".repeat(64) };
+    const fixture = await createManagedWorkspaceVerifierFixture({ innerManifest });
+    try {
+      await expect(
+        verifier.verifyResourceDirectory?.(fixture.resources, fixture.sourcePath),
+      ).rejects.toThrow(/workspace|hash|SHA-256/iu);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a link or reparse point in the managed workspace after packing", async () => {
+    const fixture = await createManagedWorkspaceVerifierFixture();
+    try {
+      const codexPath = join(fixture.resources, "codex-workspace", ".codex");
+      const outside = join(fixture.root, "outside-codex");
+      await mkdir(outside);
+      await writeFile(join(outside, "config.toml"), workspaceConfig);
+      await rm(codexPath, { recursive: true, force: true });
+      await symlink(outside, codexPath, "junction");
+
+      await expect(
+        verifier.verifyResourceDirectory?.(fixture.resources, fixture.sourcePath),
+      ).rejects.toThrow(/workspace|link|reparse|runtime resources/iu);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a workspace manifest omitted from the outer runtime manifest", async () => {
+    const fixture = await createManagedWorkspaceVerifierFixture({
+      omitOuter: "codex-workspace/workspace-manifest.json",
+    });
+    try {
+      await expect(
+        verifier.verifyResourceDirectory?.(fixture.resources, fixture.sourcePath),
+      ).rejects.toThrow(/outer|runtime|manifest|required|unexpected/iu);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it("reviews one exact managed workspace policy and one Electron extraResources entry", async () => {
+    const manifest = await readManifest(sourceManifestPath);
+    const desktopPackage = JSON.parse(
+      await readFile(join(repositoryRoot, "apps", "desktop", "package.json"), "utf8"),
+    ) as {
+      build?: { extraResources?: Array<Record<string, unknown>> };
+    };
+
+    expect(manifest.managedWorkspace).toEqual({
+      root: "codex-workspace",
+      manifest: "codex-workspace/workspace-manifest.json",
+      payloads: [".codex/config.toml", "AGENTS.md"],
+      mcpUrl: "http://127.0.0.1:32123/mcp",
+    });
+    expect(manifest.allowlist.requiredFiles).toEqual(
+      expect.arrayContaining([...workspaceLoosePaths]),
+    );
+    expect(
+      desktopPackage.build?.extraResources?.filter((entry) => entry.to === "codex-workspace"),
+    ).toEqual([
+      {
+        from: "../../build/electron-bundle/codex-workspace",
+        to: "codex-workspace",
+        filter: ["**/*"],
+      },
+    ]);
+  });
+
+  it("prepares exactly the three managed workspace loose resources", async () => {
+    expect(await filesUnder(workspaceBundleRoot)).toEqual([
+      ".codex/config.toml",
+      "AGENTS.md",
+      "workspace-manifest.json",
+    ]);
+    const innerManifest = JSON.parse(
+      await readFile(join(workspaceBundleRoot, "workspace-manifest.json"), "utf8"),
+    ) as ReturnType<typeof workspaceInnerManifest>;
+    expect(innerManifest).toEqual(workspaceInnerManifest());
+    const outerManifest = await readManifest(bundleManifestPath);
+    const outerPaths = new Set(outerManifest.resources?.map((entry) => entry.path));
+    expect(workspaceLoosePaths.every((path) => outerPaths.has(path))).toBe(true);
+  });
+
   it("computes SHA-256 without depending on the optional Get-FileHash cmdlet", async () => {
     const script = await readFile(prepareScriptPath, "utf8");
 

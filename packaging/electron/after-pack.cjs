@@ -182,6 +182,189 @@ async function readBoundRuntimeManifest(manifestPath, sourceManifestPath) {
   return { sourceManifest, resources };
 }
 
+function compareOrdinal(left, right) {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function hasExactKeys(value, expectedKeys) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const actualKeys = Object.keys(value).sort(compareOrdinal);
+  const reviewedKeys = [...expectedKeys].sort(compareOrdinal);
+  return (
+    actualKeys.length === reviewedKeys.length &&
+    actualKeys.every((key, index) => key === reviewedKeys[index])
+  );
+}
+
+function assertManagedPortablePath(portablePath) {
+  assertPortablePath(portablePath, "managed workspace manifest");
+  if (portablePath.startsWith("/") || /^[a-z]:\//iu.test(portablePath)) {
+    throw new Error("WhiteLily managed workspace manifest path must be relative");
+  }
+  return portablePath;
+}
+
+async function listManagedWorkspaceEntries(root) {
+  const entries = [];
+  const canonicalRoot = await realpath(root);
+  async function visit(directory, portableDirectory) {
+    const children = await readdir(directory, { withFileTypes: true });
+    children.sort((left, right) => compareOrdinal(left.name, right.name));
+    for (const child of children) {
+      const portablePath = portableDirectory ? `${portableDirectory}/${child.name}` : child.name;
+      assertManagedPortablePath(portablePath);
+      const path = resolveContained(root, portablePath);
+      const metadata = await lstat(path);
+      if (metadata.isSymbolicLink()) {
+        throw new Error(
+          `WhiteLily managed workspace must not contain a link or reparse point: ${portablePath}`,
+        );
+      }
+      if (metadata.isDirectory()) {
+        const canonicalPath = await realpath(path);
+        const canonicalChild = relative(canonicalRoot, canonicalPath);
+        if (
+          canonicalChild === ".." ||
+          canonicalChild.startsWith(`..${sep}`) ||
+          isAbsolute(canonicalChild)
+        ) {
+          throw new Error("WhiteLily managed workspace escaped through a reparse point");
+        }
+        entries.push(`${portablePath}/`);
+        await visit(path, portablePath);
+      } else if (metadata.isFile()) {
+        entries.push(portablePath);
+      } else {
+        throw new Error(
+          `WhiteLily managed workspace contains an unsupported reparse entry: ${portablePath}`,
+        );
+      }
+    }
+  }
+  await visit(root, "");
+  return entries.sort(compareOrdinal);
+}
+
+function assertExactManagedEntries(actual, expected, label) {
+  const sortedExpected = [...expected].sort(compareOrdinal);
+  if (
+    actual.length !== sortedExpected.length ||
+    actual.some((entry, index) => entry !== sortedExpected[index])
+  ) {
+    const missing = sortedExpected.find((entry) => !actual.includes(entry));
+    if (missing !== undefined) {
+      throw new Error(`WhiteLily ${label} is missing: ${missing}`);
+    }
+    const unexpected = actual.find((entry) => !sortedExpected.includes(entry));
+    throw new Error(`WhiteLily ${label} contains an unexpected entry: ${unexpected}`);
+  }
+}
+
+async function verifyManagedWorkspace(resourcesDirectory, policy, resources) {
+  if (policy === undefined) return;
+  const reviewedPayloads = [".codex/config.toml", "AGENTS.md"];
+  if (
+    !hasExactKeys(policy, ["root", "manifest", "payloads", "mcpUrl"]) ||
+    policy.root !== "codex-workspace" ||
+    policy.manifest !== "codex-workspace/workspace-manifest.json" ||
+    policy.mcpUrl !== "http://127.0.0.1:32123/mcp" ||
+    !Array.isArray(policy.payloads) ||
+    policy.payloads.length !== reviewedPayloads.length ||
+    policy.payloads.some((path, index) => path !== reviewedPayloads[index])
+  ) {
+    throw new Error("WhiteLily reviewed managed workspace policy is invalid");
+  }
+
+  const workspaceRoot = resolveContained(resourcesDirectory, policy.root);
+  const rootMetadata = await lstat(workspaceRoot);
+  if (!rootMetadata.isDirectory() || rootMetadata.isSymbolicLink()) {
+    throw new Error("WhiteLily managed workspace root must be a real directory");
+  }
+  const canonicalResources = await realpath(resourcesDirectory);
+  const canonicalWorkspace = await realpath(workspaceRoot);
+  const canonicalChild = relative(canonicalResources, canonicalWorkspace);
+  if (
+    canonicalChild === ".." ||
+    canonicalChild.startsWith(`..${sep}`) ||
+    isAbsolute(canonicalChild)
+  ) {
+    throw new Error("WhiteLily managed workspace escaped through a link or reparse point");
+  }
+
+  const expectedWorkspaceEntries = [".codex/", ...reviewedPayloads, "workspace-manifest.json"];
+  assertExactManagedEntries(
+    await listManagedWorkspaceEntries(workspaceRoot),
+    expectedWorkspaceEntries,
+    "managed workspace",
+  );
+
+  const expectedOuterPaths = [
+    "codex-workspace/.codex/config.toml",
+    "codex-workspace/AGENTS.md",
+    "codex-workspace/workspace-manifest.json",
+  ];
+  const outerPaths = resources
+    .map((resource) => resource.path)
+    .filter((path) => typeof path === "string" && path.startsWith("codex-workspace/"))
+    .sort(compareOrdinal);
+  assertExactManagedEntries(outerPaths, expectedOuterPaths, "outer workspace manifest");
+
+  let manifest;
+  try {
+    manifest = JSON.parse(
+      await readFile(resolveContained(workspaceRoot, "workspace-manifest.json"), "utf8"),
+    );
+  } catch {
+    throw new Error("WhiteLily managed workspace manifest is invalid JSON");
+  }
+  if (
+    !hasExactKeys(manifest, ["schemaVersion", "contentVersion", "files"]) ||
+    manifest.schemaVersion !== 1 ||
+    manifest.contentVersion !== "1" ||
+    !Array.isArray(manifest.files) ||
+    manifest.files.length !== reviewedPayloads.length
+  ) {
+    throw new Error("WhiteLily managed workspace manifest is invalid");
+  }
+
+  for (const [index, entry] of manifest.files.entries()) {
+    if (
+      !hasExactKeys(entry, ["path", "bytes", "sha256"]) ||
+      !Number.isSafeInteger(entry.bytes) ||
+      entry.bytes < 0 ||
+      typeof entry.sha256 !== "string" ||
+      !/^[a-f0-9]{64}$/u.test(entry.sha256)
+    ) {
+      throw new Error("WhiteLily managed workspace manifest entry is invalid");
+    }
+    assertManagedPortablePath(entry.path);
+    if (entry.path !== reviewedPayloads[index]) {
+      throw new Error("WhiteLily managed workspace manifest payload order is invalid");
+    }
+    const payloadPath = resolveContained(workspaceRoot, entry.path);
+    const metadata = await lstat(payloadPath);
+    if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size !== entry.bytes) {
+      throw new Error(`WhiteLily managed workspace payload size mismatch: ${entry.path}`);
+    }
+    if ((await sha256(payloadPath)) !== entry.sha256) {
+      throw new Error(`WhiteLily managed workspace payload hash mismatch: ${entry.path}`);
+    }
+  }
+
+  const expectedConfig = `[mcp_servers.minecraft]\nurl = "${policy.mcpUrl}"\n`;
+  const configBytes = await readFile(resolveContained(workspaceRoot, ".codex/config.toml"));
+  if (!configBytes.equals(Buffer.from(expectedConfig, "utf8"))) {
+    throw new Error("WhiteLily managed workspace Minecraft MCP URL must be exact loopback");
+  }
+  const agentsBytes = await readFile(resolveContained(workspaceRoot, "AGENTS.md"));
+  if (
+    agentsBytes.subarray(0, 3).equals(Buffer.from([0xef, 0xbb, 0xbf])) ||
+    !agentsBytes.toString("utf8").includes("白百合")
+  ) {
+    throw new Error("WhiteLily managed workspace AGENTS.md must be UTF-8 without BOM");
+  }
+}
+
 async function verifyResourceDirectory(resourcesDirectory, sourceManifestPath) {
   const manifestPath = resolve(resourcesDirectory, "runtime-manifest.json");
   const { sourceManifest, resources } = await readBoundRuntimeManifest(
@@ -236,6 +419,8 @@ async function verifyResourceDirectory(resourcesDirectory, sourceManifestPath) {
       asarResourcePaths.set(asarPath, resource.path);
     }
   }
+
+  await verifyManagedWorkspace(resourcesDirectory, sourceManifest.managedWorkspace, resources);
 
   for (const [resourcePath, resource] of looseDeclared) {
     const path = resolveContained(resourcesDirectory, resourcePath);
