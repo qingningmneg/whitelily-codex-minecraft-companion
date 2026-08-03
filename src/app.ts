@@ -371,8 +371,15 @@ export interface McpLifecycleOptions {
   readonly reportAuthorityLoss?: (event: RuntimeAuthorityLoss) => void;
 }
 
+interface ActiveMcpServer {
+  readonly server: RunningMcpServer;
+  readonly generation: number;
+  closed: boolean;
+  stopPromise?: Promise<void>;
+}
+
 export class McpLifecycle implements ManagedMcp {
-  private server: RunningMcpServer | undefined;
+  private activeServer: ActiveMcpServer | undefined;
   private starting: { generation: number; operation: Promise<void> } | undefined;
   private generation = 0;
   private actionSnapshot: ActionCapabilitySnapshot | null = null;
@@ -417,10 +424,22 @@ export class McpLifecycle implements ManagedMcp {
   }
 
   async start(): Promise<void> {
-    if (this.server) return;
     if (this.starting) {
       await this.starting.operation;
       return;
+    }
+    const existing = this.activeServer;
+    if (
+      existing !== undefined &&
+      existing.generation === this.generation &&
+      !existing.closed &&
+      this.actionSnapshot?.state === "ready"
+    ) {
+      return;
+    }
+    if (existing !== undefined) {
+      if (this.activeServer === existing) this.activeServer = undefined;
+      await this.stopServer(existing).catch(() => undefined);
     }
     const generation = ++this.generation;
     const operation = (async (): Promise<void> => {
@@ -449,37 +468,76 @@ export class McpLifecycle implements ManagedMcp {
         this.publishFailed(code, false, 0);
         throw new ActionCapabilityError(code);
       }
-      this.server = server;
-      void server.closed.then(() => this.handleServerClosed(server, generation));
+      const active: ActiveMcpServer = {
+        server,
+        generation,
+        closed: false,
+      };
+      this.activeServer = active;
+      const closed = server.closed.then(
+        () => {
+          active.closed = true;
+          this.handleServerClosed(active);
+          return { kind: "closed" as const };
+        },
+        () => {
+          active.closed = true;
+          this.handleServerClosed(active);
+          return { kind: "closed" as const };
+        },
+      );
       if (generation !== this.generation) {
-        this.server = undefined;
-        await server.stop().catch(() => undefined);
+        if (this.activeServer === active) this.activeServer = undefined;
+        await this.stopServer(active).catch(() => undefined);
         throw new ActionCapabilityError("startup_stopped");
       }
-      let readiness: McpReadinessSnapshot;
+      let outcome:
+        | { readonly kind: "readiness"; readonly snapshot: McpReadinessSnapshot }
+        | { readonly kind: "closed" };
       try {
-        readiness = await this.options.verify({
-          url: server.url,
-          expectedToolNames: MINECRAFT_TOOL_NAMES,
-          timeoutMs: this.options.readinessTimeoutMs,
-        });
+        outcome = await Promise.race([
+          this.options
+            .verify({
+              url: server.url,
+              expectedToolNames: MINECRAFT_TOOL_NAMES,
+              timeoutMs: this.options.readinessTimeoutMs,
+            })
+            .then((snapshot) => ({ kind: "readiness" as const, snapshot })),
+          closed,
+        ]);
       } catch {
-        this.server = undefined;
-        await server.stop().catch(() => undefined);
+        if (this.activeServer === active) this.activeServer = undefined;
+        await this.stopServer(active).catch(() => undefined);
         if (generation !== this.generation) {
           throw new ActionCapabilityError("startup_stopped");
         }
         this.publishFailed("connection_failed", false, 0);
         throw new ActionCapabilityError("connection_failed");
       }
+      if (outcome.kind === "closed") {
+        if (this.activeServer === active) this.activeServer = undefined;
+        if (generation !== this.generation) {
+          throw new ActionCapabilityError("startup_stopped");
+        }
+        await this.stopServer(active).catch(() => undefined);
+        this.publishFailed("server_closed", false, 0);
+        throw new ActionCapabilityError("server_closed");
+      }
       if (generation !== this.generation) {
-        this.server = undefined;
-        await server.stop().catch(() => undefined);
+        if (this.activeServer === active) this.activeServer = undefined;
+        await this.stopServer(active).catch(() => undefined);
         throw new ActionCapabilityError("startup_stopped");
       }
+      if (active.closed || this.activeServer !== active) {
+        if (this.activeServer === active) this.activeServer = undefined;
+        await this.stopServer(active).catch(() => undefined);
+        this.publishFailed("server_closed", false, 0);
+        throw new ActionCapabilityError("server_closed");
+      }
+      const readiness = outcome.snapshot;
       if (readiness.state === "failed") {
-        this.server = undefined;
-        await server.stop().catch(() => undefined);
+        if (this.activeServer === active) this.activeServer = undefined;
+        await this.stopServer(active).catch(() => undefined);
         this.publishFailed(
           readiness.errorCode ?? "connection_failed",
           false,
@@ -504,22 +562,22 @@ export class McpLifecycle implements ManagedMcp {
 
   async stop(): Promise<void> {
     this.generation += 1;
-    const server = this.server;
-    this.server = undefined;
-    await server?.stop();
+    const active = this.activeServer;
+    this.activeServer = undefined;
+    if (active !== undefined) await this.stopServer(active);
     if (this.actionSnapshot !== null) this.publish(null);
   }
 
-  private handleServerClosed(server: RunningMcpServer, generation: number): void {
+  private handleServerClosed(active: ActiveMcpServer): void {
     if (
-      this.server !== server ||
-      generation !== this.generation ||
+      this.activeServer !== active ||
+      active.generation !== this.generation ||
       this.actionSnapshot?.state !== "ready"
     ) {
       return;
     }
     const discoveredToolCount = this.actionSnapshot.discoveredToolCount;
-    this.server = undefined;
+    this.activeServer = undefined;
     this.publishFailed("server_closed", false, discoveredToolCount);
     try {
       this.options.onActionUnavailable?.();
@@ -531,6 +589,11 @@ export class McpLifecycle implements ManagedMcp {
     } catch {
       // Authority-loss reporting cannot weaken local action containment.
     }
+  }
+
+  private stopServer(active: ActiveMcpServer): Promise<void> {
+    active.stopPromise ??= active.server.stop();
+    return active.stopPromise;
   }
 
   private publishFailed(

@@ -24,6 +24,7 @@ import { FakeMinecraftPort } from "../../src/minecraft/fakeMinecraftPort.js";
 import { ConfirmationStore } from "../../src/safety/confirmationStore.js";
 import { SafetyEngine } from "../../src/safety/safetyEngine.js";
 import { createCompanionHarness } from "../support/companionHarness.js";
+import { TaskController } from "../../src/companion/taskController.js";
 import { ProfileStore } from "../../src/profile/profileStore.js";
 import { createJsonRpcLineTransportHarness } from "../support/jsonRpcProcessHarness.js";
 import type { OwnerIdentitySnapshot } from "../../src/identity/ownerIdentity.js";
@@ -158,9 +159,17 @@ describe("WhiteLilyApp composition", () => {
       };
       const actionStates: unknown[] = [];
       const lifecycleEvents: string[] = [];
+      const assertChatGptLogin = vi.fn(async () => undefined);
       const codexStart = vi.fn(async () => undefined);
+      const listModels = vi.fn(async () => ["gpt-5.6-terra"]);
+      const selectModel = vi.fn(() => "gpt-5.6-terra");
+      const startThread = vi.fn(async () => "thread-should-not-start");
       const companionStart = vi.fn(async () => undefined);
-      const task = { current: null as unknown };
+      const taskAudit = vi.fn();
+      const taskController = new TaskController(undefined, taskAudit, {
+        setTimer: () => 1 as unknown as ReturnType<typeof setTimeout>,
+        clearTimer: () => undefined,
+      });
       const mcp = new McpLifecycle({} as never, {
         workspaceVersion: "workspace-1",
         startServer: async () => {
@@ -191,17 +200,32 @@ describe("WhiteLilyApp composition", () => {
           },
         },
         codex: {
-          assertChatGptLogin: async () => undefined,
+          assertChatGptLogin,
           start: codexStart,
-          listModels: async () => ["gpt-5.6-terra"],
+          listModels,
           stop: async () => {
             lifecycleEvents.push("codex:stop");
           },
         },
-        selectModel: () => "gpt-5.6-terra",
+        selectModel,
         switchModel: async (_selection, commitPreference) => commitPreference(),
         companion: {
-          start: companionStart,
+          start: async () => {
+            await companionStart();
+            await startThread();
+            taskController.start({
+              goal: "must remain unaccepted while actions are unavailable",
+              expectedActions: ["move_to"],
+              limits: {
+                maxToolCalls: 1,
+                maxBlockChanges: 0,
+                maxHorizontalTravel: 1,
+                maxDurationMs: 1_000,
+                maxDangerousOperations: 0,
+              },
+              stopCondition: "action capability is unavailable",
+            });
+          },
           switchModel: async (_selection, commitPreference) => commitPreference(),
           stop: async () => {
             lifecycleEvents.push("companion:stop");
@@ -215,9 +239,14 @@ describe("WhiteLilyApp composition", () => {
         code: expectedCode,
       });
 
+      expect(assertChatGptLogin).not.toHaveBeenCalled();
       expect(codexStart).not.toHaveBeenCalled();
+      expect(listModels).not.toHaveBeenCalled();
+      expect(selectModel).not.toHaveBeenCalled();
       expect(companionStart).not.toHaveBeenCalled();
-      expect(task.current).toBeNull();
+      expect(startThread).not.toHaveBeenCalled();
+      expect(taskAudit).not.toHaveBeenCalled();
+      expect(taskController.current()).toBeNull();
       expect(lifecycleEvents).toEqual(["minecraft:connect", "mcp:stop", "minecraft:disconnect"]);
       expect(actionStates).toEqual([
         { state: "starting", workspaceVersion: "workspace-1" },
@@ -227,6 +256,297 @@ describe("WhiteLilyApp composition", () => {
       expect(serverStop).toHaveBeenCalledTimes(startError ? 0 : 1);
     },
   );
+
+  it("rejects a server close before readiness without reviving Codex or task authority", async () => {
+    let resolveClosed!: () => void;
+    const closed = new Promise<void>((resolve) => {
+      resolveClosed = resolve;
+    });
+    let resolveReadiness!: (snapshot: McpReadinessSnapshot) => void;
+    const readiness = new Promise<McpReadinessSnapshot>((resolve) => {
+      resolveReadiness = resolve;
+    });
+    const serverStop = vi.fn(async () => {
+      resolveClosed();
+    });
+    const server: RunningMcpServer = {
+      host: "127.0.0.1",
+      port: 32123,
+      url: "http://127.0.0.1:32123/mcp",
+      closed,
+      stop: serverStop,
+    };
+    const verify = vi.fn(async () => readiness);
+    const actionStates: unknown[] = [];
+    const assertChatGptLogin = vi.fn(async () => undefined);
+    const codexStart = vi.fn(async () => undefined);
+    const listModels = vi.fn(async () => ["gpt-5.6-terra"]);
+    const selectModel = vi.fn(() => "gpt-5.6-terra");
+    const startThread = vi.fn(async () => "thread-should-not-start");
+    const companionStart = vi.fn(async () => undefined);
+    const taskAudit = vi.fn();
+    const taskController = new TaskController(undefined, taskAudit, {
+      setTimer: () => 1 as unknown as ReturnType<typeof setTimeout>,
+      clearTimer: () => undefined,
+    });
+    const actionUnavailable = vi.fn();
+    const authorityLost = vi.fn();
+    const lifecycleEvents: string[] = [];
+    const mcp = new McpLifecycle({} as never, {
+      workspaceVersion: "workspace-1",
+      startServer: async () => server,
+      verify,
+      onActionUnavailable: actionUnavailable,
+      reportAuthorityLoss: authorityLost,
+    });
+    mcp.subscribe((snapshot) => actionStates.push(snapshot));
+    const app = new WhiteLilyAppLifecycle({
+      preferredModel: "gpt-5.6-terra",
+      minecraft: {
+        connect: async () => {
+          lifecycleEvents.push("minecraft:connect");
+        },
+        disconnect: async () => {
+          lifecycleEvents.push("minecraft:disconnect");
+        },
+      },
+      mcp: {
+        start: () => mcp.start(),
+        stop: async () => {
+          lifecycleEvents.push("mcp:stop");
+          await mcp.stop();
+        },
+      },
+      codex: {
+        assertChatGptLogin,
+        start: codexStart,
+        listModels,
+        stop: async () => {
+          lifecycleEvents.push("codex:stop");
+        },
+      },
+      selectModel,
+      switchModel: async (_selection, commitPreference) => commitPreference(),
+      companion: {
+        start: async () => {
+          await companionStart();
+          await startThread();
+          taskController.start({
+            goal: "must not be accepted after a pre-ready close",
+            expectedActions: ["move_to"],
+            limits: {
+              maxToolCalls: 1,
+              maxBlockChanges: 0,
+              maxHorizontalTravel: 1,
+              maxDurationMs: 1_000,
+              maxDangerousOperations: 0,
+            },
+            stopCondition: "the action server closes",
+          });
+        },
+        switchModel: async (_selection, commitPreference) => commitPreference(),
+        stop: async () => {
+          lifecycleEvents.push("companion:stop");
+        },
+      },
+      executor: { stopAll: () => undefined },
+    });
+
+    const starting = app.start().catch((error: unknown) => error);
+    await vi.waitFor(() => expect(verify).toHaveBeenCalledTimes(1));
+    expect(mcp.snapshot()).toEqual({ state: "starting", workspaceVersion: "workspace-1" });
+
+    resolveClosed();
+    await closed;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    resolveReadiness({
+      state: "ready",
+      listening: true,
+      discoveredToolCount: 15,
+      errorCode: null,
+    });
+
+    await expect(starting).resolves.toMatchObject({
+      name: "ActionCapabilityError",
+      code: "server_closed",
+    });
+    expect(actionStates).not.toContainEqual(expect.objectContaining({ state: "ready" }));
+    expect(assertChatGptLogin).not.toHaveBeenCalled();
+    expect(codexStart).not.toHaveBeenCalled();
+    expect(listModels).not.toHaveBeenCalled();
+    expect(selectModel).not.toHaveBeenCalled();
+    expect(companionStart).not.toHaveBeenCalled();
+    expect(startThread).not.toHaveBeenCalled();
+    expect(taskAudit).not.toHaveBeenCalled();
+    expect(taskController.current()).toBeNull();
+    expect(actionUnavailable).not.toHaveBeenCalled();
+    expect(authorityLost).not.toHaveBeenCalled();
+    expect(serverStop).toHaveBeenCalledTimes(1);
+    expect(lifecycleEvents).toEqual(["minecraft:connect", "mcp:stop", "minecraft:disconnect"]);
+  });
+
+  it("makes concurrent MCP starts await one deferred successful readiness operation", async () => {
+    let resolveClosed!: () => void;
+    const closed = new Promise<void>((resolve) => {
+      resolveClosed = resolve;
+    });
+    let resolveReadiness!: (snapshot: McpReadinessSnapshot) => void;
+    const readiness = new Promise<McpReadinessSnapshot>((resolve) => {
+      resolveReadiness = resolve;
+    });
+    const serverStop = vi.fn(async () => {
+      resolveClosed();
+    });
+    const startServer = vi.fn(async (): Promise<RunningMcpServer> => ({
+      host: "127.0.0.1",
+      port: 32123,
+      url: "http://127.0.0.1:32123/mcp",
+      closed,
+      stop: serverStop,
+    }));
+    const verify = vi.fn(async () => readiness);
+    const mcp = new McpLifecycle({} as never, {
+      workspaceVersion: "workspace-1",
+      startServer,
+      verify,
+    });
+
+    const first = mcp.start();
+    await vi.waitFor(() => expect(verify).toHaveBeenCalledTimes(1));
+    let secondSettled = false;
+    const second = mcp.start().then(() => {
+      secondSettled = true;
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(secondSettled).toBe(false);
+
+    resolveReadiness({
+      state: "ready",
+      listening: true,
+      discoveredToolCount: 15,
+      errorCode: null,
+    });
+    await Promise.all([first, second]);
+
+    expect(startServer).toHaveBeenCalledTimes(1);
+    expect(verify).toHaveBeenCalledTimes(1);
+    expect(mcp.snapshot()).toEqual({
+      state: "ready",
+      workspaceVersion: "workspace-1",
+      mcpListening: true,
+      discoveredToolCount: 15,
+    });
+    await mcp.stop();
+    expect(serverStop).toHaveBeenCalledTimes(1);
+  });
+
+  it("makes concurrent MCP starts reject with the same deferred readiness failure", async () => {
+    let resolveClosed!: () => void;
+    const closed = new Promise<void>((resolve) => {
+      resolveClosed = resolve;
+    });
+    let resolveReadiness!: (snapshot: McpReadinessSnapshot) => void;
+    const readiness = new Promise<McpReadinessSnapshot>((resolve) => {
+      resolveReadiness = resolve;
+    });
+    const serverStop = vi.fn(async () => {
+      resolveClosed();
+    });
+    const startServer = vi.fn(async (): Promise<RunningMcpServer> => ({
+      host: "127.0.0.1",
+      port: 32123,
+      url: "http://127.0.0.1:32123/mcp",
+      closed,
+      stop: serverStop,
+    }));
+    const verify = vi.fn(async () => readiness);
+    const mcp = new McpLifecycle({} as never, {
+      workspaceVersion: "workspace-1",
+      startServer,
+      verify,
+    });
+
+    const first = mcp.start().catch((error: unknown) => error);
+    await vi.waitFor(() => expect(verify).toHaveBeenCalledTimes(1));
+    let secondSettled = false;
+    const second = mcp.start().then(
+      () => {
+        secondSettled = true;
+        return undefined;
+      },
+      (error: unknown) => {
+        secondSettled = true;
+        return error;
+      },
+    );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(secondSettled).toBe(false);
+
+    resolveReadiness({
+      state: "failed",
+      listening: true,
+      discoveredToolCount: 14,
+      errorCode: "missing_tools",
+    });
+    const [firstError, secondError] = await Promise.all([first, second]);
+
+    expect(firstError).toMatchObject({ name: "ActionCapabilityError", code: "missing_tools" });
+    expect(secondError).toMatchObject({ name: "ActionCapabilityError", code: "missing_tools" });
+    expect(startServer).toHaveBeenCalledTimes(1);
+    expect(verify).toHaveBeenCalledTimes(1);
+    expect(serverStop).toHaveBeenCalledTimes(1);
+  });
+
+  it("treats a stop racing deferred readiness as intentional and cleans the server once", async () => {
+    let resolveClosed!: () => void;
+    const closed = new Promise<void>((resolve) => {
+      resolveClosed = resolve;
+    });
+    let resolveReadiness!: (snapshot: McpReadinessSnapshot) => void;
+    const readiness = new Promise<McpReadinessSnapshot>((resolve) => {
+      resolveReadiness = resolve;
+    });
+    const serverStop = vi.fn(async () => {
+      resolveClosed();
+    });
+    const verify = vi.fn(async () => readiness);
+    const actionUnavailable = vi.fn();
+    const authorityLost = vi.fn();
+    const actionStates: unknown[] = [];
+    const mcp = new McpLifecycle({} as never, {
+      workspaceVersion: "workspace-1",
+      startServer: async () => ({
+        host: "127.0.0.1",
+        port: 32123,
+        url: "http://127.0.0.1:32123/mcp",
+        closed,
+        stop: serverStop,
+      }),
+      verify,
+      onActionUnavailable: actionUnavailable,
+      reportAuthorityLoss: authorityLost,
+    });
+    mcp.subscribe((snapshot) => actionStates.push(snapshot));
+
+    const starting = mcp.start().catch((error: unknown) => error);
+    await vi.waitFor(() => expect(verify).toHaveBeenCalledTimes(1));
+    await mcp.stop();
+    resolveReadiness({
+      state: "failed",
+      listening: true,
+      discoveredToolCount: 0,
+      errorCode: "timeout",
+    });
+
+    await expect(starting).resolves.toMatchObject({
+      name: "ActionCapabilityError",
+      code: "startup_stopped",
+    });
+    expect(actionStates).toEqual([{ state: "starting", workspaceVersion: "workspace-1" }, null]);
+    expect(serverStop).toHaveBeenCalledTimes(1);
+    expect(actionUnavailable).not.toHaveBeenCalled();
+    expect(authorityLost).not.toHaveBeenCalled();
+  });
 
   it("reports action authority loss only for an unexpected close after readiness", async () => {
     let resolveClosed!: () => void;
