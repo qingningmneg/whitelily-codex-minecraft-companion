@@ -80,9 +80,11 @@ The installer is designed to bundle Electron, the compiled WhiteLily child runti
 
 Authentication files stay under the controlled `%LOCALAPPDATA%\WhiteLily` data root. WhiteLily does not ask you to paste an API key into configuration and has no API Key fallback.
 
-### Switch models later
+### Development build: persistent model switching (not in `v0.2.0-beta.1`)
 
-After first-run setup, open **AI model** at any time, choose a model and reasoning effort from the current ChatGPT session's live catalog, then select **Apply model**. A successful switch stops the active task and revokes its pending actions without disconnecting the confirmed Minecraft LAN session. WhiteLily saves and displays the new selection only after the model is ready, and keeps using it after either the child runtime or desktop app restarts.
+This capability is present in the current development build but **is not included in the `v0.2.0-beta.1` installer described by this guide**. Ordinary users can use it only after the next installer passes validation and is formally released; this guide does not assign that installer's final version number in advance.
+
+In a build that includes this capability, open **AI model** after first-run setup, choose a model and reasoning effort from the current ChatGPT session's live catalog, then select **Apply model**. A successful switch stops the active task and revokes its pending actions without disconnecting the confirmed Minecraft LAN session. WhiteLily saves and displays the new selection only after the model is ready, and keeps using it after either the child runtime or desktop app restarts.
 
 If switching fails, WhiteLily keeps the previous model selection and connection. Do not work around the failure by repeatedly restarting, editing local authentication files, or pasting an API key. Retry once, then save a redacted diagnostic and report the problem if it continues.
 
