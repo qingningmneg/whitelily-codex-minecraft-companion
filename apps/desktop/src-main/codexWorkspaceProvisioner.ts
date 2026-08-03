@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import {
   copyFile,
   lstat,
@@ -31,6 +31,8 @@ export interface WorkspaceProvisionResult {
 
 export type WorkspaceProvisionErrorCode =
   "WORKSPACE_RESOURCE_INVALID" | "WORKSPACE_DEPLOY_FAILED" | "WORKSPACE_ROLLBACK_FAILED";
+
+export type WorkspaceProvisionDiagnosticCode = "WORKSPACE_BACKUP_CLEANUP_FAILED";
 
 export class WorkspaceProvisionError extends Error {
   constructor(readonly code: WorkspaceProvisionErrorCode) {
@@ -68,6 +70,15 @@ interface VerifiedResource {
   readonly manifest: WorkspaceManifest;
   readonly manifestBytes: Buffer;
 }
+
+interface RealDirectoryIdentity {
+  readonly path: string;
+  readonly dev: number | bigint;
+  readonly ino: number | bigint;
+  readonly birthtimeMs: number | bigint;
+}
+
+class OwnedTemporaryCleanupError extends Error {}
 
 export interface DesktopCodexWorkspaceResources {
   readonly resourceDirectory: string;
@@ -111,19 +122,27 @@ export function createWorkspaceVersionEnvironment(
 }
 
 export async function provisionCodexWorkspace(
-  options: { resourceDirectory: string; dataRoot: string },
+  options: {
+    resourceDirectory: string;
+    dataRoot: string;
+    diagnostic?: (code: WorkspaceProvisionDiagnosticCode) => void;
+  },
   operations: WorkspaceProvisionFileOperations = nodeOperations,
 ): Promise<WorkspaceProvisionResult> {
   let resource: VerifiedResource;
   let dataRoot: string;
+  let dataRootIdentity: RealDirectoryIdentity;
   let targetDirectory: string;
   let existing: boolean;
+  let targetIdentity: RealDirectoryIdentity | undefined;
   try {
     resource = await verifyResourceDirectory(options.resourceDirectory, operations);
-    dataRoot = await requireRealDirectory(options.dataRoot, operations);
+    dataRootIdentity = await captureRealDirectory(options.dataRoot, operations);
+    dataRoot = dataRootIdentity.path;
     targetDirectory = resolveContained(dataRoot, TARGET_NAME);
     await assertSafeExistingTarget(targetDirectory, dataRoot, operations);
     existing = await pathExists(targetDirectory, operations);
+    targetIdentity = existing ? await captureRealDirectory(targetDirectory, operations) : undefined;
   } catch {
     throw new WorkspaceProvisionError("WORKSPACE_RESOURCE_INVALID");
   }
@@ -147,47 +166,79 @@ export async function provisionCodexWorkspace(
     : false;
   let stagingDirectory: string | undefined;
   let backupDirectory: string | undefined;
+  let backupContainer: string | undefined;
   let backupMoved = false;
   let candidatePublished = false;
   try {
-    stagingDirectory = await createStagingDirectory(dataRoot, operations);
+    await assertDeploymentBoundary(dataRootIdentity, targetDirectory, targetIdentity, operations);
+    stagingDirectory = await createOwnedTemporaryDirectory(
+      dataRootIdentity,
+      STAGING_PREFIX,
+      operations,
+    );
+    await assertDeploymentBoundary(dataRootIdentity, targetDirectory, targetIdentity, operations);
     await populateStagingDirectory(stagingDirectory, resource, operations);
     await verifyInstalledWorkspace(stagingDirectory, resource, operations);
 
     if (existing) {
-      backupDirectory = resolveContained(dataRoot, `${BACKUP_PREFIX}${randomUUID().toLowerCase()}`);
+      await assertDeploymentBoundary(dataRootIdentity, targetDirectory, targetIdentity, operations);
+      backupContainer = await createOwnedTemporaryDirectory(
+        dataRootIdentity,
+        BACKUP_PREFIX,
+        operations,
+      );
+      await assertDeploymentBoundary(dataRootIdentity, targetDirectory, targetIdentity, operations);
+      backupDirectory = resolveContained(backupContainer, TARGET_NAME);
       await operations.rename(targetDirectory, backupDirectory);
       backupMoved = true;
     }
+    await assertDeploymentBoundary(dataRootIdentity, targetDirectory, undefined, operations);
     await operations.rename(stagingDirectory, targetDirectory);
     stagingDirectory = undefined;
     candidatePublished = true;
     await verifyInstalledWorkspace(targetDirectory, resource, operations);
-    if (backupDirectory !== undefined) {
-      await operations.rm(backupDirectory, { recursive: true, force: false });
-      backupDirectory = undefined;
-      backupMoved = false;
-    }
-    return {
-      contentVersion: resource.manifest.contentVersion,
-      installed: true,
-      repaired,
-      targetDirectory,
-    };
-  } catch {
+  } catch (error) {
     const rollbackSucceeded = await rollbackDeployment(
       {
         targetDirectory,
         stagingDirectory,
         backupDirectory,
+        backupContainer,
         backupMoved,
         candidatePublished,
+        targetIdentity,
       },
       operations,
     );
     throw new WorkspaceProvisionError(
-      rollbackSucceeded ? "WORKSPACE_DEPLOY_FAILED" : "WORKSPACE_ROLLBACK_FAILED",
+      rollbackSucceeded && !(error instanceof OwnedTemporaryCleanupError)
+        ? "WORKSPACE_DEPLOY_FAILED"
+        : "WORKSPACE_ROLLBACK_FAILED",
     );
+  }
+  if (backupContainer !== undefined) {
+    try {
+      await operations.rm(backupContainer, { recursive: true, force: false });
+    } catch {
+      emitWorkspaceDiagnostic(options.diagnostic, "WORKSPACE_BACKUP_CLEANUP_FAILED");
+    }
+  }
+  return {
+    contentVersion: resource.manifest.contentVersion,
+    installed: true,
+    repaired,
+    targetDirectory,
+  };
+}
+
+function emitWorkspaceDiagnostic(
+  diagnostic: ((code: WorkspaceProvisionDiagnosticCode) => void) | undefined,
+  code: WorkspaceProvisionDiagnosticCode,
+): void {
+  try {
+    diagnostic?.(code);
+  } catch {
+    // A diagnostic observer cannot invalidate an already committed workspace.
   }
 }
 
@@ -243,22 +294,49 @@ async function populateStagingDirectory(
   );
 }
 
-async function createStagingDirectory(
-  dataRoot: string,
+async function createOwnedTemporaryDirectory(
+  dataRoot: RealDirectoryIdentity,
+  prefix: string,
   operations: WorkspaceProvisionFileOperations,
 ): Promise<string> {
-  const staging = resolve(await operations.mkdtemp(resolveContained(dataRoot, STAGING_PREFIX)));
-  const parent = relative(dataRoot, staging);
-  if (
-    parent.includes(sep) ||
-    !parent.startsWith(STAGING_PREFIX) ||
-    parent === STAGING_PREFIX ||
-    isAbsolute(parent)
-  ) {
-    throw new Error("invalid");
+  await assertSameRealDirectory(dataRoot, operations);
+  let created: string | undefined;
+  try {
+    created = resolve(await operations.mkdtemp(resolveContained(dataRoot.path, prefix)));
+    const child = relative(dataRoot.path, created);
+    if (child.includes(sep) || !child.startsWith(prefix) || child === prefix || isAbsolute(child)) {
+      throw new Error("invalid");
+    }
+    await requireRealDirectory(created, operations);
+    await assertSameRealDirectory(dataRoot, operations);
+    return created;
+  } catch (error) {
+    if (created !== undefined) {
+      try {
+        await operations.rm(created, { recursive: true, force: true });
+      } catch {
+        throw new OwnedTemporaryCleanupError();
+      }
+    }
+    throw error;
   }
-  await requireRealDirectory(staging, operations);
-  return staging;
+}
+
+async function assertDeploymentBoundary(
+  dataRoot: RealDirectoryIdentity,
+  targetDirectory: string,
+  targetIdentity: RealDirectoryIdentity | undefined,
+  operations: WorkspaceProvisionFileOperations,
+): Promise<void> {
+  await assertSameRealDirectory(dataRoot, operations);
+  const exists = await pathExists(targetDirectory, operations);
+  if (targetIdentity === undefined) {
+    if (exists) throw new Error("invalid");
+    return;
+  }
+  if (!exists) throw new Error("invalid");
+  await assertSafeExistingTarget(targetDirectory, dataRoot.path, operations);
+  await assertSameRealDirectory(targetIdentity, operations);
 }
 
 async function rollbackDeployment(
@@ -266,8 +344,10 @@ async function rollbackDeployment(
     targetDirectory: string;
     stagingDirectory: string | undefined;
     backupDirectory: string | undefined;
+    backupContainer: string | undefined;
     backupMoved: boolean;
     candidatePublished: boolean;
+    targetIdentity: RealDirectoryIdentity | undefined;
   },
   operations: WorkspaceProvisionFileOperations,
 ): Promise<boolean> {
@@ -285,6 +365,8 @@ async function rollbackDeployment(
         succeeded = false;
       } else {
         await operations.rename(deployment.backupDirectory, deployment.targetDirectory);
+        if (deployment.targetIdentity === undefined) throw new Error("invalid");
+        await assertSameRealDirectory(deployment.targetIdentity, operations);
       }
     } catch {
       succeeded = false;
@@ -295,6 +377,19 @@ async function rollbackDeployment(
       await operations.rm(deployment.stagingDirectory, { recursive: true, force: true });
     } catch {
       succeeded = false;
+    }
+  }
+  if (deployment.backupContainer !== undefined) {
+    const backupStillPresent =
+      deployment.backupMoved &&
+      deployment.backupDirectory !== undefined &&
+      (await pathExists(deployment.backupDirectory, operations).catch(() => true));
+    if (!backupStillPresent) {
+      try {
+        await operations.rm(deployment.backupContainer, { recursive: true, force: true });
+      } catch {
+        succeeded = false;
+      }
     }
   }
   return succeeded;
@@ -482,6 +577,34 @@ async function requireRealDirectory(
   const canonical = resolve(await operations.realpath(resolved));
   if (!samePath(canonical, resolved)) throw new Error("invalid");
   return resolved;
+}
+
+async function captureRealDirectory(
+  path: string,
+  operations: WorkspaceProvisionFileOperations,
+): Promise<RealDirectoryIdentity> {
+  const resolved = await requireRealDirectory(path, operations);
+  const metadata = await operations.lstat(resolved);
+  return {
+    path: resolved,
+    dev: metadata.dev,
+    ino: metadata.ino,
+    birthtimeMs: metadata.birthtimeMs,
+  };
+}
+
+async function assertSameRealDirectory(
+  expected: RealDirectoryIdentity,
+  operations: WorkspaceProvisionFileOperations,
+): Promise<void> {
+  const actual = await captureRealDirectory(expected.path, operations);
+  if (
+    actual.dev !== expected.dev ||
+    actual.ino !== expected.ino ||
+    actual.birthtimeMs !== expected.birthtimeMs
+  ) {
+    throw new Error("invalid");
+  }
 }
 
 async function pathExists(

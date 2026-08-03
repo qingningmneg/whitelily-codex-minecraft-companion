@@ -22,6 +22,7 @@ import {
   createWorkspaceVersionEnvironment,
   provisionCodexWorkspace,
   resolveDesktopCodexWorkspaceResources,
+  WorkspaceProvisionError,
   type WorkspaceProvisionResult,
 } from "./codexWorkspaceProvisioner.js";
 import {
@@ -314,6 +315,47 @@ export async function waitForRendererReady(options: {
 }
 
 const STARTUP_FAILURE_MESSAGE = "WhiteLily Electron startup failed";
+const STARTUP_ERROR_TITLE = "WhiteLily 启动失败";
+
+export interface ElectronMainFailureDisplayOptions {
+  run(): Promise<void>;
+  displayError(title: string, message: string): void | Promise<void>;
+  setExitCode(code: number): void;
+}
+
+export async function runElectronMainWithFailureDisplay(
+  options: ElectronMainFailureDisplayOptions,
+): Promise<void> {
+  try {
+    await options.run();
+  } catch (error) {
+    const message = localStartupFailureMessage(error);
+    try {
+      await options.displayError(STARTUP_ERROR_TITLE, message);
+    } catch {
+      // Failure display is best effort; deterministic process failure still follows.
+    }
+    try {
+      options.setExitCode(1);
+    } catch {
+      // The outer Electron process has no additional trusted recovery path.
+    }
+  }
+}
+
+function localStartupFailureMessage(error: unknown): string {
+  if (error instanceof WorkspaceProvisionError) {
+    switch (error.code) {
+      case "WORKSPACE_RESOURCE_INVALID":
+        return "无法验证 WhiteLily 动作工作区（WORKSPACE_RESOURCE_INVALID）。请重新安装 WhiteLily 后重试。";
+      case "WORKSPACE_DEPLOY_FAILED":
+        return "无法部署 WhiteLily 动作工作区（WORKSPACE_DEPLOY_FAILED）。请关闭 WhiteLily 后重试；如仍失败，请重新安装。";
+      case "WORKSPACE_ROLLBACK_FAILED":
+        return "无法恢复 WhiteLily 动作工作区（WORKSPACE_ROLLBACK_FAILED）。请保留当前用户数据并重新安装 WhiteLily。";
+    }
+  }
+  return "WhiteLily 无法启动（STARTUP_FAILED）。请重新启动；如仍失败，请重新安装。";
+}
 
 export async function startElectronComposition<TWindow extends StartupWindowPort>(
   options: ElectronStartupOptions<TWindow>,
@@ -408,6 +450,7 @@ export async function runElectronMain(): Promise<void> {
             workspaceProvision = await provisionCodexWorkspace({
               resourceDirectory: workspaceResources.resourceDirectory,
               dataRoot: paths.dataRoot,
+              diagnostic: (code) => console.error(code),
             });
           },
           createSupervisor: (paths, localAppData) => {
@@ -647,7 +690,14 @@ function createFallbackTrayIcon(nativeImage: {
 }
 
 if (process.versions.electron) {
-  void runElectronMain().catch(() => {
-    process.exitCode = 1;
+  void runElectronMainWithFailureDisplay({
+    run: runElectronMain,
+    displayError: async (title, message) => {
+      const { dialog } = await import("electron");
+      dialog.showErrorBox(title, message);
+    },
+    setExitCode: (code) => {
+      process.exitCode = code;
+    },
   });
 }

@@ -6,6 +6,7 @@ import {
   createCloseToTrayHandler,
   createNativeTray,
   prepareElectronPrimary,
+  runElectronMainWithFailureDisplay,
   runSingleInstanceApplication,
   showExistingWindow,
   startElectronPrimary,
@@ -13,6 +14,10 @@ import {
   waitForRendererReady,
 } from "./main.js";
 import { resolveAppPaths } from "./appPaths.js";
+import {
+  WorkspaceProvisionError,
+  type WorkspaceProvisionErrorCode,
+} from "./codexWorkspaceProvisioner.js";
 import type { RuntimeSnapshot } from "../../../src/runtime/runtimeEvents.js";
 
 class FakeWindow {
@@ -510,6 +515,77 @@ describe("Electron application ownership", () => {
     ).rejects.toThrow("workspace provisioning failed");
     expect(createSupervisor).not.toHaveBeenCalled();
     expect(startComposition).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [
+      "WORKSPACE_RESOURCE_INVALID",
+      "无法验证 WhiteLily 动作工作区（WORKSPACE_RESOURCE_INVALID）。请重新安装 WhiteLily 后重试。",
+    ],
+    [
+      "WORKSPACE_DEPLOY_FAILED",
+      "无法部署 WhiteLily 动作工作区（WORKSPACE_DEPLOY_FAILED）。请关闭 WhiteLily 后重试；如仍失败，请重新安装。",
+    ],
+    [
+      "WORKSPACE_ROLLBACK_FAILED",
+      "无法恢复 WhiteLily 动作工作区（WORKSPACE_ROLLBACK_FAILED）。请保留当前用户数据并重新安装 WhiteLily。",
+    ],
+  ] as const)(
+    "shows one stable local error for %s before any supervisor is created",
+    async (code, expectedMessage) => {
+      const createSupervisor = vi.fn();
+      const startComposition = vi.fn();
+      const displayError = vi.fn(async () => undefined);
+      const setExitCode = vi.fn();
+
+      await runElectronMainWithFailureDisplay({
+        run: () =>
+          startElectronPrimary(
+            {
+              prepareSupervisor: async () => {
+                throw new WorkspaceProvisionError(code as WorkspaceProvisionErrorCode);
+              },
+              createSupervisor,
+              startComposition,
+            },
+            {
+              localAppData: String.raw`C:\LocalAppData\owner`,
+              paths: { dataRoot: String.raw`C:\LocalAppData\owner\WhiteLily` },
+            },
+            { transferToComposition: vi.fn() },
+          ),
+        displayError,
+        setExitCode,
+      });
+
+      expect(createSupervisor).not.toHaveBeenCalled();
+      expect(startComposition).not.toHaveBeenCalled();
+      expect(displayError).toHaveBeenCalledOnce();
+      expect(displayError).toHaveBeenCalledWith("WhiteLily 启动失败", expectedMessage);
+      expect(setExitCode).toHaveBeenCalledOnce();
+      expect(setExitCode).toHaveBeenCalledWith(1);
+    },
+  );
+
+  it("redacts an unexpected startup failure before displaying it locally", async () => {
+    const displayError = vi.fn(async () => undefined);
+    const setExitCode = vi.fn();
+
+    await runElectronMainWithFailureDisplay({
+      run: async () => {
+        throw new Error(String.raw`failed at C:\private\owner\workspace`);
+      },
+      displayError,
+      setExitCode,
+    });
+
+    expect(displayError).toHaveBeenCalledOnce();
+    expect(displayError).toHaveBeenCalledWith(
+      "WhiteLily 启动失败",
+      "WhiteLily 无法启动（STARTUP_FAILED）。请重新启动；如仍失败，请重新安装。",
+    );
+    expect(JSON.stringify(displayError.mock.calls)).not.toContain("private");
+    expect(setExitCode).toHaveBeenCalledWith(1);
   });
 
   it("does not double quit after composition takes startup ownership", async () => {

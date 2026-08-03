@@ -268,6 +268,54 @@ describe("provisionCodexWorkspace", () => {
     await expect(residueNames(fixture.dataRoot)).resolves.toEqual([]);
   });
 
+  it("keeps the verified new target when post-commit backup cleanup partially fails", async () => {
+    const fixture = await createFixture({
+      contentVersion: "old",
+      config: "old config\n",
+      agents: "old agents\n",
+    });
+    await provisionCodexWorkspace(fixture);
+    await rm(fixture.resourceDirectory, { recursive: true });
+    await mkdir(fixture.resourceDirectory, { recursive: true });
+    await writeResource(fixture.resourceDirectory, { contentVersion: "2" });
+    const diagnostics: string[] = [];
+    const operations = actualOperations({
+      rm: async (path, options) => {
+        if (basename(path).startsWith(".codex-workspace-backup-")) {
+          const backedUpWorkspace = (await readdir(path)).includes("codex-workspace")
+            ? join(path, "codex-workspace")
+            : path;
+          await rm(join(backedUpWorkspace, ".codex"), { recursive: true, force: true });
+          throw new Error("injected partial backup cleanup failure");
+        }
+        await rm(path, options);
+      },
+    });
+
+    await expect(
+      provisionCodexWorkspace(
+        {
+          ...fixture,
+          diagnostic: (code: string) => diagnostics.push(code),
+        },
+        operations,
+      ),
+    ).resolves.toEqual({
+      contentVersion: "2",
+      installed: true,
+      repaired: false,
+      targetDirectory: resolve(fixture.targetDirectory),
+    });
+    await expect(readFile(join(fixture.targetDirectory, "AGENTS.md"), "utf8")).resolves.toBe(
+      AGENTS,
+    );
+    await expect(
+      readFile(join(fixture.targetDirectory, ".codex", "config.toml"), "utf8"),
+    ).resolves.toBe(CONFIG);
+    expect(diagnostics).toEqual(["WORKSPACE_BACKUP_CLEANUP_FAILED"]);
+    await expect(residueNames(fixture.dataRoot)).resolves.toHaveLength(1);
+  });
+
   it("reports a stable rollback failure when publishing and restoring both fail", async () => {
     const fixture = await createFixture({ contentVersion: "old", agents: "old agents\n" });
     await provisionCodexWorkspace(fixture);
@@ -279,9 +327,34 @@ describe("provisionCodexWorkspace", () => {
         const name = basename(source);
         if (
           name.startsWith(".codex-workspace-staging-") ||
-          name.startsWith(".codex-workspace-backup-")
+          name.startsWith(".codex-workspace-backup-") ||
+          basename(dirname(source)).startsWith(".codex-workspace-backup-")
         ) {
           throw new Error("injected rename failure");
+        }
+        await rename(source, destination);
+      },
+    });
+
+    await expect(provisionCodexWorkspace(fixture, operations)).rejects.toMatchObject({
+      name: "WorkspaceProvisionError",
+      code: "WORKSPACE_ROLLBACK_FAILED",
+    });
+  });
+
+  it("does not report deployment rollback success until the prior target identity is restored", async () => {
+    const fixture = await createFixture({ contentVersion: "old", agents: "old agents\n" });
+    await provisionCodexWorkspace(fixture);
+    await rm(fixture.resourceDirectory, { recursive: true });
+    await mkdir(fixture.resourceDirectory, { recursive: true });
+    await writeResource(fixture.resourceDirectory, { contentVersion: "2" });
+    const operations = actualOperations({
+      rename: async (source, destination) => {
+        if (basename(source).startsWith(".codex-workspace-staging-")) {
+          throw new Error("injected publish failure");
+        }
+        if (basename(dirname(source)).startsWith(".codex-workspace-backup-")) {
+          return;
         }
         await rename(source, destination);
       },
@@ -389,5 +462,152 @@ describe("provisionCodexWorkspace", () => {
       code: "WORKSPACE_RESOURCE_INVALID",
     });
     await expect(readdir(fixture.dataRoot)).resolves.toEqual([]);
+  });
+
+  it("cleans an in-root staging directory when its post-create realpath check fails", async () => {
+    const fixture = await createFixture();
+    let createdStaging: string | undefined;
+    const operations = actualOperations({
+      mkdtemp: async (prefix) => {
+        createdStaging = await mkdtemp(prefix);
+        return createdStaging;
+      },
+      realpath: async (path) => {
+        if (createdStaging !== undefined && resolve(path) === resolve(createdStaging)) {
+          throw new Error("injected staging realpath failure");
+        }
+        return realpath(path);
+      },
+    });
+
+    await expect(provisionCodexWorkspace(fixture, operations)).rejects.toMatchObject({
+      code: "WORKSPACE_DEPLOY_FAILED",
+    });
+    await expect(residueNames(fixture.dataRoot)).resolves.toEqual([]);
+  });
+
+  it("reports rollback failure when an invalid staging directory cannot be cleaned", async () => {
+    const fixture = await createFixture();
+    let createdStaging: string | undefined;
+    const operations = actualOperations({
+      mkdtemp: async (prefix) => {
+        createdStaging = await mkdtemp(prefix);
+        return createdStaging;
+      },
+      realpath: async (path) => {
+        if (createdStaging !== undefined && resolve(path) === resolve(createdStaging)) {
+          throw new Error("injected staging realpath failure");
+        }
+        return realpath(path);
+      },
+      rm: async (path, options) => {
+        if (createdStaging !== undefined && resolve(path) === resolve(createdStaging)) {
+          throw new Error("injected staging cleanup failure");
+        }
+        await rm(path, options);
+      },
+    });
+
+    await expect(provisionCodexWorkspace(fixture, operations)).rejects.toMatchObject({
+      code: "WORKSPACE_ROLLBACK_FAILED",
+    });
+    await expect(residueNames(fixture.dataRoot)).resolves.toHaveLength(1);
+  });
+
+  it("removes an outside directory returned by a broken staging creator", async () => {
+    const fixture = await createFixture();
+    let outsideStaging: string | undefined;
+    const operations = actualOperations({
+      mkdtemp: async (prefix) => {
+        if (basename(prefix) === ".codex-workspace-staging-") {
+          outsideStaging = await mkdtemp(join(fixture.root, "outside-staging-"));
+          return outsideStaging;
+        }
+        return mkdtemp(prefix);
+      },
+    });
+
+    await expect(provisionCodexWorkspace(fixture, operations)).rejects.toMatchObject({
+      code: "WORKSPACE_DEPLOY_FAILED",
+    });
+    await expect(residueNames(fixture.dataRoot)).resolves.toEqual([]);
+    expect(outsideStaging).toBeDefined();
+    await expect(lstat(outsideStaging!)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("revalidates the original data root identity immediately before staging mutation", async () => {
+    const fixture = await createFixture();
+    const outside = join(fixture.root, "replacement-root");
+    await mkdir(outside);
+    let dataRootRealpathChecks = 0;
+    const operations = actualOperations({
+      realpath: async (path) => {
+        if (resolve(path) === resolve(fixture.dataRoot)) {
+          dataRootRealpathChecks += 1;
+          if (dataRootRealpathChecks === 2) return outside;
+        }
+        return realpath(path);
+      },
+    });
+
+    await expect(provisionCodexWorkspace(fixture, operations)).rejects.toMatchObject({
+      code: "WORKSPACE_DEPLOY_FAILED",
+    });
+    expect(dataRootRealpathChecks).toBeGreaterThanOrEqual(2);
+    await expect(readdir(fixture.dataRoot)).resolves.toEqual([]);
+    await expect(readdir(outside)).resolves.toEqual([]);
+  });
+
+  it("revalidates an initially absent target after staging creation and before copying", async () => {
+    const fixture = await createFixture();
+    const outside = join(fixture.root, "raced-target");
+    await mkdir(outside);
+    await writeFile(join(outside, "sentinel.txt"), "untouched");
+    let copies = 0;
+    const operations = actualOperations({
+      mkdtemp: async (prefix) => {
+        const staging = await mkdtemp(prefix);
+        if (basename(prefix) === ".codex-workspace-staging-") {
+          await symlink(outside, fixture.targetDirectory, "junction");
+        }
+        return staging;
+      },
+      copyFile: async (source, destination) => {
+        copies += 1;
+        await copyFile(source, destination);
+      },
+    });
+
+    await expect(provisionCodexWorkspace(fixture, operations)).rejects.toMatchObject({
+      code: "WORKSPACE_DEPLOY_FAILED",
+    });
+    expect(copies).toBe(0);
+    await expect(readFile(join(outside, "sentinel.txt"), "utf8")).resolves.toBe("untouched");
+    await expect(residueNames(fixture.dataRoot)).resolves.toEqual([]);
+  });
+
+  it("uses an exclusive same-root temporary reservation for the backup", async () => {
+    const fixture = await createFixture({ contentVersion: "old", agents: "old agents\n" });
+    await provisionCodexWorkspace(fixture);
+    await rm(fixture.resourceDirectory, { recursive: true });
+    await mkdir(fixture.resourceDirectory, { recursive: true });
+    await writeResource(fixture.resourceDirectory, { contentVersion: "2" });
+    const collision = join(fixture.dataRoot, ".codex-workspace-backup-collision");
+    await mkdir(collision);
+    await writeFile(join(collision, "sentinel.txt"), "untouched");
+    let backupReservations = 0;
+    const operations = actualOperations({
+      mkdtemp: async (prefix) => {
+        if (basename(prefix) === ".codex-workspace-backup-") backupReservations += 1;
+        return mkdtemp(prefix);
+      },
+    });
+
+    await expect(provisionCodexWorkspace(fixture, operations)).resolves.toMatchObject({
+      contentVersion: "2",
+      installed: true,
+    });
+    expect(backupReservations).toBe(1);
+    await expect(readFile(join(collision, "sentinel.txt"), "utf8")).resolves.toBe("untouched");
   });
 });
