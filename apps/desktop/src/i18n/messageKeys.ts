@@ -158,6 +158,7 @@ export const MESSAGE_KEYS = [
   "activity.lifecycle",
   "activity.minecraft",
   "activity.codex",
+  "activity.actions",
   "activity.taskStarted",
   "activity.taskEnded",
   "activity.error",

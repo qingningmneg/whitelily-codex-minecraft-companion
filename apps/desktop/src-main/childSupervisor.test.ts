@@ -35,6 +35,7 @@ const idleSnapshot: RuntimeSnapshot = {
   lifecycle: "idle",
   minecraft: { state: "disconnected", sessionId: null },
   codex: { state: "stopped", model: null },
+  actions: null,
   task: null,
   lastError: null,
 };
@@ -259,6 +260,17 @@ function runtimeSnapshot(
     ...idleSnapshot,
     revision,
     lifecycle,
+    actions:
+      lifecycle === "running" || lifecycle === "stopping"
+        ? {
+            state: "ready",
+            workspaceVersion: "workspace-1",
+            mcpListening: true,
+            discoveredToolCount: 15,
+          }
+        : lifecycle === "starting"
+          ? { state: "starting", workspaceVersion: "workspace-1" }
+          : null,
   };
 }
 
@@ -2135,7 +2147,7 @@ describe("ChildSupervisor", () => {
       version: DESKTOP_PROTOCOL_VERSION,
       id: request!.id,
       ok: true,
-      result: { ...idleSnapshot, lifecycle: "running" },
+      result: runtimeSnapshot(idleSnapshot.revision, "running"),
     });
     await expect(started).resolves.toMatchObject({ lifecycle: "running" });
 

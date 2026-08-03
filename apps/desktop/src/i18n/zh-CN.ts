@@ -165,6 +165,7 @@ export const zhCN = {
   "activity.lifecycle": "运行状态变为“{state}”",
   "activity.minecraft": "连接状态变为“{state}”",
   "activity.codex": "伙伴状态变为“{state}”",
+  "activity.actions": "Minecraft 动作状态变为“{state}”",
   "activity.taskStarted": "任务已开始",
   "activity.taskEnded": "任务已结束",
   "activity.error": "运行时错误 · {code}",

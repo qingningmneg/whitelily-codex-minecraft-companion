@@ -722,6 +722,7 @@ describe("native tray composition", () => {
       lifecycle: "stopped",
       minecraft: { state: "disconnected", sessionId: null },
       codex: { state: "stopped", model: null },
+      actions: null,
       task: null,
       lastError: null,
     };
@@ -731,12 +732,19 @@ describe("native tray composition", () => {
           ...snapshot,
           lifecycle: "running",
           minecraft: { state: "connected", sessionId: "session_7F2A" },
+          actions: {
+            state: "ready",
+            workspaceVersion: "workspace-1",
+            mcpListening: true,
+            discoveredToolCount: 15,
+          },
         };
       } else if (command.kind === "stop_runtime") {
         snapshot = {
           ...snapshot,
           lifecycle: "stopped",
           minecraft: { state: "disconnected", sessionId: null },
+          actions: null,
         };
       }
       return snapshot;

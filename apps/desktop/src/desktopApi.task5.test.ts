@@ -56,6 +56,12 @@ describe("Task 5 preload API", () => {
       lifecycle: "running",
       minecraft: { state: "connected", sessionId: null },
       codex: { state: "ready", model: "gpt-5.6" },
+      actions: {
+        state: "ready",
+        workspaceVersion: "workspace-1",
+        mcpListening: true,
+        discoveredToolCount: 15,
+      },
       task: null,
       lastError: null,
     } as const;

@@ -182,6 +182,7 @@ export const en = {
   "activity.lifecycle": "Runtime changed to “{state}”",
   "activity.minecraft": "Connection changed to “{state}”",
   "activity.codex": "Companion changed to “{state}”",
+  "activity.actions": "Minecraft actions changed to “{state}”",
   "activity.taskStarted": "Task started",
   "activity.taskEnded": "Task ended",
   "activity.error": "Runtime error · {code}",

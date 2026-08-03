@@ -121,9 +121,10 @@ export async function verifyMinecraftMcp(
   try {
     transport = new StreamableHTTPClientTransport(endpoint);
     client = new ReadinessClient({ name: "whitelily-mcp-readiness", version: "1.0.0" });
-    // SDK 1.29 transport declarations conflict with exactOptionalPropertyTypes.
-    // @ts-expect-error The runtime transport implements the Client Transport contract.
-    await client.connect(transport, { signal: controller.signal });
+    // The SDK exposes structurally equivalent transport declarations through two module paths.
+    await client.connect(transport as unknown as Parameters<ReadinessClient["connect"]>[0], {
+      signal: controller.signal,
+    });
     listening = true;
     const listed = await client.listTools(undefined, { signal: controller.signal });
     const names = listed.tools.map((tool) => tool.name);

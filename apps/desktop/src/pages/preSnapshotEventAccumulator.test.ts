@@ -20,52 +20,72 @@ describe("pre-snapshot runtime event accumulator", () => {
     expect(accumulator.drain().map((event) => event.revision)).toEqual([3, 4]);
   });
 
-  it("retains only the latest event for each of the five disjoint snapshot fields", () => {
+  it("retains only the latest event for each of the six disjoint snapshot fields", () => {
     const accumulator = createPreSnapshotEventAccumulator();
 
     for (let index = 0; index < 20; index += 1) {
       accumulator.add({
         kind: "lifecycle",
-        revision: index * 5 + 1,
+        revision: index * 6 + 1,
         state: index % 2 === 0 ? "starting" : "running",
       });
       accumulator.add({
         kind: "minecraft",
-        revision: index * 5 + 2,
+        revision: index * 6 + 2,
         state: { state: "connecting", sessionId: `session-${index}` },
       });
       accumulator.add({
         kind: "codex",
-        revision: index * 5 + 3,
+        revision: index * 6 + 3,
         state: { state: "ready", model: `model-${index}` },
       });
-      accumulator.add({ kind: "task", revision: index * 5 + 4, task: null });
+      accumulator.add({
+        kind: "actions",
+        revision: index * 6 + 4,
+        state: {
+          state: "ready",
+          workspaceVersion: `workspace-${index}`,
+          mcpListening: true,
+          discoveredToolCount: 15,
+        },
+      });
+      accumulator.add({ kind: "task", revision: index * 6 + 5, task: null });
       accumulator.add({
         kind: "error",
-        revision: index * 5 + 5,
+        revision: index * 6 + 6,
         error: { code: `ERROR_${index}`, message: `private-${index}` },
       });
     }
 
     const retained = accumulator.drain();
-    expect(retained).toHaveLength(5);
+    expect(retained).toHaveLength(6);
     expect(retained).toEqual(
       expect.arrayContaining([
-        { kind: "lifecycle", revision: 96, state: "running" },
+        { kind: "lifecycle", revision: 115, state: "running" },
         {
           kind: "minecraft",
-          revision: 97,
+          revision: 116,
           state: { state: "connecting", sessionId: "session-19" },
         },
         {
           kind: "codex",
-          revision: 98,
+          revision: 117,
           state: { state: "ready", model: "model-19" },
         },
-        { kind: "task", revision: 99, task: null },
+        {
+          kind: "actions",
+          revision: 118,
+          state: {
+            state: "ready",
+            workspaceVersion: "workspace-19",
+            mcpListening: true,
+            discoveredToolCount: 15,
+          },
+        },
+        { kind: "task", revision: 119, task: null },
         {
           kind: "error",
-          revision: 100,
+          revision: 120,
           error: { code: "ERROR_19", message: "private-19" },
         },
       ]),

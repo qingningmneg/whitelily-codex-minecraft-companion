@@ -104,10 +104,8 @@ export async function startMcpServer(options: StartMcpServerOptions): Promise<Ru
       return;
     }
     const server = createServerForRequest(dependencies);
-    // SDK 1.29 supports stateless mode with an explicit undefined generator, but its
-    // declaration is not compatible with exactOptionalPropertyTypes.
-    // @ts-expect-error SDK 1.29 stateless transport declaration omits undefined
-    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+    // Omitting the optional session generator selects the SDK's stateless mode.
+    const transport = new StreamableHTTPServerTransport();
     let closePromise: Promise<void> | undefined;
     const activeRequest: ActiveRequest = {
       server,
@@ -124,8 +122,7 @@ export async function startMcpServer(options: StartMcpServerOptions): Promise<Ru
     active.add(activeRequest);
     response.once("close", () => void activeRequest.close());
     try {
-      // @ts-expect-error SDK 1.29 transport declaration is incompatible with exactOptionalPropertyTypes
-      await server.connect(transport);
+      await server.connect(transport as unknown as Parameters<typeof server.connect>[0]);
       await transport.handleRequest(request, response, request.body);
     } catch {
       await activeRequest.close();

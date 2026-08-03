@@ -18,6 +18,12 @@ const activeSnapshot: RuntimeSnapshot = {
   lifecycle: "running",
   minecraft: { state: "connected", sessionId: "session_7F2A" },
   codex: { state: "ready", model: "gpt-5.6" },
+  actions: {
+    state: "ready",
+    workspaceVersion: "workspace-1",
+    mcpListening: true,
+    discoveredToolCount: 15,
+  },
   task: {
     id: "task_7",
     goal: "走到主人身边",
@@ -56,6 +62,7 @@ const stoppedSnapshot: RuntimeSnapshot = {
   lifecycle: "stopped",
   minecraft: { state: "disconnected", sessionId: null },
   codex: { state: "stopped", model: null },
+  actions: null,
   task: null,
   lastError: null,
 };
@@ -366,6 +373,37 @@ describe("bilingual control-center home", () => {
     expect(await screen.findByText("gpt-fast-live")).toBeTruthy();
     expect(screen.getByRole("main").id).toBe("home");
     expect(document.querySelector(".onboarding")).toBeNull();
+  });
+
+  it("replays and describes the latest action-capability event", async () => {
+    const status = deferred<RuntimeSnapshot>();
+    const harness = createApiHarness({ status: status.promise });
+    const onInitialSnapshot = vi.fn();
+    render(<HomePage api={harness.api} locale="en" onInitialSnapshot={onInitialSnapshot} />);
+    const failedActions = {
+      state: "failed" as const,
+      workspaceVersion: "workspace-1",
+      mcpListening: false,
+      discoveredToolCount: 0,
+      errorCode: "server_closed",
+    };
+
+    act(() => {
+      harness.emit(revisionedEvent({ kind: "actions", state: failedActions }, 11));
+    });
+    await act(async () => {
+      status.resolve(revisionedSnapshot(activeSnapshot, 10));
+      await status.promise;
+    });
+
+    expect(onInitialSnapshot).toHaveBeenCalledWith(
+      expect.objectContaining({ revision: 11, actions: failedActions }),
+    );
+    expect(
+      within(screen.getByRole("region", { name: "Recent activity" })).getByText(
+        "Minecraft actions changed to “Failed”",
+      ),
+    ).toBeTruthy();
   });
 
   it("ignores an unsafe invalidation without advancing high-water or routing", async () => {

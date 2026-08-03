@@ -520,6 +520,8 @@ function applyRuntimeEvent(snapshot: RuntimeSnapshot, event: RuntimeEvent): Runt
       return { ...snapshot, revision: event.revision, minecraft: event.state };
     case "codex":
       return { ...snapshot, revision: event.revision, codex: event.state };
+    case "actions":
+      return { ...snapshot, revision: event.revision, actions: event.state };
     case "task":
       return { ...snapshot, revision: event.revision, task: event.task };
     case "error":
@@ -546,6 +548,12 @@ function codexText(locale: Locale, state: RuntimeSnapshot["codex"]["state"]): st
   return translate(locale, `codex.${state}`);
 }
 
+function actionsText(locale: Locale, state: RuntimeSnapshot["actions"]): string {
+  return state === null
+    ? translate(locale, "diagnostics.action.unavailable")
+    : translate(locale, `diagnostics.action.state.${state.state}`);
+}
+
 function eventText(locale: Locale, event: RuntimeEvent): string {
   switch (event.kind) {
     case "lifecycle":
@@ -559,6 +567,10 @@ function eventText(locale: Locale, event: RuntimeEvent): string {
     case "codex":
       return translate(locale, "activity.codex", {
         state: codexText(locale, event.state.state),
+      });
+    case "actions":
+      return translate(locale, "activity.actions", {
+        state: actionsText(locale, event.state),
       });
     case "task":
       return translate(locale, event.task ? "activity.taskStarted" : "activity.taskEnded");

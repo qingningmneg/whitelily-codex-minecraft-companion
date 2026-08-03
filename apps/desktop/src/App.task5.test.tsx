@@ -8,11 +8,19 @@ import { ONBOARDING_STORAGE_KEY, persistOnboardingLocale } from "./pages/Onboard
 
 type OwnerAuthoritySnapshot = OwnerIdentitySnapshot & { childGeneration: number };
 
+const readyActions = {
+  state: "ready" as const,
+  workspaceVersion: "workspace-1",
+  mcpListening: true as const,
+  discoveredToolCount: 15,
+};
+
 const runningSnapshot = {
   revision: 1,
   lifecycle: "running" as const,
   minecraft: { state: "connected" as const, sessionId: "session" },
   codex: { state: "ready" as const, model: "live-model" },
+  actions: readyActions,
   task: null,
   lastError: null,
 };
@@ -164,6 +172,7 @@ describe("Task 5 application routing", () => {
         lifecycle: "running",
         minecraft: { state: "connected", sessionId: "session" },
         codex: { state: "ready", model: "live-model" },
+        actions: readyActions,
         task: null,
         lastError: null,
       })),
@@ -243,6 +252,7 @@ describe("Task 5 application routing", () => {
         lifecycle: "stopped",
         minecraft: { state: "disconnected", sessionId: null },
         codex: { state: "stopped", model: null },
+        actions: null,
         task: null,
         lastError: null,
       },
@@ -616,6 +626,7 @@ describe("Task 5 application routing", () => {
           lifecycle: "stopped",
           minecraft: { state: "disconnected", sessionId: null },
           codex: { state: "stopped", model: null },
+          actions: null,
           task: null,
           lastError: null,
         },
