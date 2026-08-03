@@ -178,6 +178,89 @@ afterEach(async () => {
 });
 
 describe("Minecraft MCP readiness", () => {
+  it("rejects every non-canonical endpoint before SDK connection or network I/O", async () => {
+    const value = await endpoint();
+    const port = new URL(value.url).port;
+    const connect = vi.spyOn(Client.prototype, "connect");
+    const invalidUrls = [
+      "not-a-url",
+      `https://127.0.0.1:${port}/mcp`,
+      `http://localhost:${port}/mcp`,
+      `http://[::1]:${port}/mcp`,
+      `http://user:password@127.0.0.1:${port}/mcp`,
+      `http://127.0.0.1:${port}/mcp?token=secret`,
+      `http://127.0.0.1:${port}/mcp#fragment`,
+      `http://127.0.0.1:${port}/other`,
+      "http://127.0.0.1/mcp",
+      "http://127.0.0.1:80/mcp",
+      "http://127.0.0.1:0/mcp",
+      "http://127.0.0.1:65536/mcp",
+      `http://2130706433:${port}/mcp`,
+      `http://127.0.0.1:0${port}/mcp`,
+    ];
+
+    for (const url of invalidUrls) {
+      await expect(
+        verifyMinecraftMcp({
+          url,
+          expectedToolNames: EXPECTED_TOOL_NAMES,
+          timeoutMs: 1_000,
+        }),
+      ).resolves.toEqual({
+        state: "failed",
+        listening: false,
+        discoveredToolCount: 0,
+        errorCode: "invalid_url",
+      });
+    }
+    expect(connect).not.toHaveBeenCalled();
+    expect([...value.methodCounts.values()]).toEqual([]);
+  });
+
+  it("rejects invalid timeout boundaries before timers, SDK connection, or network I/O", async () => {
+    const value = await endpoint();
+    const connect = vi.spyOn(Client.prototype, "connect");
+    const setTimeoutCall = vi.spyOn(globalThis, "setTimeout");
+    const invalidTimeouts = [
+      0,
+      -1,
+      Number.NaN,
+      Number.POSITIVE_INFINITY,
+      Number.NEGATIVE_INFINITY,
+      1.5,
+      30_001,
+      Number.MAX_SAFE_INTEGER,
+      Number.MAX_SAFE_INTEGER + 1,
+    ];
+
+    for (const timeoutMs of invalidTimeouts) {
+      await expect(
+        verifyMinecraftMcp({
+          url: value.url,
+          expectedToolNames: EXPECTED_TOOL_NAMES,
+          timeoutMs,
+        }),
+      ).resolves.toEqual({
+        state: "failed",
+        listening: false,
+        discoveredToolCount: 0,
+        errorCode: "invalid_timeout",
+      });
+    }
+    expect(setTimeoutCall).not.toHaveBeenCalled();
+    expect(connect).not.toHaveBeenCalled();
+    expect([...value.methodCounts.values()]).toEqual([]);
+  });
+
+  it("accepts the documented 30-second local readiness timeout ceiling", async () => {
+    const value = await endpoint();
+
+    await expect(verify(value, { timeoutMs: 30_000 })).resolves.toMatchObject({
+      state: "ready",
+      errorCode: null,
+    });
+  });
+
   it("accepts exactly the expected Minecraft catalog without calling a tool", async () => {
     const value = await endpoint();
 
@@ -237,11 +320,13 @@ describe("Minecraft MCP readiness", () => {
     });
   });
 
-  it("redacts connection response bodies and URL credentials into a local error code", async () => {
+  it("redacts connection response bodies into a local error code", async () => {
     const value = await endpoint({ failInitializeBody: "server-secret-body" });
+    const clientClose = vi.spyOn(Client.prototype, "close");
+    const transportClose = vi.spyOn(StreamableHTTPClientTransport.prototype, "close");
 
     const result = await verifyMinecraftMcp({
-      url: `${value.url}?token=url-secret-token`,
+      url: value.url,
       expectedToolNames: EXPECTED_TOOL_NAMES,
       timeoutMs: 1_000,
     });
@@ -252,7 +337,9 @@ describe("Minecraft MCP readiness", () => {
       discoveredToolCount: 0,
       errorCode: "connection_failed",
     });
-    expect(JSON.stringify(result)).not.toMatch(/server-secret-body|url-secret-token/);
+    expect(JSON.stringify(result)).not.toContain("server-secret-body");
+    expect(clientClose).toHaveBeenCalledTimes(1);
+    expect(transportClose).toHaveBeenCalledTimes(1);
   });
 
   it("times out a connected server that does not return tools", async () => {
@@ -311,6 +398,38 @@ describe("Minecraft MCP readiness", () => {
     await verify(value);
 
     expect(clientClose).toHaveBeenCalledTimes(1);
-    expect(transportClose).toHaveBeenCalledTimes(2);
+    expect(transportClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("contains a client cleanup rejection without changing a ready snapshot", async () => {
+    const clientClose = vi
+      .spyOn(Client.prototype, "close")
+      .mockRejectedValue(new Error("cleanup-secret"));
+    const transportClose = vi.spyOn(StreamableHTTPClientTransport.prototype, "close");
+    const value = await endpoint();
+
+    await expect(verify(value)).resolves.toEqual({
+      state: "ready",
+      listening: true,
+      discoveredToolCount: 15,
+      errorCode: null,
+    });
+    expect(clientClose).toHaveBeenCalledTimes(1);
+    expect(transportClose).not.toHaveBeenCalled();
+  });
+
+  it("contains cleanup rejection without replacing the first timeout cause", async () => {
+    const clientClose = vi
+      .spyOn(Client.prototype, "close")
+      .mockRejectedValue(new Error("cleanup-secret"));
+    const transportClose = vi.spyOn(StreamableHTTPClientTransport.prototype, "close");
+    const value = await endpoint({ hangOnList: true });
+
+    await expect(verify(value, { timeoutMs: 50 })).resolves.toMatchObject({
+      state: "failed",
+      errorCode: "timeout",
+    });
+    expect(clientClose).toHaveBeenCalledTimes(1);
+    expect(transportClose).not.toHaveBeenCalled();
   });
 });
