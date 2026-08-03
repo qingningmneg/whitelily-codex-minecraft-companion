@@ -78,6 +78,10 @@ interface ManagedMinecraft {
 
 interface ManagedCompanion {
   start(preselectedModel: string): Promise<void>;
+  switchModel(
+    selection: ResolvedModelSelection,
+    commitPreference: () => Promise<void>,
+  ): Promise<void>;
   stop(): Promise<void>;
   ownerIdentityChanged?(snapshot: OwnerIdentitySnapshot): void;
   applyProfile?(profile: CompanionProfile): void;
@@ -93,6 +97,10 @@ export interface AppRuntime {
   mcp: ManagedMcp;
   codex: ManagedCodex;
   selectModel(available: readonly string[], preferred: string): string | Promise<string>;
+  switchModel(
+    selection: ResolvedModelSelection,
+    commitPreference: () => Promise<void>,
+  ): Promise<void>;
   minecraft: ManagedMinecraft;
   companion: ManagedCompanion;
   executor: ManagedExecutor;
@@ -482,6 +490,8 @@ export function createProductionRuntime(
     mcp: new McpLifecycle(toolDependencies),
     codex,
     selectModel,
+    switchModel: (selection, commitPreference) =>
+      companion!.switchModel(selection, commitPreference),
     minecraft,
     companion,
     executor,
@@ -723,6 +733,10 @@ export async function createRuntimeFacade(
       ? {}
       : { initialRevision: options.runtimeInitialRevision }),
     lifecycle: composition.lifecycle,
+    switchModel: async (selection, commitPreference) => {
+      await composition.runtime.switchModel(selection, commitPreference);
+      selectedModel = selection.modelId;
+    },
     task: {
       current: () => composition.taskController.current(),
       budget: () => composition.taskBudget.snapshot(),
@@ -842,6 +856,8 @@ async function composeApp(
           }
           return selectedRuntimeModel.modelId;
         },
+        switchModel: (selection, commitPreference) =>
+          runtime.switchModel(selection, commitPreference),
         minecraft: runtime.minecraft,
         companion: runtime.companion,
         executor: runtime.executor,
@@ -857,6 +873,8 @@ async function composeApp(
           observers.modelSelected?.(model);
           return model;
         },
+        switchModel: (selection, commitPreference) =>
+          runtimeForSelection.switchModel(selection, commitPreference),
         minecraft: runtimeForSelection.minecraft,
         companion: runtimeForSelection.companion,
         executor: runtimeForSelection.executor,

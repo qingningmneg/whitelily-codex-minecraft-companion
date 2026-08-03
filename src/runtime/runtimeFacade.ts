@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import type { ResolvedModelSelection } from "../codex/modelCatalog.js";
 import type { ActiveTask, TaskDisclosure } from "../companion/taskController.js";
 import { redactPublicText } from "../memory/redaction.js";
 import type { MinecraftEvent } from "../minecraft/minecraftPort.js";
@@ -34,6 +35,10 @@ interface RuntimeTaskAccess extends Omit<RuntimeTaskProjection, "status" | "subs
 
 export interface RuntimeFacadeDependencies {
   lifecycle: RuntimeLifecycle;
+  switchModel?: (
+    selection: ResolvedModelSelection,
+    commitPreference: () => Promise<void>,
+  ) => Promise<void>;
   task?: RuntimeTaskAccess;
   minecraft?: {
     subscribe(listener: (event: MinecraftEvent) => void): () => void;
@@ -285,6 +290,24 @@ export class RuntimeFacade {
         throw new Error("Task failed to stop");
       }
       if (this.#snapshot.task !== null) this.#clearTask(true);
+    });
+  }
+
+  switchModel(
+    selection: ResolvedModelSelection,
+    commitPreference: () => Promise<void>,
+  ): Promise<void> {
+    return Promise.resolve().then(async () => {
+      if (this.#terminal || this.#snapshot.lifecycle !== "running") {
+        throw new Error("Runtime is not running");
+      }
+      const switchModel = this.#dependencies.switchModel;
+      if (!switchModel) throw new Error("Runtime model switching is unavailable");
+      await switchModel(selection, commitPreference);
+      if (this.#terminal || this.#snapshot.lifecycle !== "running") {
+        throw new Error("Runtime model switch was interrupted");
+      }
+      this.#setCodex("ready", selection.modelId);
     });
   }
 

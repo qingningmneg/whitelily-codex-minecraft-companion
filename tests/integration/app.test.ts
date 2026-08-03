@@ -532,8 +532,13 @@ describe("WhiteLilyApp composition", () => {
             stop: async () => undefined,
           },
           selectModel: (available) => available[0]!,
+          switchModel: async (_selection, commitPreference) => commitPreference(),
           minecraft: { connect: async () => undefined, disconnect: async () => undefined },
-          companion: { start: async () => undefined, stop: async () => undefined },
+          companion: {
+            start: async () => undefined,
+            switchModel: async (_selection, commitPreference) => commitPreference(),
+            stop: async () => undefined,
+          },
           executor: { stopAll: () => undefined },
         };
       },
@@ -604,8 +609,13 @@ describe("WhiteLilyApp composition", () => {
             stop: async () => undefined,
           },
           selectModel: (_available, preferred) => preferred,
+          switchModel: async (_selection, commitPreference) => commitPreference(),
           minecraft: { connect: async () => undefined, disconnect: async () => undefined },
-          companion: { start: async () => undefined, stop: async () => undefined },
+          companion: {
+            start: async () => undefined,
+            switchModel: async (_selection, commitPreference) => commitPreference(),
+            stop: async () => undefined,
+          },
           executor: { stopAll: () => undefined },
         };
       },
@@ -706,9 +716,11 @@ describe("WhiteLilyApp composition", () => {
             stop: stopCodex,
           },
           selectModel: (_available, preferred) => preferred,
+          switchModel: async (_selection, commitPreference) => commitPreference(),
           minecraft: { connect: async () => undefined, disconnect },
           companion: {
             start: async () => undefined,
+            switchModel: async (_selection, commitPreference) => commitPreference(),
             stop: async () => undefined,
             ownerIdentityChanged: (snapshot: OwnerIdentitySnapshot) => ownerChanges.push(snapshot),
           },
@@ -1026,6 +1038,7 @@ describe("WhiteLilyApp composition", () => {
             events.push(`codex:model-select:${preferred}`);
             return preferred;
           },
+          switchModel: async (_selection, commitPreference) => commitPreference(),
           minecraft: {
             connect: async () => {
               events.push("minecraft:connect");
@@ -1045,6 +1058,7 @@ describe("WhiteLilyApp composition", () => {
             start: async (model) => {
               events.push(`companion:start:${model}`);
             },
+            switchModel: async (_selection, commitPreference) => commitPreference(),
             stop: async () => {
               events.push("companion:stop");
             },
@@ -1142,8 +1156,13 @@ describe("WhiteLilyApp composition", () => {
             stop: async () => undefined,
           },
           selectModel: (_available, preferred) => preferred,
+          switchModel: async (_selection, commitPreference) => commitPreference(),
           minecraft: { connect: async () => undefined, disconnect: async () => undefined },
-          companion: { start: async () => undefined, stop: async () => undefined },
+          companion: {
+            start: async () => undefined,
+            switchModel: async (_selection, commitPreference) => commitPreference(),
+            stop: async () => undefined,
+          },
           executor: { stopAll: () => undefined },
         };
       },
@@ -1192,6 +1211,7 @@ describe("WhiteLilyApp composition", () => {
             stop: async () => undefined,
           },
           selectModel: legacySelector,
+          switchModel: async (_selection, commitPreference) => commitPreference(),
           minecraft: {
             connect: async () => undefined,
             disconnect: async () => undefined,
@@ -1200,6 +1220,7 @@ describe("WhiteLilyApp composition", () => {
             start: async (model) => {
               companionStarts.push(model);
             },
+            switchModel: async (_selection, commitPreference) => commitPreference(),
             stop: async () => undefined,
           },
           executor: { stopAll: () => undefined },
@@ -1216,6 +1237,57 @@ describe("WhiteLilyApp composition", () => {
     expect(legacySelector).not.toHaveBeenCalled();
     expect(companionStarts).toEqual(["service-live-model"]);
     expect(runtime.snapshot().codex.model).toBe("service-live-model");
+  });
+
+  it("delegates a live model switch through the composed runtime before publishing it", async () => {
+    const files = await createCliHarness();
+    cleanups.push(files.cleanup);
+    const order: string[] = [];
+    const runtime = await createRuntimeFacade(files.configPath, {
+      cwd: files.directory,
+      runtimeModelSelection: {
+        modelId: "gpt-5.6-terra",
+        reasoningEffort: "medium",
+      },
+      runtimeFactory: (context) => ({
+        preferredModel: context.config.codex.preferredModel,
+        mcp: { start: async () => undefined, stop: async () => undefined },
+        codex: {
+          assertChatGptLogin: async () => undefined,
+          start: async () => undefined,
+          listModels: async () => ["gpt-5.6-terra"],
+          stop: async () => undefined,
+        },
+        selectModel: () => "gpt-5.6-terra",
+        switchModel: async (selection, commitPreference) => {
+          order.push(`runtime:${selection.modelId}:${selection.reasoningEffort}`);
+          await commitPreference();
+          order.push("runtime:published");
+        },
+        minecraft: { connect: async () => undefined, disconnect: async () => undefined },
+        companion: {
+          start: async () => undefined,
+          stop: async () => undefined,
+          switchModel: async () => {
+            throw new Error("facade must use the AppRuntime switch boundary");
+          },
+        },
+        executor: { stopAll: () => undefined },
+      }),
+    });
+    await runtime.start();
+    const before = runtime.snapshot();
+
+    await runtime.switchModel({ modelId: "gpt-5.6-luna", reasoningEffort: "high" }, async () => {
+      order.push("commit");
+    });
+
+    expect(order).toEqual(["runtime:gpt-5.6-luna:high", "commit", "runtime:published"]);
+    expect(runtime.snapshot()).toEqual({
+      ...before,
+      revision: before.revision + 1,
+      codex: { state: "ready", model: "gpt-5.6-luna" },
+    });
   });
 
   it("forwards typed model authority loss only while the exact facade is live", async () => {
@@ -1236,12 +1308,14 @@ describe("WhiteLilyApp composition", () => {
             stop: async () => undefined,
           },
           selectModel: () => "service-live-model",
+          switchModel: async (_selection, commitPreference) => commitPreference(),
           minecraft: {
             connect: async () => undefined,
             disconnect: async () => undefined,
           },
           companion: {
             start: async () => undefined,
+            switchModel: async (_selection, commitPreference) => commitPreference(),
             stop: async () => undefined,
           },
           executor: { stopAll: () => undefined },
@@ -1397,6 +1471,7 @@ describe("WhiteLilyApp composition", () => {
           },
         },
         selectModel: (_models, preferred) => preferred,
+        switchModel: async (_selection, commitPreference) => commitPreference(),
         minecraft: {
           connect: async () => {
             events.push("minecraft:connect");
@@ -1422,6 +1497,7 @@ describe("WhiteLilyApp composition", () => {
             });
             throw new Error("startup:companion");
           },
+          switchModel: async (_selection, commitPreference) => commitPreference(),
           stop: async () => {
             events.push("companion:stop");
           },

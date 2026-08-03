@@ -143,12 +143,14 @@ export async function createAppHarness(options: AppHarnessOptions = {}) {
           if (!models.includes(preferred)) throw new Error("preferred model unavailable");
           return preferred;
         },
+        switchModel: async (_selection, commitPreference) => commitPreference(),
         minecraft: {
           connect: () => step("minecraft", "minecraft:connect"),
           disconnect: () => cleanup("minecraft", "minecraft:disconnect"),
         },
         companion: {
           start: (model) => step("companion", `companion:start:${model}`),
+          switchModel: async (_selection, commitPreference) => commitPreference(),
           stop: () => cleanup("companion", "companion:stop"),
         },
         executor: {

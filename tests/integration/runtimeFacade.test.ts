@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { ActiveTask } from "../../src/companion/taskController.js";
+import type { ResolvedModelSelection } from "../../src/codex/modelCatalog.js";
 import { RuntimeFacade } from "../../src/runtime/runtimeFacade.js";
 import type { RuntimeEvent } from "../../src/runtime/runtimeEvents.js";
 import type { TaskBudgetSnapshot, TaskStopReason } from "../../src/safety/taskBudget.js";
@@ -139,6 +140,89 @@ function createRuntimeFacadeHarness() {
 }
 
 describe("RuntimeFacade", () => {
+  it("publishes only the committed model after a live companion switch", async () => {
+    const order: string[] = [];
+    const selection: ResolvedModelSelection = {
+      modelId: "gpt-5.6-luna",
+      reasoningEffort: "high",
+    };
+    const runtime = new RuntimeFacade({
+      lifecycle: { start: async () => undefined, stop: async () => undefined },
+      codex: { model: () => "gpt-5.6-terra" },
+      switchModel: async (next, commitPreference) => {
+        order.push(`switch:${next.modelId}:${next.reasoningEffort}`);
+        await commitPreference();
+        order.push("switched");
+      },
+    });
+    const events: RuntimeEvent[] = [];
+    runtime.subscribe((event) => events.push(event));
+    await runtime.start();
+    const before = runtime.snapshot();
+    events.length = 0;
+
+    await runtime.switchModel(selection, async () => {
+      order.push("commit");
+    });
+
+    expect(order).toEqual(["switch:gpt-5.6-luna:high", "commit", "switched"]);
+    expect(runtime.snapshot()).toEqual({
+      ...before,
+      revision: before.revision + 1,
+      codex: { state: "ready", model: "gpt-5.6-luna" },
+    });
+    expect(events).toEqual([
+      {
+        kind: "codex",
+        revision: before.revision + 1,
+        state: { state: "ready", model: "gpt-5.6-luna" },
+      },
+    ]);
+  });
+
+  it("keeps the running snapshot unchanged when live model preference commit fails", async () => {
+    const runtime = new RuntimeFacade({
+      lifecycle: { start: async () => undefined, stop: async () => undefined },
+      codex: { model: () => "gpt-5.6-terra" },
+      switchModel: async (_selection, commitPreference) => commitPreference(),
+    });
+    await runtime.start();
+    const before = runtime.snapshot();
+    const events: RuntimeEvent[] = [];
+    runtime.subscribe((event) => events.push(event));
+
+    await expect(
+      runtime.switchModel({ modelId: "gpt-5.6-luna", reasoningEffort: "medium" }, async () => {
+        throw new Error("stale preference");
+      }),
+    ).rejects.toThrow("stale preference");
+
+    expect(runtime.snapshot()).toEqual(before);
+    expect(events).toEqual([]);
+  });
+
+  it("rejects model switching unless the runtime is running", async () => {
+    let delegated = false;
+    const runtime = new RuntimeFacade({
+      lifecycle: { start: async () => undefined, stop: async () => undefined },
+      switchModel: async (_selection, commitPreference) => {
+        delegated = true;
+        await commitPreference();
+      },
+    });
+    const before = runtime.snapshot();
+
+    await expect(
+      runtime.switchModel(
+        { modelId: "gpt-5.6-luna", reasoningEffort: "medium" },
+        async () => undefined,
+      ),
+    ).rejects.toThrow("Runtime is not running");
+
+    expect(delegated).toBe(false);
+    expect(runtime.snapshot()).toEqual(before);
+  });
+
   it("forwards a memory-scope change without changing the Minecraft lifecycle", () => {
     const scopes: unknown[] = [];
     const runtime = new RuntimeFacade({

@@ -28,6 +28,7 @@ import type {
   ModelCatalogEvent,
   ModelSelection,
   ModelSelectionInput,
+  PreparedModelSelection,
   ResolvedModelSelection,
 } from "../codex/modelCatalog.js";
 import type { ConfirmedRuntimeConnection } from "../config/schema.js";
@@ -58,6 +59,10 @@ import { OwnerIdentityError, type OwnerIdentityAccess } from "../identity/ownerI
 
 export interface DesktopChildRuntime {
   start(): Promise<void>;
+  switchModel(
+    selection: ResolvedModelSelection,
+    commitPreference: () => Promise<void>,
+  ): Promise<void>;
   stop(reason: TaskStopReason): Promise<void>;
   stopTask(): Promise<void>;
   snapshot(): RuntimeSnapshot;
@@ -142,6 +147,8 @@ export interface DesktopChildAccountService {
 export interface DesktopChildModelCatalog {
   listModels(): Promise<ModelCatalogSnapshot>;
   selectModel(selection: ModelSelectionInput): Promise<ModelSelection>;
+  prepareSelection(selection: ModelSelectionInput): Promise<PreparedModelSelection>;
+  commitSelection(prepared: PreparedModelSelection): Promise<ModelSelection>;
   resolveRuntimeSelection(options?: { signal?: AbortSignal }): Promise<ResolvedModelSelection>;
   subscribe(listener: (event: ModelCatalogEvent) => void): () => void;
   stop(): void;
@@ -310,6 +317,8 @@ export class DesktopChildServer {
   ) => ReturnType<typeof setTimeout>;
   readonly #clearModelValidationTimer: (timer: ReturnType<typeof setTimeout>) => void;
   #acceptedConnectionAuthority: AcceptedConnectionAuthority | undefined;
+  #activeRuntimeConnection: ConfirmedRuntimeConnection | undefined;
+  #recoveryConnectionAuthority: ConfirmedRuntimeConnection | undefined;
   #currentConfirmedConnectionProof: ConfirmedConnectionProof | undefined;
   #activeWorldBinding: ConfirmedWorldBinding | undefined;
   #authorityContained = true;
@@ -338,6 +347,7 @@ export class DesktopChildServer {
   #lineBytes = 0;
   #discardingOversizedLine = false;
   #requestTail: Promise<void> = Promise.resolve();
+  #modelSelectionTail: Promise<void> = Promise.resolve();
   #outputTail: Promise<void> = Promise.resolve();
 
   constructor(options: DesktopChildServerOptions) {
@@ -423,7 +433,7 @@ export class DesktopChildServer {
     });
     this.#unsubscribeAccount = this.#account.subscribe((account) => {
       if (account.status !== "signed_in") {
-        void this.#invalidateDesktopAuthority("model_unavailable", "account_lost");
+        void this.#invalidateDesktopAuthority("model_unavailable", "account_lost", true, true);
       }
       const envelope: DesktopEvent = {
         version: DESKTOP_PROTOCOL_VERSION,
@@ -437,7 +447,7 @@ export class DesktopChildServer {
     });
     this.#unsubscribeModelInvalidation = this.#models.subscribe((event) => {
       if (event.kind !== "selection_invalidated") return;
-      void this.#invalidateDesktopAuthority("model_unavailable", event.reason);
+      void this.#invalidateDesktopAuthority("model_unavailable", event.reason, true, true);
     });
     this.#input.on("data", this.#onData);
     this.#input.once("end", this.#onEnd);
@@ -491,6 +501,8 @@ export class DesktopChildServer {
           "model_unavailable",
           true,
           "model_unavailable",
+          true,
+          true,
           true,
         ).catch(() => undefined);
       }
@@ -827,7 +839,7 @@ export class DesktopChildServer {
         case "select_model":
           await this.#writeCommandResult(
             request,
-            await this.#models.selectModel(request.command.selection),
+            await this.#selectModel(request.command.selection, interruptGeneration),
           );
           return;
         case "read_profile":
@@ -1099,6 +1111,8 @@ export class DesktopChildServer {
           this.#currentConfirmedConnectionProof = Object.freeze(
             structuredClone(request.command.proof),
           );
+          this.#activeRuntimeConnection = undefined;
+          this.#recoveryConnectionAuthority = undefined;
           this.#acceptedConnectionAuthority = authority;
           this.#authorityContained = false;
           this.#needsFreshRuntime = true;
@@ -1124,17 +1138,23 @@ export class DesktopChildServer {
         !(error instanceof OwnerIdentityError)
       ) {
         this.#needsFreshRuntime = true;
-        this.#invalidateConnectionAuthority();
+        const preserveModelRecovery =
+          request.command.kind === "start_runtime" &&
+          this.#currentConfirmedConnectionProof !== undefined &&
+          this.#recoveryConnectionAuthority !== undefined;
+        this.#invalidateConnectionAuthority(preserveModelRecovery, preserveModelRecovery);
       }
       await this.#writeError(
         request.id,
         error instanceof OwnerIdentityError
           ? error.code
-          : error instanceof DocumentStoreError && error.code === "DOCUMENT_CONFLICT"
-            ? "DOCUMENT_CONFLICT"
-            : error instanceof ConnectionOperationError
-              ? "CONNECTION_OPERATION_FAILED"
-              : errorCodeFor(request.command.kind),
+          : request.command.kind === "select_model"
+            ? "MODEL_OPERATION_FAILED"
+            : error instanceof DocumentStoreError && error.code === "DOCUMENT_CONFLICT"
+              ? "DOCUMENT_CONFLICT"
+              : error instanceof ConnectionOperationError
+                ? "CONNECTION_OPERATION_FAILED"
+                : errorCodeFor(request.command.kind),
       );
     }
   }
@@ -1225,6 +1245,71 @@ export class DesktopChildServer {
     }
   }
 
+  #selectModel(
+    selection: ModelSelectionInput,
+    replacementGeneration: number,
+  ): Promise<ModelSelection> {
+    const operation = this.#modelSelectionTail
+      .catch(() => undefined)
+      .then(() => this.#performModelSelection(selection, replacementGeneration));
+    this.#modelSelectionTail = operation.then(
+      () => undefined,
+      () => undefined,
+    );
+    return operation;
+  }
+
+  async #performModelSelection(
+    selection: ModelSelectionInput,
+    replacementGeneration: number,
+  ): Promise<ModelSelection> {
+    this.#assertModelSelectionGeneration(replacementGeneration);
+    const prepared = await this.#models.prepareSelection(selection);
+    this.#assertModelSelectionGeneration(replacementGeneration);
+    const runtime = this.#runtime;
+    const lifecycle = runtime?.snapshot().lifecycle;
+    if (runtime && !this.#needsFreshRuntime && lifecycle === "running") {
+      let committed: ModelSelection | undefined;
+      await runtime.switchModel(prepared.resolved, async () => {
+        if (committed !== undefined) throw new Error("Model preference was already committed");
+        committed = await this.#models.commitSelection(prepared);
+      });
+      this.#assertModelSelectionGeneration(replacementGeneration, runtime);
+      const snapshot = runtime.snapshot();
+      if (
+        snapshot.lifecycle !== "running" ||
+        snapshot.codex.state !== "ready" ||
+        snapshot.codex.model !== prepared.resolved.modelId ||
+        committed === undefined
+      ) {
+        throw new Error("Runtime model switch did not publish the prepared selection");
+      }
+      this.#runtimeSelection = prepared.resolved;
+      this.#startModelValidation(runtime, prepared.resolved);
+      return committed;
+    }
+    if (runtime && lifecycle !== "idle" && lifecycle !== "stopped" && lifecycle !== "failed") {
+      throw new Error("Runtime model switching is unavailable");
+    }
+    const committed = await this.#models.commitSelection(prepared);
+    this.#assertModelSelectionGeneration(replacementGeneration);
+    this.#runtimeSelection = prepared.resolved;
+    return committed;
+  }
+
+  #assertModelSelectionGeneration(
+    replacementGeneration: number,
+    runtime?: DesktopChildRuntime,
+  ): void {
+    if (
+      this.#shutdownRequested ||
+      replacementGeneration !== this.#interruptGeneration ||
+      (runtime !== undefined && runtime !== this.#runtime)
+    ) {
+      throw new Error("Model selection was interrupted");
+    }
+  }
+
   async #dispatchAuthorityControl(
     request: DesktopRequest,
     invalidation: Promise<void>,
@@ -1249,9 +1334,17 @@ export class DesktopChildServer {
     _interrupt: boolean,
     publicReason: ConnectionInvalidationReason = connectionInvalidationReason(reason),
     synchronousRuntimeStop = false,
+    preserveWorldBinding = false,
+    preserveConnectionAuthority = false,
   ): Promise<void> {
     if (runtime !== this.#runtime) return Promise.resolve();
-    return this.#beginAuthorityInvalidation(reason, publicReason, synchronousRuntimeStop);
+    return this.#beginAuthorityInvalidation(
+      reason,
+      publicReason,
+      synchronousRuntimeStop,
+      preserveWorldBinding,
+      preserveConnectionAuthority,
+    );
   }
 
   #beginAuthorityInvalidation(
@@ -1293,7 +1386,9 @@ export class DesktopChildServer {
           });
           return this.#trackAuthorityInvalidationOperation(followUpPolicy, followUp);
         }
-        policy.publicReason = publicReason;
+        if (policy.publicReason !== "model_unavailable" && policy.publicReason !== "account_lost") {
+          policy.publicReason = publicReason;
+        }
         policy.preserveWorldBinding = tightenedWorldBinding;
         policy.preserveConnectionAuthority = tightenedConnectionAuthority;
       }
@@ -1400,8 +1495,16 @@ export class DesktopChildServer {
   #invalidateDesktopAuthority(
     reason: Exclude<TaskStopReason, "owner_changed" | "model_changed">,
     publicReason: ConnectionInvalidationReason = connectionInvalidationReason(reason),
+    preserveWorldBinding = false,
+    preserveConnectionAuthority = false,
   ): Promise<void> {
-    return this.#beginAuthorityInvalidation(reason, publicReason);
+    return this.#beginAuthorityInvalidation(
+      reason,
+      publicReason,
+      true,
+      preserveWorldBinding,
+      preserveConnectionAuthority,
+    );
   }
 
   #readContainedSnapshot(runtime: DesktopChildRuntime): RuntimeSnapshot {
@@ -1499,7 +1602,7 @@ export class DesktopChildServer {
       return;
     }
     if (!valid) {
-      await this.#invalidateDesktopAuthority("model_unavailable");
+      await this.#invalidateDesktopAuthority("model_unavailable", "model_unavailable", true, true);
       return;
     }
     scheduleNext();
@@ -1666,18 +1769,28 @@ export class DesktopChildServer {
     const authority = this.#acceptedConnectionAuthority;
     this.#acceptedConnectionAuthority = undefined;
     const now = this.#now();
-    if (
-      !authority ||
-      !Number.isSafeInteger(now) ||
-      now < authority.issuedAt ||
-      now >= authority.expiresAt ||
-      authority.generation !== generation ||
-      generation !== this.#interruptGeneration ||
-      this.#shutdownRequested
-    ) {
+    if (generation !== this.#interruptGeneration || this.#shutdownRequested) {
       throw new ConnectionOperationError("Minecraft connection is not confirmed");
     }
-    return authority.connection;
+    if (authority) {
+      if (
+        !Number.isSafeInteger(now) ||
+        now < authority.issuedAt ||
+        now >= authority.expiresAt ||
+        authority.generation !== generation
+      ) {
+        throw new ConnectionOperationError("Minecraft connection is not confirmed");
+      }
+      this.#activeRuntimeConnection = authority.connection;
+      return authority.connection;
+    }
+    const recovery = this.#recoveryConnectionAuthority;
+    this.#recoveryConnectionAuthority = undefined;
+    if (!recovery) {
+      throw new ConnectionOperationError("Minecraft connection is not confirmed");
+    }
+    this.#activeRuntimeConnection = recovery;
+    return recovery;
   }
 
   #assertConnectionGeneration(generation: number): void {
@@ -1690,7 +1803,13 @@ export class DesktopChildServer {
     preserveWorldBinding = false,
     preserveConnectionAuthority = false,
   ): void {
-    if (!preserveConnectionAuthority) this.#acceptedConnectionAuthority = undefined;
+    if (preserveConnectionAuthority) {
+      this.#recoveryConnectionAuthority ??= this.#activeRuntimeConnection;
+    } else {
+      this.#acceptedConnectionAuthority = undefined;
+      this.#activeRuntimeConnection = undefined;
+      this.#recoveryConnectionAuthority = undefined;
+    }
     if (!preserveWorldBinding) {
       this.#currentConfirmedConnectionProof = undefined;
       this.#activeWorldBinding = undefined;

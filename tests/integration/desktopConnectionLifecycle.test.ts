@@ -165,6 +165,15 @@ function createProtocolHarness(options: {
         legacyMigrationCompleted: false,
       }),
       selectModel: async () => ({ mode: "automatic" }),
+      prepareSelection: async (selection) => ({
+        preferenceRevision: 0,
+        requested: selection,
+        resolved: await options.resolveSelection(),
+      }),
+      commitSelection: async (prepared) =>
+        prepared.requested.mode === "automatic"
+          ? { mode: "automatic" }
+          : { ...prepared.requested, available: true },
       resolveRuntimeSelection: options.resolveSelection,
       subscribe: options.subscribeModel ?? (() => () => undefined),
       stop: () => undefined,
@@ -302,10 +311,14 @@ describe("desktop connection lifecycle", () => {
     expect(harness.selections).toEqual([selection]);
   });
 
-  it("fences a running runtime on ChatGPT sign-out and requires fresh confirmation", async () => {
+  it("fences a running runtime on ChatGPT sign-out while retaining confirmed LAN recovery", async () => {
     let publishAccount: ((snapshot: AccountSnapshot) => void) | undefined;
+    let accountAvailable = true;
     const harness = createProtocolHarness({
-      resolveSelection: async () => ({ modelId: "live-runtime", reasoningEffort: "medium" }),
+      resolveSelection: async () => {
+        if (!accountAvailable) throw new Error("ChatGPT authentication is required");
+        return { modelId: "live-runtime", reasoningEffort: "medium" };
+      },
       createRuntime: async (selection, initialRevision) =>
         createTrackedRuntime(selection.modelId, initialRevision),
       subscribeAccount: (listener) => {
@@ -326,6 +339,7 @@ describe("desktop connection lifecycle", () => {
     });
     await harness.send("start-account", { kind: "start_runtime" });
 
+    accountAvailable = false;
     publishAccount?.({ status: "signed_out" });
     await vi.waitFor(() =>
       expect(harness.runtimes[0]?.runtime.snapshot().lifecycle).toBe("stopped"),
@@ -339,15 +353,24 @@ describe("desktop connection lifecycle", () => {
       harness.send("restart-account-without-confirm", { kind: "start_runtime" }),
     ).resolves.toMatchObject({
       ok: false,
-      error: { code: "CONNECTION_OPERATION_FAILED" },
+      error: { code: "RUNTIME_START_FAILED" },
     });
+    accountAvailable = true;
+    publishAccount?.({ status: "signed_in", auth: "chatgpt" });
+    await expect(
+      harness.send("restart-account-after-login", { kind: "start_runtime" }),
+    ).resolves.toMatchObject({ ok: true, result: { lifecycle: "running" } });
   });
 
   it("cancels an in-flight runtime start when account authority is lost", async () => {
     let publishAccount: ((snapshot: AccountSnapshot) => void) | undefined;
+    let accountAvailable = true;
     const startGate = deferred();
     const harness = createProtocolHarness({
-      resolveSelection: async () => ({ modelId: "live-runtime", reasoningEffort: "medium" }),
+      resolveSelection: async () => {
+        if (!accountAvailable) throw new Error("ChatGPT authentication is required");
+        return { modelId: "live-runtime", reasoningEffort: "medium" };
+      },
       createRuntime: async (selection, initialRevision) => {
         const tracked = createTrackedRuntime(selection.modelId, initialRevision);
         const runtime = new RuntimeFacade({
@@ -379,6 +402,7 @@ describe("desktop connection lifecycle", () => {
 
     const starting = harness.send("start-inflight", { kind: "start_runtime" });
     await vi.waitFor(() => expect(harness.runtimes).toHaveLength(1));
+    accountAvailable = false;
     publishAccount?.({ status: "signed_out" });
     startGate.resolve();
 
@@ -390,14 +414,23 @@ describe("desktop connection lifecycle", () => {
       harness.send("restart-inflight-without-confirm", { kind: "start_runtime" }),
     ).resolves.toMatchObject({
       ok: false,
-      error: { code: "CONNECTION_OPERATION_FAILED" },
+      error: { code: "RUNTIME_START_FAILED" },
     });
+    accountAvailable = true;
+    publishAccount?.({ status: "signed_in", auth: "chatgpt" });
+    await expect(
+      harness.send("restart-inflight-after-login", { kind: "start_runtime" }),
+    ).resolves.toMatchObject({ ok: true, result: { lifecycle: "running" } });
   });
 
   it("fences a running runtime when the selected live model or effort becomes unavailable", async () => {
     let publishModelEvent: ((event: ModelCatalogEvent) => void) | undefined;
+    let modelAvailable = true;
     const harness = createProtocolHarness({
-      resolveSelection: async () => ({ modelId: "live-runtime", reasoningEffort: "minimal" }),
+      resolveSelection: async () => {
+        if (!modelAvailable) throw new Error("Selected model is unavailable");
+        return { modelId: "live-runtime", reasoningEffort: "minimal" };
+      },
       createRuntime: async (selection, initialRevision) =>
         createTrackedRuntime(selection.modelId, initialRevision),
       subscribeModel: (listener) => {
@@ -418,6 +451,7 @@ describe("desktop connection lifecycle", () => {
     });
     await harness.send("start-model", { kind: "start_runtime" });
 
+    modelAvailable = false;
     publishModelEvent?.({ kind: "selection_invalidated", reason: "model_unavailable" });
     await vi.waitFor(() =>
       expect(harness.runtimes[0]?.runtime.snapshot().lifecycle).toBe("stopped"),
@@ -431,8 +465,12 @@ describe("desktop connection lifecycle", () => {
       harness.send("restart-model-without-confirm", { kind: "start_runtime" }),
     ).resolves.toMatchObject({
       ok: false,
-      error: { code: "CONNECTION_OPERATION_FAILED" },
+      error: { code: "RUNTIME_START_FAILED" },
     });
+    modelAvailable = true;
+    await expect(
+      harness.send("restart-model-after-selection", { kind: "start_runtime" }),
+    ).resolves.toMatchObject({ ok: true, result: { lifecycle: "running" } });
   });
 
   it("publishes world change as a disconnected authority boundary instead of reconnecting", async () => {

@@ -12,6 +12,7 @@ import type {
   ModelCatalogEvent,
   ModelSelection,
   ModelSelectionInput,
+  PreparedModelSelection,
   ResolvedModelSelection,
 } from "../../src/codex/modelCatalog.js";
 import { RuntimeFacade } from "../../src/runtime/runtimeFacade.js";
@@ -42,6 +43,10 @@ import {
 
 export interface DesktopRuntime {
   start(): Promise<void>;
+  switchModel?(
+    selection: ResolvedModelSelection,
+    commitPreference: () => Promise<void>,
+  ): Promise<void>;
   stop(reason: TaskStopReason): Promise<void>;
   stopTask(): Promise<void>;
   snapshot(): RuntimeSnapshot;
@@ -92,6 +97,8 @@ export function createDesktopChildHarness(
     models?: Partial<{
       listModels(): Promise<ModelCatalogSnapshot>;
       selectModel(selection: ModelSelectionInput): Promise<ModelSelection>;
+      prepareSelection(selection: ModelSelectionInput): Promise<PreparedModelSelection>;
+      commitSelection(prepared: PreparedModelSelection): Promise<ModelSelection>;
       resolveRuntimeSelection(options?: { signal?: AbortSignal }): Promise<ResolvedModelSelection>;
       subscribe(listener: (event: ModelCatalogEvent) => void): () => void;
       stop(): void;
@@ -241,6 +248,18 @@ export function createDesktopChildHarness(
     }),
     selectModel: async (selection: ModelSelectionInput): Promise<ModelSelection> =>
       selection.mode === "automatic" ? { mode: "automatic" } : { ...selection, available: true },
+    prepareSelection: async (selection: ModelSelectionInput): Promise<PreparedModelSelection> => ({
+      preferenceRevision: 0,
+      requested: selection,
+      resolved:
+        selection.mode === "automatic"
+          ? { modelId: "harness-live-model", reasoningEffort: "medium" }
+          : { modelId: selection.modelId, reasoningEffort: selection.reasoningEffort },
+    }),
+    commitSelection: async (prepared: PreparedModelSelection): Promise<ModelSelection> =>
+      prepared.requested.mode === "automatic"
+        ? { mode: "automatic" }
+        : { ...prepared.requested, available: true },
     resolveRuntimeSelection: async (): Promise<ResolvedModelSelection> => ({
       modelId: "harness-live-model",
       reasoningEffort: "medium",

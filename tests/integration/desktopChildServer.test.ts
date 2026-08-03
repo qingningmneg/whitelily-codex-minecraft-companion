@@ -18,11 +18,19 @@ import { runDesktopChild, type DesktopChildServices } from "../../src/desktop/ch
 import { RuntimeFacade } from "../../src/runtime/runtimeFacade.js";
 import type { AccountSnapshot } from "../../src/codex/accountService.js";
 import type { Model } from "../../src/codex/generated/v2/Model.js";
-import { ModelCatalog, type ModelCatalogEvent } from "../../src/codex/modelCatalog.js";
+import {
+  ModelCatalog,
+  type ModelCatalogEvent,
+  type ModelSelection,
+  type ModelSelectionInput,
+  type PreparedModelSelection,
+  type ResolvedModelSelection,
+} from "../../src/codex/modelCatalog.js";
 import { ModelPreferenceStore } from "../../src/codex/modelPreferenceStore.js";
 import type { MinecraftEvent } from "../../src/minecraft/minecraftPort.js";
 import type { RuntimeEvent, RuntimeSnapshot } from "../../src/runtime/runtimeEvents.js";
 import type { TaskStopReason } from "../../src/safety/taskBudget.js";
+import type { RuntimeSafetyConfiguration } from "../../src/safety/safetyProfile.js";
 import { createDefaultCompanionProfile } from "../../src/profile/profileSchema.js";
 import { DocumentStoreError } from "../../src/storage/documentStore.js";
 import {
@@ -59,6 +67,16 @@ const idleSnapshot: RuntimeSnapshot = {
 const stopNoTask = async (): Promise<void> => undefined;
 
 const openHarnesses: DesktopChildHarness[] = [];
+
+function deferred<T = void>() {
+  let resolve!: (value: T) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
 
 function createHarness(
   options: Parameters<typeof createDesktopChildHarness>[0] = {},
@@ -152,6 +170,15 @@ function inertDesktopChildServices(): DesktopChildServices {
         legacyMigrationCompleted: false,
       }),
       selectModel: async () => ({ mode: "automatic" }),
+      prepareSelection: async (selection) => ({
+        preferenceRevision: 0,
+        requested: selection,
+        resolved: { modelId: "inert-live-model", reasoningEffort: "medium" },
+      }),
+      commitSelection: async (prepared) =>
+        prepared.requested.mode === "automatic"
+          ? { mode: "automatic" }
+          : { ...prepared.requested, available: true },
       resolveRuntimeSelection: async () => ({
         modelId: "inert-live-model",
         reasoningEffort: "medium",
@@ -3106,6 +3133,15 @@ describe("DesktopChildServer", () => {
               legacyMigrationCompleted: false,
             }),
             selectModel: async () => ({ mode: "automatic" }),
+            prepareSelection: async (selection) => ({
+              preferenceRevision: 0,
+              requested: selection,
+              resolved: { modelId: "lazy-live-model", reasoningEffort: "medium" },
+            }),
+            commitSelection: async (prepared) =>
+              prepared.requested.mode === "automatic"
+                ? { mode: "automatic" }
+                : { ...prepared.requested, available: true },
             resolveRuntimeSelection: async () => ({
               modelId: "lazy-live-model",
               reasoningEffort: "medium",
@@ -4274,6 +4310,10 @@ describe("DesktopChildServer", () => {
   it("dispatches the five account and model commands through separate services", async () => {
     let modelListener: ((event: ModelCatalogEvent) => void) | undefined;
     const harness = createHarness({
+      runtime: new RuntimeFacade({
+        lifecycle: { start: async () => undefined, stop: async () => undefined },
+        switchModel: async (_selection, commitPreference) => commitPreference(),
+      }),
       account: {
         getAccount: async () => ({ status: "signed_in", auth: "chatgpt" }),
         startChatGptLogin: async () => ({
@@ -4298,7 +4338,19 @@ describe("DesktopChildServer", () => {
           selection: { mode: "automatic" },
           legacyMigrationCompleted: false,
         }),
-        selectModel: async (selection) => {
+        selectModel: async () => {
+          throw new Error("legacy single-phase selection must not run");
+        },
+        prepareSelection: async (selection) => ({
+          preferenceRevision: 0,
+          requested: selection,
+          resolved:
+            selection.mode === "automatic"
+              ? { modelId: "live-model", reasoningEffort: "medium" }
+              : { modelId: selection.modelId, reasoningEffort: selection.reasoningEffort },
+        }),
+        commitSelection: async (prepared) => {
+          const selection = prepared.requested;
           const selected =
             selection.mode === "automatic"
               ? ({ mode: "automatic" } as const)
@@ -4371,6 +4423,392 @@ describe("DesktopChildServer", () => {
     await Promise.resolve();
     expect(connectionInvalidations(harness)).toEqual([]);
     expect(harness.stopReasons).toEqual([]);
+  });
+
+  it("orders a running model selection through prepare, runtime commit, and response", async () => {
+    const order: string[] = [];
+    const requested: ModelSelectionInput = {
+      mode: "explicit",
+      modelId: "gpt-5.6-luna",
+      reasoningEffort: "high",
+    };
+    const prepared: PreparedModelSelection = {
+      preferenceRevision: 7,
+      requested,
+      resolved: { modelId: "gpt-5.6-luna", reasoningEffort: "high" },
+    };
+    let snapshot: RuntimeSnapshot = {
+      revision: 4,
+      lifecycle: "running",
+      minecraft: { state: "connected", sessionId: "lan-session-1" },
+      codex: { state: "ready", model: "gpt-5.6-terra" },
+      task: null,
+      lastError: null,
+    };
+    const runtime = {
+      start: async () => undefined,
+      stop: async () => {
+        snapshot = {
+          ...snapshot,
+          lifecycle: "stopped",
+          minecraft: { state: "disconnected", sessionId: null },
+          codex: { state: "stopped", model: null },
+        };
+      },
+      stopTask: async () => undefined,
+      snapshot: () => structuredClone(snapshot),
+      subscribe: () => () => undefined,
+      switchModel: async (
+        selection: ResolvedModelSelection,
+        commitPreference: () => Promise<void>,
+      ) => {
+        order.push(`runtime:${selection.modelId}`);
+        await commitPreference();
+        snapshot = { ...snapshot, codex: { state: "ready", model: selection.modelId } };
+      },
+    };
+    const models = {
+      selectModel: async (): Promise<ModelSelection> => {
+        order.push("legacy-select");
+        return { ...requested, available: true };
+      },
+      prepareSelection: async (selection: ModelSelectionInput) => {
+        order.push(`prepare:${selection.mode}`);
+        return prepared;
+      },
+      commitSelection: async (candidate: PreparedModelSelection): Promise<ModelSelection> => {
+        expect(candidate).toBe(prepared);
+        order.push("commit");
+        return { ...requested, available: true };
+      },
+    };
+    const harness = createHarness({ runtime, models });
+
+    harness.send(
+      commandRequest("model-two-phase-running", { kind: "select_model", selection: requested }),
+    );
+    const response = await harness.nextResponse();
+    order.push("response");
+
+    expect(response).toMatchObject({
+      id: "model-two-phase-running",
+      ok: true,
+      result: { mode: "explicit", modelId: "gpt-5.6-luna", available: true },
+    });
+    expect(order).toEqual(["prepare:explicit", "runtime:gpt-5.6-luna", "commit", "response"]);
+    expect(snapshot).toMatchObject({
+      lifecycle: "running",
+      minecraft: { state: "connected", sessionId: "lan-session-1" },
+      codex: { state: "ready", model: "gpt-5.6-luna" },
+    });
+    expect(connectionInvalidations(harness)).toEqual([]);
+  });
+
+  it("commits an idle model selection without asking the runtime to switch", async () => {
+    const order: string[] = [];
+    const requested: ModelSelectionInput = {
+      mode: "explicit",
+      modelId: "gpt-5.6-luna",
+      reasoningEffort: "medium",
+    };
+    const prepared: PreparedModelSelection = {
+      preferenceRevision: 3,
+      requested,
+      resolved: { modelId: "gpt-5.6-luna", reasoningEffort: "medium" },
+    };
+    const runtime = {
+      start: async () => undefined,
+      stop: async () => undefined,
+      stopTask: async () => undefined,
+      snapshot: () => idleSnapshot,
+      subscribe: () => () => undefined,
+      switchModel: async () => {
+        order.push("runtime-switch");
+      },
+    };
+    const models = {
+      selectModel: async (): Promise<ModelSelection> => {
+        order.push("legacy-select");
+        return { ...requested, available: true };
+      },
+      prepareSelection: async () => {
+        order.push("prepare");
+        return prepared;
+      },
+      commitSelection: async (): Promise<ModelSelection> => {
+        order.push("commit");
+        return { ...requested, available: true };
+      },
+    };
+    const harness = createHarness({ runtime, models });
+
+    harness.send(
+      commandRequest("model-two-phase-idle", { kind: "select_model", selection: requested }),
+    );
+    await expect(harness.nextResponse()).resolves.toMatchObject({
+      id: "model-two-phase-idle",
+      ok: true,
+      result: { modelId: "gpt-5.6-luna" },
+    });
+
+    expect(order).toEqual(["prepare", "commit"]);
+  });
+
+  it("maps a stale live model commit to the stable model operation error", async () => {
+    const requested: ModelSelectionInput = {
+      mode: "explicit",
+      modelId: "gpt-5.6-luna",
+      reasoningEffort: "medium",
+    };
+    const prepared: PreparedModelSelection = {
+      preferenceRevision: 9,
+      requested,
+      resolved: { modelId: "gpt-5.6-luna", reasoningEffort: "medium" },
+    };
+    const originalSnapshot: RuntimeSnapshot = {
+      revision: 10,
+      lifecycle: "running",
+      minecraft: { state: "connected", sessionId: "lan-session-stale" },
+      codex: { state: "ready", model: "gpt-5.6-terra" },
+      task: null,
+      lastError: null,
+    };
+    let snapshot = structuredClone(originalSnapshot);
+    let catalogSelection: ModelSelection = { mode: "automatic" };
+    const runtime = {
+      start: async () => undefined,
+      stop: async () => {
+        snapshot = {
+          ...snapshot,
+          lifecycle: "stopped",
+          minecraft: { state: "disconnected", sessionId: null },
+          codex: { state: "stopped", model: null },
+        };
+      },
+      stopTask: async () => undefined,
+      snapshot: () => structuredClone(snapshot),
+      subscribe: () => () => undefined,
+      switchModel: async (
+        selection: ResolvedModelSelection,
+        commitPreference: () => Promise<void>,
+      ) => {
+        await commitPreference();
+        snapshot = { ...snapshot, codex: { state: "ready", model: selection.modelId } };
+      },
+    };
+    const models = {
+      selectModel: async (): Promise<ModelSelection> => {
+        catalogSelection = { ...requested, available: true };
+        return catalogSelection;
+      },
+      prepareSelection: async () => prepared,
+      commitSelection: async (): Promise<ModelSelection> => {
+        throw new DocumentStoreError("DOCUMENT_CONFLICT", "private stale revision");
+      },
+    };
+    const harness = createHarness({ runtime, models });
+
+    harness.send(
+      commandRequest("model-two-phase-stale", { kind: "select_model", selection: requested }),
+    );
+    await expect(harness.nextResponse()).resolves.toEqual({
+      version: DESKTOP_PROTOCOL_VERSION,
+      id: "model-two-phase-stale",
+      ok: false,
+      error: { code: "MODEL_OPERATION_FAILED", message: "Model operation failed" },
+    });
+
+    expect(snapshot).toEqual(originalSnapshot);
+    expect(catalogSelection).toEqual({ mode: "automatic" });
+  });
+
+  it("suppresses a live model result completed after its runtime was stopped", async () => {
+    const entered = deferred<void>();
+    const release = deferred<void>();
+    const requested: ModelSelectionInput = {
+      mode: "explicit",
+      modelId: "gpt-5.6-luna",
+      reasoningEffort: "medium",
+    };
+    const prepared: PreparedModelSelection = {
+      preferenceRevision: 11,
+      requested,
+      resolved: { modelId: "gpt-5.6-luna", reasoningEffort: "medium" },
+    };
+    let snapshot: RuntimeSnapshot = {
+      revision: 12,
+      lifecycle: "running",
+      minecraft: { state: "connected", sessionId: "lan-session-late" },
+      codex: { state: "ready", model: "gpt-5.6-terra" },
+      task: null,
+      lastError: null,
+    };
+    const runtime = {
+      start: async () => undefined,
+      stop: async () => {
+        snapshot = {
+          ...snapshot,
+          lifecycle: "stopped",
+          minecraft: { state: "disconnected", sessionId: null },
+          codex: { state: "stopped", model: null },
+        };
+      },
+      stopTask: async () => undefined,
+      snapshot: () => structuredClone(snapshot),
+      subscribe: () => () => undefined,
+      switchModel: async (
+        _selection: ResolvedModelSelection,
+        commitPreference: () => Promise<void>,
+      ) => {
+        await commitPreference();
+        entered.resolve();
+        await release.promise;
+      },
+    };
+    const models = {
+      selectModel: async (): Promise<ModelSelection> => {
+        entered.resolve();
+        await release.promise;
+        return { ...requested, available: true };
+      },
+      prepareSelection: async () => prepared,
+      commitSelection: async (): Promise<ModelSelection> => ({ ...requested, available: true }),
+    };
+    const harness = createHarness({ runtime, models });
+
+    harness.send(
+      commandRequest("model-late-select", { kind: "select_model", selection: requested }),
+    );
+    await entered.promise;
+    harness.send(request("model-late-stop", "stop_runtime"));
+    await expect(harness.nextResponse()).resolves.toMatchObject({
+      id: "model-late-stop",
+      ok: true,
+      result: { lifecycle: "stopped" },
+    });
+    release.resolve();
+
+    await expect(harness.nextResponse()).resolves.toEqual({
+      version: DESKTOP_PROTOCOL_VERSION,
+      id: "model-late-select",
+      ok: false,
+      error: { code: "MODEL_OPERATION_FAILED", message: "Model operation failed" },
+    });
+  });
+
+  it("recovers from true model invalidation with the confirmed LAN and world binding", async () => {
+    let modelListener: ((event: ModelCatalogEvent) => void) | undefined;
+    let profile: WorldProfile | null = null;
+    let revision = 0;
+    let runtimeCreations = 0;
+    const safetyConfigurations: RuntimeSafetyConfiguration[] = [];
+    const proof: ConfirmedConnectionProof = {
+      nonce: "model_recovery_proof_0001",
+      port: 25565,
+      issuedAt: 10,
+      expiresAt: 9_999,
+    };
+    const binding: ConfirmedWorldBinding = {
+      canonicalInstancePath: "C:/Minecraft/ModelRecovery",
+      javaSession: {
+        pid: 2468,
+        processStartedAt: 20,
+        port: 25565,
+        version: "1.21.5",
+      },
+      ownerUsername: "HarnessOwner",
+      proof,
+    };
+    const worlds: DesktopChildWorldProfileStore = {
+      read: async () => ({
+        schemaVersion: 1,
+        revision,
+        updatedAt: "2026-08-03T00:00:00.000Z",
+        value: profile,
+      }),
+      bindConfirmedWorld: async (_expectedRevision, confirmed, label) => {
+        revision += 1;
+        profile = {
+          id: "be176ae1-a4b4-4fd6-b04c-89634cd74a99",
+          label,
+          instanceFingerprint: fingerprintConfirmedWorld(
+            confirmed.canonicalInstancePath,
+            confirmed.javaSession,
+          ),
+          ownerUsername: confirmed.ownerUsername,
+          safetyPreset: "standard",
+        };
+        return {
+          schemaVersion: 1,
+          revision,
+          updatedAt: "2026-08-03T00:00:01.000Z",
+          value: profile,
+        };
+      },
+      updateSafetyProfile: async () => {
+        throw new Error("unused");
+      },
+    };
+    const harness = createHarness({
+      lazyRuntime: true,
+      now: () => 100,
+      worldProfiles: worlds,
+      models: {
+        resolveRuntimeSelection: async () => ({
+          modelId: "gpt-5.6-terra",
+          reasoningEffort: "medium",
+        }),
+        subscribe: (listener) => {
+          modelListener = listener;
+          return () => {
+            modelListener = undefined;
+          };
+        },
+      },
+      createRuntime: async (_connection, initialRevision, _selection, safety) => {
+        runtimeCreations += 1;
+        safetyConfigurations.push(safety);
+        return new RuntimeFacade({
+          initialRevision,
+          lifecycle: { start: async () => undefined, stop: async () => undefined },
+        });
+      },
+    });
+    harness.send(
+      commandRequest("model-recovery-confirm", { kind: "set_confirmed_connection", proof }),
+    );
+    await expect(harness.nextResponse()).resolves.toMatchObject({
+      id: "model-recovery-confirm",
+      ok: true,
+    });
+    harness.sendRaw(privateWorldBindRequest("model-recovery-bind", binding));
+    await expect(harness.nextResponse()).resolves.toMatchObject({
+      id: "model-recovery-bind",
+      ok: true,
+    });
+    harness.send(request("model-recovery-start", "start_runtime"));
+    await expect(harness.nextResponse()).resolves.toMatchObject({
+      id: "model-recovery-start",
+      ok: true,
+    });
+    expect(safetyConfigurations).toEqual([
+      { requestedPreset: "standard", compatibilityVerified: true },
+    ]);
+
+    modelListener?.({ kind: "selection_invalidated", reason: "model_unavailable" });
+    await vi.waitFor(() => expect(connectionInvalidations(harness)).toContain("model_unavailable"));
+    harness.send(request("model-recovery-restart", "start_runtime"));
+
+    await expect(harness.nextResponse()).resolves.toMatchObject({
+      id: "model-recovery-restart",
+      ok: true,
+      result: { lifecycle: "running" },
+    });
+    expect(safetyConfigurations).toEqual([
+      { requestedPreset: "standard", compatibilityVerified: true },
+      { requestedPreset: "standard", compatibilityVerified: true },
+    ]);
+    expect(runtimeCreations).toBe(2);
   });
 
   it("serves account state before a Minecraft runtime can be composed", async () => {
