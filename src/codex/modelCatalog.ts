@@ -1,5 +1,9 @@
 import type { AccountSnapshot } from "./accountService.js";
 import type { Model } from "./generated/v2/Model.js";
+import type {
+  LegacyModelPreferenceCandidate,
+  ModelPreferenceStore,
+} from "./modelPreferenceStore.js";
 
 const MODEL_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const REASONING_EFFORT_PATTERN = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/u;
@@ -48,6 +52,11 @@ export interface ModelCatalogAccountPort {
   subscribe(listener: (snapshot: AccountSnapshot) => void): () => void;
 }
 
+export interface ModelCatalogPersistenceDependencies {
+  readonly store: ModelPreferenceStore;
+  readonly legacyConfigCandidate: LegacyModelPreferenceCandidate;
+}
+
 export class ModelCatalog {
   readonly #appServer: ModelCatalogAppServerPort;
   readonly #account: ModelCatalogAccountPort;
@@ -59,7 +68,11 @@ export class ModelCatalog {
   #accountGeneration = 0;
   #operationTail: Promise<void> = Promise.resolve();
 
-  constructor(appServer: ModelCatalogAppServerPort, account: ModelCatalogAccountPort) {
+  constructor(
+    appServer: ModelCatalogAppServerPort,
+    account: ModelCatalogAccountPort,
+    _persistence?: ModelCatalogPersistenceDependencies,
+  ) {
     this.#appServer = appServer;
     this.#account = account;
     this.#unsubscribeAccount = account.subscribe((snapshot) => {

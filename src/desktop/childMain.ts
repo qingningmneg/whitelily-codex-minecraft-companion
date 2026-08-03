@@ -1,14 +1,15 @@
 import type { Readable, Writable } from "node:stream";
-import { relative, resolve } from "node:path";
+import { dirname, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { createRuntimeFacade } from "../app.js";
 import { AccountService } from "../codex/accountService.js";
 import { CodexAppServerClient } from "../codex/appServerClient.js";
 import { ModelCatalog } from "../codex/modelCatalog.js";
+import { ModelPreferenceStore } from "../codex/modelPreferenceStore.js";
 import type { ResolvedModelSelection } from "../codex/modelCatalog.js";
 import type { RuntimeFacade } from "../runtime/runtimeFacade.js";
 import type { ConfirmedRuntimeConnection } from "../config/schema.js";
-import { resolveCoreAppPaths } from "../config/loadConfig.js";
+import { loadConfig, resolveCoreAppPaths } from "../config/loadConfig.js";
 import { arch, platform, release } from "node:os";
 import { DiagnosticExporter } from "../diagnostics/diagnosticExporter.js";
 import { ProfileStore } from "../profile/profileStore.js";
@@ -162,14 +163,24 @@ async function createDefaultDesktopChildServices(
     ownerIdentity: OwnerIdentityAccess,
   ) => Promise<RuntimeFacade>,
 ): Promise<DesktopChildServices> {
+  const paths = resolveCoreAppPaths(context.configPath, {
+    cwd: context.cwd,
+    ...(context.dataRoot === undefined ? {} : { dataRoot: context.dataRoot }),
+  });
+  const legacyConfig = await loadConfig(context.configPath);
+  const modelPreferenceStore = new ModelPreferenceStore({ rootDirectory: dirname(paths.config) });
+  const legacyConfigCandidate = {
+    mode: "explicit" as const,
+    modelId: legacyConfig.codex.preferredModel,
+    reasoningEffort: legacyConfig.codex.reasoningEffort,
+  };
   const client = new CodexAppServerClient(undefined, {
     workspacePath: resolve(context.cwd, "codex-workspace"),
   });
   const account = new AccountService(client);
-  const models = new ModelCatalog(client, account);
-  const paths = resolveCoreAppPaths(context.configPath, {
-    cwd: context.cwd,
-    ...(context.dataRoot === undefined ? {} : { dataRoot: context.dataRoot }),
+  const models = new ModelCatalog(client, account, {
+    store: modelPreferenceStore,
+    legacyConfigCandidate,
   });
   const profiles = new ProfileStore({ rootDirectory: paths.profiles });
   const ownerIdentity = await OwnerIdentityService.open(paths.config);
