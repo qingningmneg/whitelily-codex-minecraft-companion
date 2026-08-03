@@ -5,6 +5,7 @@ import type {
   ModelPreferenceStore,
   PersistedModelPreference,
   PersistedModelPreferenceSelection,
+  RecoverableModelPreferenceUpdate,
 } from "./modelPreferenceStore.js";
 import { DocumentStoreError, type DocumentEnvelope } from "../storage/documentStore.js";
 
@@ -140,13 +141,17 @@ export class ModelCatalog {
       if (!preference.value.legacyMigrationCompleted) {
         if (this.#persistence) {
           try {
-            preference = await this.#persistence.store.migrateLegacyOnce(preference.revision, {
-              ...(candidate?.mode === "explicit" ? { ui: candidate } : {}),
-              config: this.#persistence.legacyConfigCandidate,
-              validate: async (legacyCandidate) =>
-                resolveExplicitSelection(normalized.models, legacyCandidate) !== undefined,
-            });
-            await this.#assertCurrentAccount(generation);
+            const migrated = await this.#persistence.store.migrateLegacyOnceRecoverably(
+              preference.revision,
+              {
+                ...(candidate?.mode === "explicit" ? { ui: candidate } : {}),
+                config: this.#persistence.legacyConfigCandidate,
+                validate: async (legacyCandidate) =>
+                  resolveExplicitSelection(normalized.models, legacyCandidate) !== undefined,
+              },
+            );
+            await this.#verifyDurableUpdate(generation, migrated);
+            preference = migrated.envelope;
           } catch (error) {
             if (!(error instanceof DocumentStoreError) || error.code !== "DOCUMENT_CONFLICT") {
               throw error;
@@ -165,7 +170,7 @@ export class ModelCatalog {
           preference = this.#volatilePreference(migrated, true);
         }
       }
-      return this.#applyRefresh(normalized, preference, false, generation);
+      return this.#applyRefresh(normalized, preference, true, generation);
     });
   }
 
@@ -246,10 +251,12 @@ export class ModelCatalog {
     const persistedSelection = persistedSelectionFromInput(prepared.requested);
     let committed: DocumentEnvelope<PersistedModelPreference>;
     if (this.#persistence) {
-      committed = await this.#persistence.store.replace(prepared.preferenceRevision, {
+      const update = await this.#persistence.store.replaceRecoverably(prepared.preferenceRevision, {
         selection: persistedSelection,
         legacyMigrationCompleted: current.value.legacyMigrationCompleted,
       });
+      await this.#verifyDurableUpdate(generation, update);
+      committed = update.envelope;
     } else {
       if (prepared.preferenceRevision !== this.#volatilePreferenceRevision) {
         throw new DocumentStoreError("DOCUMENT_CONFLICT", "document revision conflict");
@@ -259,8 +266,8 @@ export class ModelCatalog {
         persistedSelection,
         current.value.legacyMigrationCompleted,
       );
+      await this.#assertCurrentAccount(generation);
     }
-    await this.#assertCurrentAccount(generation);
     const selection = publicSelection(prepared.requested);
     const changed = !samePersistedSelection(current.value.selection, persistedSelection);
     this.#selection = selection;
@@ -288,11 +295,12 @@ export class ModelCatalog {
     if (selection === undefined) {
       unavailable = true;
       if (this.#persistence) {
-        preference = await this.#persistence.store.replace(preference.revision, {
+        const repaired = await this.#persistence.store.replaceRecoverably(preference.revision, {
           selection: { mode: "automatic" },
           legacyMigrationCompleted: preference.value.legacyMigrationCompleted,
         });
-        await this.#assertCurrentAccount(generation, signal);
+        await this.#verifyDurableUpdate(generation, repaired, signal);
+        preference = repaired.envelope;
       } else {
         this.#volatilePreferenceRevision += 1;
         preference = this.#volatilePreference(
@@ -359,6 +367,19 @@ export class ModelCatalog {
     await this.#assertSignedIn(signal);
     if (generation !== this.#accountGeneration) {
       throw new Error("ChatGPT authentication is required");
+    }
+  }
+
+  async #verifyDurableUpdate(
+    generation: number,
+    update: RecoverableModelPreferenceUpdate,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    try {
+      await this.#assertCurrentAccount(generation, signal);
+    } catch (error) {
+      await update.restore();
+      throw error;
     }
   }
 

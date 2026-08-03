@@ -1,5 +1,5 @@
 import { PassThrough } from "node:stream";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -19,6 +19,7 @@ import { RuntimeFacade } from "../../src/runtime/runtimeFacade.js";
 import type { AccountSnapshot } from "../../src/codex/accountService.js";
 import type { Model } from "../../src/codex/generated/v2/Model.js";
 import { ModelCatalog, type ModelCatalogEvent } from "../../src/codex/modelCatalog.js";
+import { ModelPreferenceStore } from "../../src/codex/modelPreferenceStore.js";
 import type { MinecraftEvent } from "../../src/minecraft/minecraftPort.js";
 import type { RuntimeEvent, RuntimeSnapshot } from "../../src/runtime/runtimeEvents.js";
 import type { TaskStopReason } from "../../src/safety/taskBudget.js";
@@ -4850,6 +4851,58 @@ describe("DesktopChildServer", () => {
     expect(harness.stopReasons).toEqual(["model_unavailable"]);
     expect(harness.runtimeCreations()).toBe(2);
     expect(vi.getTimerCount()).toBe(1);
+  });
+
+  it("contains a running runtime when a completed migration refresh loses its selected model", async () => {
+    const rootDirectory = await mkdtemp(join(tmpdir(), "whitelily-model-migration-child-"));
+    try {
+      let records = [serviceModel("migration-live-model", "xhigh", true)];
+      const catalog = new ModelCatalog(
+        { listModelRecords: async () => records },
+        {
+          getAccount: async () => ({ status: "signed_in", auth: "chatgpt" }),
+          subscribe: () => () => undefined,
+        },
+        {
+          store: new ModelPreferenceStore({ rootDirectory }),
+          legacyConfigCandidate: {
+            mode: "explicit",
+            modelId: "legacy-config-model",
+            reasoningEffort: "medium",
+          },
+        },
+      );
+      await catalog.migrateLegacyPreference({
+        mode: "explicit",
+        modelId: "migration-live-model",
+        reasoningEffort: "xhigh",
+      });
+      const harness = createHarness({
+        models: {
+          listModels: () => catalog.listModels(),
+          selectModel: (selection) => catalog.selectModel(selection),
+          resolveRuntimeSelection: (options) => catalog.resolveRuntimeSelection(options),
+          subscribe: (listener) => catalog.subscribe(listener),
+          stop: () => catalog.stop(),
+        },
+      });
+      harness.send(request("migration-model-start", "start_runtime"));
+      await expect(harness.nextResponse()).resolves.toMatchObject({
+        id: "migration-model-start",
+        ok: true,
+        result: { lifecycle: "running" },
+      });
+      records = [serviceModel("migration-replacement-model", "medium", true)];
+
+      await catalog.migrateLegacyPreference(null);
+
+      await vi.waitFor(() => {
+        expect(harness.stopReasons).toEqual(["model_unavailable"]);
+        expect(connectionInvalidations(harness)).toEqual(["model_unavailable"]);
+      });
+    } finally {
+      await rm(rootDirectory, { recursive: true, force: true });
+    }
   });
 
   it("immediately contains typed recovery-time model authority loss from the exact live runtime", async () => {

@@ -55,6 +55,11 @@ export interface ModelPreferenceStoreOptions {
   readonly fileIo?: AtomicJsonFileIo;
 }
 
+export interface RecoverableModelPreferenceUpdate {
+  readonly envelope: DocumentEnvelope<PersistedModelPreference>;
+  restore(): Promise<DocumentEnvelope<PersistedModelPreference>>;
+}
+
 const legacyCandidateSchema = z
   .object({
     mode: z.literal("explicit"),
@@ -101,6 +106,13 @@ export class ModelPreferenceStore {
     });
   }
 
+  replaceRecoverably(
+    expectedRevision: number,
+    value: PersistedModelPreference,
+  ): Promise<RecoverableModelPreferenceUpdate> {
+    return this.#recoverableUpdate(expectedRevision, () => this.replace(expectedRevision, value));
+  }
+
   migrateLegacyOnce(
     expectedRevision: number,
     input: LegacyMigrationInput,
@@ -119,6 +131,42 @@ export class ModelPreferenceStore {
     });
   }
 
+  migrateLegacyOnceRecoverably(
+    expectedRevision: number,
+    input: LegacyMigrationInput,
+  ): Promise<RecoverableModelPreferenceUpdate> {
+    return this.#recoverableUpdate(expectedRevision, () =>
+      this.migrateLegacyOnce(expectedRevision, input),
+    );
+  }
+
+  async #recoverableUpdate(
+    expectedRevision: number,
+    update: () => Promise<DocumentEnvelope<PersistedModelPreference>>,
+  ): Promise<RecoverableModelPreferenceUpdate> {
+    const before = await this.read();
+    if (before.revision !== expectedRevision) {
+      throw new DocumentStoreError("DOCUMENT_CONFLICT", "document revision conflict");
+    }
+    const committed = await update();
+    let restored = false;
+    return Object.freeze({
+      envelope: committed,
+      restore: async () => {
+        if (restored) {
+          throw new DocumentStoreError("DOCUMENT_CONFLICT", "document revision conflict");
+        }
+        const current = await this.read();
+        if (!sameEnvelope(current, committed)) {
+          throw new DocumentStoreError("DOCUMENT_CONFLICT", "document revision conflict");
+        }
+        const recovery = await this.#document.replace(committed.revision, before.value);
+        restored = true;
+        return recovery;
+      },
+    });
+  }
+
   async #firstValidLegacySelection(
     input: LegacyMigrationInput,
   ): Promise<PersistedModelPreferenceSelection> {
@@ -133,4 +181,27 @@ export class ModelPreferenceStore {
     }
     return { mode: "automatic" };
   }
+}
+
+function sameEnvelope(
+  left: DocumentEnvelope<PersistedModelPreference>,
+  right: DocumentEnvelope<PersistedModelPreference>,
+): boolean {
+  return (
+    left.schemaVersion === right.schemaVersion &&
+    left.revision === right.revision &&
+    left.updatedAt === right.updatedAt &&
+    samePreference(left.value, right.value)
+  );
+}
+
+function samePreference(left: PersistedModelPreference, right: PersistedModelPreference): boolean {
+  return (
+    left.legacyMigrationCompleted === right.legacyMigrationCompleted &&
+    left.selection.mode === right.selection.mode &&
+    (left.selection.mode === "automatic" ||
+      (right.selection.mode === "explicit" &&
+        left.selection.modelId === right.selection.modelId &&
+        left.selection.reasoningEffort === right.selection.reasoningEffort))
+  );
 }

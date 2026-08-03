@@ -495,11 +495,11 @@ describe("ModelCatalog", () => {
     records = [model("replacement", "Replacement", ["medium"])];
     const replacementEntered = gate();
     const allowReplacement = gate();
-    const replace = store.replace.bind(store);
-    vi.spyOn(store, "replace").mockImplementation(async (revision, value) => {
+    const replaceRecoverably = store.replaceRecoverably.bind(store);
+    vi.spyOn(store, "replaceRecoverably").mockImplementation(async (revision, value) => {
       replacementEntered.release();
       await allowReplacement.promise;
-      return replace(revision, value);
+      return replaceRecoverably(revision, value);
     });
     const events: ModelCatalogEvent[] = [];
     catalog.subscribe((event) => events.push(event));
@@ -511,6 +511,17 @@ describe("ModelCatalog", () => {
 
     await expect(listing).rejects.toThrow("ChatGPT authentication is required");
     expect(events).toEqual([{ kind: "selection_invalidated", reason: "account_lost" }]);
+    await expect(store.read()).resolves.toMatchObject({
+      revision: 3,
+      value: {
+        selection: {
+          mode: "explicit",
+          modelId: "temporary",
+          reasoningEffort: "low",
+        },
+        legacyMigrationCompleted: false,
+      },
+    });
   });
 
   it("does not apply a legacy migration that finishes after logout", async () => {
@@ -531,11 +542,11 @@ describe("ModelCatalog", () => {
     await catalog.listModels();
     const migrationEntered = gate();
     const allowMigration = gate();
-    const migrateLegacyOnce = store.migrateLegacyOnce.bind(store);
-    vi.spyOn(store, "migrateLegacyOnce").mockImplementation(async (revision, input) => {
+    const migrateLegacyOnceRecoverably = store.migrateLegacyOnceRecoverably.bind(store);
+    vi.spyOn(store, "migrateLegacyOnceRecoverably").mockImplementation(async (revision, input) => {
       migrationEntered.release();
       await allowMigration.promise;
-      return migrateLegacyOnce(revision, input);
+      return migrateLegacyOnceRecoverably(revision, input);
     });
     const events: ModelCatalogEvent[] = [];
     catalog.subscribe((event) => events.push(event));
@@ -551,6 +562,13 @@ describe("ModelCatalog", () => {
 
     await expect(migrating).rejects.toThrow("ChatGPT authentication is required");
     expect(events).toEqual([{ kind: "selection_invalidated", reason: "account_lost" }]);
+    await expect(store.read()).resolves.toMatchObject({
+      revision: 2,
+      value: {
+        selection: { mode: "automatic" },
+        legacyMigrationCompleted: false,
+      },
+    });
   });
 
   it("does not apply a prepared selection whose persistence finishes after logout", async () => {
@@ -576,11 +594,11 @@ describe("ModelCatalog", () => {
     });
     const replacementEntered = gate();
     const allowReplacement = gate();
-    const replace = store.replace.bind(store);
-    vi.spyOn(store, "replace").mockImplementation(async (revision, value) => {
+    const replaceRecoverably = store.replaceRecoverably.bind(store);
+    vi.spyOn(store, "replaceRecoverably").mockImplementation(async (revision, value) => {
       replacementEntered.release();
       await allowReplacement.promise;
-      return replace(revision, value);
+      return replaceRecoverably(revision, value);
     });
     const events: ModelCatalogEvent[] = [];
     catalog.subscribe((event) => events.push(event));
@@ -592,6 +610,91 @@ describe("ModelCatalog", () => {
 
     await expect(committing).rejects.toThrow("ChatGPT authentication is required");
     expect(events).toEqual([{ kind: "selection_invalidated", reason: "account_lost" }]);
+    await expect(store.read()).resolves.toMatchObject({
+      revision: 2,
+      value: {
+        selection: { mode: "automatic" },
+        legacyMigrationCompleted: false,
+      },
+    });
+  });
+
+  it("does not let compensation overwrite a later preference writer", async () => {
+    const account = signedInAccount();
+    const store = await preferenceStore();
+    const catalog = new ModelCatalog(
+      { listModelRecords: async () => [model("live", "Live", ["medium"])] },
+      account,
+      {
+        store,
+        legacyConfigCandidate: {
+          mode: "explicit",
+          modelId: "legacy-config",
+          reasoningEffort: "medium",
+        },
+      },
+    );
+    await catalog.listModels();
+    const prepared = await catalog.prepareSelection({
+      mode: "explicit",
+      modelId: "live",
+      reasoningEffort: "medium",
+    });
+    const forwardCommitted = gate();
+    const allowForwardReturn = gate();
+    const replaceRecoverably = store.replaceRecoverably.bind(store);
+    vi.spyOn(store, "replaceRecoverably").mockImplementation(async (revision, value) => {
+      const update = await replaceRecoverably(revision, value);
+      forwardCommitted.release();
+      await allowForwardReturn.promise;
+      return update;
+    });
+
+    const committing = catalog.commitSelection(prepared);
+    await forwardCommitted.promise;
+    account.set({ status: "signed_out" });
+    await store.replace(1, {
+      selection: { mode: "automatic" },
+      legacyMigrationCompleted: true,
+    });
+    allowForwardReturn.release();
+
+    await expect(committing).rejects.toMatchObject({ code: "DOCUMENT_CONFLICT" });
+    await expect(store.read()).resolves.toMatchObject({
+      revision: 2,
+      value: {
+        selection: { mode: "automatic" },
+        legacyMigrationCompleted: true,
+      },
+    });
+  });
+
+  it("invalidates when a completed migration refresh discovers that the selected model disappeared", async () => {
+    const account = signedInAccount();
+    const store = await preferenceStore();
+    let records = [model("legacy-ui", "Legacy UI", ["high"])];
+    const catalog = new ModelCatalog({ listModelRecords: async () => records }, account, {
+      store,
+      legacyConfigCandidate: {
+        mode: "explicit",
+        modelId: "legacy-config",
+        reasoningEffort: "medium",
+      },
+    });
+    await catalog.migrateLegacyPreference({
+      mode: "explicit",
+      modelId: "legacy-ui",
+      reasoningEffort: "high",
+    });
+    const events: ModelCatalogEvent[] = [];
+    catalog.subscribe((event) => events.push(event));
+    records = [model("replacement", "Replacement", ["medium"])];
+
+    await expect(catalog.migrateLegacyPreference(null)).resolves.toMatchObject({
+      selection: { mode: "automatic" },
+      legacyMigrationCompleted: true,
+    });
+    expect(events).toEqual([{ kind: "selection_invalidated", reason: "model_unavailable" }]);
   });
 
   it("supports an explicit return to automatic selection", async () => {
