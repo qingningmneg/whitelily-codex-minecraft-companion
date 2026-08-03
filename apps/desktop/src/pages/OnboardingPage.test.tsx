@@ -44,6 +44,7 @@ const liveCatalog: ModelCatalogSnapshot = {
     },
   ],
   selection: { mode: "automatic" },
+  legacyMigrationCompleted: true,
 };
 
 const pcl2Candidate: Pcl2Candidate = {
@@ -74,6 +75,7 @@ interface ApiHarness {
   startChatGptLogin: ReturnType<typeof vi.fn<WhiteLilyDesktopApi["startChatGptLogin"]>>;
   cancelChatGptLogin: ReturnType<typeof vi.fn<WhiteLilyDesktopApi["cancelChatGptLogin"]>>;
   listModels: ReturnType<typeof vi.fn<WhiteLilyDesktopApi["listModels"]>>;
+  migrateModelPreference: ReturnType<typeof vi.fn<WhiteLilyDesktopApi["migrateModelPreference"]>>;
   selectModel: ReturnType<typeof vi.fn<WhiteLilyDesktopApi["selectModel"]>>;
   discoverPcl2: ReturnType<typeof vi.fn<WhiteLilyDesktopApi["discoverPcl2"]>>;
   detectLanCandidates: ReturnType<typeof vi.fn<WhiteLilyDesktopApi["detectLanCandidates"]>>;
@@ -139,6 +141,23 @@ function createApiHarness(
   const listModels = vi.fn<WhiteLilyDesktopApi["listModels"]>(
     async () => options.catalog ?? liveCatalog,
   );
+  const migrateModelPreference = vi.fn<WhiteLilyDesktopApi["migrateModelPreference"]>(
+    async (candidate) => {
+      const catalog = options.catalog ?? liveCatalog;
+      const validExplicit =
+        candidate?.mode === "explicit" &&
+        catalog.models.some(
+          (model) =>
+            model.id === candidate.modelId &&
+            model.supportedReasoningEfforts.includes(candidate.reasoningEffort),
+        );
+      return {
+        ...catalog,
+        selection: validExplicit ? { ...candidate, available: true } : { mode: "automatic" },
+        legacyMigrationCompleted: true,
+      };
+    },
+  );
   const selectModel = vi.fn<WhiteLilyDesktopApi["selectModel"]>(
     async (selection): Promise<ModelSelection> =>
       selection.mode === "automatic" ? { mode: "automatic" } : { ...selection, available: true },
@@ -199,6 +218,7 @@ function createApiHarness(
       startChatGptLogin,
       cancelChatGptLogin,
       listModels,
+      migrateModelPreference,
       selectModel,
       discoverPcl2,
       detectLanCandidates,
@@ -209,6 +229,7 @@ function createApiHarness(
     startChatGptLogin,
     cancelChatGptLogin,
     listModels,
+    migrateModelPreference,
     selectModel,
     discoverPcl2,
     detectLanCandidates,
@@ -259,6 +280,164 @@ afterEach(() => {
 });
 
 describe("first-run onboarding", () => {
+  it("submits a bounded v2 model preference once and rewrites storage without model authority", async () => {
+    window.localStorage.setItem(
+      ONBOARDING_STORAGE_KEY,
+      JSON.stringify({
+        version: 2,
+        locale: "zh-CN",
+        progressHint: "model",
+        modelPreference: {
+          mode: "explicit",
+          modelId: "gpt-live",
+          reasoningEffort: "high",
+        },
+      }),
+    );
+    const harness = createApiHarness({
+      catalog: { ...liveCatalog, legacyMigrationCompleted: false },
+    });
+
+    render(<App api={harness.api} />);
+
+    await screen.findByRole("heading", { name: "选择智能模型" });
+    expect(harness.migrateModelPreference).toHaveBeenCalledOnce();
+    expect(harness.migrateModelPreference).toHaveBeenCalledWith({
+      mode: "explicit",
+      modelId: "gpt-live",
+      reasoningEffort: "high",
+    });
+    expect(harness.selectModel).not.toHaveBeenCalled();
+    expect(JSON.parse(window.localStorage.getItem(ONBOARDING_STORAGE_KEY)!)).toEqual({
+      version: 3,
+      locale: "zh-CN",
+      progressHint: "model",
+    });
+  });
+
+  it("shares one migration submission across a locale-triggered catalog reload", async () => {
+    window.localStorage.setItem(
+      ONBOARDING_STORAGE_KEY,
+      JSON.stringify({
+        version: 2,
+        locale: "zh-CN",
+        progressHint: "model",
+        modelPreference: {
+          mode: "explicit",
+          modelId: "gpt-live",
+          reasoningEffort: "high",
+        },
+      }),
+    );
+    const migration = deferred<ModelCatalogSnapshot>();
+    const harness = createApiHarness({
+      catalog: { ...liveCatalog, legacyMigrationCompleted: false },
+    });
+    harness.migrateModelPreference.mockImplementation(() => migration.promise);
+    const user = userEvent.setup();
+    render(<App api={harness.api} />);
+
+    await waitFor(() => expect(harness.migrateModelPreference).toHaveBeenCalledOnce());
+    await user.click(screen.getByRole("button", { name: "English" }));
+    await waitFor(() => expect(harness.listModels).toHaveBeenCalledTimes(2));
+    expect(harness.migrateModelPreference).toHaveBeenCalledOnce();
+
+    await act(async () => {
+      migration.resolve({
+        ...liveCatalog,
+        selection: {
+          mode: "explicit",
+          modelId: "gpt-live",
+          reasoningEffort: "high",
+          available: true,
+        },
+        legacyMigrationCompleted: true,
+      });
+      await migration.promise;
+    });
+    await screen.findByRole("heading", { name: "Choose an AI model" });
+    expect(JSON.parse(window.localStorage.getItem(ONBOARDING_STORAGE_KEY)!)).toEqual({
+      version: 3,
+      locale: "en",
+      progressHint: "model",
+    });
+  });
+
+  it("retains the bounded legacy candidate until backend migration is confirmed complete", async () => {
+    window.localStorage.setItem(
+      ONBOARDING_STORAGE_KEY,
+      JSON.stringify({
+        version: 2,
+        locale: "en",
+        progressHint: "model",
+        modelPreference: {
+          mode: "explicit",
+          modelId: "gpt-live",
+          reasoningEffort: "high",
+        },
+      }),
+    );
+    const harness = createApiHarness({
+      catalog: { ...liveCatalog, legacyMigrationCompleted: false },
+    });
+    harness.migrateModelPreference.mockResolvedValue({
+      ...liveCatalog,
+      legacyMigrationCompleted: false,
+    });
+    render(<App api={harness.api} />);
+
+    await screen.findByRole("heading", { name: "Choose an AI model" });
+    expect(screen.getByRole("alert").textContent).toContain("model catalog");
+    expect(JSON.parse(window.localStorage.getItem(ONBOARDING_STORAGE_KEY)!)).toEqual({
+      version: 2,
+      locale: "en",
+      progressHint: "model",
+      modelPreference: {
+        mode: "explicit",
+        modelId: "gpt-live",
+        reasoningEffort: "high",
+      },
+    });
+  });
+
+  it("cannot let stale v2 model storage overwrite a completed backend selection on restart", async () => {
+    window.localStorage.setItem(
+      ONBOARDING_STORAGE_KEY,
+      JSON.stringify({
+        version: 2,
+        locale: "en",
+        progressHint: "model",
+        modelPreference: {
+          mode: "explicit",
+          modelId: "gpt-live",
+          reasoningEffort: "high",
+        },
+      }),
+    );
+    const backendCatalog: ModelCatalogSnapshot = {
+      ...liveCatalog,
+      selection: {
+        mode: "explicit",
+        modelId: "gpt-calm",
+        reasoningEffort: "medium",
+        available: true,
+      },
+      legacyMigrationCompleted: true,
+    };
+    const harness = createApiHarness({ catalog: backendCatalog });
+
+    render(<App api={harness.api} />);
+
+    await screen.findByRole("heading", { name: "Choose an AI model" });
+    expect(harness.migrateModelPreference).not.toHaveBeenCalled();
+    expect(harness.selectModel).not.toHaveBeenCalled();
+    expect(screen.getByRole("status").textContent).toContain("GPT Calm");
+    expect(JSON.parse(window.localStorage.getItem(ONBOARDING_STORAGE_KEY)!)).toEqual({
+      version: 3,
+      locale: "en",
+      progressHint: "model",
+    });
+  });
   it("adds a seven-step owner confirmation without persisting the exact-case username", async () => {
     const harness = createApiHarness();
     const user = userEvent.setup();
@@ -289,12 +468,7 @@ describe("first-run onboarding", () => {
     });
     const stored = window.localStorage.getItem(ONBOARDING_STORAGE_KEY);
     expect(stored).not.toContain("NewOwner");
-    expect(Object.keys(JSON.parse(stored!)).sort()).toEqual([
-      "locale",
-      "modelPreference",
-      "progressHint",
-      "version",
-    ]);
+    expect(Object.keys(JSON.parse(stored!)).sort()).toEqual(["locale", "progressHint", "version"]);
   });
 
   it("rejects malformed, placeholder, and bot-collision usernames before submission", async () => {
@@ -657,7 +831,7 @@ describe("first-run onboarding", () => {
     expect(harness.readOwnerIdentity).toHaveBeenCalledTimes(1);
     expect(harness.discoverPcl2).not.toHaveBeenCalled();
     expect(JSON.parse(window.localStorage.getItem(ONBOARDING_STORAGE_KEY)!)).toMatchObject({
-      version: 2,
+      version: 3,
       progressHint: "owner",
     });
   });
@@ -824,7 +998,7 @@ describe("first-run onboarding", () => {
     expect(screen.getByRole("status").textContent).toContain("自动选择");
   });
 
-  it("restores a persisted explicit preference only after the live selection succeeds", async () => {
+  it("migrates a persisted explicit preference through backend authority", async () => {
     window.localStorage.setItem(
       "whitelily.onboarding.v1",
       JSON.stringify({
@@ -838,19 +1012,22 @@ describe("first-run onboarding", () => {
         },
       }),
     );
-    const harness = createApiHarness();
+    const harness = createApiHarness({
+      catalog: { ...liveCatalog, legacyMigrationCompleted: false },
+    });
     render(<App api={harness.api} />);
 
     await screen.findByRole("heading", { name: "选择智能模型" });
-    expect(harness.selectModel).toHaveBeenCalledWith({
+    expect(harness.migrateModelPreference).toHaveBeenCalledWith({
       mode: "explicit",
       modelId: "gpt-live",
       reasoningEffort: "high",
     });
+    expect(harness.selectModel).not.toHaveBeenCalled();
     expect(screen.getByRole("status").textContent).toContain("GPT Live · high");
   });
 
-  it("clears a missing persisted model and applies automatic selection to live authority", async () => {
+  it("lets backend migration replace a missing persisted model with automatic authority", async () => {
     window.localStorage.setItem(
       "whitelily.onboarding.v1",
       JSON.stringify({
@@ -867,6 +1044,7 @@ describe("first-run onboarding", () => {
     const harness = createApiHarness({
       catalog: {
         ...liveCatalog,
+        legacyMigrationCompleted: false,
         selection: {
           mode: "explicit",
           modelId: "gpt-live",
@@ -878,16 +1056,27 @@ describe("first-run onboarding", () => {
     render(<App api={harness.api} />);
 
     await screen.findByRole("heading", { name: "选择智能模型" });
-    expect(harness.selectModel).toHaveBeenCalledWith({ mode: "automatic" });
+    expect(harness.migrateModelPreference).toHaveBeenCalledWith({
+      mode: "explicit",
+      modelId: "gpt-removed",
+      reasoningEffort: "high",
+    });
+    expect(harness.selectModel).not.toHaveBeenCalled();
     expect(screen.getByRole("status").textContent).toContain("自动选择");
-    expect(JSON.parse(window.localStorage.getItem("whitelily.onboarding.v1")!)).toMatchObject({
-      modelPreference: null,
+    expect(JSON.parse(window.localStorage.getItem("whitelily.onboarding.v1")!)).toEqual({
+      version: 3,
+      locale: "zh-CN",
+      progressHint: "model",
     });
   });
 
   it("blocks progress when the live account returns no usable models", async () => {
     const harness = createApiHarness({
-      catalog: { models: [], selection: { mode: "automatic" } },
+      catalog: {
+        models: [],
+        selection: { mode: "automatic" },
+        legacyMigrationCompleted: true,
+      },
     });
     render(<App api={harness.api} />);
 
@@ -901,7 +1090,11 @@ describe("first-run onboarding", () => {
     const retryCatalog = deferred<ModelCatalogSnapshot>();
     const harness = createApiHarness();
     harness.listModels
-      .mockResolvedValueOnce({ models: [], selection: { mode: "automatic" } })
+      .mockResolvedValueOnce({
+        models: [],
+        selection: { mode: "automatic" },
+        legacyMigrationCompleted: true,
+      })
       .mockImplementationOnce(() => retryCatalog.promise);
     render(<App api={harness.api} />);
 
@@ -956,6 +1149,7 @@ describe("first-run onboarding", () => {
           },
         ],
         selection: { mode: "automatic" },
+        legacyMigrationCompleted: true,
       });
       await latest.promise;
     });
@@ -971,108 +1165,20 @@ describe("first-run onboarding", () => {
           },
         ],
         selection: { mode: "automatic" },
+        legacyMigrationCompleted: true,
       });
       await older.promise;
     });
 
     expect(screen.queryByRole("option", { name: "Older Service Model" })).toBeNull();
     expect(screen.getByRole("heading", { name: "Choose an AI model" })).toBeTruthy();
-    expect(harness.selectModel).toHaveBeenLastCalledWith({
-      mode: "explicit",
-      modelId: "latest-model",
-      reasoningEffort: "high",
-    });
-    expect(JSON.parse(window.localStorage.getItem("whitelily.onboarding.v1")!)).toMatchObject({
+    expect(harness.selectModel).not.toHaveBeenCalled();
+    expect(JSON.parse(window.localStorage.getItem("whitelily.onboarding.v1")!)).toEqual({
+      version: 3,
       locale: "en",
       progressHint: "model",
-      modelPreference: {
-        mode: "explicit",
-        modelId: "latest-model",
-        reasoningEffort: "high",
-      },
     });
     expect(harness.discoverPcl2).not.toHaveBeenCalled();
-  });
-
-  it("reapplies the latest model choice after a stale catalog selection was already sent", async () => {
-    const staleSelection = deferred<ModelSelection>();
-    const latestSelection = deferred<ModelSelection>();
-    const harness = createApiHarness();
-    harness.listModels
-      .mockResolvedValueOnce({
-        models: [
-          {
-            id: "older-model",
-            displayName: "Older Service Model",
-            supportedReasoningEfforts: ["low"],
-          },
-        ],
-        selection: { mode: "automatic" },
-      })
-      .mockResolvedValueOnce({
-        models: [
-          {
-            id: "latest-model",
-            displayName: "Latest Service Model",
-            supportedReasoningEfforts: ["high"],
-          },
-        ],
-        selection: { mode: "automatic" },
-      });
-    harness.selectModel
-      .mockImplementationOnce(() => staleSelection.promise)
-      .mockImplementationOnce(() => latestSelection.promise);
-    window.localStorage.setItem(
-      "whitelily.onboarding.v1",
-      JSON.stringify({
-        version: 2,
-        locale: "zh-CN",
-        progressHint: "model",
-        modelPreference: {
-          mode: "explicit",
-          modelId: "latest-model",
-          reasoningEffort: "high",
-        },
-      }),
-    );
-    const user = userEvent.setup();
-    render(<App api={harness.api} />);
-    await waitFor(() => expect(harness.selectModel).toHaveBeenCalledWith({ mode: "automatic" }));
-
-    await user.click(screen.getByRole("button", { name: "English" }));
-    await waitFor(() => expect(harness.listModels).toHaveBeenCalledTimes(2));
-    expect(harness.selectModel).toHaveBeenCalledTimes(1);
-
-    await act(async () => {
-      staleSelection.resolve({ mode: "automatic" });
-      await staleSelection.promise;
-    });
-    await waitFor(() => expect(harness.selectModel).toHaveBeenCalledTimes(2));
-    expect(harness.selectModel).toHaveBeenLastCalledWith({
-      mode: "explicit",
-      modelId: "latest-model",
-      reasoningEffort: "high",
-    });
-
-    await act(async () => {
-      latestSelection.resolve({
-        mode: "explicit",
-        modelId: "latest-model",
-        reasoningEffort: "high",
-        available: true,
-      });
-      await latestSelection.promise;
-    });
-    expect(await screen.findByRole("option", { name: "Latest Service Model" })).toBeTruthy();
-    expect(JSON.parse(window.localStorage.getItem("whitelily.onboarding.v1")!)).toMatchObject({
-      locale: "en",
-      progressHint: "model",
-      modelPreference: {
-        mode: "explicit",
-        modelId: "latest-model",
-        reasoningEffort: "high",
-      },
-    });
   });
 
   it("does not let a persisted ready hint bypass an empty live model catalog", async () => {
@@ -1086,7 +1192,11 @@ describe("first-run onboarding", () => {
       }),
     );
     const harness = createApiHarness({
-      catalog: { models: [], selection: { mode: "automatic" } },
+      catalog: {
+        models: [],
+        selection: { mode: "automatic" },
+        legacyMigrationCompleted: true,
+      },
       pcl2: [pcl2Candidate],
     });
     render(<App api={harness.api} />);
@@ -1097,7 +1207,7 @@ describe("first-run onboarding", () => {
     expect(harness.detectLanCandidates).not.toHaveBeenCalled();
   });
 
-  it("does not resume past model selection when restoring live authority fails", async () => {
+  it("does not resume past model selection when backend migration fails", async () => {
     window.localStorage.setItem(
       "whitelily.onboarding.v1",
       JSON.stringify({
@@ -1107,8 +1217,11 @@ describe("first-run onboarding", () => {
         modelPreference: { mode: "automatic" },
       }),
     );
-    const harness = createApiHarness({ pcl2: [pcl2Candidate] });
-    harness.selectModel.mockRejectedValue(new Error("MODEL_UNAVAILABLE"));
+    const harness = createApiHarness({
+      catalog: { ...liveCatalog, legacyMigrationCompleted: false },
+      pcl2: [pcl2Candidate],
+    });
+    harness.migrateModelPreference.mockRejectedValue(new Error("MODEL_UNAVAILABLE"));
     render(<App api={harness.api} />);
 
     expect(await screen.findByRole("heading", { name: "Choose an AI model" })).toBeTruthy();
@@ -1117,7 +1230,7 @@ describe("first-run onboarding", () => {
     expect(harness.detectLanCandidates).not.toHaveBeenCalled();
   });
 
-  it("applies live automatic authority before using a resumed downstream hint", async () => {
+  it("completes null-candidate backend migration before using a resumed downstream hint", async () => {
     window.localStorage.setItem(
       "whitelily.onboarding.v1",
       JSON.stringify({
@@ -1128,6 +1241,7 @@ describe("first-run onboarding", () => {
       }),
     );
     const harness = createApiHarness({
+      catalog: { ...liveCatalog, legacyMigrationCompleted: false },
       owner: {
         revision: 4,
         ownerUsername: "LiveOwner",
@@ -1139,9 +1253,10 @@ describe("first-run onboarding", () => {
     render(<App api={harness.api} />);
 
     expect(await screen.findByRole("heading", { name: "Check PCL2" })).toBeTruthy();
-    expect(harness.selectModel).toHaveBeenCalledWith({ mode: "automatic" });
+    expect(harness.migrateModelPreference).toHaveBeenCalledWith(null);
+    expect(harness.selectModel).not.toHaveBeenCalled();
     expect(harness.readOwnerIdentity).toHaveBeenCalledTimes(1);
-    expect(harness.selectModel.mock.invocationCallOrder[0]).toBeLessThan(
+    expect(harness.migrateModelPreference.mock.invocationCallOrder[0]).toBeLessThan(
       harness.readOwnerIdentity.mock.invocationCallOrder[0]!,
     );
     expect(harness.discoverPcl2).toHaveBeenCalledTimes(1);
@@ -1354,7 +1469,7 @@ describe("first-run onboarding", () => {
     );
   });
 
-  it("clears a restored-model failure after a later live selection succeeds", async () => {
+  it("retries a failed migration before allowing a later live selection", async () => {
     window.localStorage.setItem(
       "whitelily.onboarding.v1",
       JSON.stringify({
@@ -1364,13 +1479,17 @@ describe("first-run onboarding", () => {
         modelPreference: { mode: "automatic" },
       }),
     );
-    const harness = createApiHarness();
-    harness.selectModel.mockRejectedValueOnce(new Error("MODEL_UNAVAILABLE"));
+    const harness = createApiHarness({
+      catalog: { ...liveCatalog, legacyMigrationCompleted: false },
+    });
+    harness.migrateModelPreference.mockRejectedValueOnce(new Error("MODEL_UNAVAILABLE"));
     const user = userEvent.setup();
     render(<App api={harness.api} />);
 
     await screen.findByRole("heading", { name: "选择智能模型" });
     expect(screen.getByRole("alert").textContent).toContain("模型列表");
+    await user.click(screen.getByRole("button", { name: "重试" }));
+    await screen.findByRole("combobox", { name: "模型" });
     await user.selectOptions(screen.getByRole("combobox", { name: "模型" }), "gpt-live");
 
     await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
@@ -1539,10 +1658,9 @@ describe("first-run onboarding", () => {
     await screen.findByRole("heading", { name: "登录 ChatGPT" });
 
     expect(JSON.parse(window.localStorage.getItem("whitelily.onboarding.v1")!)).toEqual({
-      version: 2,
+      version: 3,
       locale: "zh-CN",
       progressHint: "login",
-      modelPreference: null,
     });
     expect(window.localStorage.getItem("whitelily.onboarding.v1")).not.toContain(
       "lan_candidate_0001",
@@ -1586,6 +1704,7 @@ describe("model picker concurrency", () => {
             reasoningEffort: "high",
             available: true,
           },
+          legacyMigrationCompleted: true,
         }}
         onSelect={vi.fn()}
         onApplied={vi.fn()}

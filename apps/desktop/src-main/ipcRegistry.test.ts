@@ -157,7 +157,17 @@ function createRegistryHarness(snapshot: unknown = idleSnapshot) {
       case "cancel_chatgpt_login":
         return { status: "cancelled", attemptId: command.attemptId };
       case "list_models":
-        return { models: [], selection: { mode: "automatic" } };
+        return {
+          models: [],
+          selection: { mode: "automatic" },
+          legacyMigrationCompleted: false,
+        };
+      case "migrate_model_preference":
+        return {
+          models: [],
+          selection: { mode: "automatic" },
+          legacyMigrationCompleted: true,
+        };
       case "select_model":
         return command.selection.mode === "automatic"
           ? { mode: "automatic" }
@@ -281,6 +291,7 @@ describe("IPC registry", () => {
         WHITE_LILY_IPC_CHANNELS.cancelChatGptLogin,
         WHITE_LILY_IPC_CHANNELS.commitMemoryMigration,
         WHITE_LILY_IPC_CHANNELS.listModels,
+        WHITE_LILY_IPC_CHANNELS.migrateModelPreference,
         WHITE_LILY_IPC_CHANNELS.selectModel,
         WHITE_LILY_IPC_CHANNELS.discoverPcl2,
         WHITE_LILY_IPC_CHANNELS.detectLanCandidates,
@@ -1232,6 +1243,7 @@ describe("IPC registry", () => {
         WHITE_LILY_IPC_CHANNELS.cancelChatGptLogin,
         WHITE_LILY_IPC_CHANNELS.commitMemoryMigration,
         WHITE_LILY_IPC_CHANNELS.listModels,
+        WHITE_LILY_IPC_CHANNELS.migrateModelPreference,
         WHITE_LILY_IPC_CHANNELS.selectModel,
         WHITE_LILY_IPC_CHANNELS.discoverPcl2,
         WHITE_LILY_IPC_CHANNELS.detectLanCandidates,
@@ -1261,6 +1273,33 @@ describe("IPC registry", () => {
       ].sort(),
     );
     expect(unsubscribeSupervisor).toHaveBeenCalledOnce();
+  });
+
+  it("validates a bounded model migration candidate before forwarding it", async () => {
+    const { handlers, request } = createRegistryHarness();
+    const migrate = handlers.get(WHITE_LILY_IPC_CHANNELS.migrateModelPreference)!;
+
+    await expect(
+      migrate(undefined, {
+        mode: "explicit",
+        modelId: "gpt-live",
+        reasoningEffort: "high",
+      }),
+    ).resolves.toMatchObject({ legacyMigrationCompleted: true });
+    expect(request).toHaveBeenLastCalledWith({
+      kind: "migrate_model_preference",
+      candidate: { mode: "explicit", modelId: "gpt-live", reasoningEffort: "high" },
+    });
+
+    await expect(migrate(undefined, null)).resolves.toMatchObject({
+      legacyMigrationCompleted: true,
+    });
+    await expect(
+      migrate(undefined, { mode: "explicit", modelId: "../private", reasoningEffort: "high" }),
+    ).rejects.toThrow("invalid desktop request");
+    await expect(migrate(undefined, "raw-local-storage-json")).rejects.toThrow(
+      "invalid desktop request",
+    );
   });
 
   it("rolls back earlier handlers when IPC registration throws", () => {
@@ -1334,7 +1373,18 @@ describe("typed preload API", () => {
           return { status: "cancelled", attemptId: "opaque_attempt_1234" };
         }
         if (channel === WHITE_LILY_IPC_CHANNELS.listModels) {
-          return { models: [], selection: { mode: "automatic" } };
+          return {
+            models: [],
+            selection: { mode: "automatic" },
+            legacyMigrationCompleted: false,
+          };
+        }
+        if (channel === WHITE_LILY_IPC_CHANNELS.migrateModelPreference) {
+          return {
+            models: [],
+            selection: { mode: "automatic" },
+            legacyMigrationCompleted: true,
+          };
         }
         if (channel === WHITE_LILY_IPC_CHANNELS.selectModel) {
           return { mode: "automatic" };
@@ -1382,6 +1432,7 @@ describe("typed preload API", () => {
         "cancelChatGptLogin",
         "commitMemoryMigration",
         "listModels",
+        "migrateModelPreference",
         "selectModel",
         "discoverPcl2",
         "detectLanCandidates",
@@ -1421,6 +1472,7 @@ describe("typed preload API", () => {
     await api.startChatGptLogin();
     await api.cancelChatGptLogin("opaque_attempt_1234");
     await api.listModels();
+    await api.migrateModelPreference(null);
     await api.selectModel({ mode: "automatic" });
     await expect(api.discoverPcl2()).resolves.toEqual(pcl2Candidates);
     await expect(api.detectLanCandidates()).resolves.toEqual(lanCandidates);
@@ -1440,6 +1492,7 @@ describe("typed preload API", () => {
       WHITE_LILY_IPC_CHANNELS.startChatGptLogin,
       WHITE_LILY_IPC_CHANNELS.cancelChatGptLogin,
       WHITE_LILY_IPC_CHANNELS.listModels,
+      WHITE_LILY_IPC_CHANNELS.migrateModelPreference,
       WHITE_LILY_IPC_CHANNELS.selectModel,
       WHITE_LILY_IPC_CHANNELS.discoverPcl2,
       WHITE_LILY_IPC_CHANNELS.detectLanCandidates,

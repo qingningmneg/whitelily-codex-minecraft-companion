@@ -528,6 +528,12 @@ const desktopCommandSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("list_models") }).strict(),
   z
     .object({
+      kind: z.literal("migrate_model_preference"),
+      candidate: modelSelectionInputSchema.nullable(),
+    })
+    .strict(),
+  z
+    .object({
       kind: z.literal("select_model"),
       selection: modelSelectionInputSchema,
     })
@@ -779,7 +785,7 @@ export type DesktopCommandResult<C extends DesktopCommand> = C["kind"] extends
       ? AccountSnapshot
       : C["kind"] extends "start_chatgpt_login"
         ? StartChatGptLoginResult
-        : C["kind"] extends "list_models"
+        : C["kind"] extends "list_models" | "migrate_model_preference"
           ? ModelCatalogSnapshot
           : C["kind"] extends "select_model"
             ? ModelSelection
@@ -924,6 +930,7 @@ export function parseDesktopCommandResult<C extends DesktopCommand>(
       schema = startChatGptLoginResultSchema;
       break;
     case "list_models":
+    case "migrate_model_preference":
       schema = modelCatalogSnapshotSchema;
       break;
     case "select_model":

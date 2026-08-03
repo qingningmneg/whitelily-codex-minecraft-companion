@@ -1489,6 +1489,52 @@ describe("desktop protocol v1", () => {
     ).toThrow("invalid desktop command result");
   });
 
+  it("parses model preference migration with the same bounded selection schema", () => {
+    const explicitRequest = {
+      version: DESKTOP_PROTOCOL_VERSION,
+      id: "migration-explicit",
+      command: {
+        kind: "migrate_model_preference",
+        candidate: {
+          mode: "explicit",
+          modelId: "gpt-live",
+          reasoningEffort: "high",
+        },
+      },
+    } as const;
+    expect(parseDesktopRequest(explicitRequest)).toEqual(explicitRequest);
+
+    const nullRequest = {
+      version: DESKTOP_PROTOCOL_VERSION,
+      id: "migration-null",
+      command: { kind: "migrate_model_preference", candidate: null },
+    } as const;
+    expect(parseDesktopRequest(nullRequest)).toEqual(nullRequest);
+
+    expect(() =>
+      parseDesktopRequest({
+        ...explicitRequest,
+        command: {
+          ...explicitRequest.command,
+          candidate: { ...explicitRequest.command.candidate, modelId: "../private" },
+        },
+      }),
+    ).toThrow("invalid desktop request");
+    expect(() =>
+      parseDesktopRequest({
+        ...nullRequest,
+        command: { ...nullRequest.command, localStorage: "raw-private-json" },
+      }),
+    ).toThrow("invalid desktop request");
+
+    const snapshot = {
+      models: [],
+      selection: { mode: "automatic" as const },
+      legacyMigrationCompleted: true,
+    };
+    expect(parseDesktopCommandResult(explicitRequest.command, snapshot)).toEqual(snapshot);
+  });
+
   it("accepts account state events without ever including the login URL", () => {
     expect(
       parseDesktopEvent({

@@ -436,13 +436,31 @@ function createServerBackedWorldHarness(): ServerBackedWorldHarness {
           stop: async () => undefined,
         },
         models: {
-          listModels: async () => ({ models: [], selection: { mode: "automatic" } }),
+          listModels: async () => ({
+            models: [],
+            selection: { mode: "automatic" },
+            legacyMigrationCompleted: true,
+          }),
+          migrateLegacyPreference: async () => ({
+            models: [],
+            selection: { mode: "automatic" },
+            legacyMigrationCompleted: true,
+          }),
           selectModel: async () => ({ mode: "automatic" }),
+          prepareSelection: async (selection) => ({
+            preferenceRevision: 0,
+            requested: selection,
+            resolved: { modelId: "correlated-live-model", reasoningEffort: "medium" },
+          }),
+          commitSelection: async (prepared) =>
+            prepared.requested.mode === "automatic"
+              ? { mode: "automatic" }
+              : { ...prepared.requested, available: true },
           resolveRuntimeSelection: async () => ({
             modelId: "correlated-live-model",
             reasoningEffort: "medium",
           }),
-          subscribeInvalidation: () => () => undefined,
+          subscribe: () => () => undefined,
           stop: () => undefined,
         },
         worldProfiles,

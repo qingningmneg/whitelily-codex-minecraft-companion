@@ -354,6 +354,20 @@ export function registerIpcHandlers(options: IpcRegistryOptions): () => void {
       return parseDesktopCommandResult(command, await options.supervisor.request(command));
     });
     registeredChannels.push(WHITE_LILY_IPC_CHANNELS.listModels);
+    options.ipcMain.handle(
+      WHITE_LILY_IPC_CHANNELS.migrateModelPreference,
+      async (_event, ...args) => {
+        if (args.length !== 1) throw new Error("invalid IPC input");
+        const command = parseDesktopRequest({
+          version: 1,
+          id: "ipc",
+          command: { kind: "migrate_model_preference", candidate: args[0] },
+        }).command;
+        if (command.kind !== "migrate_model_preference") throw new Error("invalid IPC input");
+        return parseDesktopCommandResult(command, await options.supervisor.request(command));
+      },
+    );
+    registeredChannels.push(WHITE_LILY_IPC_CHANNELS.migrateModelPreference);
     options.ipcMain.handle(WHITE_LILY_IPC_CHANNELS.selectModel, async (_event, ...args) => {
       if (args.length !== 1) throw new Error("invalid IPC input");
       const command = parseDesktopRequest({

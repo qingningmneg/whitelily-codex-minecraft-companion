@@ -127,6 +127,12 @@ function createApiHarness(
       listModels: vi.fn(async () => ({
         models: [],
         selection: { mode: "automatic" as const },
+        legacyMigrationCompleted: true,
+      })),
+      migrateModelPreference: vi.fn(async () => ({
+        models: [],
+        selection: { mode: "automatic" as const },
+        legacyMigrationCompleted: true,
       })),
       selectModel: vi.fn(async () => ({ mode: "automatic" as const })),
       discoverPcl2: vi.fn(async () => []),
@@ -342,6 +348,22 @@ describe("bilingual control-center home", () => {
       });
     });
 
+    expect(screen.getByRole("main").id).toBe("home");
+    expect(document.querySelector(".onboarding")).toBeNull();
+  });
+
+  it("updates the model card from a runtime event without returning to onboarding", async () => {
+    const harness = createApiHarness({ snapshot: revisionedSnapshot(activeSnapshot, 10) });
+    render(renderApp(harness.api));
+    await screen.findByText("gpt-5.6");
+
+    act(() => {
+      harness.emit(
+        revisionedEvent({ kind: "codex", state: { state: "ready", model: "gpt-fast-live" } }, 11),
+      );
+    });
+
+    expect(await screen.findByText("gpt-fast-live")).toBeTruthy();
     expect(screen.getByRole("main").id).toBe("home");
     expect(document.querySelector(".onboarding")).toBeNull();
   });
@@ -914,6 +936,12 @@ describe("bilingual control-center home", () => {
         listModels: vi.fn(async () => ({
           models: [],
           selection: { mode: "automatic" as const },
+          legacyMigrationCompleted: true,
+        })),
+        migrateModelPreference: vi.fn(async () => ({
+          models: [],
+          selection: { mode: "automatic" as const },
+          legacyMigrationCompleted: true,
         })),
         selectModel: vi.fn(async () => ({ mode: "automatic" as const })),
         discoverPcl2: vi.fn(async () => []),

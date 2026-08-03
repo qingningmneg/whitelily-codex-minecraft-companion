@@ -152,6 +152,7 @@ export interface DesktopChildAccountService {
 
 export interface DesktopChildModelCatalog {
   listModels(): Promise<ModelCatalogSnapshot>;
+  migrateLegacyPreference(candidate: ModelSelectionInput | null): Promise<ModelCatalogSnapshot>;
   selectModel(selection: ModelSelectionInput): Promise<ModelSelection>;
   prepareSelection(selection: ModelSelectionInput): Promise<PreparedModelSelection>;
   commitSelection(prepared: PreparedModelSelection): Promise<ModelSelection>;
@@ -848,6 +849,12 @@ export class DesktopChildServer {
           return;
         case "list_models":
           await this.#writeCommandResult(request, await this.#models.listModels());
+          return;
+        case "migrate_model_preference":
+          await this.#writeCommandResult(
+            request,
+            await this.#models.migrateLegacyPreference(request.command.candidate),
+          );
           return;
         case "select_model":
           await this.#writeCommandResult(
@@ -2305,6 +2312,7 @@ function errorCodeFor(kind: DesktopRequest["command"]["kind"]): DesktopErrorCode
     case "cancel_chatgpt_login":
       return "ACCOUNT_OPERATION_FAILED";
     case "list_models":
+    case "migrate_model_preference":
     case "select_model":
       return "MODEL_OPERATION_FAILED";
     case "set_confirmed_connection":

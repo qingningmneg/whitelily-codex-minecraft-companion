@@ -45,6 +45,7 @@ export const WHITE_LILY_IPC_CHANNELS = {
   startChatGptLogin: "whitelily:start-chatgpt-login",
   cancelChatGptLogin: "whitelily:cancel-chatgpt-login",
   listModels: "whitelily:list-models",
+  migrateModelPreference: "whitelily:migrate-model-preference",
   selectModel: "whitelily:select-model",
   discoverPcl2: "whitelily:discover-pcl2",
   detectLanCandidates: "whitelily:detect-lan-candidates",
@@ -114,6 +115,7 @@ export interface WhiteLilyDesktopApi {
   startChatGptLogin(): Promise<Extract<AccountSnapshot, { status: "pending" }>>;
   cancelChatGptLogin(attemptId: string): Promise<AccountSnapshot>;
   listModels(): Promise<ModelCatalogSnapshot>;
+  migrateModelPreference(candidate: ModelSelectionInput | null): Promise<ModelCatalogSnapshot>;
   selectModel(selection: ModelSelectionInput): Promise<ModelSelection>;
   discoverPcl2(): Promise<readonly Pcl2Candidate[]>;
   detectLanCandidates(): Promise<readonly LanCandidate[]>;
@@ -312,6 +314,20 @@ export function createWhiteLilyApi(transport: PreloadTransport): WhiteLilyAppApi
         { kind: "list_models" },
         await transport.invoke(WHITE_LILY_IPC_CHANNELS.listModels),
       ),
+    migrateModelPreference: async (candidate: ModelSelectionInput | null) => {
+      const command = parseDesktopRequest({
+        version: 1,
+        id: "preload",
+        command: { kind: "migrate_model_preference", candidate },
+      }).command;
+      if (command.kind !== "migrate_model_preference") {
+        throw new Error("invalid model migration candidate");
+      }
+      return parseDesktopCommandResult(
+        command,
+        await transport.invoke(WHITE_LILY_IPC_CHANNELS.migrateModelPreference, command.candidate),
+      );
+    },
     selectModel: async (selection: ModelSelectionInput) => {
       const command = parseDesktopRequest({
         version: 1,

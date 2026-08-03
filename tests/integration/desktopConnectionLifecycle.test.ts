@@ -164,6 +164,11 @@ function createProtocolHarness(options: {
         selection: { mode: "automatic" },
         legacyMigrationCompleted: false,
       }),
+      migrateLegacyPreference: async () => ({
+        models: [],
+        selection: { mode: "automatic" },
+        legacyMigrationCompleted: true,
+      }),
       selectModel: async () => ({ mode: "automatic" }),
       prepareSelection: async (selection) => ({
         preferenceRevision: 0,

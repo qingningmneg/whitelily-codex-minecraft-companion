@@ -96,6 +96,7 @@ export function createDesktopChildHarness(
     lazyRuntime?: boolean;
     models?: Partial<{
       listModels(): Promise<ModelCatalogSnapshot>;
+      migrateLegacyPreference(candidate: ModelSelectionInput | null): Promise<ModelCatalogSnapshot>;
       selectModel(selection: ModelSelectionInput): Promise<ModelSelection>;
       prepareSelection(selection: ModelSelectionInput): Promise<PreparedModelSelection>;
       commitSelection(prepared: PreparedModelSelection): Promise<ModelSelection>;
@@ -245,6 +246,14 @@ export function createDesktopChildHarness(
       models: [],
       selection: { mode: "automatic" },
       legacyMigrationCompleted: false,
+    }),
+    migrateLegacyPreference: async (
+      candidate: ModelSelectionInput | null,
+    ): Promise<ModelCatalogSnapshot> => ({
+      models: [],
+      selection:
+        candidate?.mode === "explicit" ? { ...candidate, available: true } : { mode: "automatic" },
+      legacyMigrationCompleted: true,
     }),
     selectModel: async (selection: ModelSelectionInput): Promise<ModelSelection> =>
       selection.mode === "automatic" ? { mode: "automatic" } : { ...selection, available: true },

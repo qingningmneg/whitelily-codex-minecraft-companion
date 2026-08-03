@@ -40,7 +40,16 @@ function createAppApi(
     getAccount: vi.fn(async () => ({ status: "signed_out" as const })),
     startChatGptLogin: vi.fn(),
     cancelChatGptLogin: vi.fn(),
-    listModels: vi.fn(async () => ({ models: [], selection: { mode: "automatic" as const } })),
+    listModels: vi.fn(async () => ({
+      models: [],
+      selection: { mode: "automatic" as const },
+      legacyMigrationCompleted: true,
+    })),
+    migrateModelPreference: vi.fn(async () => ({
+      models: [],
+      selection: { mode: "automatic" as const },
+      legacyMigrationCompleted: true,
+    })),
     selectModel: vi.fn(),
     discoverPcl2: vi.fn(async () => []),
     detectLanCandidates: vi.fn(async () => []),
@@ -568,6 +577,7 @@ describe("Task 5 application routing", () => {
         },
       ],
       selection: { mode: "automatic" },
+      legacyMigrationCompleted: true,
     });
     vi.mocked(harness.api.selectModel).mockResolvedValue({ mode: "automatic" });
     vi.mocked(harness.api.discoverPcl2).mockResolvedValue([

@@ -169,6 +169,14 @@ function inertDesktopChildServices(): DesktopChildServices {
         selection: { mode: "automatic" },
         legacyMigrationCompleted: false,
       }),
+      migrateLegacyPreference: async (candidate) => ({
+        models: [],
+        selection:
+          candidate?.mode === "explicit"
+            ? { ...candidate, available: true }
+            : { mode: "automatic" },
+        legacyMigrationCompleted: true,
+      }),
       selectModel: async () => ({ mode: "automatic" }),
       prepareSelection: async (selection) => ({
         preferenceRevision: 0,
@@ -3132,6 +3140,11 @@ describe("DesktopChildServer", () => {
               selection: { mode: "automatic" },
               legacyMigrationCompleted: false,
             }),
+            migrateLegacyPreference: async () => ({
+              models: [],
+              selection: { mode: "automatic" },
+              legacyMigrationCompleted: true,
+            }),
             selectModel: async () => ({ mode: "automatic" }),
             prepareSelection: async (selection) => ({
               preferenceRevision: 0,
@@ -4307,8 +4320,22 @@ describe("DesktopChildServer", () => {
     }
   });
 
-  it("dispatches the five account and model commands through separate services", async () => {
+  it("dispatches account, model, and bounded model migration commands through separate services", async () => {
     let modelListener: ((event: ModelCatalogEvent) => void) | undefined;
+    const migrateLegacyPreference = vi.fn(async (candidate: ModelSelectionInput | null) => ({
+      models: [
+        {
+          id: "live-model",
+          displayName: "Live Model",
+          supportedReasoningEfforts: ["medium"] as const,
+        },
+      ],
+      selection:
+        candidate?.mode === "explicit"
+          ? { ...candidate, available: true as const }
+          : ({ mode: "automatic" } as const),
+      legacyMigrationCompleted: true,
+    }));
     const harness = createHarness({
       runtime: new RuntimeFacade({
         lifecycle: { start: async () => undefined, stop: async () => undefined },
@@ -4327,6 +4354,7 @@ describe("DesktopChildServer", () => {
         }),
       },
       models: {
+        migrateLegacyPreference,
         listModels: async () => ({
           models: [
             {
@@ -4392,6 +4420,29 @@ describe("DesktopChildServer", () => {
       id: "login-cancel",
       ok: true,
       result: { status: "cancelled", attemptId: "opaque_attempt_1234" },
+    });
+    harness.send(
+      commandRequest("model-migrate", {
+        kind: "migrate_model_preference",
+        candidate: {
+          mode: "explicit",
+          modelId: "live-model",
+          reasoningEffort: "medium",
+        },
+      }),
+    );
+    await expect(harness.nextResponse()).resolves.toMatchObject({
+      id: "model-migrate",
+      ok: true,
+      result: {
+        selection: { mode: "explicit", modelId: "live-model", reasoningEffort: "medium" },
+        legacyMigrationCompleted: true,
+      },
+    });
+    expect(migrateLegacyPreference).toHaveBeenCalledWith({
+      mode: "explicit",
+      modelId: "live-model",
+      reasoningEffort: "medium",
     });
     harness.send(request("models-list", "list_models"));
     await expect(harness.nextResponse()).resolves.toMatchObject({

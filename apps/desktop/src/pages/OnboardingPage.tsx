@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { AccountSnapshot } from "../../../../src/codex/accountService";
 import { parseMinecraftJavaUsername } from "../../../../src/identity/ownerIdentity";
-import type { ModelCatalogSnapshot, ModelSelection } from "../../../../src/codex/modelCatalog";
+import type { ModelCatalogSnapshot, ModelSelectionInput } from "../../../../src/codex/modelCatalog";
 import type { RuntimeSnapshot } from "../../../../src/runtime/runtimeEvents";
 import type { Pcl2Candidate } from "../../src-main/discovery/pcl2Discovery";
 import type { LanCandidate } from "../../src-main/discovery/lanDetector";
@@ -14,7 +14,7 @@ import { translate } from "../i18n/translator";
 
 export const ONBOARDING_STORAGE_KEY = "whitelily.onboarding.v1";
 
-const STORAGE_VERSION = 2;
+const STORAGE_VERSION = 3;
 const MAX_STORAGE_BYTES = 2_048;
 const MAX_LOGIN_POLL_MS = 10 * 60_000;
 const LOGIN_POLL_INTERVAL_MS = 250;
@@ -24,11 +24,15 @@ const EFFORT_PATTERN = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/u;
 type SafeProgressHint = "login" | "model" | "owner" | "pcl2" | "lan" | "ready";
 
 interface SafePreferences {
-  version: 2;
+  version: 3;
   locale: Locale;
   progressHint: SafeProgressHint;
-  modelPreference:
-    { mode: "automatic" } | { mode: "explicit"; modelId: string; reasoningEffort: string } | null;
+}
+
+interface ReadOnboardingPreferencesResult {
+  preferences: SafePreferences;
+  legacyMigrationPending: boolean;
+  legacyModelCandidate: ModelSelectionInput | null;
 }
 
 interface OnboardingPageProps {
@@ -63,7 +67,6 @@ const defaultPreferences: SafePreferences = {
   version: STORAGE_VERSION,
   locale: "zh-CN",
   progressHint: "login",
-  modelPreference: null,
 };
 
 export function OnboardingPage({ api, locale, active, onReady }: OnboardingPageProps) {
@@ -89,20 +92,27 @@ export function OnboardingPage({ api, locale, active, onReady }: OnboardingPageP
   const loginPollWait = useRef<LoginPollWait | null>(null);
   const catalogRequestId = useRef(0);
   const catalogInFlight = useRef<CatalogLoadIntent | null>(null);
-  const catalogSelectionTail = useRef<Promise<void>>(Promise.resolve());
   const ownerUpdateRequestId = useRef(0);
   const activeOwnerUpdate = useRef<OwnerUpdateIntent | null>(null);
   const observedLocale = useRef(locale);
   const heading = useRef<HTMLHeadingElement>(null);
   const ownerAlert = useRef<HTMLParagraphElement>(null);
-  const preferences = useRef(readOnboardingPreferences());
+  const initialPreferences = useRef(readOnboardingPreferences());
+  const preferences = useRef(initialPreferences.current.preferences);
+  const legacyMigrationPending = useRef(initialPreferences.current.legacyMigrationPending);
+  const legacyModelCandidate = useRef(initialPreferences.current.legacyModelCandidate);
+  const legacyMigrationRequest = useRef<Promise<ModelCatalogSnapshot> | null>(null);
   const resumeHint = useRef(preferences.current.progressHint);
   const resumedPcl2 = useRef(false);
 
   const persist = useCallback((patch: Partial<Omit<SafePreferences, "version">>) => {
     const next: SafePreferences = { ...preferences.current, ...patch, version: STORAGE_VERSION };
     preferences.current = next;
-    writeOnboardingPreferences(next);
+    if (legacyMigrationPending.current) {
+      writeLegacyOnboardingPreferences(next, legacyModelCandidate.current);
+    } else {
+      writeOnboardingPreferences(next);
+    }
   }, []);
 
   const clearLoginWait = useCallback((): void => {
@@ -119,27 +129,21 @@ export function OnboardingPage({ api, locale, active, onReady }: OnboardingPageP
     if (mounted.current) setCatalogLoading(false);
   }, []);
 
-  const queueCatalogSelection = useCallback(
-    (
-      input: Parameters<WhiteLilyDesktopApi["selectModel"]>[0],
-      isCurrent: () => boolean,
-    ): Promise<ModelSelection | null> => {
-      const operation = catalogSelectionTail.current
-        .catch(() => undefined)
-        .then(async () => {
-          if (!isCurrent()) return null;
-          const selected = await api.selectModel(input);
-          if (!isCurrent()) return null;
-          return selected;
-        });
-      catalogSelectionTail.current = operation.then(
-        () => undefined,
-        () => undefined,
-      );
-      return operation;
-    },
-    [api],
-  );
+  const migrateLegacyModelPreference = useCallback((): Promise<ModelCatalogSnapshot> => {
+    const existing = legacyMigrationRequest.current;
+    if (existing) return existing;
+    const operation = Promise.resolve()
+      .then(() => api.migrateModelPreference(legacyModelCandidate.current))
+      .then((snapshot) => {
+        if (!snapshot.legacyMigrationCompleted) throw new Error("MODEL_UNAVAILABLE");
+        return snapshot;
+      });
+    legacyMigrationRequest.current = operation;
+    void operation.catch(() => {
+      if (legacyMigrationRequest.current === operation) legacyMigrationRequest.current = null;
+    });
+    return operation;
+  }, [api]);
 
   const loadOwnerIdentity = useCallback(
     async (
@@ -201,42 +205,27 @@ export function OnboardingPage({ api, locale, active, onReady }: OnboardingPageP
           }
           if (!isCurrent()) return;
 
-          const control: CatalogSelectionControl = {
-            isCurrent,
-            select: (input) => queueCatalogSelection(input, isCurrent),
-          };
-          let restored =
-            preferences.current.modelPreference === null && liveCatalog.models.length > 0
-              ? await applyAutomaticFallback(control, liveCatalog)
-              : await restoreLiveModelPreference(control, liveCatalog, preferences.current);
-          if (!isCurrent() || !restored) return;
+          if (!liveCatalog.legacyMigrationCompleted) {
+            try {
+              liveCatalog = await migrateLegacyModelPreference();
+            } catch (error) {
+              if (!isCurrent()) return;
+              setStep("model");
+              setErrorKey(safeOnboardingErrorKey(asStableError(error, "MODEL_UNAVAILABLE")));
+              return;
+            }
+          }
+          if (!isCurrent()) return;
+          legacyMigrationPending.current = false;
+          legacyModelCandidate.current = null;
+          writeOnboardingPreferences(preferences.current);
           const wantsDownstreamResume =
             resumeHint.current === "pcl2" ||
             resumeHint.current === "lan" ||
             resumeHint.current === "ready";
           const wantsOwnerResume = resumeHint.current === "owner";
-          if (
-            wantsDownstreamResume &&
-            liveCatalog.models.length > 0 &&
-            !restored.fallbackFailed &&
-            !restored.selectionApplied
-          ) {
-            if (!isCurrent()) return;
-            const automatic = await applyAutomaticFallback(control, restored.catalog);
-            if (!isCurrent() || !automatic) return;
-            restored = automatic;
-          }
-          liveCatalog = restored.catalog;
-          if (!isCurrent()) return;
-          if (restored.preference !== preferences.current.modelPreference) {
-            persist({ modelPreference: restored.preference });
-          }
-          if (!isCurrent()) return;
           setCatalog(liveCatalog);
-          const liveModelAuthorityReady =
-            liveCatalog.models.length > 0 &&
-            !restored.fallbackFailed &&
-            (!wantsDownstreamResume || restored.selectionApplied);
+          const liveModelAuthorityReady = liveCatalog.models.length > 0;
           setErrorKey(liveModelAuthorityReady ? null : "onboarding.error.MODEL_UNAVAILABLE");
 
           if (!isCurrent()) return;
@@ -258,7 +247,7 @@ export function OnboardingPage({ api, locale, active, onReady }: OnboardingPageP
       catalogInFlight.current = { requestId, generation, promise: operation };
       return operation;
     },
-    [api, loadOwnerIdentity, persist, queueCatalogSelection],
+    [api, loadOwnerIdentity, migrateLegacyModelPreference, persist],
   );
 
   useEffect(() => {
@@ -637,15 +626,6 @@ export function OnboardingPage({ api, locale, active, onReady }: OnboardingPageP
                 onApplied={(selection) => {
                   setErrorKey(null);
                   setCatalog((current) => (current ? { ...current, selection } : current));
-                  const preference =
-                    selection.mode === "automatic"
-                      ? ({ mode: "automatic" } as const)
-                      : {
-                          mode: "explicit" as const,
-                          modelId: selection.modelId,
-                          reasoningEffort: selection.reasoningEffort,
-                        };
-                  persist({ modelPreference: preference });
                 }}
                 onContinue={() => {
                   void loadOwnerIdentity(flowGeneration.current);
@@ -830,12 +810,17 @@ export function OnboardingPage({ api, locale, active, onReady }: OnboardingPageP
 }
 
 export function readOnboardingLocale(): Locale {
-  return readOnboardingPreferences().locale;
+  return readOnboardingPreferences().preferences.locale;
 }
 
 export function persistOnboardingLocale(locale: Locale): void {
   const current = readOnboardingPreferences();
-  writeOnboardingPreferences({ ...current, locale });
+  const next = { ...current.preferences, locale };
+  if (current.legacyMigrationPending) {
+    writeLegacyOnboardingPreferences(next, current.legacyModelCandidate);
+  } else {
+    writeOnboardingPreferences(next);
+  }
 }
 
 export function safeOnboardingErrorKey(error: unknown): MessageKey {
@@ -899,95 +884,6 @@ async function pollForSignedInAccount(options: {
   throw new Error("CODEX_NOT_LOGGED_IN");
 }
 
-interface CatalogSelectionControl {
-  isCurrent(): boolean;
-  select(input: Parameters<WhiteLilyDesktopApi["selectModel"]>[0]): Promise<ModelSelection | null>;
-}
-
-interface RestoredModelPreference {
-  catalog: ModelCatalogSnapshot;
-  preference: SafePreferences["modelPreference"];
-  fallbackFailed: boolean;
-  selectionApplied: boolean;
-}
-
-async function restoreLiveModelPreference(
-  control: CatalogSelectionControl,
-  catalog: ModelCatalogSnapshot,
-  preferences: SafePreferences,
-): Promise<RestoredModelPreference | null> {
-  if (!control.isCurrent()) return null;
-  const preference = preferences.modelPreference;
-  if (!preference) {
-    return { catalog, preference: null, fallbackFailed: false, selectionApplied: false };
-  }
-  if (preference.mode === "automatic") {
-    try {
-      if (!control.isCurrent()) return null;
-      const selection = await control.select({ mode: "automatic" });
-      if (!control.isCurrent() || !selection) return null;
-      return {
-        catalog: { ...catalog, selection },
-        preference,
-        fallbackFailed: false,
-        selectionApplied: true,
-      };
-    } catch {
-      if (!control.isCurrent()) return null;
-      return {
-        catalog: { ...catalog, selection: { mode: "automatic" } },
-        preference: null,
-        fallbackFailed: true,
-        selectionApplied: false,
-      };
-    }
-  }
-  const model = catalog.models.find((candidate) => candidate.id === preference.modelId);
-  if (!model || !model.supportedReasoningEfforts.includes(preference.reasoningEffort)) {
-    if (!control.isCurrent()) return null;
-    return applyAutomaticFallback(control, catalog);
-  }
-  try {
-    if (!control.isCurrent()) return null;
-    const selection = await control.select(preference);
-    if (!control.isCurrent() || !selection) return null;
-    return {
-      catalog: { ...catalog, selection },
-      preference,
-      fallbackFailed: false,
-      selectionApplied: true,
-    };
-  } catch {
-    if (!control.isCurrent()) return null;
-    return applyAutomaticFallback(control, catalog);
-  }
-}
-
-async function applyAutomaticFallback(
-  control: CatalogSelectionControl,
-  catalog: ModelCatalogSnapshot,
-): Promise<RestoredModelPreference | null> {
-  try {
-    if (!control.isCurrent()) return null;
-    const selection = await control.select({ mode: "automatic" });
-    if (!control.isCurrent() || !selection) return null;
-    return {
-      catalog: { ...catalog, selection },
-      preference: null,
-      fallbackFailed: false,
-      selectionApplied: true,
-    };
-  } catch {
-    if (!control.isCurrent()) return null;
-    return {
-      catalog: { ...catalog, selection: { mode: "automatic" } },
-      preference: null,
-      fallbackFailed: true,
-      selectionApplied: false,
-    };
-  }
-}
-
 function isSignedIn(
   account: AccountSnapshot,
 ): account is Extract<AccountSnapshot, { status: "signed_in" }> {
@@ -1001,24 +897,39 @@ function asStableError(error: unknown, fallbackCode: string): Error {
   return new Error(fallbackCode);
 }
 
-function readOnboardingPreferences(): SafePreferences {
+function readOnboardingPreferences(): ReadOnboardingPreferencesResult {
   try {
     const raw = window.localStorage.getItem(ONBOARDING_STORAGE_KEY);
-    if (!raw) return { ...defaultPreferences };
+    if (!raw) {
+      return {
+        preferences: { ...defaultPreferences },
+        legacyMigrationPending: false,
+        legacyModelCandidate: null,
+      };
+    }
     if (raw.length > MAX_STORAGE_BYTES) throw new Error("oversized onboarding preferences");
     const parsed: unknown = JSON.parse(raw);
-    if (isSafePreferences(parsed)) return parsed;
-    const migrated = migrateLegacyPreferences(parsed);
-    if (!migrated) throw new Error("invalid onboarding preferences");
-    writeOnboardingPreferences(migrated);
-    return migrated;
+    if (isSafePreferences(parsed)) {
+      return {
+        preferences: parsed,
+        legacyMigrationPending: false,
+        legacyModelCandidate: null,
+      };
+    }
+    const legacy = readLegacyPreferences(parsed);
+    if (!legacy) throw new Error("invalid onboarding preferences");
+    return legacy;
   } catch {
     try {
       window.localStorage.removeItem(ONBOARDING_STORAGE_KEY);
     } catch {
       // Storage may be unavailable; onboarding remains live-authority driven.
     }
-    return { ...defaultPreferences };
+    return {
+      preferences: { ...defaultPreferences },
+      legacyMigrationPending: false,
+      legacyModelCandidate: null,
+    };
   }
 }
 
@@ -1036,11 +947,33 @@ function writeOnboardingPreferences(preferences: SafePreferences): void {
   }
 }
 
+function writeLegacyOnboardingPreferences(
+  preferences: SafePreferences,
+  modelPreference: ModelSelectionInput | null,
+): void {
+  try {
+    const raw = JSON.stringify({
+      version: 2,
+      locale: preferences.locale,
+      progressHint: preferences.progressHint,
+      modelPreference,
+    });
+    if (raw.length > MAX_STORAGE_BYTES) throw new Error("oversized onboarding preferences");
+    window.localStorage.setItem(ONBOARDING_STORAGE_KEY, raw);
+  } catch {
+    try {
+      window.localStorage.removeItem(ONBOARDING_STORAGE_KEY);
+    } catch {
+      // Optional resume state can be dropped when storage is unavailable.
+    }
+  }
+}
+
 function isSafePreferences(value: unknown): value is SafePreferences {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const record = value as Record<string, unknown>;
   if (
-    Object.keys(record).sort().join(",") !== "locale,modelPreference,progressHint,version" ||
+    Object.keys(record).sort().join(",") !== "locale,progressHint,version" ||
     record.version !== STORAGE_VERSION ||
     !(record.locale === "zh-CN" || record.locale === "en") ||
     !(
@@ -1054,19 +987,20 @@ function isSafePreferences(value: unknown): value is SafePreferences {
   ) {
     return false;
   }
-  return isSafeModelPreference(record.modelPreference);
+  return true;
 }
 
-function migrateLegacyPreferences(value: unknown): SafePreferences | null {
+function readLegacyPreferences(value: unknown): ReadOnboardingPreferencesResult | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const record = value as Record<string, unknown>;
   if (
     Object.keys(record).sort().join(",") !== "locale,modelPreference,progressHint,version" ||
-    record.version !== 1 ||
+    !(record.version === 1 || record.version === 2) ||
     !(record.locale === "zh-CN" || record.locale === "en") ||
     !(
       record.progressHint === "login" ||
       record.progressHint === "model" ||
+      record.progressHint === "owner" ||
       record.progressHint === "pcl2" ||
       record.progressHint === "lan" ||
       record.progressHint === "ready"
@@ -1076,17 +1010,20 @@ function migrateLegacyPreferences(value: unknown): SafePreferences | null {
     return null;
   }
   return {
-    version: STORAGE_VERSION,
-    locale: record.locale,
-    progressHint:
-      record.progressHint === "login" || record.progressHint === "model"
-        ? record.progressHint
-        : "owner",
-    modelPreference: record.modelPreference,
+    preferences: {
+      version: STORAGE_VERSION,
+      locale: record.locale,
+      progressHint:
+        record.version === 1 && record.progressHint !== "login" && record.progressHint !== "model"
+          ? "owner"
+          : record.progressHint,
+    },
+    legacyMigrationPending: true,
+    legacyModelCandidate: record.modelPreference,
   };
 }
 
-function isSafeModelPreference(value: unknown): value is SafePreferences["modelPreference"] {
+function isSafeModelPreference(value: unknown): value is ModelSelectionInput | null {
   if (value === null) return true;
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return false;
