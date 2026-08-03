@@ -947,7 +947,7 @@ describe("deterministic Electron resources", () => {
 
     expect(manifest).toMatchObject({
       schemaVersion: 1,
-      productVersion: "0.2.0-beta.1",
+      productVersion: "0.2.0-beta.2",
       target: { platform: "win32", arch: "x64" },
       versions: {
         electron: "43.2.0",
@@ -1020,6 +1020,13 @@ describe("deterministic Electron resources", () => {
   it("starts the prepared child with pinned Electron, becomes ready, and exits on stdin EOF", async () => {
     const manifest = await readManifest(bundleManifestPath);
     const childEntry = resolve(bundleRoot, ...manifest.paths.childEntry.split("/"));
+    const workspaceManifestPath = resolve(
+      bundleRoot,
+      ...(manifest.managedWorkspace?.manifest.split("/") ?? []),
+    );
+    const workspaceManifest = JSON.parse(await readFile(workspaceManifestPath, "utf8")) as {
+      contentVersion: string;
+    };
     const electronExecutable = require("electron") as string;
     const root = await mkdtemp(join(tmpdir(), "whitelily-electron-child-"));
     const configPath = join(root, "config.toml");
@@ -1045,6 +1052,7 @@ describe("deterministic Electron resources", () => {
             WHITELILY_CODEX_RESOURCE_ROOT: bundleRoot,
             WHITELILY_CODEX_MANIFEST: bundleManifestPath,
             WHITELILY_CODEX_LAYOUT: "packaged",
+            WHITELILY_WORKSPACE_VERSION: workspaceManifest.contentVersion,
           },
           shell: false,
           stdio: ["pipe", "pipe", "pipe"],
@@ -1090,7 +1098,7 @@ describe("deterministic Electron resources", () => {
 
       expect(result).toEqual({ code: 0, stderr: "", ready: true });
     } finally {
-      await rm(root, { recursive: true, force: true });
+      await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
   }, 30_000);
 });

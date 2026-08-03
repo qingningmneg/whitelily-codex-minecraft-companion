@@ -2,7 +2,7 @@
 
 [English](installation-windows.md)
 
-> **状态：`v0.2.0-beta.1` Public Beta 已通过隔离 Windows 安装生命周期与 Minecraft Java 1.21.5 同机 LAN 连接验收，并以 GitHub 预发布版提供。** 这是未签名测试版，请严格核对 SHA-256，并只在可丢弃世界中使用。
+> **状态：`v0.2.0-beta.2` Public Beta 候选。** 它把模型热切换和 Minecraft 动作工作区合并进一个未签名的 Windows x64 安装包。该候选已通过隔离清洁安装、beta.1 原位升级、工作区修复、数据保留、卸载与重装检查；真实游戏动作只在已确认可丢弃的 Minecraft Java 1.21.5 LAN 世界中验收。请严格核对 SHA-256。
 
 已发布的 `v0.1.1` 是面向开发者和早期测试者的旧版 CLI ZIP 预览，需要系统开发工具；它不是下面介绍的桌面 EXE 安装包。
 
@@ -23,8 +23,8 @@ WhiteLily 不会启动、控制、点击或修改 PCL2，也不会自动启动 M
 
 从官方 [GitHub Releases](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/releases) 下载：
 
-1. [`WhiteLily-0.2.0-beta.1-windows-x64-setup.exe`](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/releases/download/v0.2.0-beta.1/WhiteLily-0.2.0-beta.1-windows-x64-setup.exe)
-2. [`WhiteLily-0.2.0-beta.1-windows-x64-setup.exe.sha256`](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/releases/download/v0.2.0-beta.1/WhiteLily-0.2.0-beta.1-windows-x64-setup.exe.sha256)
+1. [`WhiteLily-0.2.0-beta.2-windows-x64-setup.exe`](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/releases/download/v0.2.0-beta.2/WhiteLily-0.2.0-beta.2-windows-x64-setup.exe)
+2. [`WhiteLily-0.2.0-beta.2-windows-x64-setup.exe.sha256`](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/releases/download/v0.2.0-beta.2/WhiteLily-0.2.0-beta.2-windows-x64-setup.exe.sha256)
 
 不要从源码目录、聊天附件、网盘或第三方镜像获取同名 EXE。文件名相同不代表内容可信。
 
@@ -33,8 +33,8 @@ WhiteLily 不会启动、控制、点击或修改 PCL2，也不会自动启动 M
 把 EXE 和 `.sha256` 放在同一目录，打开 PowerShell 并进入该目录，然后运行：
 
 ```powershell
-$installer = ".\WhiteLily-0.2.0-beta.1-windows-x64-setup.exe"
-$checksum = ".\WhiteLily-0.2.0-beta.1-windows-x64-setup.exe.sha256"
+$installer = ".\WhiteLily-0.2.0-beta.2-windows-x64-setup.exe"
+$checksum = ".\WhiteLily-0.2.0-beta.2-windows-x64-setup.exe.sha256"
 $expected = ((Get-Content -Raw $checksum).Trim() -split "\s+")[0].ToLowerInvariant()
 $actual = (Get-FileHash -Algorithm SHA256 $installer).Hash.ToLowerInvariant()
 if ($actual -ne $expected) { throw "SHA-256 mismatch. Do not run the installer." }
@@ -80,13 +80,15 @@ if ($actual -ne $expected) { throw "SHA-256 mismatch. Do not run the installer."
 
 认证文件保存在 `%LOCALAPPDATA%\WhiteLily` 下的受控本机数据目录。WhiteLily 不要求把 API 密钥粘贴进配置，也不提供 API Key 回退。
 
-### 开发构建：持久化模型切换（`v0.2.0-beta.1` 不支持）
+### 持久化模型热切换与动作工作区
 
-以下能力已进入当前开发构建，但**尚未包含在本指南介绍的 `v0.2.0-beta.1` 安装包中**。只有下一个安装包完成验证并正式发布后，普通用户才能使用；这里不预先指定它的最终版本号。
+`v0.2.0-beta.2` 在同一个安装包中提供这两项能力，不需要单独安装模型组件或动作组件。
 
-在包含此能力的构建中，首次设置完成后，可以随时打开左侧“智能模型”，从当前 ChatGPT 会话的实时列表中重新选择模型和推理强度，再点“应用模型”。成功切换会停止当前活动任务并撤销该任务尚未执行的动作，但不会断开已经确认的 Minecraft LAN 会话。新选择只有在模型准备成功后才会保存并显示，并会在 WhiteLily 后台或桌面应用重启后继续使用。
+首次设置完成后，可以随时打开左侧“智能模型”，从当前 ChatGPT 会话的实时列表中重新选择模型和推理强度，再点“应用模型”。成功切换会停止当前活动任务并撤销该任务尚未执行的动作，但不会断开已经确认的 Minecraft LAN 会话。新选择只有在模型准备成功后才会保存并显示，并会在 WhiteLily 后台或桌面应用重启后继续使用。
 
 如果切换失败，WhiteLily 会保留原来的模型选择和连接。不要通过反复重启、手工编辑本机认证文件或粘贴 API Key 绕过失败；先直接重试，仍然失败时保存脱敏诊断并报告问题。
+
+每次启动时，WhiteLily 都会核验 `%LOCALAPPDATA%\WhiteLily\codex-workspace` 中精确的三个受管文件：`.codex/config.toml`、`AGENTS.md` 和 `workspace-manifest.json`。缺失、旧版或被修改的普通目录会从安装包内的已校验副本原子修复。稳定恢复错误为 `WORKSPACE_RESOURCE_INVALID`、`WORKSPACE_DEPLOY_FAILED` 和 `WORKSPACE_ROLLBACK_FAILED`；出现错误时先完全退出并重试，再运行同一个 beta.2 安装包执行修复安装。不要手工下载脚本，也不要向工作区写入 API 密钥。
 
 ## 7. 用 PCL2 进入 Minecraft
 
@@ -148,6 +150,13 @@ WhiteLily 只做只读发现，不替你安装或启动 PCL2。请从 PCL2 官�
 
 ## 12. 开发者预览
 
-公开的 `v0.1.1` CLI ZIP 是旧版开发者预览，确实要求 Node.js、npm、Git/源码工作区和 Codex CLI。它的要求不适用于 `v0.2.0-beta.1` 桌面安装包。
+公开的 `v0.1.1` CLI ZIP 是旧版开发者预览，确实要求 Node.js、npm、Git/源码工作区和 Codex CLI。它的要求不适用于 `v0.2.0-beta.2` 桌面安装包。
+
+## 12. 已知 Beta 限制
+
+- 仅支持同一台电脑上 `127.0.0.1` 的 Minecraft Java 1.21.5 LAN 世界；不支持远程主机。
+- 模型列表、响应速度和使用额度由当前 ChatGPT/Codex 账户决定；没有 Platform API 密钥回退。
+- 游戏动作只能使用 WhiteLily 当前发现并校验的受限工具，任意自然语言请求不保证都能执行。
+- PCL2、Minecraft 和 LAN 世界仍由用户自行启动、操作和确认；每次更新后先在可丢弃世界中测试。
 
 维护者从源码验证桌面构建时应使用锁定依赖和仓库中的开发脚本；普通安装用户不需要克隆仓库或运行 `npm ci`。只有通过隔离生命周期和 Minecraft 1.21.5 同机连接验收的构建才可作为预发布安装包提供。

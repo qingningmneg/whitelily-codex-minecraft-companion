@@ -11,8 +11,10 @@ const packageScript = join(repositoryRoot, "scripts", "package-installer.ps1");
 const releaseScript = join(repositoryRoot, "scripts", "package-release.ps1");
 const inspectScript = join(repositoryRoot, "scripts", "inspect-installer.ps1");
 const lifecycleScript = join(repositoryRoot, "scripts", "test-installer.ps1");
-const version = "0.2.0-beta.1";
+const version = "0.2.0-beta.2";
+const baselineVersion = "0.2.0-beta.1";
 const installerName = `WhiteLily-${version}-windows-x64-setup.exe`;
+const baselineInstallerName = `WhiteLily-${baselineVersion}-windows-x64-setup.exe`;
 const temporaryRoots: string[] = [];
 const require = createRequire(import.meta.url);
 const asar = require("@electron/asar") as {
@@ -134,16 +136,21 @@ public static class FakeWindowsSandbox {
 
     public static int Main(string[] args) {
         try {
-            if (args.Length == 4 && StringComparer.Ordinal.Equals(args[0], "--worker")) {
+            if (args.Length == 6 && StringComparer.Ordinal.Equals(args[0], "--worker")) {
                 Thread.Sleep(5000);
                 var requestedError = Environment.GetEnvironmentVariable(
                     "WHITELILY_FAKE_SANDBOX_REPORT_ERROR"
                 );
                 var report = String.IsNullOrWhiteSpace(requestedError)
                     ? "{\"schemaVersion\":1,\"installerSha256\":\"" + args[3] +
-                        "\",\"success\":true,\"stages\":[\"isolated_path\",\"hash_verified\",\"installed\",\"launched_without_system_tooling\",\"keep_data\",\"reinstalled\",\"delete_data\"],\"error\":null}\n"
+                        "\",\"expectedVersion\":\"" + args[4] +
+                        "\",\"baselineInstallerSha256\":\"" + args[5] +
+                        "\",\"installedVersion\":\"" + args[4] +
+                        "\",\"managedWorkspaceResources\":3,\"success\":true,\"stages\":[\"isolated_path\",\"hashes_verified\",\"clean_installed\",\"clean_workspace_verified\",\"clean_delete_data\",\"beta1_installed\",\"beta1_data_root_prepared\",\"beta1_upgraded\",\"workspace_repaired\",\"keep_data\",\"reinstalled\",\"delete_data\"],\"error\":null}\n"
                     : "{\"schemaVersion\":1,\"installerSha256\":\"" + args[3] +
-                        "\",\"success\":false,\"stages\":[],\"error\":\"" + requestedError + "\"}\n";
+                        "\",\"expectedVersion\":\"" + args[4] +
+                        "\",\"baselineInstallerSha256\":\"" + args[5] +
+                        "\",\"installedVersion\":null,\"managedWorkspaceResources\":0,\"success\":false,\"stages\":[],\"error\":\"" + requestedError + "\"}\n";
                 var holdMilliseconds = 0;
                 Int32.TryParse(
                     Environment.GetEnvironmentVariable("WHITELILY_FAKE_SANDBOX_HOLD_MS"),
@@ -176,7 +183,22 @@ public static class FakeWindowsSandbox {
                 "-InstallerSha256 \\\"(?<hash>[0-9a-f]{64})\\\"",
                 RegexOptions.CultureInvariant
             ).Groups["hash"].Value;
-            if (String.IsNullOrWhiteSpace(reportRoot) || hash.Length != 64) {
+            var expectedVersion = Regex.Match(
+                command,
+                "-ExpectedVersion \\\"(?<version>[^\\\"]+)\\\"",
+                RegexOptions.CultureInvariant
+            ).Groups["version"].Value;
+            var baselineHash = Regex.Match(
+                command,
+                "-BaselineInstallerSha256 \\\"(?<hash>[0-9a-f]{64})\\\"",
+                RegexOptions.CultureInvariant
+            ).Groups["hash"].Value;
+            if (
+                String.IsNullOrWhiteSpace(reportRoot) ||
+                hash.Length != 64 ||
+                String.IsNullOrWhiteSpace(expectedVersion) ||
+                baselineHash.Length != 64
+            ) {
                 return 2;
             }
             var capturePath = Environment.GetEnvironmentVariable(
@@ -196,7 +218,8 @@ public static class FakeWindowsSandbox {
             );
             Process.Start(new ProcessStartInfo {
                 FileName = executable,
-                Arguments = "--worker " + Quote(args[0]) + " " + Quote(reportRoot) + " " + hash,
+                Arguments = "--worker " + Quote(args[0]) + " " + Quote(reportRoot) + " " + hash +
+                    " " + Quote(expectedVersion) + " " + baselineHash,
                 UseShellExecute = false,
                 CreateNoWindow = true,
                 WindowStyle = ProcessWindowStyle.Hidden,
@@ -253,6 +276,9 @@ async function createInstallerFixture(
   const appRoot = join(work, "app");
   const resourcesRoot = join(appRoot, "resources");
   const requiredFiles = [
+    "codex-workspace/.codex/config.toml",
+    "codex-workspace/AGENTS.md",
+    "codex-workspace/workspace-manifest.json",
     "core/childMain.js",
     "desktop/main/main.js",
     "desktop/preload/preload.cjs",
@@ -260,7 +286,27 @@ async function createInstallerFixture(
     "codex/native/vendor/x86_64-pc-windows-msvc/bin/codex.exe",
     "licenses/WhiteLily-LICENSE.txt",
   ];
+  const workspacePayloads = new Map<string, string>([
+    [".codex/config.toml", '[mcp_servers.minecraft]\nurl = "http://127.0.0.1:32123/mcp"\n'],
+    ["AGENTS.md", "# 白百合测试动作工作区\n"],
+  ]);
+  const workspaceManifest = `${JSON.stringify(
+    {
+      schemaVersion: 1,
+      contentVersion: "1",
+      files: [...workspacePayloads].map(([path, value]) => ({
+        path,
+        bytes: Buffer.byteLength(value),
+        sha256: createHash("sha256").update(value).digest("hex"),
+      })),
+    },
+    null,
+    2,
+  )}\n`;
   const looseFiles = new Map<string, string>([
+    ["codex-workspace/.codex/config.toml", workspacePayloads.get(".codex/config.toml") ?? ""],
+    ["codex-workspace/AGENTS.md", workspacePayloads.get("AGENTS.md") ?? ""],
+    ["codex-workspace/workspace-manifest.json", workspaceManifest],
     ["core/childMain.js", "fixture child"],
     ["codex/native/vendor/x86_64-pc-windows-msvc/bin/codex.exe", "fixture bundled codex"],
     ["licenses/WhiteLily-LICENSE.txt", "fixture license"],
@@ -313,6 +359,12 @@ async function createInstallerFixture(
       codexNativePackage: "codex/native",
       codexExecutable: "codex/native/vendor/x86_64-pc-windows-msvc/bin/codex.exe",
       licenses: "licenses",
+    },
+    managedWorkspace: {
+      root: "codex-workspace",
+      manifest: "codex-workspace/workspace-manifest.json",
+      payloads: [".codex/config.toml", "AGENTS.md"],
+      mcpUrl: "http://127.0.0.1:32123/mcp",
     },
     allowlist: {
       generatedRoots: [],
@@ -381,6 +433,7 @@ async function createInstallerFixture(
 async function createRepositoryFixture(options: FixtureOptions = {}): Promise<{
   root: string;
   installer: string;
+  baselineInstaller: string;
   environment: NodeJS.ProcessEnv;
 }> {
   const root = await createTemporaryRoot("whitelily-installer-repo-");
@@ -423,6 +476,8 @@ async function createRepositoryFixture(options: FixtureOptions = {}): Promise<{
   await writeFile(join(root, ".gitignore"), "build/\nrelease/\n", "utf8");
   await writeFile(join(root, "tracked.txt"), "clean\n", "utf8");
   const installer = await createInstallerFixture(root, options);
+  const baselineInstaller = join(root, "fixture", baselineInstallerName);
+  await writeFile(baselineInstaller, "fixture beta.1 baseline installer\n", "utf8");
 
   const tools = join(root, "fixture-tools");
   await mkdir(tools, { recursive: true });
@@ -472,6 +527,7 @@ async function createRepositoryFixture(options: FixtureOptions = {}): Promise<{
   return {
     root,
     installer,
+    baselineInstaller,
     environment: {
       ...process.env,
       PATH: `${tools};${process.env.PATH ?? ""}`,
@@ -483,6 +539,21 @@ async function createRepositoryFixture(options: FixtureOptions = {}): Promise<{
       NODE_PATH: join(repositoryRoot, "node_modules"),
     },
   };
+}
+
+async function stageLifecycleInstallers(fixture: {
+  root: string;
+  installer: string;
+  baselineInstaller: string;
+}): Promise<string> {
+  const releaseRoot = join(fixture.root, "release");
+  await mkdir(releaseRoot, { recursive: true });
+  const releaseInstaller = join(releaseRoot, installerName);
+  await Promise.all([
+    copyFile(fixture.installer, releaseInstaller),
+    copyFile(fixture.baselineInstaller, join(releaseRoot, baselineInstallerName)),
+  ]);
+  return releaseInstaller;
 }
 
 beforeAll(() => {
@@ -832,9 +903,7 @@ public static class SmokeWindowFixture {
 
   it("waits for a delegated Sandbox session after the launcher exits successfully", async () => {
     const fixture = await createRepositoryFixture();
-    const releaseInstaller = join(fixture.root, "release", installerName);
-    await mkdir(dirname(releaseInstaller), { recursive: true });
-    await copyFile(fixture.installer, releaseInstaller);
+    const releaseInstaller = await stageLifecycleInstallers(fixture);
     const fakeWindowsRoot = await createTemporaryRoot("whitelily-fake-windows-");
     await createDelegatingSandboxLauncher(fakeWindowsRoot);
 
@@ -862,9 +931,14 @@ public static class SmokeWindowFixture {
       success: true,
       stages: [
         "isolated_path",
-        "hash_verified",
-        "installed",
-        "launched_without_system_tooling",
+        "hashes_verified",
+        "clean_installed",
+        "clean_workspace_verified",
+        "clean_delete_data",
+        "beta1_installed",
+        "beta1_data_root_prepared",
+        "beta1_upgraded",
+        "workspace_repaired",
         "keep_data",
         "reinstalled",
         "delete_data",
@@ -874,9 +948,7 @@ public static class SmokeWindowFixture {
 
   it("waits for the Sandbox mapping to close before removing lifecycle artifacts", async () => {
     const fixture = await createRepositoryFixture();
-    const releaseInstaller = join(fixture.root, "release", installerName);
-    await mkdir(dirname(releaseInstaller), { recursive: true });
-    await copyFile(fixture.installer, releaseInstaller);
+    const releaseInstaller = await stageLifecycleInstallers(fixture);
     const fakeWindowsRoot = await createTemporaryRoot("whitelily-fake-windows-");
     await createDelegatingSandboxLauncher(fakeWindowsRoot);
     const lockerScript = join(fixture.root, "hold-sandbox-mapping.ps1");
@@ -948,9 +1020,7 @@ public static class SmokeWindowFixture {
 
   it("closes the remote Sandbox session bound to the lifecycle configuration", async () => {
     const fixture = await createRepositoryFixture();
-    const releaseInstaller = join(fixture.root, "release", installerName);
-    await mkdir(dirname(releaseInstaller), { recursive: true });
-    await copyFile(fixture.installer, releaseInstaller);
+    const releaseInstaller = await stageLifecycleInstallers(fixture);
     const fakeWindowsRoot = await createTemporaryRoot("whitelily-fake-windows-");
     await createDelegatingSandboxLauncher(fakeWindowsRoot);
 
@@ -977,9 +1047,7 @@ public static class SmokeWindowFixture {
 
   it("does not close a Sandbox remote session bound to another configuration", async () => {
     const fixture = await createRepositoryFixture();
-    const releaseInstaller = join(fixture.root, "release", installerName);
-    await mkdir(dirname(releaseInstaller), { recursive: true });
-    await copyFile(fixture.installer, releaseInstaller);
+    const releaseInstaller = await stageLifecycleInstallers(fixture);
     const fakeWindowsRoot = await createTemporaryRoot("whitelily-fake-windows-");
     const sandboxLauncher = await createDelegatingSandboxLauncher(fakeWindowsRoot);
     const unrelatedRoot = await createTemporaryRoot("whitelily-unrelated-sandbox-");
@@ -1015,7 +1083,14 @@ public static class SmokeWindowFixture {
     );
     const unrelated = spawn(
       join(dirname(sandboxLauncher), "WindowsSandboxRemoteSession.exe"),
-      ["--worker", unrelatedConfiguration, unrelatedReportRoot, "a".repeat(64)],
+      [
+        "--worker",
+        unrelatedConfiguration,
+        unrelatedReportRoot,
+        "a".repeat(64),
+        version,
+        "b".repeat(64),
+      ],
       {
         env: {
           ...fixture.environment,
@@ -1067,9 +1142,7 @@ public static class SmokeWindowFixture {
 
   it("preserves the guest lifecycle error when mapped-folder cleanup also fails", async () => {
     const fixture = await createRepositoryFixture();
-    const releaseInstaller = join(fixture.root, "release", installerName);
-    await mkdir(dirname(releaseInstaller), { recursive: true });
-    await copyFile(fixture.installer, releaseInstaller);
+    const releaseInstaller = await stageLifecycleInstallers(fixture);
     const fakeWindowsRoot = await createTemporaryRoot("whitelily-fake-windows-");
     await createDelegatingSandboxLauncher(fakeWindowsRoot);
     const lockerScript = join(fixture.root, "hold-sandbox-artifact.ps1");
@@ -1143,9 +1216,7 @@ public static class SmokeWindowFixture {
 
   it("embeds a working SHA-256 verifier in the guest lifecycle script", async () => {
     const fixture = await createRepositoryFixture();
-    const releaseInstaller = join(fixture.root, "release", installerName);
-    await mkdir(dirname(releaseInstaller), { recursive: true });
-    await copyFile(fixture.installer, releaseInstaller);
+    const releaseInstaller = await stageLifecycleInstallers(fixture);
     const fakeWindowsRoot = await createTemporaryRoot("whitelily-fake-windows-");
     await createDelegatingSandboxLauncher(fakeWindowsRoot);
     const capturedGuest = join(fixture.root, "captured-guest-lifecycle.ps1");
@@ -1203,9 +1274,7 @@ public static class SmokeWindowFixture {
 
   it("discovers the delegated NSIS uninstaller process by its _?= marker", async () => {
     const fixture = await createRepositoryFixture();
-    const releaseInstaller = join(fixture.root, "release", installerName);
-    await mkdir(dirname(releaseInstaller), { recursive: true });
-    await copyFile(fixture.installer, releaseInstaller);
+    const releaseInstaller = await stageLifecycleInstallers(fixture);
     const fakeWindowsRoot = await createTemporaryRoot("whitelily-fake-windows-");
     await createDelegatingSandboxLauncher(fakeWindowsRoot);
     const capturedGuest = join(fixture.root, "captured-guest-lifecycle.ps1");
@@ -1329,9 +1398,7 @@ public static class SmokeWindowFixture {
 
   it("advances every NSIS uninstaller page until the delegated process exits", async () => {
     const fixture = await createRepositoryFixture();
-    const releaseInstaller = join(fixture.root, "release", installerName);
-    await mkdir(dirname(releaseInstaller), { recursive: true });
-    await copyFile(fixture.installer, releaseInstaller);
+    const releaseInstaller = await stageLifecycleInstallers(fixture);
     const fakeWindowsRoot = await createTemporaryRoot("whitelily-fake-windows-");
     await createDelegatingSandboxLauncher(fakeWindowsRoot);
     const capturedGuest = join(fixture.root, "captured-guest-lifecycle.ps1");
@@ -1461,9 +1528,7 @@ public static class FakeUninstallerWizard {
 
   it("fails closed when Windows Sandbox is unavailable and never falls back to this profile", async () => {
     const fixture = await createRepositoryFixture();
-    const releaseInstaller = join(fixture.root, "release", installerName);
-    await mkdir(dirname(releaseInstaller), { recursive: true });
-    await copyFile(fixture.installer, releaseInstaller);
+    const releaseInstaller = await stageLifecycleInstallers(fixture);
     const result = runPowerShell(
       join(fixture.root, "scripts", "test-installer.ps1"),
       ["-InstallerPath", releaseInstaller],
@@ -1478,6 +1543,8 @@ public static class FakeUninstallerWizard {
 
     expect(result.status).not.toBe(0);
     expect(`${result.stdout}\n${result.stderr}`).toContain("WINDOWS_SANDBOX_REQUIRED");
-    expect(await readdir(join(fixture.root, "release"))).toEqual([installerName]);
+    expect((await readdir(join(fixture.root, "release"))).sort()).toEqual(
+      [baselineInstallerName, installerName].sort(),
+    );
   });
 });

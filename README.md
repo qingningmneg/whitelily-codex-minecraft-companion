@@ -4,14 +4,14 @@
 
 ## 中文
 
-### Windows 安装包（v0.2.0-beta.1）
+### Windows 安装包（v0.2.0-beta.2）
 
-> **发布状态：Public Beta。** `v0.2.0-beta.1` Windows x64 EXE 已通过 Windows Sandbox 隔离安装/启动/保留数据卸载/重装/删除数据卸载验收，并完成 Minecraft Java 1.21.5 同机 LAN 连接验收。本版本以 GitHub 预发布版提供。
+> **发布状态：Public Beta 候选。** `v0.2.0-beta.2` 只提供一个 Windows x64 EXE，合并模型热切换与 Minecraft 动作工作区修复。该候选已通过安装包解包校验、Windows Sandbox 清洁安装、beta.1 原位升级、工作区修复、数据保留、卸载与重装验收；真实游戏动作仍必须在已确认可丢弃的 Minecraft Java 1.21.5 LAN 世界中验证。
 
 从官方 [GitHub Releases](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/releases) 同时下载：
 
-- [`WhiteLily-0.2.0-beta.1-windows-x64-setup.exe`](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/releases/download/v0.2.0-beta.1/WhiteLily-0.2.0-beta.1-windows-x64-setup.exe)
-- [`WhiteLily-0.2.0-beta.1-windows-x64-setup.exe.sha256`](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/releases/download/v0.2.0-beta.1/WhiteLily-0.2.0-beta.1-windows-x64-setup.exe.sha256)
+- [`WhiteLily-0.2.0-beta.2-windows-x64-setup.exe`](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/releases/download/v0.2.0-beta.2/WhiteLily-0.2.0-beta.2-windows-x64-setup.exe)
+- [`WhiteLily-0.2.0-beta.2-windows-x64-setup.exe.sha256`](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/releases/download/v0.2.0-beta.2/WhiteLily-0.2.0-beta.2-windows-x64-setup.exe.sha256)
 
 先按[中文安装指南](docs/installation-windows.zh-CN.md)验证 SHA-256，再阅读[未签名与 SmartScreen 说明](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/blob/main/docs/smartscreen.zh-CN.md)。首个 Beta 是未签名构建，Windows SmartScreen 可能显示“未知发布者”；不要关闭系统保护，也不要运行哈希不匹配或来源不明的文件。
 
@@ -21,9 +21,9 @@
 
 WhiteLily（白百合）是一个面向 Minecraft Java 版的本地 AI 伙伴运行时。它通过 Mineflayer 以机器人身份加入 Minecraft 世界，让主人直接在游戏聊天框中与本机已登录的 Codex 交互。它不是 Minecraft 客户端模组，也不替代启动器。
 
-**当前状态：Public Beta。** 最新公开版本是 **v0.2.0-beta.1**，提供按用户安装的 Windows x64 EXE。旧版 [`v0.1.1`](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/releases/tag/v0.1.1) CLI ZIP 仍保留给开发者参考，但它不是桌面安装器。
+**当前状态：Public Beta。** 当前发布候选是 **v0.2.0-beta.2**，提供按用户安装的单一 Windows x64 EXE。旧版 [`v0.1.1`](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/releases/tag/v0.1.1) CLI ZIP 仍保留给开发者参考，但它不是桌面安装器。
 
-`v0.2.0-beta.1` 包含 Electron 控制中心、ChatGPT 登录与状态恢复、实时模型选择、只读 PCL2 发现、Minecraft LAN 检测与确认，以及主人身份首次设置和在线切换。它是首个面向普通测试用户的一键桌面安装包，仍应只在可丢弃世界中试用。
+`v0.2.0-beta.2` 包含 Electron 控制中心、ChatGPT 登录与状态恢复、可持久化的模型热切换、只读 PCL2 发现、Minecraft LAN 检测与确认、主人身份在线切换，以及自动部署和修复的 Minecraft 动作工作区。它仍应只在可丢弃世界中试用。
 
 ### 当前运行架构
 
@@ -71,7 +71,7 @@ PCL2 始终由用户自行启动和操作。WhiteLily 不会启动、控制、�
 
 ### 快速开始
 
-以下步骤适用于 `v0.2.0-beta.1` 桌面安装包，不适用于旧版 v0.1.1 CLI ZIP。请先阅读 [Windows 11 + PCL2 完整安装指南](docs/installation-windows.zh-CN.md)。首次安装和每次更新都应在可丢弃世界中验证。
+以下步骤适用于 `v0.2.0-beta.2` 桌面安装包，不适用于旧版 v0.1.1 CLI ZIP。请先阅读 [Windows 11 + PCL2 完整安装指南](docs/installation-windows.zh-CN.md)。首次安装和每次更新都应在可丢弃世界中验证。
 
 1. 按安装指南完成 WhiteLily 安装并打开桌面应用。
 2. 在 WhiteLily 中使用 ChatGPT 登录，然后从实时模型列表中选择模型。
@@ -82,13 +82,17 @@ PCL2 始终由用户自行启动和操作。WhiteLily 不会启动、控制、�
 
 运行中切换主人会立即撤销旧主人的命令权限，并取消旧主人授权的活动任务，尚未执行的动作不会继续。WhiteLily、Mineflayer 连接和本机 Codex 服务保持连接；如果新主人离线，界面会显示“正在等待新主人上线”，且不会恢复旧主人的权限。
 
-#### 开发构建：持久化模型切换（`v0.2.0-beta.1` 不支持）
+#### 持久化模型热切换与动作工作区
 
-以下能力已进入当前开发构建，但**尚未包含在已发布的 `v0.2.0-beta.1` 安装包中**。只有下一个安装包完成验证并正式发布后，普通用户才能使用；这里不预先指定它的最终版本号。
+`v0.2.0-beta.2` 把这两项能力合并进同一个安装包，不需要另外安装模型组件或动作组件。
 
-在包含此能力的构建中，要更换模型时可打开“智能模型”，从当前 ChatGPT 会话的实时列表中选择模型和推理强度，再点“应用模型”。
+要更换模型时可打开“智能模型”，从当前 ChatGPT 会话的实时列表中选择模型和推理强度，再点“应用模型”。
 
 成功切换模型会停止当前活动任务并撤销该任务尚未执行的动作，但不会断开已确认的 Minecraft LAN 会话。新选择只有在模型准备成功后才会保存并显示，并会在 WhiteLily 后台或桌面应用重启后继续使用；如果切换失败，WhiteLily 会保留原来的模型选择和连接，可直接重试。
+
+每次启动时，WhiteLily 会核验并在需要时原子修复 `%LOCALAPPDATA%\WhiteLily\codex-workspace` 中的 `.codex/config.toml`、`AGENTS.md` 和 `workspace-manifest.json`。固定恢复错误为 `WORKSPACE_RESOURCE_INVALID`、`WORKSPACE_DEPLOY_FAILED` 和 `WORKSPACE_ROLLBACK_FAILED`；出现这些错误时先退出并重试，再用同一个 beta.2 安装包执行修复安装，不要手工下载脚本或把 API 密钥写入工作区。
+
+当前 Beta 的限制包括：仅支持同机 `127.0.0.1` 的 Minecraft Java 1.21.5 LAN 世界；模型列表、响应速度和额度取决于 ChatGPT/Codex 账户；动作仅通过当前受限工具集合执行，不保证任意自然语言请求都能完成。默认卸载保留 `%LOCALAPPDATA%\WhiteLily`，只有在交互式卸载中明确选择“删除 WhiteLily 数据”才删除该精确数据目录。
 
 #### 高级故障排查：手工配置主人
 
@@ -170,14 +174,14 @@ npm run build
 
 ## English
 
-### Windows installer (v0.2.0-beta.1)
+### Windows installer (v0.2.0-beta.2)
 
-> **Release status: Public Beta.** The `v0.2.0-beta.1` Windows x64 EXE passed Windows Sandbox install, launch, keep-data uninstall, reinstall, and delete-data uninstall acceptance, plus a same-machine Minecraft Java 1.21.5 LAN connection check. It is distributed as a GitHub prerelease.
+> **Release status: Public Beta candidate.** `v0.2.0-beta.2` is one Windows x64 EXE combining persistent model hot switching and Minecraft action-workspace repair. This candidate passed extraction inspection, clean Windows Sandbox installation, in-place beta.1 upgrade, workspace repair, data-preservation, uninstall, and reinstall checks. Real actions must still be accepted only in a confirmed disposable Minecraft Java 1.21.5 LAN world.
 
 Download both assets from the official [GitHub Releases](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/releases) page:
 
-- [`WhiteLily-0.2.0-beta.1-windows-x64-setup.exe`](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/releases/download/v0.2.0-beta.1/WhiteLily-0.2.0-beta.1-windows-x64-setup.exe)
-- [`WhiteLily-0.2.0-beta.1-windows-x64-setup.exe.sha256`](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/releases/download/v0.2.0-beta.1/WhiteLily-0.2.0-beta.1-windows-x64-setup.exe.sha256)
+- [`WhiteLily-0.2.0-beta.2-windows-x64-setup.exe`](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/releases/download/v0.2.0-beta.2/WhiteLily-0.2.0-beta.2-windows-x64-setup.exe)
+- [`WhiteLily-0.2.0-beta.2-windows-x64-setup.exe.sha256`](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/releases/download/v0.2.0-beta.2/WhiteLily-0.2.0-beta.2-windows-x64-setup.exe.sha256)
 
 Verify the SHA-256 using the [Windows installation guide](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/blob/main/docs/installation-windows.md), then read the [unsigned build and SmartScreen guide](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/blob/main/docs/smartscreen.md). The first Beta is unsigned, so Windows SmartScreen may report an unknown publisher. Do not disable system protection or run a file from another source or with a mismatched hash.
 
@@ -187,9 +191,9 @@ The installer bundles Electron, the WhiteLily child runtime, and an exact Codex 
 
 WhiteLily is a local AI companion runtime for Minecraft Java Edition. It joins a Minecraft world as a Mineflayer bot and lets the configured owner interact with a locally authenticated Codex session from the normal in-game chat. It is not a Minecraft client mod and does not replace the launcher.
 
-**Current status: Public Beta.** The latest public version is **v0.2.0-beta.1**, with a per-user Windows x64 installer. The older [`v0.1.1`](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/releases/tag/v0.1.1) CLI ZIP remains available for developer reference, but it is not the desktop installer.
+**Current status: Public Beta.** The current release candidate is **v0.2.0-beta.2**, with one per-user Windows x64 installer. The older [`v0.1.1`](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/releases/tag/v0.1.1) CLI ZIP remains available for developer reference, but it is not the desktop installer.
 
-`v0.2.0-beta.1` includes the Electron control center, ChatGPT sign-in and state recovery, live model selection, read-only PCL2 discovery, Minecraft LAN detection and confirmation, and first-run/live-switch owner identity. It is the first one-click desktop installer for general Beta testers and should still be used only with a disposable world.
+`v0.2.0-beta.2` includes the Electron control center, ChatGPT sign-in and recovery, persistent model hot switching, read-only PCL2 discovery, Minecraft LAN detection and confirmation, live owner changes, and automatically provisioned and repaired Minecraft action workspace. It should still be used only with a disposable world.
 
 ### Current runtime architecture
 
@@ -237,7 +241,7 @@ Availability and limits depend on the user's ChatGPT/Codex account and current p
 
 ### Quick start
 
-The following workflow applies to the `v0.2.0-beta.1` desktop installer, not the older v0.1.1 CLI ZIP. Read the [complete Windows 11 + PCL2 installation guide](docs/installation-windows.zh-CN.md) first. Validate every installation and update in a disposable world.
+The following workflow applies to the `v0.2.0-beta.2` desktop installer, not the older v0.1.1 CLI ZIP. Read the [complete Windows 11 + PCL2 installation guide](docs/installation-windows.zh-CN.md) first. Validate every installation and update in a disposable world.
 
 1. Complete the installation guide, then open the WhiteLily desktop app.
 2. Sign in with ChatGPT inside WhiteLily and choose a model from the live catalog.
@@ -248,13 +252,17 @@ The following workflow applies to the `v0.2.0-beta.1` desktop installer, not the
 
 A live owner change immediately revokes the old owner's command authority and cancels any active task authorized by that owner, so pending actions do not continue. WhiteLily, the Mineflayer connection, and the local Codex service remain connected. If the new owner is offline, the UI waits for the new owner and does not restore the old owner's authority.
 
-#### Development build: persistent model switching (not in `v0.2.0-beta.1`)
+#### Persistent model hot switching and action workspace
 
-This capability is present in the current development build but **is not included in the published `v0.2.0-beta.1` installer**. Ordinary users can use it only after the next installer passes validation and is formally released; this document does not assign that installer's final version number in advance.
+`v0.2.0-beta.2` combines both capabilities in the same installer; there is no separate model or action installer.
 
-In a build that includes this capability, open **AI model**, choose a model and reasoning effort from the current ChatGPT session's live catalog, then select **Apply model**.
+Open **AI model**, choose a model and reasoning effort from the current ChatGPT session's live catalog, then select **Apply model**.
 
 A successful model switch stops the active task and revokes its pending actions without disconnecting the confirmed Minecraft LAN session. WhiteLily saves and displays the new selection only after the model is ready, and keeps using it after either the child runtime or desktop app restarts. If switching fails, the previous model selection and connection remain in place so you can retry.
+
+On every start, WhiteLily verifies and, when necessary, atomically repairs `.codex/config.toml`, `AGENTS.md`, and `workspace-manifest.json` under `%LOCALAPPDATA%\WhiteLily\codex-workspace`. Stable recovery codes are `WORKSPACE_RESOURCE_INVALID`, `WORKSPACE_DEPLOY_FAILED`, and `WORKSPACE_ROLLBACK_FAILED`. Quit and retry first, then run the same beta.2 installer as a repair install; do not download scripts manually or add an API key to the workspace.
+
+Known Beta limits: only same-machine `127.0.0.1` Minecraft Java 1.21.5 LAN worlds are supported; model catalog, latency, and usage limits depend on the ChatGPT/Codex account; actions are limited to the current constrained tool catalog and arbitrary requests are not guaranteed. Uninstall keeps `%LOCALAPPDATA%\WhiteLily` by default and deletes that exact data root only when the user explicitly chooses **Delete WhiteLily data**.
 
 #### Advanced troubleshooting: manual owner configuration
 

@@ -122,7 +122,7 @@ describe("WhiteLily assisted Windows installer configuration", () => {
 
     expect(desktopPackage).toMatchObject({
       productName: "WhiteLily",
-      version: "0.2.0-beta.1",
+      version: "0.2.0-beta.2",
       main: "dist/main/main.js",
     });
     expect(build).toMatchObject({

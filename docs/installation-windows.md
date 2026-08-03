@@ -2,7 +2,7 @@
 
 [中文](installation-windows.zh-CN.md)
 
-> **Status: the `v0.2.0-beta.1` Public Beta passed isolated Windows installer lifecycle and same-machine Minecraft Java 1.21.5 LAN connection acceptance and is available as a GitHub prerelease.** This is an unsigned test build. Verify its SHA-256 and use only a disposable world.
+> **Status: `v0.2.0-beta.2` Public Beta candidate.** It combines model hot switching and the Minecraft action workspace in one unsigned Windows x64 installer. This candidate passed isolated clean installation, in-place beta.1 upgrade, workspace repair, data-preservation, uninstall, and reinstall checks. Real game actions are accepted only in a confirmed disposable Minecraft Java 1.21.5 LAN world. Verify its SHA-256.
 
 The published `v0.1.1` is an older CLI ZIP preview for developers and early testers. It requires system development tools and is not the desktop EXE described below.
 
@@ -23,8 +23,8 @@ WhiteLily does not launch, control, click, or modify PCL2. It does not automatic
 
 Download these files from the official [GitHub Releases](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/releases) page:
 
-1. [`WhiteLily-0.2.0-beta.1-windows-x64-setup.exe`](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/releases/download/v0.2.0-beta.1/WhiteLily-0.2.0-beta.1-windows-x64-setup.exe)
-2. [`WhiteLily-0.2.0-beta.1-windows-x64-setup.exe.sha256`](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/releases/download/v0.2.0-beta.1/WhiteLily-0.2.0-beta.1-windows-x64-setup.exe.sha256)
+1. [`WhiteLily-0.2.0-beta.2-windows-x64-setup.exe`](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/releases/download/v0.2.0-beta.2/WhiteLily-0.2.0-beta.2-windows-x64-setup.exe)
+2. [`WhiteLily-0.2.0-beta.2-windows-x64-setup.exe.sha256`](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/releases/download/v0.2.0-beta.2/WhiteLily-0.2.0-beta.2-windows-x64-setup.exe.sha256)
 
 Do not obtain a same-named EXE from source folders, chat attachments, file-sharing services, or third-party mirrors. A matching filename does not prove matching contents.
 
@@ -33,8 +33,8 @@ Do not obtain a same-named EXE from source folders, chat attachments, file-shari
 Place the EXE and `.sha256` file in the same directory, open PowerShell in that directory, and run:
 
 ```powershell
-$installer = ".\WhiteLily-0.2.0-beta.1-windows-x64-setup.exe"
-$checksum = ".\WhiteLily-0.2.0-beta.1-windows-x64-setup.exe.sha256"
+$installer = ".\WhiteLily-0.2.0-beta.2-windows-x64-setup.exe"
+$checksum = ".\WhiteLily-0.2.0-beta.2-windows-x64-setup.exe.sha256"
 $expected = ((Get-Content -Raw $checksum).Trim() -split "\s+")[0].ToLowerInvariant()
 $actual = (Get-FileHash -Algorithm SHA256 $installer).Hash.ToLowerInvariant()
 if ($actual -ne $expected) { throw "SHA-256 mismatch. Do not run the installer." }
@@ -80,13 +80,15 @@ The installer is designed to bundle Electron, the compiled WhiteLily child runti
 
 Authentication files stay under the controlled `%LOCALAPPDATA%\WhiteLily` data root. WhiteLily does not ask you to paste an API key into configuration and has no API Key fallback.
 
-### Development build: persistent model switching (not in `v0.2.0-beta.1`)
+### Persistent model hot switching and action workspace
 
-This capability is present in the current development build but **is not included in the `v0.2.0-beta.1` installer described by this guide**. Ordinary users can use it only after the next installer passes validation and is formally released; this guide does not assign that installer's final version number in advance.
+`v0.2.0-beta.2` includes both capabilities in the same installer; there is no separate model or action installer.
 
-In a build that includes this capability, open **AI model** after first-run setup, choose a model and reasoning effort from the current ChatGPT session's live catalog, then select **Apply model**. A successful switch stops the active task and revokes its pending actions without disconnecting the confirmed Minecraft LAN session. WhiteLily saves and displays the new selection only after the model is ready, and keeps using it after either the child runtime or desktop app restarts.
+Open **AI model** after first-run setup, choose a model and reasoning effort from the current ChatGPT session's live catalog, then select **Apply model**. A successful switch stops the active task and revokes its pending actions without disconnecting the confirmed Minecraft LAN session. WhiteLily saves and displays the new selection only after the model is ready, and keeps using it after either the child runtime or desktop app restarts.
 
 If switching fails, WhiteLily keeps the previous model selection and connection. Do not work around the failure by repeatedly restarting, editing local authentication files, or pasting an API key. Retry once, then save a redacted diagnostic and report the problem if it continues.
+
+On every start WhiteLily verifies exactly three managed files under `%LOCALAPPDATA%\WhiteLily\codex-workspace`: `.codex/config.toml`, `AGENTS.md`, and `workspace-manifest.json`. A missing, stale, or modified ordinary directory is atomically repaired from the attested installer copy. Stable recovery codes are `WORKSPACE_RESOURCE_INVALID`, `WORKSPACE_DEPLOY_FAILED`, and `WORKSPACE_ROLLBACK_FAILED`. Quit completely and retry first, then run the same beta.2 installer as a repair installation. Do not download scripts manually or write an API key into the workspace.
 
 ## 7. Enter Minecraft with PCL2
 
@@ -148,6 +150,13 @@ Do not disable system protection. Recheck the official download source and SHA-2
 
 ## 12. Developer preview
 
-The published `v0.1.1` CLI ZIP is an older developer preview and does require Node.js, npm, a Git/source workspace, and Codex CLI. Those requirements do not apply to the `v0.2.0-beta.1` desktop installer.
+The published `v0.1.1` CLI ZIP is an older developer preview and does require Node.js, npm, a Git/source workspace, and Codex CLI. Those requirements do not apply to the `v0.2.0-beta.2` desktop installer.
+
+## 12. Known Beta limits
+
+- Only same-machine `127.0.0.1` Minecraft Java 1.21.5 LAN worlds are supported; remote hosts are not supported.
+- Model catalog, response latency, and usage limits depend on the current ChatGPT/Codex account; there is no Platform API-key fallback.
+- Game actions are limited to the constrained tools WhiteLily currently discovers and verifies; arbitrary natural-language requests are not guaranteed to execute.
+- You still start and operate PCL2, Minecraft, and the LAN world and must test every update in a disposable world first.
 
 Maintainers validating a desktop build from source use locked dependencies and repository development scripts. Ordinary installer users do not clone the repository or run `npm ci`. Only a build that passes isolated lifecycle and same-machine Minecraft 1.21.5 connection acceptance may be offered as a prerelease installer.

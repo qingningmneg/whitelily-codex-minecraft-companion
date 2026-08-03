@@ -3,6 +3,8 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$InstallerPath,
 
+    [string]$BaselineInstallerPath,
+
     [string]$ReportPath
 )
 
@@ -109,6 +111,33 @@ if (-not $nameMatch.Success) {
     throw 'INSTALLER_NAME_OR_PATH_INVALID'
 }
 $version = $nameMatch.Groups['version'].Value
+$baselineVersion = '0.2.0-beta.1'
+$installerDirectory = [System.IO.Path]::GetFullPath((Split-Path -Parent $resolvedInstaller))
+$expectedBaselineInstaller = [System.IO.Path]::GetFullPath(
+    (Join-Path $installerDirectory "WhiteLily-$baselineVersion-windows-x64-setup.exe")
+)
+$resolvedBaselineInstaller = if ([string]::IsNullOrWhiteSpace($BaselineInstallerPath)) {
+    $expectedBaselineInstaller
+} else {
+    Resolve-FullPath $BaselineInstallerPath $repositoryRoot
+}
+if (
+    -not [StringComparer]::OrdinalIgnoreCase.Equals(
+        $resolvedBaselineInstaller,
+        $expectedBaselineInstaller
+    ) -or
+    -not (Test-Path -LiteralPath $resolvedBaselineInstaller -PathType Leaf)
+) {
+    throw 'BETA1_BASELINE_INSTALLER_REQUIRED'
+}
+$baselineInstallerHash = Get-Sha256Hex $resolvedBaselineInstaller
+$candidateInstallerHash = Get-Sha256Hex $resolvedInstaller
+if (
+    [StringComparer]::Ordinal.Equals($version, $baselineVersion) -or
+    [StringComparer]::Ordinal.Equals($candidateInstallerHash, $baselineInstallerHash)
+) {
+    throw 'BETA1_UPGRADE_TARGET_REQUIRED'
+}
 
 $inspectionOutput = @(
     & (Join-Path $PSScriptRoot 'inspect-installer.ps1') `
@@ -120,6 +149,9 @@ if ($LASTEXITCODE -ne 0 -or $inspectionOutput.Count -ne 1) {
 }
 $inspection = [string]$inspectionOutput[0] | ConvertFrom-Json
 $installerHash = [string]$inspection.sha256
+if (-not [StringComparer]::Ordinal.Equals($installerHash, $candidateInstallerHash)) {
+    throw 'INSTALLER_HASH_CHANGED_DURING_INSPECTION'
+}
 
 if ($env:WHITELILY_FORCE_SANDBOX_UNAVAILABLE -eq '1') {
     throw 'WINDOWS_SANDBOX_REQUIRED'
@@ -141,7 +173,6 @@ if (
     throw 'WINDOWS_SANDBOX_REQUIRED'
 }
 
-$installerDirectory = [System.IO.Path]::GetFullPath((Split-Path -Parent $resolvedInstaller))
 $expectedReport = [System.IO.Path]::GetFullPath(
     (Join-Path $installerDirectory "WhiteLily-$version-windows-x64-installer-lifecycle.json")
 )
@@ -170,7 +201,11 @@ $guestScript = @'
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$InstallerName,
-    [Parameter(Mandatory = $true)][string]$InstallerSha256
+    [Parameter(Mandatory = $true)][string]$InstallerSha256,
+    [Parameter(Mandatory = $true)][string]$ExpectedVersion,
+    [Parameter(Mandatory = $true)][string]$BaselineInstallerName,
+    [Parameter(Mandatory = $true)][string]$BaselineInstallerSha256,
+    [Parameter(Mandatory = $true)][string]$BaselineVersion
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -178,6 +213,10 @@ $resultPath = 'C:\WhiteLilyReport\sandbox-result.json'
 $result = [ordered]@{
     schemaVersion = 1
     installerSha256 = $InstallerSha256
+    expectedVersion = $ExpectedVersion
+    baselineInstallerSha256 = $BaselineInstallerSha256
+    installedVersion = $null
+    managedWorkspaceResources = 0
     success = $false
     stages = [Collections.Generic.List[string]]::new()
     error = $null
@@ -281,6 +320,183 @@ function Get-Uninstaller {
     if ($matches.Count -ne 1) { throw 'installed uninstaller was not found' }
     return $matches[0].FullName
 }
+function Get-WhiteLilyProductEntries {
+    $entries = [Collections.Generic.List[object]]::new()
+    $registryRoots = @(
+        'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall',
+        'HKCU:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall',
+        'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall',
+        'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+    )
+    foreach ($registryRoot in $registryRoots) {
+        if (-not (Test-Path -LiteralPath $registryRoot -PathType Container)) { continue }
+        foreach ($key in @(Get-ChildItem -LiteralPath $registryRoot -ErrorAction Stop)) {
+            $entry = Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction Stop
+            $displayName = $entry.PSObject.Properties['DisplayName']
+            if (
+                $null -ne $displayName -and
+                (
+                    [StringComparer]::Ordinal.Equals([string]$displayName.Value, 'WhiteLily') -or
+                    ([string]$displayName.Value).StartsWith(
+                        'WhiteLily ',
+                        [StringComparison]::Ordinal
+                    )
+                )
+            ) {
+                $entries.Add($entry)
+            }
+        }
+    }
+    return $entries.ToArray()
+}
+function Assert-WhiteLilyProductEntry {
+    param(
+        [Parameter(Mandatory = $true)][string]$ExpectedVersion,
+        [Parameter(Mandatory = $true)][string]$ProgramRoot
+    )
+    $entries = @(Get-WhiteLilyProductEntries)
+    if ($entries.Count -ne 1) {
+        throw "expected exactly one WhiteLily product/uninstall entry, found $($entries.Count)"
+    }
+    $entry = $entries[0]
+    $displayName = $entry.PSObject.Properties['DisplayName']
+    $expectedDisplayName = "WhiteLily $ExpectedVersion"
+    if (
+        $null -eq $displayName -or
+        -not [StringComparer]::Ordinal.Equals(
+            [string]$displayName.Value,
+            $expectedDisplayName
+        )
+    ) {
+        throw 'installed WhiteLily display name mismatch'
+    }
+    $displayVersion = $entry.PSObject.Properties['DisplayVersion']
+    $receivedVersion = if ($null -eq $displayVersion) {
+        ''
+    } else {
+        [string]$displayVersion.Value
+    }
+    if (-not [StringComparer]::Ordinal.Equals($receivedVersion, $ExpectedVersion)) {
+        throw "installed WhiteLily version mismatch: $receivedVersion"
+    }
+    $uninstallProperty = $entry.PSObject.Properties['UninstallString']
+    $uninstallString = if ($null -eq $uninstallProperty) {
+        ''
+    } else {
+        [string]$uninstallProperty.Value
+    }
+    if (
+        [string]::IsNullOrWhiteSpace($uninstallString) -or
+        $uninstallString.IndexOf($ProgramRoot, [StringComparison]::OrdinalIgnoreCase) -lt 0
+    ) {
+        throw 'WhiteLily uninstall entry is not bound to the fixed program root'
+    }
+    if (
+        @(Get-ChildItem -LiteralPath $ProgramRoot -File -Filter 'WhiteLily.exe').Count -ne 1 -or
+        @(Get-ChildItem -LiteralPath $ProgramRoot -File -Filter 'Uninstall*.exe').Count -ne 1
+    ) {
+        throw 'WhiteLily product files are not unique'
+    }
+}
+function Assert-NoWhiteLilyProductEntry {
+    $entries = @(Get-WhiteLilyProductEntries)
+    if ($entries.Count -ne 0) {
+        throw "WhiteLily product/uninstall entry remained after uninstall: $($entries.Count)"
+    }
+}
+function Get-PortableWorkspaceFiles {
+    param([Parameter(Mandatory = $true)][string]$Root)
+    $prefix = $Root.TrimEnd('\') + '\'
+    [string[]]$files = @(
+        Get-ChildItem -LiteralPath $Root -Recurse -File -Force |
+            ForEach-Object { $_.FullName.Substring($prefix.Length).Replace('\', '/') }
+    )
+    [Array]::Sort($files, [StringComparer]::Ordinal)
+    return $files
+}
+function Assert-ManagedWorkspace {
+    param(
+        [Parameter(Mandatory = $true)][string]$ProgramRoot,
+        [Parameter(Mandatory = $true)][string]$DataRoot
+    )
+    $resourceRoot = Join-Path $ProgramRoot 'resources\codex-workspace'
+    $targetRoot = Join-Path $DataRoot 'codex-workspace'
+    [string[]]$expectedFiles = @(
+        '.codex/config.toml',
+        'AGENTS.md',
+        'workspace-manifest.json'
+    )
+    [Array]::Sort($expectedFiles, [StringComparer]::Ordinal)
+    foreach ($root in @($resourceRoot, $targetRoot)) {
+        if (-not (Test-Path -LiteralPath $root -PathType Container)) {
+            throw "managed workspace root is missing: $root"
+        }
+        $actualFiles = @(Get-PortableWorkspaceFiles $root)
+        if (-not [System.Linq.Enumerable]::SequenceEqual([string[]]$actualFiles, $expectedFiles)) {
+            throw "managed workspace file set is not exact: $root"
+        }
+    }
+    $resourceManifestPath = Join-Path $resourceRoot 'workspace-manifest.json'
+    $targetManifestPath = Join-Path $targetRoot 'workspace-manifest.json'
+    $resourceManifest = Get-Content -LiteralPath $resourceManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    $targetManifest = Get-Content -LiteralPath $targetManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    if (
+        [int]$resourceManifest.schemaVersion -ne 1 -or
+        [int]$targetManifest.schemaVersion -ne 1 -or
+        -not [StringComparer]::Ordinal.Equals(
+            [string]$resourceManifest.contentVersion,
+            [string]$targetManifest.contentVersion
+        ) -or
+        @($resourceManifest.files).Count -ne 2 -or
+        @($targetManifest.files).Count -ne 2 -or
+        -not [StringComparer]::Ordinal.Equals(
+            (Get-Sha256Hex $resourceManifestPath),
+            (Get-Sha256Hex $targetManifestPath)
+        )
+    ) {
+        throw 'managed workspace manifests do not match'
+    }
+    $expectedPayloads = @('.codex/config.toml', 'AGENTS.md')
+    for ($index = 0; $index -lt $expectedPayloads.Count; $index += 1) {
+        $resourceEntry = @($resourceManifest.files)[$index]
+        $targetEntry = @($targetManifest.files)[$index]
+        $portablePath = $expectedPayloads[$index]
+        if (
+            -not [StringComparer]::Ordinal.Equals([string]$resourceEntry.path, $portablePath) -or
+            -not [StringComparer]::Ordinal.Equals([string]$targetEntry.path, $portablePath) -or
+            [long]$resourceEntry.bytes -ne [long]$targetEntry.bytes -or
+            -not [StringComparer]::Ordinal.Equals(
+                [string]$resourceEntry.sha256,
+                [string]$targetEntry.sha256
+            )
+        ) {
+            throw "managed workspace inner manifest mismatch: $portablePath"
+        }
+        $resourcePath = Join-Path $resourceRoot $portablePath.Replace('/', '\')
+        $targetPath = Join-Path $targetRoot $portablePath.Replace('/', '\')
+        $resourceFile = Get-Item -LiteralPath $resourcePath
+        $targetFile = Get-Item -LiteralPath $targetPath
+        $expectedHash = [string]$resourceEntry.sha256
+        if (
+            $resourceFile.Length -ne [long]$resourceEntry.bytes -or
+            $targetFile.Length -ne [long]$resourceEntry.bytes -or
+            -not [StringComparer]::Ordinal.Equals((Get-Sha256Hex $resourcePath), $expectedHash) -or
+            -not [StringComparer]::Ordinal.Equals((Get-Sha256Hex $targetPath), $expectedHash)
+        ) {
+            throw "managed workspace inner/outer hash mismatch: $portablePath"
+        }
+    }
+    return $expectedFiles.Count
+}
+function Invoke-WhiteLilySmoke {
+    param([Parameter(Mandatory = $true)][string]$Application)
+    $applicationProcess = Start-Process -FilePath $Application -ArgumentList @('--installer-smoke') -PassThru
+    Wait-WhiteLilyMainWindow $applicationProcess
+    if (-not $applicationProcess.HasExited) {
+        $applicationProcess.Kill()
+        $applicationProcess.WaitForExit()
+    }
+}
 function Get-UninstallerUiProcessIds {
     param(
         [Parameter(Mandatory = $true)][int]$LauncherPid,
@@ -321,44 +537,20 @@ try {
     $result.stages.Add('isolated_path')
 
     $installer = Join-Path 'C:\WhiteLilyInstaller' $InstallerName
+    $baselineInstaller = Join-Path 'C:\WhiteLilyInstaller' $BaselineInstallerName
     $actualHash = Get-Sha256Hex $installer
-    if (-not [StringComparer]::Ordinal.Equals($actualHash, $InstallerSha256)) {
+    $actualBaselineHash = Get-Sha256Hex $baselineInstaller
+    if (
+        -not [StringComparer]::Ordinal.Equals($actualHash, $InstallerSha256) -or
+        -not [StringComparer]::Ordinal.Equals($actualBaselineHash, $BaselineInstallerSha256)
+    ) {
         throw 'mapped installer hash mismatch'
     }
-    $result.stages.Add('hash_verified')
+    $result.stages.Add('hashes_verified')
 
     $programRoot = Join-Path $env:LOCALAPPDATA 'Programs\WhiteLily'
     $dataRoot = Join-Path $env:LOCALAPPDATA 'WhiteLily'
     $application = Join-Path $programRoot 'WhiteLily.exe'
-    Invoke-Process $installer @('/S')
-    if (-not (Test-Path -LiteralPath $application -PathType Leaf)) {
-        throw 'WhiteLily application was not installed'
-    }
-    $result.stages.Add('installed')
-
-    $applicationProcess = Start-Process -FilePath $application -ArgumentList @('--installer-smoke') -PassThru
-    Wait-WhiteLilyMainWindow $applicationProcess
-    if (-not $applicationProcess.HasExited) {
-        $applicationProcess.Kill()
-        $applicationProcess.WaitForExit()
-    }
-    $result.stages.Add('launched_without_system_tooling')
-
-    New-Item -ItemType Directory -Path $dataRoot -Force | Out-Null
-    $marker = Join-Path $dataRoot 'installer-lifecycle-marker.txt'
-    [System.IO.File]::WriteAllText($marker, 'preserve', [System.Text.UTF8Encoding]::new($false))
-    $uninstaller = Get-Uninstaller $programRoot
-    Invoke-Process $uninstaller @('/S')
-    if (-not (Test-Path -LiteralPath $marker -PathType Leaf)) {
-        throw 'silent Keep Data uninstall removed the data marker'
-    }
-    $result.stages.Add('keep_data')
-
-    Invoke-Process $installer @('/S')
-    if (-not (Test-Path -LiteralPath $marker -PathType Leaf)) {
-        throw 'reinstall did not preserve the data marker'
-    }
-    $result.stages.Add('reinstalled')
 
     Add-Type -TypeDefinition @"
 using System;
@@ -435,45 +627,133 @@ public static class WhiteLilyInstallerUi {
         }
         throw 'interactive Delete Data uninstall timed out'
     }
-    $uninstaller = Get-Uninstaller $programRoot
-    $deleteProcess = Start-Process -FilePath $uninstaller -PassThru
-    $uiProcessId = $null
-    $welcomeDeadline = [DateTime]::UtcNow.AddSeconds(30)
-    do {
-        foreach ($candidateId in @(Get-UninstallerUiProcessIds -LauncherPid $deleteProcess.Id -ProgramRoot $programRoot)) {
-            if ([WhiteLilyInstallerUi]::ClickId([uint32]$candidateId, 1)) {
-                $uiProcessId = [int]$candidateId
-                break
-            }
-        }
-        if ($null -ne $uiProcessId) { break }
-        Start-Sleep -Milliseconds 250
-    } while ([DateTime]::UtcNow -lt $welcomeDeadline)
-    if ($null -eq $uiProcessId) {
-        throw 'could not advance the interactive uninstaller welcome page'
-    }
-
-    $choiceDeadline = [DateTime]::UtcNow.AddSeconds(30)
-    $choiceSelected = $false
-    do {
-        $choiceSelected = [WhiteLilyInstallerUi]::ClickContaining(
-            [uint32]$uiProcessId,
-            'Delete WhiteLily data'
+    function Invoke-DeleteDataUninstall {
+        param(
+            [Parameter(Mandatory = $true)][string]$ProgramRoot,
+            [Parameter(Mandatory = $true)][string]$DataRoot
         )
-        if ($choiceSelected) { break }
-        Start-Sleep -Milliseconds 250
-    } while ([DateTime]::UtcNow -lt $choiceDeadline)
-    if (-not $choiceSelected) {
-        throw 'could not explicitly select Delete Data'
+        $uninstaller = Get-Uninstaller $ProgramRoot
+        $deleteProcess = Start-Process -FilePath $uninstaller -PassThru
+        $uiProcessId = $null
+        $welcomeDeadline = [DateTime]::UtcNow.AddSeconds(30)
+        do {
+            foreach ($candidateId in @(Get-UninstallerUiProcessIds -LauncherPid $deleteProcess.Id -ProgramRoot $ProgramRoot)) {
+                if ([WhiteLilyInstallerUi]::ClickId([uint32]$candidateId, 1)) {
+                    $uiProcessId = [int]$candidateId
+                    break
+                }
+            }
+            if ($null -ne $uiProcessId) { break }
+            Start-Sleep -Milliseconds 250
+        } while ([DateTime]::UtcNow -lt $welcomeDeadline)
+        if ($null -eq $uiProcessId) {
+            throw 'could not advance the interactive uninstaller welcome page'
+        }
+
+        $choiceDeadline = [DateTime]::UtcNow.AddSeconds(30)
+        $choiceSelected = $false
+        do {
+            $choiceSelected = [WhiteLilyInstallerUi]::ClickContaining(
+                [uint32]$uiProcessId,
+                'Delete WhiteLily data'
+            )
+            if ($choiceSelected) { break }
+            Start-Sleep -Milliseconds 250
+        } while ([DateTime]::UtcNow -lt $choiceDeadline)
+        if (-not $choiceSelected) {
+            throw 'could not explicitly select Delete Data'
+        }
+
+        $deleteExitCode = Complete-UninstallerUi -UiProcessId $uiProcessId
+        if ($deleteExitCode -ne 0) {
+            throw "interactive Delete Data uninstall failed with exit code $deleteExitCode"
+        }
+        if (Test-Path -LiteralPath $DataRoot) {
+            throw 'explicit Delete Data uninstall preserved the data root'
+        }
+        Assert-NoWhiteLilyProductEntry
     }
 
-    $deleteExitCode = Complete-UninstallerUi -UiProcessId $uiProcessId
-    if ($deleteExitCode -ne 0) {
-        throw "interactive Delete Data uninstall failed with exit code $deleteExitCode"
+    Invoke-Process $installer @('/S')
+    if (-not (Test-Path -LiteralPath $application -PathType Leaf)) {
+        throw 'WhiteLily application was not installed'
     }
-    if (Test-Path -LiteralPath $dataRoot) {
-        throw 'explicit Delete Data uninstall preserved the data root'
+    Assert-WhiteLilyProductEntry -ExpectedVersion $ExpectedVersion -ProgramRoot $programRoot
+    $result.stages.Add('clean_installed')
+    Invoke-WhiteLilySmoke $application
+    $result.managedWorkspaceResources = Assert-ManagedWorkspace `
+        -ProgramRoot $programRoot `
+        -DataRoot $dataRoot
+    $result.stages.Add('clean_workspace_verified')
+
+    Invoke-DeleteDataUninstall -ProgramRoot $programRoot -DataRoot $dataRoot
+    $result.stages.Add('clean_delete_data')
+
+    Invoke-Process $baselineInstaller @('/S')
+    Assert-WhiteLilyProductEntry -ExpectedVersion $BaselineVersion -ProgramRoot $programRoot
+    $result.stages.Add('beta1_installed')
+
+    New-Item -ItemType Directory -Path (Join-Path $dataRoot 'codex-workspace\.codex') -Force | Out-Null
+    $marker = Join-Path $dataRoot 'installer-lifecycle-beta1-marker.txt'
+    [System.IO.File]::WriteAllText($marker, 'preserve-beta1-data', [System.Text.UTF8Encoding]::new($false))
+    [System.IO.File]::WriteAllText(
+        (Join-Path $dataRoot 'codex-workspace\.codex\config.toml'),
+        "stale = true`n",
+        [System.Text.UTF8Encoding]::new($false)
+    )
+    [System.IO.File]::WriteAllText(
+        (Join-Path $dataRoot 'codex-workspace\AGENTS.md'),
+        "stale beta.1 workspace`n",
+        [System.Text.UTF8Encoding]::new($false)
+    )
+    [System.IO.File]::WriteAllText(
+        (Join-Path $dataRoot 'codex-workspace\workspace-manifest.json'),
+        "{}`n",
+        [System.Text.UTF8Encoding]::new($false)
+    )
+    [System.IO.File]::WriteAllText(
+        (Join-Path $dataRoot 'codex-workspace\obsolete.txt'),
+        "remove during repair`n",
+        [System.Text.UTF8Encoding]::new($false)
+    )
+    $result.stages.Add('beta1_data_root_prepared')
+
+    Invoke-Process $installer @('/S')
+    Assert-WhiteLilyProductEntry -ExpectedVersion $ExpectedVersion -ProgramRoot $programRoot
+    if (-not (Test-Path -LiteralPath $marker -PathType Leaf)) {
+        throw 'beta.1 data marker was removed during upgrade'
     }
+    $result.stages.Add('beta1_upgraded')
+    Invoke-WhiteLilySmoke $application
+    $result.managedWorkspaceResources = Assert-ManagedWorkspace `
+        -ProgramRoot $programRoot `
+        -DataRoot $dataRoot
+    if (Test-Path -LiteralPath (Join-Path $dataRoot 'codex-workspace\obsolete.txt')) {
+        throw 'beta.1 workspace drift was not repaired'
+    }
+    $result.stages.Add('workspace_repaired')
+
+    $uninstaller = Get-Uninstaller $programRoot
+    Invoke-Process $uninstaller @('/S')
+    Assert-NoWhiteLilyProductEntry
+    if (-not (Test-Path -LiteralPath $marker -PathType Leaf)) {
+        throw 'silent Keep Data uninstall removed the beta.1 data marker'
+    }
+    $result.stages.Add('keep_data')
+
+    Invoke-Process $installer @('/S')
+    Assert-WhiteLilyProductEntry -ExpectedVersion $ExpectedVersion -ProgramRoot $programRoot
+    if (-not (Test-Path -LiteralPath $marker -PathType Leaf)) {
+        throw 'reinstall did not preserve the beta.1 data marker'
+    }
+    Invoke-WhiteLilySmoke $application
+    $result.managedWorkspaceResources = Assert-ManagedWorkspace `
+        -ProgramRoot $programRoot `
+        -DataRoot $dataRoot
+    $result.installedVersion = $ExpectedVersion
+    $result.stages.Add('reinstalled')
+
+    Invoke-DeleteDataUninstall -ProgramRoot $programRoot -DataRoot $dataRoot
     $result.stages.Add('delete_data')
     $result.success = $true
 } catch {
@@ -492,7 +772,11 @@ $utf8 = [System.Text.UTF8Encoding]::new($false)
 [System.IO.File]::WriteAllText($guestScriptPath, $guestScript, $utf8)
 
 $guestCommand = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\WhiteLilyReport\guest-lifecycle.ps1"' +
-    " -InstallerName `"$installerName`" -InstallerSha256 `"$installerHash`""
+    " -InstallerName `"$installerName`" -InstallerSha256 `"$installerHash`"" +
+    " -ExpectedVersion `"$version`"" +
+    " -BaselineInstallerName `"$([System.IO.Path]::GetFileName($resolvedBaselineInstaller))`"" +
+    " -BaselineInstallerSha256 `"$baselineInstallerHash`"" +
+    " -BaselineVersion `"$baselineVersion`""
 $configuration = @"
 <Configuration>
   <MappedFolders>
@@ -533,7 +817,7 @@ try {
         throw 'WINDOWS_SANDBOX_REQUIRED'
     }
 
-    $deadline = [DateTime]::UtcNow.AddMinutes(15)
+    $deadline = [DateTime]::UtcNow.AddMinutes(20)
     while (-not (Test-Path -LiteralPath $sandboxResultPath -PathType Leaf)) {
         if ([DateTime]::UtcNow -ge $deadline) {
             throw 'SANDBOX_LIFECYCLE_TIMEOUT'
@@ -547,9 +831,14 @@ try {
     $report = Get-Content -LiteralPath $sandboxResultPath -Raw -Encoding UTF8 | ConvertFrom-Json
     $expectedStages = @(
         'isolated_path',
-        'hash_verified',
-        'installed',
-        'launched_without_system_tooling',
+        'hashes_verified',
+        'clean_installed',
+        'clean_workspace_verified',
+        'clean_delete_data',
+        'beta1_installed',
+        'beta1_data_root_prepared',
+        'beta1_upgraded',
+        'workspace_repaired',
         'keep_data',
         'reinstalled',
         'delete_data'
@@ -558,6 +847,13 @@ try {
     if (
         [int]$report.schemaVersion -ne 1 -or
         -not [StringComparer]::Ordinal.Equals([string]$report.installerSha256, $installerHash) -or
+        -not [StringComparer]::Ordinal.Equals([string]$report.expectedVersion, $version) -or
+        -not [StringComparer]::Ordinal.Equals(
+            [string]$report.baselineInstallerSha256,
+            $baselineInstallerHash
+        ) -or
+        -not [StringComparer]::Ordinal.Equals([string]$report.installedVersion, $version) -or
+        [int]$report.managedWorkspaceResources -ne 3 -or
         $report.success -ne $true -or
         -not [System.Linq.Enumerable]::SequenceEqual([string[]]$actualStages, [string[]]$expectedStages)
     ) {
