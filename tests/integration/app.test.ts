@@ -16,6 +16,9 @@ import {
 } from "../../src/app.js";
 import { ActionExecutor } from "../../src/actions/actionExecutor.js";
 import { CodexAppServerClient } from "../../src/codex/appServerClient.js";
+import type { CodexPort, CodexTurnResult } from "../../src/codex/codexPort.js";
+import { ChatRouter } from "../../src/companion/chatRouter.js";
+import { CompanionService } from "../../src/companion/companionService.js";
 import type { AppConfig } from "../../src/config/schema.js";
 import { isMainModule, runCli, type CliDependencies } from "../../src/index.js";
 import { TurnToolBudget } from "../../src/mcp/toolBudget.js";
@@ -25,8 +28,11 @@ import {
   createToolRegistry,
   createTrustedSnapshotStore,
   MINECRAFT_TOOL_NAMES,
+  type ToolResult,
 } from "../../src/mcp/toolRegistry.js";
 import { FakeMinecraftPort } from "../../src/minecraft/fakeMinecraftPort.js";
+import { MemoryStore } from "../../src/memory/memoryStore.js";
+import { StateStore } from "../../src/memory/stateStore.js";
 import { ConfirmationStore } from "../../src/safety/confirmationStore.js";
 import { SafetyEngine } from "../../src/safety/safetyEngine.js";
 import { createCompanionHarness } from "../support/companionHarness.js";
@@ -137,6 +143,248 @@ async function createAttestedWorkspaceFixture() {
   return { root, resourceDirectory, dataRoot };
 }
 
+interface AuditDeferred<T> {
+  readonly promise: Promise<T>;
+  resolve(value: T): void;
+}
+
+function auditDeferred<T>(): AuditDeferred<T> {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
+
+class PersistentAuditCodex implements CodexPort {
+  private threadCount = 0;
+  private turnCount = 0;
+  private readonly execution = auditDeferred<CodexTurnResult>();
+
+  constructor(private readonly intentDecision: string) {}
+
+  async start(): Promise<void> {}
+
+  async listModels(): Promise<string[]> {
+    return ["gpt-5.6-terra"];
+  }
+
+  async validateModelSelection(): Promise<boolean> {
+    return true;
+  }
+
+  async startThread(): Promise<string> {
+    this.threadCount += 1;
+    return this.threadCount === 1 ? "persistent-audit-intent" : "persistent-audit-execution";
+  }
+
+  async sendTurn(
+    threadId: string,
+    _text: string,
+    onStarted?: (turnId: string) => void,
+  ): Promise<CodexTurnResult> {
+    const turnId = `persistent-audit-turn-${++this.turnCount}`;
+    onStarted?.(turnId);
+    if (threadId === "persistent-audit-intent") {
+      return {
+        threadId,
+        turnId,
+        text: this.intentDecision,
+        status: "completed",
+      };
+    }
+    return this.execution.promise;
+  }
+
+  releaseExecution(reply: string): void {
+    this.execution.resolve({
+      threadId: "persistent-audit-execution",
+      turnId: `persistent-audit-turn-${this.turnCount}`,
+      text: JSON.stringify({ reply, status: "completed", memoryCandidates: [] }),
+      status: "completed",
+    });
+  }
+
+  async interrupt(): Promise<void> {}
+
+  async closeThread(): Promise<void> {}
+
+  async stop(): Promise<void> {}
+}
+
+interface PersistedTaskAuditRecord {
+  readonly kind: string;
+  readonly detail: {
+    readonly expectedActionCategoryCount: number;
+    readonly toolCalls: number;
+    readonly horizontalTravel: number;
+    readonly reason?: string;
+  };
+}
+
+type PersistedActionScenario =
+  | { readonly kind: "position"; readonly ownerText: "查看一下你现在的位置" }
+  | { readonly kind: "follow"; readonly ownerText: "走到我身边来" };
+
+async function runPersistedActionScenario(scenario: PersistedActionScenario) {
+  const files = await createCliHarness();
+  const decision = JSON.stringify({
+    kind: "start_task",
+    naturalReply: null,
+    task: {
+      goal: scenario.kind === "position" ? "查看当前位置" : "走到主人身边",
+      allowedActions: scenario.kind === "position" ? ["get_state"] : ["follow_owner", "move_to"],
+      requestedLimits:
+        scenario.kind === "position"
+          ? { maxToolCalls: 2 }
+          : { maxToolCalls: 2, maxHorizontalTravel: 16 },
+    },
+    memoryCandidates: [],
+  });
+  const codex = new PersistentAuditCodex(decision);
+  let app: Awaited<ReturnType<typeof createApp>> | undefined;
+  let context: AppCompositionContext | undefined;
+  let minecraft: FakeMinecraftPort | undefined;
+  let toolResult: ToolResult | undefined;
+  let executeScenarioTool: (() => Promise<ToolResult>) | undefined;
+  let turnLease: string | undefined;
+  let turnBudget: ReturnType<AppCompositionContext["budget"]["snapshot"]> | undefined;
+  const executorResults: unknown[] = [];
+
+  try {
+    app = await createApp(files.configPath, {
+      cwd: files.directory,
+      runtimeFactory: (createdContext) => {
+        context = createdContext;
+        minecraft = new FakeMinecraftPort();
+        minecraft.ownerOnline = true;
+        if (scenario.kind === "follow") {
+          minecraft.world.ownerPosition = { x: 6, y: 64, z: 0 };
+        }
+        const confirmations = new ConfirmationStore();
+        const executor = new ActionExecutor(
+          minecraft,
+          new SafetyEngine(confirmations, createdContext.config.safety, (lease) =>
+            createdContext.taskController.isLeaseLive(lease),
+          ),
+          confirmations,
+          () => "TestOwner",
+          () => createdContext.taskController.stop("owner_stop"),
+          {
+            isLeaseLive: (lease) => createdContext.taskController.isLeaseLive(lease),
+            reserveAdditionalTravel: (lease, horizontalTravel) =>
+              createdContext.taskController.reserveAdditionalTravel(lease, horizontalTravel),
+          },
+        );
+        executor.onResult((result) => executorResults.push(result));
+        const safetyContextProvider = async () => ({
+          spawn: { x: 0, y: 64, z: 0 },
+          owner: { ...(minecraft?.world.ownerPosition ?? { x: 0, y: 64, z: 0 }) },
+        });
+        const service = new CompanionService({
+          minecraft,
+          codex,
+          mode: createdContext.mode,
+          memories: new MemoryStore(createdContext.paths.memories),
+          state: new StateStore(createdContext.paths.state),
+          confirmations,
+          executor,
+          budget: createdContext.budget,
+          taskController: createdContext.taskController,
+          autonomy: {
+            start: () => undefined,
+            stop: () => undefined,
+            notifyModeChanged: () => undefined,
+            notifyGoalCompleted: () => undefined,
+            notifyActionFailed: () => undefined,
+            notifyThreat: () => undefined,
+            canChatProactively: () => false,
+            canSendProactively: () => false,
+            markProactiveChat: () => undefined,
+          },
+          safetyContextProvider,
+          ownerUsername: () => "TestOwner",
+          ownerIdentity: createdContext.ownerIdentity,
+          chatRouter: new ChatRouter({ ownerUsername: () => "TestOwner", maxMessageLength: 4_000 }),
+          cwd: createdContext.paths.cwd,
+          preferredModel: "gpt-5.6-terra",
+          reasoningEffort: "low",
+          logger: createdContext.logger,
+          compatibilityVerified: () => true,
+          safetyPresetAllows: () => true,
+          setTimer: (callback) => {
+            queueMicrotask(callback);
+            return 1 as unknown as ReturnType<typeof setTimeout>;
+          },
+          clearTimer: () => undefined,
+        });
+        const tools = createToolRegistry({
+          minecraft,
+          executor,
+          budget: createdContext.budget,
+          safetyContextProvider,
+          ownerUsername: () => "TestOwner",
+        });
+        const begin = createdContext.budget.begin.bind(createdContext.budget);
+        createdContext.budget.begin = (taskLease, authorization = {}) => {
+          turnLease = begin(taskLease, authorization);
+          return turnLease;
+        };
+        executeScenarioTool = async () => {
+          if (!turnLease) throw new Error("expected a production turn lease");
+          if (scenario.kind === "position") {
+            return tools.minecraft_get_state.execute({ turnLease });
+          }
+          return tools.minecraft_follow_owner.execute({ distance: 3, turnLease });
+        };
+        return {
+          preferredModel: "gpt-5.6-terra",
+          mcp: { start: async () => undefined, stop: async () => undefined },
+          codex: {
+            assertChatGptLogin: async () => undefined,
+            start: () => codex.start(),
+            listModels: () => codex.listModels(),
+            stop: () => codex.stop(),
+          },
+          selectModel: (_models, preferred) => preferred,
+          switchModel: async (_selection, commitPreference) => commitPreference(),
+          minecraft,
+          companion: service,
+          executor,
+        };
+      },
+    });
+    await app.start();
+    minecraft!.emit({ kind: "chat", username: "TestOwner", message: scenario.ownerText });
+    await vi.waitFor(() => {
+      expect(context?.taskController.current()).not.toBeNull();
+      expect(turnLease).toMatch(/^[A-Za-z0-9_-]{43}$/u);
+    });
+    if (!executeScenarioTool) throw new Error("scenario tool was not composed");
+    toolResult = await executeScenarioTool();
+    turnBudget = context!.budget.snapshot();
+    codex.releaseExecution(scenario.kind === "position" ? "位置已确认" : "已到达");
+    await vi.waitFor(() => expect(context?.taskController.current()).toBeNull());
+    await app.stop();
+
+    const auditRecords = (await readFile(context!.paths.audit, "utf8"))
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as PersistedTaskAuditRecord);
+    return {
+      auditRecords,
+      executorResults,
+      minecraftCalls: [...minecraft!.calls],
+      toolResult,
+      turnBudget,
+    };
+  } finally {
+    await app?.stop().catch(() => undefined);
+    await files.cleanup();
+  }
+}
+
 afterEach(async () => {
   await Promise.allSettled(cleanups.splice(0).map((cleanup) => cleanup()));
 });
@@ -173,7 +421,7 @@ describe("WhiteLilyApp composition", () => {
       {
         workspaceVersion: provisioned.contentVersion,
         startServer: async (options) => {
-          const server = await startMcpServer(options);
+          const server = await startMcpServer({ ...options, port: 0 });
           events.push("mcp:listening");
           return server;
         },
@@ -1576,6 +1824,58 @@ describe("WhiteLilyApp composition", () => {
     ]) {
       expect(output).not.toContain(sensitive);
     }
+  });
+
+  it("persists production audit counters for the exact installed position action", async () => {
+    const result = await runPersistedActionScenario({
+      kind: "position",
+      ownerText: "查看一下你现在的位置",
+    });
+
+    expect(result.toolResult?.isError).not.toBe(true);
+    expect(JSON.parse(result.toolResult?.text ?? "null")).toMatchObject({
+      botPosition: { x: 0, y: 64, z: 0 },
+    });
+    expect(result.turnBudget).toMatchObject({ totalCalls: 1, cumulativeHorizontalTravel: 0 });
+    expect(result.auditRecords).toHaveLength(2);
+    expect(result.auditRecords[0]).toMatchObject({
+      kind: "task_started",
+      detail: { expectedActionCategoryCount: 1, toolCalls: 0, horizontalTravel: 0 },
+    });
+    expect(result.auditRecords[1]).toMatchObject({
+      kind: "task_stopped",
+      detail: {
+        expectedActionCategoryCount: 1,
+        toolCalls: 1,
+        horizontalTravel: 0,
+        reason: "completed",
+      },
+    });
+  });
+
+  it("persists production budget counters and executor success for the exact installed follow action", async () => {
+    const result = await runPersistedActionScenario({
+      kind: "follow",
+      ownerText: "走到我身边来",
+    });
+
+    expect(result.toolResult).toEqual({ text: '{"status":"completed"}' });
+    expect(result.executorResults).toEqual([{ status: "completed" }]);
+    expect(result.minecraftCalls).toContainEqual({
+      method: "followOwner",
+      args: ["TestOwner", 3],
+    });
+    expect(result.turnBudget).toMatchObject({ totalCalls: 1, cumulativeHorizontalTravel: 6 });
+    expect(result.auditRecords).toHaveLength(2);
+    expect(result.auditRecords[1]).toMatchObject({
+      kind: "task_stopped",
+      detail: {
+        expectedActionCategoryCount: 2,
+        toolCalls: 1,
+        horizontalTravel: result.turnBudget?.cumulativeHorizontalTravel,
+        reason: "completed",
+      },
+    });
   });
 
   it("flushes the process_exit task audit before legacy app.stop resolves", async () => {
