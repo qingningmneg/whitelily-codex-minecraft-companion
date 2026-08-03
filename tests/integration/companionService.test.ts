@@ -588,6 +588,45 @@ describe("CompanionService lifecycle", () => {
     ]);
   });
 
+  it("keeps only the latest separately merged owner intent while a model switch is blocked", async () => {
+    const latestReply = "latest intent only";
+    const value = await harness({
+      intentResponses: [JSON.stringify({ kind: "chat", reply: latestReply, memoryCandidates: [] })],
+      intentThreadIds: ["terra-intent", "luna-intent"],
+      threadIds: ["terra-execution", "luna-execution"],
+      gatedThreadStarts: [3],
+    });
+    await value.service.start("gpt-5.6-terra");
+    const switching = value.service.switchModel(
+      { modelId: "gpt-5.6-luna", reasoningEffort: "medium" },
+      async () => undefined,
+    );
+    await value.untilThreadStart(3);
+    const budgetEventsBeforeOwnerMessages = [...value.budgetEvents];
+
+    value.minecraft.emit({ kind: "chat", username: "TestOwner", message: "OWNER_STALE_A" });
+    await value.untilMergeTimer();
+    value.fireMergeTimers();
+    value.minecraft.emit({ kind: "chat", username: "TestOwner", message: "OWNER_LATEST_B" });
+    await value.untilMergeTimer();
+    value.fireMergeTimers();
+    expect(value.codex.turnsFor("intent")).toEqual([]);
+
+    value.releaseThreadStart(3);
+    await switching;
+    await value.untilChat(latestReply);
+    await value.untilTurnSettled();
+
+    expect(value.codex.turnsFor("intent")).toHaveLength(1);
+    expect(value.codex.turnsFor("intent")[0]).toMatchObject({ threadId: "luna-intent" });
+    expect(value.codex.turnsFor("intent")[0]?.text).toContain("OWNER_LATEST_B");
+    expect(value.codex.turnsFor("intent")[0]?.text).not.toContain("OWNER_STALE_A");
+    expect(value.codex.turnsFor("execution")).toEqual([]);
+    expect(value.taskController.current()).toBeNull();
+    expect(value.taskAuditEvents).toEqual([]);
+    expect(value.budgetEvents).toEqual(budgetEventsBeforeOwnerMessages);
+  });
+
   it("recovery recreates two independent threads before its execution handshake", async () => {
     const value = await harness({
       persistedState: {

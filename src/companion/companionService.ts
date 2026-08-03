@@ -1008,19 +1008,23 @@ export class CompanionService {
   }
 
   private async captureIntentStamp(): Promise<IntentStamp> {
+    const messageSequence = this.messageSequence;
+    const ownerRevision = this.dependencies.ownerIdentity?.snapshot().revision ?? 0;
+    const worldGeneration = this.worldGeneration;
+    const taskLease = this.dependencies.taskController.current()?.lease ?? null;
+    const taskLeaseAtDispatch =
+      taskLease === null
+        ? null
+        : Object.freeze({ id: taskLease.id, startedAt: taskLease.startedAt });
     await this.modelSwitchTail;
     const threadPair = this.currentThreadPair();
     if (!threadPair) throw new Error("Companion model authority is unavailable");
-    const taskLease = this.dependencies.taskController.current()?.lease ?? null;
     return Object.freeze({
       generation: this.generation,
-      messageSequence: this.messageSequence,
-      ownerRevision: this.dependencies.ownerIdentity?.snapshot().revision ?? 0,
-      worldGeneration: this.worldGeneration,
-      taskLeaseAtDispatch:
-        taskLease === null
-          ? null
-          : Object.freeze({ id: taskLease.id, startedAt: taskLease.startedAt }),
+      messageSequence,
+      ownerRevision,
+      worldGeneration,
+      taskLeaseAtDispatch,
       threadPair,
     });
   }
