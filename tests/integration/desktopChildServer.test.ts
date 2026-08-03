@@ -5009,6 +5009,58 @@ describe("DesktopChildServer", () => {
     ]);
   });
 
+  it.each([
+    { name: "an expired", invalidationNow: 10_100 },
+    { name: "a clock-rewound future-issued", invalidationNow: 99 },
+  ])(
+    "does not upgrade $name accepted connection into explicit model recovery",
+    async (scenario) => {
+      let now = 100;
+      let modelListener: ((event: ModelCatalogEvent) => void) | undefined;
+      const harness = createHarness({
+        lazyRuntime: true,
+        now: () => now,
+        models: {
+          subscribe: (listener) => {
+            modelListener = listener;
+            return () => {
+              modelListener = undefined;
+            };
+          },
+        },
+      });
+      harness.send(
+        commandRequest("expired-recovery-confirm", {
+          kind: "set_confirmed_connection",
+          proof: {
+            nonce: "expired_model_recovery_01",
+            port: 25565,
+            issuedAt: 100,
+            expiresAt: 10_100,
+          },
+        }),
+      );
+      await expect(harness.nextResponse()).resolves.toMatchObject({
+        id: "expired-recovery-confirm",
+        ok: true,
+      });
+
+      now = scenario.invalidationNow;
+      modelListener?.({ kind: "selection_invalidated", reason: "model_unavailable" });
+      await vi.waitFor(() =>
+        expect(connectionInvalidations(harness)).toContain("model_unavailable"),
+      );
+      harness.send(request("expired-recovery-start", "start_runtime"));
+
+      await expect(harness.nextResponse()).resolves.toMatchObject({
+        id: "expired-recovery-start",
+        ok: false,
+        error: { code: "CONNECTION_OPERATION_FAILED" },
+      });
+      expect(harness.runtimeCreations()).toBe(0);
+    },
+  );
+
   it("consumes one-shot confirmation after an ordinary pre-consumption resolve failure", async () => {
     let resolveCalls = 0;
     const harness = createHarness({

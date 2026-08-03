@@ -1382,6 +1382,9 @@ export class DesktopChildServer {
         policy.preserveConnectionAuthority && preserveConnectionAuthority;
       const upgradedExplicitModelRecovery =
         tightenedConnectionAuthority && explicitModelRecovery && !policy.explicitModelRecovery;
+      const validatedAcceptedModelRecovery = upgradedExplicitModelRecovery
+        ? this.#validAcceptedConnectionForRecovery(this.#interruptGeneration)
+        : undefined;
       if (
         tightenedWorldBinding !== policy.preserveWorldBinding ||
         tightenedConnectionAuthority !== policy.preserveConnectionAuthority ||
@@ -1399,6 +1402,7 @@ export class DesktopChildServer {
           tightenedWorldBinding,
           tightenedConnectionAuthority,
           effectiveExplicitModelRecovery,
+          validatedAcceptedModelRecovery,
         );
         this.#rebasePreservedConnectionAuthority(tightenedConnectionAuthority);
         if (policy.finalized) {
@@ -1438,6 +1442,9 @@ export class DesktopChildServer {
       explicitModelRecovery: preserveConnectionAuthority && explicitModelRecovery,
       finalized: false,
     };
+    const validatedAcceptedModelRecovery = policy.explicitModelRecovery
+      ? this.#validAcceptedConnectionForRecovery(this.#interruptGeneration)
+      : undefined;
     const runtime = this.#runtime;
     const replacement = this.#replacementOperation;
     if (
@@ -1453,6 +1460,7 @@ export class DesktopChildServer {
         policy.preserveWorldBinding,
         policy.preserveConnectionAuthority,
         policy.explicitModelRecovery,
+        validatedAcceptedModelRecovery,
       );
       this.#rebasePreservedConnectionAuthority(policy.preserveConnectionAuthority);
       return Promise.resolve();
@@ -1464,6 +1472,7 @@ export class DesktopChildServer {
       policy.preserveWorldBinding,
       policy.preserveConnectionAuthority,
       policy.explicitModelRecovery,
+      validatedAcceptedModelRecovery,
     );
     this.#rebasePreservedConnectionAuthority(policy.preserveConnectionAuthority);
     if (replacement && replacement.retirementReason === undefined) {
@@ -1848,17 +1857,33 @@ export class DesktopChildServer {
     }
   }
 
+  #validAcceptedConnectionForRecovery(generation: number): ConfirmedRuntimeConnection | undefined {
+    const authority = this.#acceptedConnectionAuthority;
+    const now = this.#now();
+    if (
+      !authority ||
+      !Number.isSafeInteger(now) ||
+      now < authority.issuedAt ||
+      now >= authority.expiresAt ||
+      authority.generation !== generation
+    ) {
+      return undefined;
+    }
+    return authority.connection;
+  }
+
   #invalidateConnectionAuthority(
     preserveWorldBinding = false,
     preserveConnectionAuthority = false,
     explicitModelRecovery = false,
+    validatedAcceptedModelRecovery?: ConfirmedRuntimeConnection,
   ): void {
     if (preserveConnectionAuthority) {
       const existing = this.#recoveryConnectionAuthority;
       const connection =
         existing?.connection ??
         this.#activeRuntimeConnection ??
-        (explicitModelRecovery ? this.#acceptedConnectionAuthority?.connection : undefined);
+        (explicitModelRecovery ? validatedAcceptedModelRecovery : undefined);
       if (connection) {
         this.#recoveryConnectionAuthority = Object.freeze({
           connection,
