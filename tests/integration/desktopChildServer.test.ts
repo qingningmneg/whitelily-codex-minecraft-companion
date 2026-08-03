@@ -2796,6 +2796,86 @@ describe("DesktopChildServer", () => {
     }
   });
 
+  it.each([
+    ["a missing version", undefined],
+    ["an empty version", ""],
+    ["a path-shaped version", "../workspace"],
+    ["an overlong version", "x".repeat(65)],
+  ])("rejects %s in packaged mode before composing services", async (_label, version) => {
+    const previousLayout = process.env.WHITELILY_CODEX_LAYOUT;
+    const previousVersion = process.env.WHITELILY_WORKSPACE_VERSION;
+    const previousExitCode = process.exitCode;
+    process.env.WHITELILY_CODEX_LAYOUT = "packaged";
+    if (version === undefined) delete process.env.WHITELILY_WORKSPACE_VERSION;
+    else process.env.WHITELILY_WORKSPACE_VERSION = version;
+    process.exitCode = undefined;
+    const input = new PassThrough();
+    const output = new PassThrough();
+    const stderr: string[] = [];
+    let serviceCreations = 0;
+    try {
+      const running = runDesktopChild(["C:/WhiteLily/config.toml"], {
+        input,
+        output,
+        cwd: "C:/WhiteLily",
+        writeStderr: (message) => stderr.push(message),
+        createServices: async () => {
+          serviceCreations += 1;
+          return inertDesktopChildServices();
+        },
+      });
+      input.end(`${JSON.stringify(request("invalid-workspace-version", "get_status"))}\n`);
+      await running;
+
+      expect(serviceCreations).toBe(0);
+      expect(output.readableLength).toBe(0);
+      expect(stderr).toEqual(["WhiteLily desktop child failed to initialize"]);
+      expect(process.exitCode).toBe(1);
+    } finally {
+      if (previousLayout === undefined) delete process.env.WHITELILY_CODEX_LAYOUT;
+      else process.env.WHITELILY_CODEX_LAYOUT = previousLayout;
+      if (previousVersion === undefined) delete process.env.WHITELILY_WORKSPACE_VERSION;
+      else process.env.WHITELILY_WORKSPACE_VERSION = previousVersion;
+      process.exitCode = previousExitCode;
+    }
+  });
+
+  it("accepts a bounded supervisor-provided workspace version in packaged mode", async () => {
+    const previousLayout = process.env.WHITELILY_CODEX_LAYOUT;
+    const previousVersion = process.env.WHITELILY_WORKSPACE_VERSION;
+    process.env.WHITELILY_CODEX_LAYOUT = "packaged";
+    process.env.WHITELILY_WORKSPACE_VERSION = "release-1.2_3";
+    const input = new PassThrough();
+    const output = new PassThrough();
+    let outputText = "";
+    output.setEncoding("utf8");
+    output.on("data", (chunk: string) => {
+      outputText += chunk;
+    });
+    try {
+      const running = runDesktopChild(["C:/WhiteLily/config.toml"], {
+        input,
+        output,
+        cwd: "C:/WhiteLily",
+        createServices: async () => inertDesktopChildServices(),
+      });
+      input.write(`${JSON.stringify(request("valid-workspace-version", "get_status"))}\n`);
+      await vi.waitFor(() => expect(outputText).toContain("\n"));
+      input.end();
+      await running;
+
+      expect(parseDesktopResponse(JSON.parse(outputText.trim()))).toMatchObject({
+        id: "valid-workspace-version",
+        ok: true,
+      });
+    } finally {
+      if (previousLayout === undefined) delete process.env.WHITELILY_CODEX_LAYOUT;
+      else process.env.WHITELILY_CODEX_LAYOUT = previousLayout;
+      if (previousVersion === undefined) delete process.env.WHITELILY_WORKSPACE_VERSION;
+      else process.env.WHITELILY_WORKSPACE_VERSION = previousVersion;
+    }
+  });
+
   it("exits on initially empty stdin without composing a runtime or writing output", async () => {
     const input = new PassThrough();
     const output = new PassThrough();

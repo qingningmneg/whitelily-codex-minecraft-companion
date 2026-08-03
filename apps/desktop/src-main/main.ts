@@ -19,6 +19,12 @@ import { saveDiagnosticArchive } from "./diagnosticExport.js";
 import { createStartupSettings } from "./startupSettings.js";
 import { DesktopPreferences } from "./desktopPreferences.js";
 import {
+  createWorkspaceVersionEnvironment,
+  provisionCodexWorkspace,
+  resolveDesktopCodexWorkspaceResources,
+  type WorkspaceProvisionResult,
+} from "./codexWorkspaceProvisioner.js";
+import {
   createSupervisorTrayRuntime,
   createTrayController,
   type TrayAction,
@@ -201,6 +207,7 @@ export interface PreparedElectronPrimary<TPaths> {
 }
 
 export interface ElectronPrimaryOptions<TPaths, TSupervisor> {
+  prepareSupervisor(paths: TPaths, localAppData: string): Promise<void>;
   createSupervisor(paths: TPaths, localAppData: string): TSupervisor;
   startComposition(supervisor: TSupervisor, transferOwnership: () => void): Promise<void>;
 }
@@ -222,6 +229,7 @@ export async function startElectronPrimary<TPaths, TSupervisor>(
   ownership: PrimaryStartupOwnership,
 ): Promise<void> {
   const { localAppData, paths } = prepared;
+  await options.prepareSupervisor(paths, localAppData);
   const supervisor = options.createSupervisor(paths, localAppData);
   await options.startComposition(supervisor, ownership.transferToComposition);
 }
@@ -370,6 +378,7 @@ export async function runElectronMain(): Promise<void> {
   const { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, shell, Tray } =
     await import("electron");
   let mainWindow: InstanceType<typeof BrowserWindow> | undefined;
+  let workspaceProvision: WorkspaceProvisionResult | undefined;
   await runSingleInstanceApplication({
     app,
     showWindow: () => showExistingWindow(mainWindow),
@@ -389,7 +398,22 @@ export async function runElectronMain(): Promise<void> {
     startPrimary: (prepared, ownership) =>
       startElectronPrimary(
         {
+          prepareSupervisor: async (paths) => {
+            workspaceProvision = undefined;
+            const workspaceResources = resolveDesktopCodexWorkspaceResources({
+              appPath: app.getAppPath(),
+              resourcesPath: process.resourcesPath,
+              development: !app.isPackaged,
+            });
+            workspaceProvision = await provisionCodexWorkspace({
+              resourceDirectory: workspaceResources.resourceDirectory,
+              dataRoot: paths.dataRoot,
+            });
+          },
           createSupervisor: (paths, localAppData) => {
+            if (workspaceProvision === undefined) {
+              throw new Error("WhiteLily workspace was not provisioned");
+            }
             const appPath = app.getAppPath();
             const development = !app.isPackaged;
             const childEntry = development
@@ -411,6 +435,7 @@ export async function runElectronMain(): Promise<void> {
                 WHITELILY_CODEX_RESOURCE_ROOT: codexResources.resourceRoot,
                 WHITELILY_CODEX_MANIFEST: codexResources.manifestPath,
                 WHITELILY_CODEX_LAYOUT: codexResources.layout,
+                ...createWorkspaceVersionEnvironment(workspaceProvision),
               },
               development,
             });

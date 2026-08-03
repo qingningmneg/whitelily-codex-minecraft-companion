@@ -311,6 +311,7 @@ describe("Electron application ownership", () => {
         startPrimary: (prepared, ownership) =>
           startElectronPrimary(
             {
+              prepareSupervisor: async () => undefined,
               createSupervisor,
               startComposition,
             },
@@ -377,6 +378,7 @@ describe("Electron application ownership", () => {
         startPrimary: (prepared, ownership) =>
           startElectronPrimary(
             {
+              prepareSupervisor: async () => undefined,
               createSupervisor,
               startComposition,
             },
@@ -442,6 +444,7 @@ describe("Electron application ownership", () => {
         startPrimary: (prepared, ownership) =>
           startElectronPrimary(
             {
+              prepareSupervisor: async () => undefined,
               createSupervisor: () => {
                 throw new Error("supervisor failed");
               },
@@ -455,6 +458,58 @@ describe("Electron application ownership", () => {
 
     expect(startComposition).not.toHaveBeenCalled();
     expect(app.quit).toHaveBeenCalledOnce();
+  });
+
+  it("prepares the workspace before constructing and starting the child supervisor", async () => {
+    const order: string[] = [];
+
+    await startElectronPrimary(
+      {
+        prepareSupervisor: async (paths, localAppData) => {
+          expect(paths).toEqual({ dataRoot: String.raw`C:\LocalAppData\owner\WhiteLily` });
+          expect(localAppData).toBe(String.raw`C:\LocalAppData\owner`);
+          order.push("prepare workspace");
+        },
+        createSupervisor: () => {
+          order.push("create supervisor");
+          return { id: "supervisor" };
+        },
+        startComposition: async () => {
+          order.push("start composition");
+        },
+      },
+      {
+        localAppData: String.raw`C:\LocalAppData\owner`,
+        paths: { dataRoot: String.raw`C:\LocalAppData\owner\WhiteLily` },
+      },
+      { transferToComposition: vi.fn() },
+    );
+
+    expect(order).toEqual(["prepare workspace", "create supervisor", "start composition"]);
+  });
+
+  it("does not construct or start a child when workspace preparation fails", async () => {
+    const createSupervisor = vi.fn();
+    const startComposition = vi.fn();
+
+    await expect(
+      startElectronPrimary(
+        {
+          prepareSupervisor: async () => {
+            throw new Error("workspace provisioning failed");
+          },
+          createSupervisor,
+          startComposition,
+        },
+        {
+          localAppData: String.raw`C:\LocalAppData\owner`,
+          paths: { dataRoot: String.raw`C:\LocalAppData\owner\WhiteLily` },
+        },
+        { transferToComposition: vi.fn() },
+      ),
+    ).rejects.toThrow("workspace provisioning failed");
+    expect(createSupervisor).not.toHaveBeenCalled();
+    expect(startComposition).not.toHaveBeenCalled();
   });
 
   it("does not double quit after composition takes startup ownership", async () => {
@@ -474,6 +529,7 @@ describe("Electron application ownership", () => {
         startPrimary: (prepared, ownership) =>
           startElectronPrimary(
             {
+              prepareSupervisor: async () => undefined,
               createSupervisor: () => ({ id: "supervisor" }),
               startComposition: async (_supervisor, transferOwnership) => {
                 transferOwnership();

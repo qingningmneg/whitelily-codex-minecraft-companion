@@ -28,6 +28,8 @@ import {
   type DesktopChildRuntime,
 } from "./childServer.js";
 
+const WORKSPACE_VERSION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u;
+
 export interface DesktopChildServices {
   ownerIdentity: OwnerIdentityAccess;
   account: DesktopChildAccountService;
@@ -86,6 +88,10 @@ export async function runDesktopChild(
   let runtimeRevisionSeed: number;
   try {
     runtimeRevisionSeed = parseRuntimeRevisionSeed(args[1]);
+    assertPackagedWorkspaceVersion(
+      process.env.WHITELILY_CODEX_LAYOUT,
+      process.env.WHITELILY_WORKSPACE_VERSION,
+    );
     const dataRoot =
       process.env.WHITELILY_DATA_ROOT === undefined
         ? undefined
@@ -139,6 +145,15 @@ export async function runDesktopChild(
   input.resume();
   await waitForEnd(input);
   await server.stop();
+}
+
+function assertPackagedWorkspaceVersion(
+  layout: string | undefined,
+  contentVersion: string | undefined,
+): void {
+  if (layout === "packaged" && !WORKSPACE_VERSION_PATTERN.test(contentVersion ?? "")) {
+    throw new Error("Packaged workspace version is invalid");
+  }
 }
 
 function parseRuntimeRevisionSeed(value: string | undefined): number {
