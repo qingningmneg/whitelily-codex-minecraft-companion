@@ -180,6 +180,7 @@ async function createManagedWorkspaceVerifierFixture(options?: {
   extraFiles?: Record<string, Buffer | string>;
   omitActual?: string;
   omitOuter?: string;
+  extraOuter?: Array<{ path: string; bytes: number; sha256: string }>;
 }): Promise<{ root: string; resources: string; sourcePath: string }> {
   const payloads = {
     ".codex/config.toml": workspaceConfig,
@@ -226,6 +227,7 @@ async function createManagedWorkspaceVerifierFixture(options?: {
   const resourcesManifest = Object.entries(workspaceFiles)
     .filter(([path]) => path !== options?.omitOuter)
     .map(([path, contents]) => resource(path, Buffer.from(contents)));
+  resourcesManifest.push(...(options?.extraOuter ?? []));
   await writeFile(
     join(resources, "runtime-manifest.json"),
     JSON.stringify({
@@ -532,6 +534,50 @@ describe("deterministic Electron resources", () => {
     }
   });
 
+  it("rejects an uppercase outer-manifest alias of a managed workspace payload", async () => {
+    const fixture = await createManagedWorkspaceVerifierFixture({
+      extraOuter: [resource("CODEX-WORKSPACE/AGENTS.md", Buffer.from(workspaceAgents))],
+    });
+    try {
+      await expect(
+        verifier.verifyResourceDirectory?.(fixture.resources, fixture.sourcePath),
+      ).rejects.toThrow(/alias|canonical|case|duplicate/iu);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it("recognizes a case-insensitive workspace prefix but rejects non-exact path spelling", async () => {
+    const fixture = await createManagedWorkspaceVerifierFixture({
+      omitOuter: "codex-workspace/AGENTS.md",
+      extraOuter: [resource("CODEX-WORKSPACE/AGENTS.md", Buffer.from(workspaceAgents))],
+    });
+    try {
+      await expect(
+        verifier.verifyResourceDirectory?.(fixture.resources, fixture.sourcePath),
+      ).rejects.toThrow(/alias|canonical|exact spelling/iu);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    "codex-workspace/AGENTS.md.",
+    "codex-workspace/AGENTS.md ",
+    "codex-workspace/AGENTS.md:stream",
+  ])("rejects the noncanonical Windows outer-manifest path %s", async (path) => {
+    const fixture = await createManagedWorkspaceVerifierFixture({
+      extraOuter: [resource(path, Buffer.from(workspaceAgents))],
+    });
+    try {
+      await expect(
+        verifier.verifyResourceDirectory?.(fixture.resources, fixture.sourcePath),
+      ).rejects.toThrow(/Windows|canonical|colon|trailing|path is invalid/iu);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
   it("reviews one exact managed workspace policy and one Electron extraResources entry", async () => {
     const manifest = await readManifest(sourceManifestPath);
     const desktopPackage = JSON.parse(
@@ -546,9 +592,11 @@ describe("deterministic Electron resources", () => {
       payloads: [".codex/config.toml", "AGENTS.md"],
       mcpUrl: "http://127.0.0.1:32123/mcp",
     });
-    expect(manifest.allowlist.requiredFiles).toEqual(
-      expect.arrayContaining([...workspaceLoosePaths]),
-    );
+    expect(
+      manifest.allowlist.requiredFiles
+        .filter((path) => path.toLowerCase().startsWith("codex-workspace/"))
+        .sort(),
+    ).toEqual([...workspaceLoosePaths].sort());
     expect(
       desktopPackage.build?.extraResources?.filter((entry) => entry.to === "codex-workspace"),
     ).toEqual([
@@ -864,6 +912,31 @@ describe("deterministic Electron resources", () => {
           fixture.sourcePath,
         ),
       ).rejects.toThrow(/escape|invalid|path/iu);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a prepared dependency Windows alias before materializing target files", async () => {
+    const dependencyBytes = Buffer.from("reviewed dependency");
+    const fixture = await createMaterializationFixture({
+      declaredDependencies: {
+        "core/node_modules/example/index.js": dependencyBytes,
+        "CORE/NODE_MODULES/EXAMPLE/INDEX.JS": dependencyBytes,
+      },
+      preparedDependencies: {
+        "core/node_modules/example/index.js": dependencyBytes,
+      },
+    });
+    try {
+      await expect(
+        verifier.materializePreparedNodeModulesAndVerify?.(
+          { appOutDir: fixture.appOutDir },
+          fixture.preparedBundleRoot,
+          fixture.sourcePath,
+        ),
+      ).rejects.toThrow(/alias|case|duplicate|canonical/iu);
+      await expect(stat(fixture.targetNodeModules)).rejects.toMatchObject({ code: "ENOENT" });
     } finally {
       await rm(fixture.root, { recursive: true, force: true });
     }

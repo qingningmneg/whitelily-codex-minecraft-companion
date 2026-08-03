@@ -33,15 +33,53 @@ function sha256Bytes(bytes) {
 }
 
 function assertPortablePath(portablePath, label) {
+  const parts = typeof portablePath === "string" ? portablePath.split("/") : [];
   if (
     typeof portablePath !== "string" ||
     portablePath.length === 0 ||
     portablePath.includes("\\") ||
-    portablePath.split("/").some((part) => part === "" || part === "." || part === "..")
+    parts.some((part) => part === "" || part === "." || part === "..")
   ) {
     throw new Error(`WhiteLily ${label} path is invalid`);
   }
+  if (
+    parts.some(
+      (part) =>
+        /[<>:"|?*\u0000-\u001f]/u.test(part) ||
+        /[ .]$/u.test(part) ||
+        /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/iu.test(part),
+    )
+  ) {
+    throw new Error(`WhiteLily ${label} Windows path is noncanonical`);
+  }
   return portablePath;
+}
+
+function portablePathKey(portablePath, label) {
+  return assertPortablePath(portablePath, label).toLowerCase();
+}
+
+function indexPortablePaths(paths, label) {
+  const indexed = new Map();
+  for (const path of paths) {
+    const key = portablePathKey(path, label);
+    const previous = indexed.get(key);
+    if (previous !== undefined) {
+      throw new Error(`WhiteLily ${label} contains duplicate Windows path aliases: ${previous}`);
+    }
+    indexed.set(key, path);
+  }
+  return indexed;
+}
+
+function addExactPortablePath(indexed, path, label) {
+  const key = portablePathKey(path, label);
+  const previous = indexed.get(key);
+  if (previous !== undefined) {
+    throw new Error(`WhiteLily ${label} contains duplicate Windows path aliases: ${previous}`);
+  }
+  indexed.set(key, path);
+  return key;
 }
 
 function resolveContained(root, portablePath) {
@@ -303,10 +341,27 @@ async function verifyManagedWorkspace(resourcesDirectory, policy, resources) {
     "codex-workspace/AGENTS.md",
     "codex-workspace/workspace-manifest.json",
   ];
+  const workspacePrefixKey = `${portablePathKey(policy.root, "managed workspace root")}/`;
   const outerPaths = resources
     .map((resource) => resource.path)
-    .filter((path) => typeof path === "string" && path.startsWith("codex-workspace/"))
+    .filter(
+      (path) =>
+        typeof path === "string" &&
+        portablePathKey(path, "managed workspace outer resource").startsWith(workspacePrefixKey),
+    )
     .sort(compareOrdinal);
+  const expectedOuterByKey = indexPortablePaths(
+    expectedOuterPaths,
+    "expected managed workspace outer resources",
+  );
+  for (const path of outerPaths) {
+    const expectedPath = expectedOuterByKey.get(
+      portablePathKey(path, "managed workspace outer resource"),
+    );
+    if (expectedPath !== undefined && expectedPath !== path) {
+      throw new Error(`WhiteLily managed workspace outer resource uses a Windows alias: ${path}`);
+    }
+  }
   assertExactManagedEntries(outerPaths, expectedOuterPaths, "outer workspace manifest");
 
   let manifest;
@@ -392,31 +447,34 @@ async function verifyResourceDirectory(resourcesDirectory, sourceManifestPath) {
     mappings: WHITE_LILY_DESKTOP_ASAR_MAPPINGS,
   };
 
-  const declared = new Set();
+  const declared = new Map();
   const looseDeclared = new Map();
   const asarDeclared = new Map();
   const asarResourcePaths = new Map();
+  const resourceToAsarPath = new Map();
+  const asarCanonicalPaths = new Map();
   for (const resource of resources) {
     if (
       typeof resource.path !== "string" ||
       !Number.isSafeInteger(resource.bytes) ||
       resource.bytes < 0 ||
-      !/^[a-f0-9]{64}$/u.test(resource.sha256) ||
-      declared.has(resource.path)
+      !/^[a-f0-9]{64}$/u.test(resource.sha256)
     ) {
       throw new Error("WhiteLily runtime manifest resource is invalid");
     }
-    assertPortablePath(resource.path, "runtime manifest");
-    declared.add(resource.path);
+    const resourceKey = addExactPortablePath(declared, resource.path, "runtime manifest resources");
     const asarPath = mapDesktopResource(resource.path, desktopAsar.mappings);
     if (asarPath === undefined) {
       looseDeclared.set(resource.path, resource);
     } else {
-      if (asarDeclared.has(asarPath)) {
+      const asarKey = portablePathKey(asarPath, "desktop ASAR mapping");
+      if (asarCanonicalPaths.has(asarKey)) {
         throw new Error(`WhiteLily desktop ASAR mapping is duplicated: ${asarPath}`);
       }
+      asarCanonicalPaths.set(asarKey, asarPath);
       asarDeclared.set(asarPath, resource);
       asarResourcePaths.set(asarPath, resource.path);
+      resourceToAsarPath.set(resourceKey, asarPath);
     }
   }
 
@@ -444,9 +502,7 @@ async function verifyResourceDirectory(resourcesDirectory, sourceManifestPath) {
   } catch {
     throw new Error("WhiteLily app.asar is missing or invalid");
   }
-  if (new Set(actualAsarEntries).size !== actualAsarEntries.length) {
-    throw new Error("WhiteLily app.asar contains duplicate entries");
-  }
+  indexPortablePaths(actualAsarEntries, "app.asar entries");
   const expectedArchiveEntries = expectedAsarEntries(asarDeclared.keys());
   const actualArchiveEntrySet = new Set(actualAsarEntries);
   const expectedArchiveEntrySet = new Set(expectedArchiveEntries);
@@ -480,47 +536,76 @@ async function verifyResourceDirectory(resourcesDirectory, sourceManifestPath) {
     typeof entry === "string" ? entry : entry.path,
   );
   const actual = await listFiles(resourcesDirectory);
-  const afterPack = new Set(allowlist.afterPackFiles);
-  const allowedActual = new Set([...looseDeclared.keys(), ...afterPack, "runtime-manifest.json"]);
-  for (const path of actual) {
-    if (!allowedActual.has(path)) {
+  const actualByKey = indexPortablePaths(actual, "runtime resource directory");
+  const afterPackByKey = indexPortablePaths(allowlist.afterPackFiles, "after-pack allowlist");
+  const allowedActualByKey = new Map();
+  for (const path of [
+    ...looseDeclared.keys(),
+    ...afterPackByKey.values(),
+    "runtime-manifest.json",
+  ]) {
+    addExactPortablePath(allowedActualByKey, path, "allowed runtime resources");
+  }
+  for (const [key, path] of actualByKey) {
+    const allowedPath = allowedActualByKey.get(key);
+    if (allowedPath === undefined) {
       throw new Error(`WhiteLily runtime contains unexpected allowlist resource: ${path}`);
+    }
+    if (allowedPath !== path) {
+      throw new Error(`WhiteLily runtime resource uses a noncanonical Windows alias: ${path}`);
+    }
+  }
+  for (const [key, path] of allowedActualByKey) {
+    const actualPath = actualByKey.get(key);
+    if (actualPath === undefined) {
+      throw new Error(`WhiteLily declared runtime resource is missing: ${path}`);
+    }
+    if (actualPath !== path) {
+      throw new Error(`WhiteLily declared runtime resource uses a Windows alias: ${path}`);
     }
   }
   for (const path of requiredFiles) {
-    const mappedAsarPath = [...asarResourcePaths].find(
-      ([, resourcePath]) => resourcePath === path,
-    )?.[0];
+    const requiredKey = portablePathKey(path, "required runtime resource");
+    const declaredPath = declared.get(requiredKey);
+    const mappedAsarPath = resourceToAsarPath.get(requiredKey);
     if (
-      !declared.has(path) ||
+      declaredPath !== path ||
       (mappedAsarPath === undefined
-        ? !actual.includes(path)
+        ? actualByKey.get(requiredKey) !== path
         : !actualArchiveEntrySet.has(mappedAsarPath))
     ) {
       throw new Error(`WhiteLily required runtime resource is missing: ${path}`);
     }
   }
-  for (const path of afterPack) {
-    if (!actual.includes(path)) {
+  for (const [key, path] of afterPackByKey) {
+    if (actualByKey.get(key) !== path) {
       throw new Error(`WhiteLily after-pack resource is missing: ${path}`);
     }
   }
 
-  const executableFiles = new Set(allowlist.executableFiles);
-  const scriptFiles = new Set(allowlist.scriptFiles);
+  const executableFiles = indexPortablePaths(allowlist.executableFiles, "executable allowlist");
+  const scriptFiles = indexPortablePaths(allowlist.scriptFiles, "script allowlist");
   for (const path of actual) {
-    if (/\.(?:com|exe|msi)$/iu.test(path) && !executableFiles.has(path)) {
+    const key = portablePathKey(path, "runtime resource");
+    if (/\.(?:com|exe|msi)$/iu.test(path) && executableFiles.get(key) !== path) {
       throw new Error(`WhiteLily executable is absent from the allowlist: ${path}`);
     }
-    if (/\.(?:bat|cmd|ps1|psm1|vbs)$/iu.test(path) && !scriptFiles.has(path)) {
+    if (/\.(?:bat|cmd|ps1|psm1|vbs)$/iu.test(path) && scriptFiles.get(key) !== path) {
       throw new Error(`WhiteLily script is absent from the allowlist: ${path}`);
     }
   }
   for (const [asarPath, resourcePath] of asarResourcePaths) {
-    if (/\.(?:com|exe|msi)$/iu.test(asarPath) && !executableFiles.has(resourcePath)) {
+    const resourceKey = portablePathKey(resourcePath, "ASAR resource");
+    if (
+      /\.(?:com|exe|msi)$/iu.test(asarPath) &&
+      executableFiles.get(resourceKey) !== resourcePath
+    ) {
       throw new Error(`WhiteLily executable is absent from the allowlist: ${resourcePath}`);
     }
-    if (/\.(?:bat|cmd|ps1|psm1|vbs)$/iu.test(asarPath) && !scriptFiles.has(resourcePath)) {
+    if (
+      /\.(?:bat|cmd|ps1|psm1|vbs)$/iu.test(asarPath) &&
+      scriptFiles.get(resourceKey) !== resourcePath
+    ) {
       throw new Error(`WhiteLily script is absent from the allowlist: ${resourcePath}`);
     }
   }
@@ -553,6 +638,8 @@ async function materializePreparedNodeModulesAndVerify(
   const { resources } = await readBoundRuntimeManifest(preparedManifestPath, sourceManifestPath);
 
   const dependencyPrefix = "core/node_modules/";
+  const dependencyPrefixKey = dependencyPrefix.toLowerCase();
+  const preparedResources = new Map();
   const declaredDependencies = new Map();
   for (const resource of resources) {
     if (
@@ -563,14 +650,18 @@ async function materializePreparedNodeModulesAndVerify(
     ) {
       throw new Error("WhiteLily prepared runtime manifest resource is invalid");
     }
-    assertPortablePath(resource.path, "prepared runtime manifest");
-    if (!resource.path.startsWith(dependencyPrefix)) continue;
+    const resourceKey = addExactPortablePath(
+      preparedResources,
+      resource.path,
+      "prepared runtime manifest resources",
+    );
+    if (!resourceKey.startsWith(dependencyPrefixKey)) continue;
     const dependencyPath = resource.path.slice(dependencyPrefix.length);
-    assertPortablePath(dependencyPath, "prepared dependency");
-    if (declaredDependencies.has(dependencyPath)) {
+    const dependencyKey = portablePathKey(dependencyPath, "prepared dependency");
+    if (declaredDependencies.has(dependencyKey)) {
       throw new Error(`WhiteLily prepared dependency is duplicated: ${dependencyPath}`);
     }
-    declaredDependencies.set(dependencyPath, resource);
+    declaredDependencies.set(dependencyKey, { path: dependencyPath, resource });
   }
   if (declaredDependencies.size === 0) {
     throw new Error("WhiteLily prepared node_modules manifest is empty");
@@ -583,18 +674,25 @@ async function materializePreparedNodeModulesAndVerify(
   );
   const preparedNodeModules = resolveContained(resolvedPreparedRoot, "core/node_modules");
   const actualPreparedDependencies = await listFiles(preparedNodeModules);
-  const actualPreparedSet = new Set(actualPreparedDependencies);
-  for (const dependencyPath of declaredDependencies.keys()) {
-    if (!actualPreparedSet.has(dependencyPath)) {
-      throw new Error(`WhiteLily prepared dependency is missing: ${dependencyPath}`);
+  const actualPreparedByKey = indexPortablePaths(
+    actualPreparedDependencies,
+    "prepared dependency directory",
+  );
+  for (const [key, { path }] of declaredDependencies) {
+    const actualPath = actualPreparedByKey.get(key);
+    if (actualPath === undefined) {
+      throw new Error(`WhiteLily prepared dependency is missing: ${path}`);
+    }
+    if (actualPath !== path) {
+      throw new Error(`WhiteLily prepared dependency uses a Windows alias: ${actualPath}`);
     }
   }
-  for (const dependencyPath of actualPreparedDependencies) {
-    if (!declaredDependencies.has(dependencyPath)) {
+  for (const [key, dependencyPath] of actualPreparedByKey) {
+    if (!declaredDependencies.has(key)) {
       throw new Error(`WhiteLily prepared dependency is unexpected: ${dependencyPath}`);
     }
   }
-  for (const [dependencyPath, resource] of declaredDependencies) {
+  for (const { path: dependencyPath, resource } of declaredDependencies.values()) {
     const sourcePath = resolveContained(preparedNodeModules, dependencyPath);
     const metadata = await lstat(sourcePath);
     if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size !== resource.bytes) {
@@ -636,7 +734,7 @@ async function materializePreparedNodeModulesAndVerify(
   await mkdir(stagingNodeModules);
   let stagingExists = true;
   try {
-    for (const dependencyPath of actualPreparedDependencies) {
+    for (const dependencyPath of actualPreparedByKey.values()) {
       const sourcePath = resolveContained(preparedNodeModules, dependencyPath);
       const destinationPath = resolveContained(stagingNodeModules, dependencyPath);
       await mkdir(dirname(destinationPath), { recursive: true });
