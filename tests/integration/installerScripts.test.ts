@@ -254,7 +254,23 @@ public static class FakeWindowsSandbox {
                     FileShare.Read
                 )
                 : null) {
-                File.WriteAllText(Path.Combine(reportRoot, "sandbox-result.json"), envelope);
+                var guardPath = Path.Combine(reportRoot, "shutdown-guard.lock");
+                FileStream shutdownGuard = null;
+                if (!File.Exists(guardPath)) {
+                    shutdownGuard = new FileStream(
+                        guardPath,
+                        FileMode.CreateNew,
+                        FileAccess.ReadWrite,
+                        FileShare.None
+                    );
+                }
+                try {
+                    File.WriteAllText(Path.Combine(reportRoot, "sandbox-result.json"), envelope);
+                } finally {
+                    if (shutdownGuard != null) {
+                        shutdownGuard.Dispose();
+                    }
+                }
                 if (holdMilliseconds > 0) {
                     Thread.Sleep(holdMilliseconds);
                 }
@@ -295,6 +311,64 @@ public static class FakeWindowsSandbox {
   }
   await copyFile(executablePath, join(system32, "WindowsSandboxRemoteSession.exe"));
   return executablePath;
+}
+
+async function startShutdownGuardHolder(
+  repository: string,
+  holdMilliseconds: number,
+): Promise<{ holder: ReturnType<typeof spawn>; readyPath: string }> {
+  const holderScript = join(repository, `hold-shutdown-guard-${holdMilliseconds}.ps1`);
+  const readyPath = join(repository, `shutdown-guard-${holdMilliseconds}.ready`);
+  await writeFile(
+    holderScript,
+    [
+      "param(",
+      "    [Parameter(Mandatory = $true)][string]$BuildRoot,",
+      "    [Parameter(Mandatory = $true)][string]$ReadyPath,",
+      "    [Parameter(Mandatory = $true)][int]$HoldMilliseconds",
+      ")",
+      "$ErrorActionPreference = 'Stop'",
+      "$deadline = [DateTime]::UtcNow.AddSeconds(30)",
+      "$guardPath = $null",
+      "do {",
+      "    $sandboxRoot = Get-ChildItem -LiteralPath $BuildRoot -Directory -Filter 'installer-sandbox-*' -ErrorAction SilentlyContinue | Select-Object -First 1",
+      "    if ($null -ne $sandboxRoot) {",
+      "        $reportRoot = Join-Path $sandboxRoot.FullName 'report'",
+      "        if (Test-Path -LiteralPath $reportRoot -PathType Container) {",
+      "            $guardPath = Join-Path $reportRoot 'shutdown-guard.lock'",
+      "            break",
+      "        }",
+      "    }",
+      "    Start-Sleep -Milliseconds 50",
+      "} while ([DateTime]::UtcNow -lt $deadline)",
+      "if ($null -eq $guardPath) { throw 'GUARD_PATH_NOT_FOUND' }",
+      "$stream = [IO.File]::Open($guardPath, 'CreateNew', 'ReadWrite', 'None')",
+      "try {",
+      "    [IO.File]::WriteAllText($ReadyPath, $guardPath)",
+      "    Start-Sleep -Milliseconds $HoldMilliseconds",
+      "} finally { $stream.Dispose() }",
+      "",
+    ].join("\r\n"),
+    "utf8",
+  );
+  const holder = spawn(
+    "powershell.exe",
+    [
+      "-NoProfile",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-File",
+      holderScript,
+      "-BuildRoot",
+      join(repository, "build"),
+      "-ReadyPath",
+      readyPath,
+      "-HoldMilliseconds",
+      String(holdMilliseconds),
+    ],
+    { windowsHide: true, stdio: "ignore" },
+  );
+  return { holder, readyPath };
 }
 
 async function writeFixtureFile(root: string, portablePath: string, value: string): Promise<void> {
@@ -863,6 +937,90 @@ describe("WhiteLily isolated installer lifecycle", () => {
     ).rejects.toThrow();
   }, 180_000);
 
+  it("preserves a contaminated mapped tree without following a junction outside it", async () => {
+    const fixture = await createRepositoryFixture();
+    const releaseInstaller = await stageLifecycleInstallers(fixture);
+    const fakeWindowsRoot = await createTemporaryRoot("whitelily-fake-windows-");
+    await createDelegatingSandboxLauncher(fakeWindowsRoot);
+    const externalRoot = await createTemporaryRoot("whitelily-external-sentinel-");
+    const sentinel = join(externalRoot, "keep-me.txt");
+    await writeFile(sentinel, "preserve\n", "utf8");
+    const contaminatorScript = join(fixture.root, "create-mapped-junction.ps1");
+    const contaminatorReady = join(fixture.root, "mapped-junction.ready");
+    await writeFile(
+      contaminatorScript,
+      [
+        "param(",
+        "    [Parameter(Mandatory = $true)][string]$BuildRoot,",
+        "    [Parameter(Mandatory = $true)][string]$TargetRoot,",
+        "    [Parameter(Mandatory = $true)][string]$ReadyPath",
+        ")",
+        "$ErrorActionPreference = 'Stop'",
+        "$deadline = [DateTime]::UtcNow.AddSeconds(30)",
+        "$junctionPath = $null",
+        "do {",
+        "    $sandboxRoot = Get-ChildItem -LiteralPath $BuildRoot -Directory -Filter 'installer-sandbox-*' -ErrorAction SilentlyContinue | Select-Object -First 1",
+        "    if ($null -ne $sandboxRoot) {",
+        "        $reportRoot = Join-Path $sandboxRoot.FullName 'report'",
+        "        if (Test-Path -LiteralPath $reportRoot -PathType Container) {",
+        "            $junctionPath = Join-Path $reportRoot 'candidate-junction'",
+        "            New-Item -ItemType Junction -Path $junctionPath -Target $TargetRoot | Out-Null",
+        "            break",
+        "        }",
+        "    }",
+        "    Start-Sleep -Milliseconds 50",
+        "} while ([DateTime]::UtcNow -lt $deadline)",
+        "if ($null -eq $junctionPath) { throw 'JUNCTION_TARGET_NOT_FOUND' }",
+        "[IO.File]::WriteAllText($ReadyPath, $junctionPath)",
+        "",
+      ].join("\r\n"),
+      "utf8",
+    );
+    const contaminator = spawn(
+      "powershell.exe",
+      [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        contaminatorScript,
+        "-BuildRoot",
+        join(fixture.root, "build"),
+        "-TargetRoot",
+        externalRoot,
+        "-ReadyPath",
+        contaminatorReady,
+      ],
+      { windowsHide: true, stdio: "ignore" },
+    );
+    let result: CommandResult;
+    try {
+      result = runPowerShell(
+        join(fixture.root, "scripts", "test-installer.ps1"),
+        ["-InstallerPath", releaseInstaller],
+        {
+          cwd: fixture.root,
+          env: {
+            ...fixture.environment,
+            WINDIR: fakeWindowsRoot,
+          },
+          timeout: 120_000,
+        },
+      );
+    } finally {
+      contaminator.kill();
+    }
+
+    expect(result.status).not.toBe(0);
+    expect(`${result.stdout}\n${result.stderr}`).toContain("SANDBOX_MAPPING_CONTAMINATED");
+    await expect(readFile(contaminatorReady, "utf8")).resolves.toContain("candidate-junction");
+    await expect(readFile(sentinel, "utf8")).resolves.toBe("preserve\n");
+    const retained = (await readdir(join(fixture.root, "build"))).filter((entry) =>
+      entry.startsWith("installer-sandbox-"),
+    );
+    expect(retained).toHaveLength(1);
+  }, 180_000);
+
   it("does not enumerate or terminate WindowsSandboxRemoteSession processes", async () => {
     const source = await readFile(lifecycleScript, "utf8");
 
@@ -1177,6 +1335,166 @@ public static class SmokeWindowFixture {
 
     expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
     await expect(readFile(lockerReady, "utf8")).resolves.toContain("guest-lifecycle.ps1");
+    await expect(readdir(join(fixture.root, "build"))).resolves.not.toContainEqual(
+      expect.stringMatching(/^installer-sandbox-/u),
+    );
+  }, 180_000);
+
+  it("retries non-recursive removal while an empty mapped report directory is still open", async () => {
+    const fixture = await createRepositoryFixture();
+    const releaseInstaller = await stageLifecycleInstallers(fixture);
+    const fakeWindowsRoot = await createTemporaryRoot("whitelily-fake-windows-");
+    await createDelegatingSandboxLauncher(fakeWindowsRoot);
+    const lockerScript = join(fixture.root, "hold-report-directory.ps1");
+    const lockerReady = join(fixture.root, "report-directory-lock.ready");
+    await writeFile(
+      lockerScript,
+      [
+        "param(",
+        "    [Parameter(Mandatory = $true)][string]$BuildRoot,",
+        "    [Parameter(Mandatory = $true)][string]$ReadyPath",
+        ")",
+        "$ErrorActionPreference = 'Stop'",
+        "Add-Type -TypeDefinition @'",
+        "using System;",
+        "using System.ComponentModel;",
+        "using System.Runtime.InteropServices;",
+        "using Microsoft.Win32.SafeHandles;",
+        "public static class DirectoryLock {",
+        '    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]',
+        "    private static extern SafeFileHandle CreateFileW(string path, uint access, uint share, IntPtr security, uint creation, uint flags, IntPtr template);",
+        "    public static SafeFileHandle Open(string path) {",
+        "        var handle = CreateFileW(path, 1, 3, IntPtr.Zero, 3, 0x02000000, IntPtr.Zero);",
+        "        if (handle.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error());",
+        "        return handle;",
+        "    }",
+        "}",
+        "'@",
+        "$deadline = [DateTime]::UtcNow.AddSeconds(30)",
+        "$reportRoot = $null",
+        "do {",
+        "    $sandboxRoot = Get-ChildItem -LiteralPath $BuildRoot -Directory -Filter 'installer-sandbox-*' -ErrorAction SilentlyContinue | Select-Object -First 1",
+        "    if ($null -ne $sandboxRoot) {",
+        "        $candidate = Join-Path $sandboxRoot.FullName 'report'",
+        "        if (Test-Path -LiteralPath $candidate -PathType Container) { $reportRoot = $candidate; break }",
+        "    }",
+        "    Start-Sleep -Milliseconds 50",
+        "} while ([DateTime]::UtcNow -lt $deadline)",
+        "if ($null -eq $reportRoot) { throw 'REPORT_DIRECTORY_NOT_FOUND' }",
+        "$handle = [DirectoryLock]::Open($reportRoot)",
+        "try {",
+        "    [IO.File]::WriteAllText($ReadyPath, $reportRoot)",
+        "    Start-Sleep -Seconds 12",
+        "} finally { $handle.Dispose() }",
+        "",
+      ].join("\r\n"),
+      "utf8",
+    );
+    const locker = spawn(
+      "powershell.exe",
+      [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        lockerScript,
+        "-BuildRoot",
+        join(fixture.root, "build"),
+        "-ReadyPath",
+        lockerReady,
+      ],
+      { windowsHide: true, stdio: "ignore" },
+    );
+    const startedAt = Date.now();
+    let result: CommandResult;
+    try {
+      result = runPowerShell(
+        join(fixture.root, "scripts", "test-installer.ps1"),
+        ["-InstallerPath", releaseInstaller],
+        {
+          cwd: fixture.root,
+          env: {
+            ...fixture.environment,
+            WINDIR: fakeWindowsRoot,
+          },
+          timeout: 120_000,
+        },
+      );
+    } finally {
+      locker.kill();
+    }
+
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(11_500);
+    await expect(readFile(lockerReady, "utf8")).resolves.toContain("report");
+    await expect(readdir(join(fixture.root, "build"))).resolves.not.toContainEqual(
+      expect.stringMatching(/^installer-sandbox-/u),
+    );
+  }, 180_000);
+
+  it("fails closed when the exact Sandbox launcher exits before the shutdown guard releases", async () => {
+    const fixture = await createRepositoryFixture();
+    const releaseInstaller = await stageLifecycleInstallers(fixture);
+    const fakeWindowsRoot = await createTemporaryRoot("whitelily-fake-windows-");
+    await createDelegatingSandboxLauncher(fakeWindowsRoot);
+    const { holder, readyPath } = await startShutdownGuardHolder(fixture.root, 15_000);
+    let result: CommandResult;
+    try {
+      result = runPowerShell(
+        join(fixture.root, "scripts", "test-installer.ps1"),
+        ["-InstallerPath", releaseInstaller],
+        {
+          cwd: fixture.root,
+          env: {
+            ...fixture.environment,
+            WINDIR: fakeWindowsRoot,
+            WHITELILY_SHUTDOWN_GUARD_TIMEOUT_SECONDS: "2",
+          },
+          timeout: 120_000,
+        },
+      );
+    } finally {
+      holder.kill();
+    }
+
+    expect(result.status).not.toBe(0);
+    expect(`${result.stdout}\n${result.stderr}`).toContain("SANDBOX_SHUTDOWN_GUARD_TIMEOUT");
+    await expect(readFile(readyPath, "utf8")).resolves.toContain("shutdown-guard.lock");
+    const retained = (await readdir(join(fixture.root, "build"))).filter((entry) =>
+      entry.startsWith("installer-sandbox-"),
+    );
+    expect(retained).toHaveLength(1);
+  }, 180_000);
+
+  it("waits for a released shutdown guard after the exact Sandbox launcher exits", async () => {
+    const fixture = await createRepositoryFixture();
+    const releaseInstaller = await stageLifecycleInstallers(fixture);
+    const fakeWindowsRoot = await createTemporaryRoot("whitelily-fake-windows-");
+    await createDelegatingSandboxLauncher(fakeWindowsRoot);
+    const { holder, readyPath } = await startShutdownGuardHolder(fixture.root, 8_000);
+    const startedAt = Date.now();
+    let result: CommandResult;
+    try {
+      result = runPowerShell(
+        join(fixture.root, "scripts", "test-installer.ps1"),
+        ["-InstallerPath", releaseInstaller],
+        {
+          cwd: fixture.root,
+          env: {
+            ...fixture.environment,
+            WINDIR: fakeWindowsRoot,
+            WHITELILY_SHUTDOWN_GUARD_TIMEOUT_SECONDS: "20",
+          },
+          timeout: 120_000,
+        },
+      );
+    } finally {
+      holder.kill();
+    }
+
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(7_500);
+    await expect(readFile(readyPath, "utf8")).resolves.toContain("shutdown-guard.lock");
     await expect(readdir(join(fixture.root, "build"))).resolves.not.toContainEqual(
       expect.stringMatching(/^installer-sandbox-/u),
     );

@@ -99,6 +99,199 @@ function ConvertTo-XmlEscapedText {
     return [System.Security.SecurityElement]::Escape($Value)
 }
 
+function Test-FileSystemEntryHasAttribute {
+    param(
+        [Parameter(Mandatory = $true)][System.IO.FileSystemInfo]$Entry,
+        [Parameter(Mandatory = $true)][System.IO.FileAttributes]$Attribute
+    )
+    return ($Entry.Attributes -band $Attribute) -eq $Attribute
+}
+
+function Assert-OrdinaryFileEntry {
+    param(
+        [Parameter(Mandatory = $true)][System.IO.FileSystemInfo]$Entry,
+        [Parameter(Mandatory = $true)][string]$SandboxRoot
+    )
+    if (
+        $Entry.PSIsContainer -or
+        -not ($Entry -is [System.IO.FileInfo]) -or
+        (Test-FileSystemEntryHasAttribute `
+            -Entry $Entry `
+            -Attribute ([System.IO.FileAttributes]::ReparsePoint))
+    ) {
+        throw "SANDBOX_MAPPING_CONTAMINATED: non-ordinary or reparse entry '$($Entry.FullName)'; mapped lifecycle artifacts were retained at $SandboxRoot. Inspect the retained directory and remove only verified ordinary files manually."
+    }
+}
+
+function Remove-EmptyOrdinaryDirectoryWithRetry {
+    param(
+        [Parameter(Mandatory = $true)][string]$LiteralPath,
+        [Parameter(Mandatory = $true)][string]$SandboxRoot,
+        [Parameter(Mandatory = $true)][DateTime]$Deadline
+    )
+    while (Test-Path -LiteralPath $LiteralPath) {
+        $directory = Get-Item -LiteralPath $LiteralPath -Force -ErrorAction Stop
+        if (
+            -not $directory.PSIsContainer -or
+            (Test-FileSystemEntryHasAttribute `
+                -Entry $directory `
+                -Attribute ([System.IO.FileAttributes]::ReparsePoint))
+        ) {
+            throw "SANDBOX_MAPPING_CONTAMINATED: mapped path '$LiteralPath' is not an ordinary directory; mapped lifecycle artifacts were retained at $SandboxRoot."
+        }
+        if (@(Get-ChildItem -LiteralPath $LiteralPath -Force -ErrorAction Stop).Count -ne 0) {
+            throw "SANDBOX_MAPPING_CONTAMINATED: mapped directory '$LiteralPath' changed during cleanup; mapped lifecycle artifacts were retained at $SandboxRoot."
+        }
+        try {
+            Remove-Item -LiteralPath $LiteralPath -Force -ErrorAction Stop
+        } catch [System.IO.IOException] {
+            if ([DateTime]::UtcNow -ge $Deadline) {
+                throw "SANDBOX_CLEANUP_TIMEOUT: empty mapped directory '$LiteralPath' remained busy; close Windows Sandbox manually. Mapped lifecycle artifacts were retained at $SandboxRoot"
+            }
+            Start-Sleep -Milliseconds 250
+        } catch [System.UnauthorizedAccessException] {
+            if ([DateTime]::UtcNow -ge $Deadline) {
+                throw "SANDBOX_CLEANUP_TIMEOUT: empty mapped directory '$LiteralPath' remained busy; close Windows Sandbox manually. Mapped lifecycle artifacts were retained at $SandboxRoot"
+            }
+            Start-Sleep -Milliseconds 250
+        }
+    }
+}
+
+function Remove-InstallerSandboxTreeNoFollow {
+    param(
+        [Parameter(Mandatory = $true)][string]$SandboxRoot,
+        [Parameter(Mandatory = $true)][string]$ReportRoot,
+        [Parameter(Mandatory = $true)][string]$ConfigurationPath
+    )
+    $sandboxDirectory = Get-Item -LiteralPath $SandboxRoot -Force -ErrorAction Stop
+    $reportDirectory = Get-Item -LiteralPath $ReportRoot -Force -ErrorAction Stop
+    foreach ($directory in @($sandboxDirectory, $reportDirectory)) {
+        if (
+            -not $directory.PSIsContainer -or
+            (Test-FileSystemEntryHasAttribute `
+                -Entry $directory `
+                -Attribute ([System.IO.FileAttributes]::ReparsePoint))
+        ) {
+            throw "SANDBOX_MAPPING_CONTAMINATED: mapped directory '$($directory.FullName)' is not an ordinary directory; mapped lifecycle artifacts were retained at $SandboxRoot. Inspect the retained directory and remove it manually without following reparse points."
+        }
+    }
+
+    $allowedReportFiles = [System.Collections.Generic.HashSet[string]]::new(
+        [StringComparer]::OrdinalIgnoreCase
+    )
+    @(
+        'guest-lifecycle.ps1',
+        'sandbox-result.json',
+        'bootstrap-secret.txt',
+        'bootstrap-error.txt',
+        'shutdown-guard.lock'
+    ) | ForEach-Object { [void]$allowedReportFiles.Add($_) }
+    $allowedSandboxFiles = [System.Collections.Generic.HashSet[string]]::new(
+        [StringComparer]::OrdinalIgnoreCase
+    )
+    [void]$allowedSandboxFiles.Add([System.IO.Path]::GetFileName($ConfigurationPath))
+
+    $sandboxEntries = @(Get-ChildItem -LiteralPath $SandboxRoot -Force -ErrorAction Stop)
+    foreach ($entry in $sandboxEntries) {
+        if ([StringComparer]::OrdinalIgnoreCase.Equals($entry.FullName, $ReportRoot)) {
+            if (
+                -not $entry.PSIsContainer -or
+                (Test-FileSystemEntryHasAttribute `
+                    -Entry $entry `
+                    -Attribute ([System.IO.FileAttributes]::ReparsePoint))
+            ) {
+                throw "SANDBOX_MAPPING_CONTAMINATED: report path is not an ordinary directory; mapped lifecycle artifacts were retained at $SandboxRoot."
+            }
+            continue
+        }
+        Assert-OrdinaryFileEntry -Entry $entry -SandboxRoot $SandboxRoot
+        if (-not $allowedSandboxFiles.Contains($entry.Name)) {
+            throw "SANDBOX_MAPPING_CONTAMINATED: unexpected top-level entry '$($entry.FullName)'; mapped lifecycle artifacts were retained at $SandboxRoot. Inspect the retained directory and remove only verified ordinary files manually."
+        }
+    }
+
+    $reportEntries = @(Get-ChildItem -LiteralPath $ReportRoot -Force -ErrorAction Stop)
+    foreach ($entry in $reportEntries) {
+        Assert-OrdinaryFileEntry -Entry $entry -SandboxRoot $SandboxRoot
+        if (-not $allowedReportFiles.Contains($entry.Name)) {
+            throw "SANDBOX_MAPPING_CONTAMINATED: unexpected report entry '$($entry.FullName)'; mapped lifecycle artifacts were retained at $SandboxRoot. Inspect the retained directory and remove only verified ordinary files manually."
+        }
+    }
+
+    $cleanupDeadline = [DateTime]::UtcNow.AddSeconds(30)
+    foreach ($name in $allowedReportFiles) {
+        $path = Join-Path $ReportRoot $name
+        while (Test-Path -LiteralPath $path) {
+            try {
+                $entry = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+                Assert-OrdinaryFileEntry -Entry $entry -SandboxRoot $SandboxRoot
+                Remove-Item -LiteralPath $path -Force -ErrorAction Stop
+            } catch [System.IO.IOException] {
+                if ([DateTime]::UtcNow -ge $cleanupDeadline) { throw }
+                Start-Sleep -Milliseconds 250
+            } catch [System.UnauthorizedAccessException] {
+                if ([DateTime]::UtcNow -ge $cleanupDeadline) { throw }
+                Start-Sleep -Milliseconds 250
+            }
+        }
+    }
+    if (@(Get-ChildItem -LiteralPath $ReportRoot -Force -ErrorAction Stop).Count -ne 0) {
+        throw "SANDBOX_MAPPING_CONTAMINATED: report directory changed during cleanup; mapped lifecycle artifacts were retained at $SandboxRoot."
+    }
+    Remove-EmptyOrdinaryDirectoryWithRetry `
+        -LiteralPath $ReportRoot `
+        -SandboxRoot $SandboxRoot `
+        -Deadline $cleanupDeadline
+
+    foreach ($name in $allowedSandboxFiles) {
+        $path = Join-Path $SandboxRoot $name
+        if (Test-Path -LiteralPath $path) {
+            $entry = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+            Assert-OrdinaryFileEntry -Entry $entry -SandboxRoot $SandboxRoot
+            Remove-Item -LiteralPath $path -Force -ErrorAction Stop
+        }
+    }
+    if (@(Get-ChildItem -LiteralPath $SandboxRoot -Force -ErrorAction Stop).Count -ne 0) {
+        throw "SANDBOX_MAPPING_CONTAMINATED: sandbox directory changed during cleanup; mapped lifecycle artifacts were retained at $SandboxRoot."
+    }
+    Remove-EmptyOrdinaryDirectoryWithRetry `
+        -LiteralPath $SandboxRoot `
+        -SandboxRoot $SandboxRoot `
+        -Deadline $cleanupDeadline
+}
+
+function Wait-ShutdownGuardRelease {
+    param(
+        [Parameter(Mandatory = $true)][string]$LiteralPath,
+        [Parameter(Mandatory = $true)][string]$SandboxRoot,
+        [Parameter(Mandatory = $true)][int]$TimeoutSeconds
+    )
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    while ($true) {
+        if (Test-Path -LiteralPath $LiteralPath) {
+            $entry = Get-Item -LiteralPath $LiteralPath -Force -ErrorAction Stop
+            Assert-OrdinaryFileEntry -Entry $entry -SandboxRoot $SandboxRoot
+            try {
+                $stream = [System.IO.File]::Open(
+                    $LiteralPath,
+                    [System.IO.FileMode]::Open,
+                    [System.IO.FileAccess]::ReadWrite,
+                    [System.IO.FileShare]::None
+                )
+                $stream.Dispose()
+                return
+            } catch [System.IO.IOException] {
+            } catch [System.UnauthorizedAccessException] {
+            }
+        }
+        if ([DateTime]::UtcNow -ge $deadline) {
+            throw "SANDBOX_SHUTDOWN_GUARD_TIMEOUT: the trusted guest controller still owns the mapped shutdown guard; close the Windows Sandbox window manually. Mapped lifecycle artifacts were retained at $SandboxRoot"
+        }
+        Start-Sleep -Milliseconds 250
+    }
+}
+
 $repositoryRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $resolvedInstaller = Resolve-FullPath $InstallerPath (Get-Location).Path
 if (-not (Test-Path -LiteralPath $resolvedInstaller -PathType Leaf)) {
@@ -197,6 +390,7 @@ if (-not $sandboxRoot.StartsWith($sandboxPrefix, [StringComparison]::OrdinalIgno
 $reportRoot = Join-Path $sandboxRoot 'report'
 $guestScriptPath = Join-Path $reportRoot 'guest-lifecycle.ps1'
 $sandboxResultPath = Join-Path $reportRoot 'sandbox-result.json'
+$shutdownGuardPath = Join-Path $reportRoot 'shutdown-guard.lock'
 $sandboxConfigurationPath = Join-Path $sandboxRoot 'WhiteLily-installer-lifecycle.wsb'
 New-Item -ItemType Directory -Path $reportRoot -Force | Out-Null
 $reportKeyBytes = [byte[]]::new(32)
@@ -241,6 +435,7 @@ $brokerResponsePath = Join-Path $trustedControlRoot 'candidate-response.json'
 $brokerStopPath = Join-Path $trustedControlRoot 'candidate-broker.stop'
 $reportSecretPath = Join-Path $trustedControlRoot 'report-secret.txt'
 $mappedResultPath = 'C:\WhiteLilyReport\sandbox-result.json'
+$mappedShutdownGuardPath = 'C:\WhiteLilyReport\shutdown-guard.lock'
 $result = [ordered]@{
     schemaVersion = 2
     controllerSid = $null
@@ -287,6 +482,19 @@ function Get-ReportHmacSha256Hex {
         $hmac.Dispose()
         [Array]::Clear($key, 0, $key.Length)
     }
+}
+function Publish-AuthenticatedLifecycleResult {
+    param([Parameter(Mandatory = $true)][System.Collections.IDictionary]$Value)
+    $utf8 = [System.Text.UTF8Encoding]::new($false)
+    $payload = $Value | ConvertTo-Json -Depth 5 -Compress
+    [System.IO.File]::WriteAllText($resultPath, $payload + "`n", $utf8)
+    $reportKeyHex = (Get-Content -LiteralPath $reportSecretPath -Raw -Encoding UTF8).Trim()
+    $envelope = [ordered]@{
+        transportSchemaVersion = 1
+        payload = $payload
+        hmacSha256 = Get-ReportHmacSha256Hex -Payload $payload -KeyHex $reportKeyHex
+    }
+    Write-AtomicJson -LiteralPath $mappedResultPath -Value $envelope
 }
 function Invoke-Process {
     param([Parameter(Mandatory = $true)][string]$Path, [string[]]$Arguments = @())
@@ -1326,24 +1534,40 @@ public static class WhiteLilyInstallerUi {
             '/grant:r' `
             '*S-1-5-18:(OI)(CI)F' `
             '*S-1-5-32-544:(OI)(CI)F' | Out-Null
-        $utf8 = [System.Text.UTF8Encoding]::new($false)
-        $payload = $result | ConvertTo-Json -Depth 5 -Compress
-        [System.IO.File]::WriteAllText(
-            $resultPath,
-            $payload + "`n",
-            $utf8
+        $shutdownGuard = [System.IO.File]::Open(
+            $mappedShutdownGuardPath,
+            [System.IO.FileMode]::CreateNew,
+            [System.IO.FileAccess]::ReadWrite,
+            [System.IO.FileShare]::None
         )
-        $reportKeyHex = (Get-Content -LiteralPath $reportSecretPath -Raw -Encoding UTF8).Trim()
-        $envelope = [ordered]@{
-            transportSchemaVersion = 1
-            payload = $payload
-            hmacSha256 = Get-ReportHmacSha256Hex -Payload $payload -KeyHex $reportKeyHex
+        try {
+            Publish-AuthenticatedLifecycleResult -Value $result
+            try {
+                $shutdownProcess = Start-Process `
+                    -FilePath "$env:SystemRoot\System32\shutdown.exe" `
+                    -ArgumentList @('/s', '/t', '0') `
+                    -WindowStyle Hidden `
+                    -Wait `
+                    -PassThru
+                if ($shutdownProcess.ExitCode -ne 0) {
+                    throw "shutdown.exe exited with code $($shutdownProcess.ExitCode)"
+                }
+            } catch {
+                $result.success = $false
+                $shutdownError = "guest shutdown command failed: $($_.Exception.Message)"
+                if ([string]::IsNullOrWhiteSpace([string]$result.error)) {
+                    $result.error = $shutdownError
+                } else {
+                    $result.error = "$([string]$result.error); $shutdownError"
+                }
+                Publish-AuthenticatedLifecycleResult -Value $result
+            }
+            while ($true) {
+                Start-Sleep -Seconds 1
+            }
+        } finally {
+            $shutdownGuard.Dispose()
         }
-        Write-AtomicJson -LiteralPath $mappedResultPath -Value $envelope
-        Start-Process `
-            -FilePath "$env:SystemRoot\System32\shutdown.exe" `
-            -ArgumentList @('/s', '/t', '0') `
-            -WindowStyle Hidden
     }
 }
 '@
@@ -1434,6 +1658,29 @@ try {
         }
         Start-Sleep -Seconds 2
     }
+    $shutdownGuardTimeoutSeconds = 120
+    if (
+        -not [string]::IsNullOrWhiteSpace($env:WHITELILY_SHUTDOWN_GUARD_TIMEOUT_SECONDS) -and
+        (
+            -not [int]::TryParse(
+                $env:WHITELILY_SHUTDOWN_GUARD_TIMEOUT_SECONDS,
+                [ref]$shutdownGuardTimeoutSeconds
+            ) -or
+            $shutdownGuardTimeoutSeconds -lt 1
+        )
+    ) {
+        throw 'INVALID_SHUTDOWN_GUARD_TIMEOUT'
+    }
+    Wait-ShutdownGuardRelease `
+        -LiteralPath $shutdownGuardPath `
+        -SandboxRoot $sandboxRoot `
+        -TimeoutSeconds $shutdownGuardTimeoutSeconds
+    $trustedEnvelope = Get-TrustedSandboxEnvelope `
+        -LiteralPath $sandboxResultPath `
+        -KeyHex $reportKeyHex
+    if ($null -eq $trustedEnvelope) {
+        throw "SANDBOX_LIFECYCLE_UNTRUSTED_REPORT: mapped lifecycle artifacts were retained at $sandboxRoot"
+    }
     $sandboxProcessDeadline = [DateTime]::UtcNow.AddMinutes(2)
     while (-not $sandboxProcess.HasExited) {
         if ([DateTime]::UtcNow -ge $sandboxProcessDeadline) {
@@ -1511,24 +1758,10 @@ try {
             (Test-Path -LiteralPath $sandboxRoot) -and
             $sandboxRoot.StartsWith($sandboxPrefix, [StringComparison]::OrdinalIgnoreCase)
         ) {
-            $cleanupDeadline = [DateTime]::UtcNow.AddSeconds(30)
-            while (Test-Path -LiteralPath $sandboxRoot) {
-                try {
-                    Remove-Item -LiteralPath $sandboxRoot -Recurse -Force
-                } catch [System.IO.IOException] {
-                    if ([DateTime]::UtcNow -ge $cleanupDeadline) {
-                        $cleanupError = $_
-                        break
-                    }
-                    Start-Sleep -Seconds 1
-                } catch [System.UnauthorizedAccessException] {
-                    if ([DateTime]::UtcNow -ge $cleanupDeadline) {
-                        $cleanupError = $_
-                        break
-                    }
-                    Start-Sleep -Seconds 1
-                }
-            }
+            Remove-InstallerSandboxTreeNoFollow `
+                -SandboxRoot $sandboxRoot `
+                -ReportRoot $reportRoot `
+                -ConfigurationPath $sandboxConfigurationPath
         }
     } catch {
         $cleanupError = $_
