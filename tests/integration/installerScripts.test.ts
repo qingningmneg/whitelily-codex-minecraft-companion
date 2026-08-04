@@ -125,6 +125,8 @@ using System;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Xml.Linq;
@@ -134,41 +136,29 @@ public static class FakeWindowsSandbox {
         return "\"" + value.Replace("\"", "\\\"") + "\"";
     }
 
+    private static string JsonEscape(string value) {
+        return value
+            .Replace("\\", "\\\\")
+            .Replace("\"", "\\\"")
+            .Replace("\r", "\\r")
+            .Replace("\n", "\\n");
+    }
+
+    private static string HmacSha256(string payload, string keyHex) {
+        var key = Enumerable.Range(0, keyHex.Length / 2)
+            .Select(index => Convert.ToByte(keyHex.Substring(index * 2, 2), 16))
+            .ToArray();
+        using (var hmac = new HMACSHA256(key)) {
+            return BitConverter.ToString(hmac.ComputeHash(Encoding.UTF8.GetBytes(payload)))
+                .Replace("-", "")
+                .ToLowerInvariant();
+        }
+    }
+
     public static int Main(string[] args) {
         try {
-            if (args.Length == 6 && StringComparer.Ordinal.Equals(args[0], "--worker")) {
-                Thread.Sleep(5000);
-                var requestedError = Environment.GetEnvironmentVariable(
-                    "WHITELILY_FAKE_SANDBOX_REPORT_ERROR"
-                );
-                var report = String.IsNullOrWhiteSpace(requestedError)
-                    ? "{\"schemaVersion\":1,\"installerSha256\":\"" + args[3] +
-                        "\",\"expectedVersion\":\"" + args[4] +
-                        "\",\"baselineInstallerSha256\":\"" + args[5] +
-                        "\",\"installedVersion\":\"" + args[4] +
-                        "\",\"managedWorkspaceResources\":3,\"success\":true,\"stages\":[\"isolated_path\",\"hashes_verified\",\"clean_installed\",\"clean_workspace_verified\",\"clean_delete_data\",\"beta1_installed\",\"beta1_data_root_prepared\",\"beta1_upgraded\",\"workspace_repaired\",\"keep_data\",\"reinstalled\",\"delete_data\"],\"error\":null}\n"
-                    : "{\"schemaVersion\":1,\"installerSha256\":\"" + args[3] +
-                        "\",\"expectedVersion\":\"" + args[4] +
-                        "\",\"baselineInstallerSha256\":\"" + args[5] +
-                        "\",\"installedVersion\":null,\"managedWorkspaceResources\":0,\"success\":false,\"stages\":[],\"error\":\"" + requestedError + "\"}\n";
-                var holdMilliseconds = 0;
-                Int32.TryParse(
-                    Environment.GetEnvironmentVariable("WHITELILY_FAKE_SANDBOX_HOLD_MS"),
-                    out holdMilliseconds
-                );
-                using (var mappingLock = holdMilliseconds > 0
-                    ? new FileStream(
-                        Path.Combine(args[2], "guest-lifecycle.ps1"),
-                        FileMode.Open,
-                        FileAccess.Read,
-                        FileShare.Read
-                    )
-                    : null) {
-                    File.WriteAllText(Path.Combine(args[2], "sandbox-result.json"), report);
-                    if (holdMilliseconds > 0) {
-                        Thread.Sleep(holdMilliseconds);
-                    }
-                }
+            if (args.Length == 1 && StringComparer.Ordinal.Equals(args[0], "--sleeper")) {
+                Thread.Sleep(30000);
                 return 0;
             }
 
@@ -212,18 +202,63 @@ public static class FakeWindowsSandbox {
                 );
             }
 
-            var executable = Path.Combine(
-                Path.GetDirectoryName(Process.GetCurrentProcess().MainModule.FileName),
-                "WindowsSandboxRemoteSession.exe"
+            if (StringComparer.Ordinal.Equals(
+                Environment.GetEnvironmentVariable("WHITELILY_FAKE_SANDBOX_FORGE_ONLY"),
+                "1"
+            )) {
+                var buildRoot = Directory.GetParent(Directory.GetParent(reportRoot).FullName).FullName;
+                File.WriteAllText(
+                    Path.Combine(buildRoot, "candidate-forged-result.json"),
+                    "AccessDenied: candidate could not create the trusted SYSTEM report\n"
+                );
+                File.WriteAllText(
+                    Path.Combine(reportRoot, "sandbox-result.json"),
+                    "{\"forged\":true}\n"
+                );
+                return 0;
+            }
+
+            Thread.Sleep(5000);
+            var requestedError = Environment.GetEnvironmentVariable(
+                "WHITELILY_FAKE_SANDBOX_REPORT_ERROR"
             );
-            Process.Start(new ProcessStartInfo {
-                FileName = executable,
-                Arguments = "--worker " + Quote(args[0]) + " " + Quote(reportRoot) + " " + hash +
-                    " " + Quote(expectedVersion) + " " + baselineHash,
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                WindowStyle = ProcessWindowStyle.Hidden,
-            });
+            var stages = "[\"controller_identity_verified\",\"isolated_path\",\"hashes_verified\",\"candidate_write_denied\",\"clean_installed\",\"clean_workspace_verified\",\"clean_delete_data\",\"beta1_installed\",\"beta1_data_root_prepared\",\"beta1_upgraded\",\"workspace_repaired\",\"keep_data\",\"reinstalled\",\"delete_data\",\"candidate_principal_removed\"]";
+            var report = String.IsNullOrWhiteSpace(requestedError)
+                ? "{\"schemaVersion\":2,\"controllerSid\":\"S-1-5-18\",\"candidateSid\":\"S-1-5-21-1-2-3-1001\",\"candidateReportWriteDenied\":true,\"installerSha256\":\"" + hash +
+                    "\",\"controllerObservedInstallerSha256\":\"" + hash +
+                    "\",\"expectedVersion\":\"" + expectedVersion +
+                    "\",\"baselineInstallerSha256\":\"" + baselineHash +
+                    "\",\"controllerObservedBaselineInstallerSha256\":\"" + baselineHash +
+                    "\",\"installedVersion\":\"" + expectedVersion +
+                    "\",\"managedWorkspaceResources\":3,\"success\":true,\"stages\":" + stages + ",\"error\":null}\n"
+                : "{\"schemaVersion\":2,\"controllerSid\":\"S-1-5-18\",\"candidateSid\":\"S-1-5-21-1-2-3-1001\",\"candidateReportWriteDenied\":true,\"installerSha256\":\"" + hash +
+                    "\",\"controllerObservedInstallerSha256\":\"" + hash +
+                    "\",\"expectedVersion\":\"" + expectedVersion +
+                    "\",\"baselineInstallerSha256\":\"" + baselineHash +
+                    "\",\"controllerObservedBaselineInstallerSha256\":\"" + baselineHash +
+                    "\",\"installedVersion\":null,\"managedWorkspaceResources\":0,\"success\":false,\"stages\":[],\"error\":\"" + requestedError + "\"}";
+            report = report.TrimEnd('\r', '\n');
+            var keyHex = File.ReadAllText(Path.Combine(reportRoot, "bootstrap-secret.txt")).Trim();
+            var envelope = "{\"transportSchemaVersion\":1,\"payload\":\"" + JsonEscape(report) +
+                "\",\"hmacSha256\":\"" + HmacSha256(report, keyHex) + "\"}\n";
+            var holdMilliseconds = 0;
+            Int32.TryParse(
+                Environment.GetEnvironmentVariable("WHITELILY_FAKE_SANDBOX_HOLD_MS"),
+                out holdMilliseconds
+            );
+            using (var mappingLock = holdMilliseconds > 0
+                ? new FileStream(
+                    Path.Combine(reportRoot, "guest-lifecycle.ps1"),
+                    FileMode.Open,
+                    FileAccess.Read,
+                    FileShare.Read
+                )
+                : null) {
+                File.WriteAllText(Path.Combine(reportRoot, "sandbox-result.json"), envelope);
+                if (holdMilliseconds > 0) {
+                    Thread.Sleep(holdMilliseconds);
+                }
+            }
             return 0;
         } catch (Exception error) {
             Console.Error.WriteLine(error);
@@ -720,6 +755,175 @@ describe("WhiteLily installer inspection", () => {
 });
 
 describe("WhiteLily isolated installer lifecycle", () => {
+  it("separates a SYSTEM-owned trusted controller from the standard candidate user", async () => {
+    const source = await readFile(lifecycleScript, "utf8");
+
+    expect(source).toContain("S-1-5-18");
+    expect(source).toMatch(/New-LocalUser|\bnet\.exe\b/u);
+    expect(source).toMatch(/-UserId\s+['"]SYSTEM['"]/u);
+    expect(source).toContain("candidateReportWriteDenied");
+    expect(source).toContain("controllerSid");
+    expect(source).toContain("candidateSid");
+    expect(source).toContain("Registry::HKEY_USERS");
+    expect(source).toMatch(/icacls\.exe/u);
+    expect(source).toContain("candidate user creation failed with exit code");
+    expect(source).toContain("$previousErrorActionPreference = $ErrorActionPreference");
+    expect(source).toContain("$ErrorActionPreference = 'Continue'");
+    expect(source).toContain("$ErrorActionPreference = $previousErrorActionPreference");
+  });
+
+  it("uses a noninteractive legacy-compatible password for the disposable candidate user", async () => {
+    const source = await readFile(lifecycleScript, "utf8");
+
+    expect(source).toContain("[Guid]::NewGuid().ToString('N').Substring(0, 11)");
+    expect(source).toContain("$candidatePassword = 'WL!'");
+  });
+
+  it("runs candidate operations through a trusted interactive broker instead of using credentials from SYSTEM", async () => {
+    const source = await readFile(lifecycleScript, "utf8");
+
+    expect(source).not.toContain("WhiteLilyCandidateOperation-");
+    expect(source).not.toContain("-Credential $script:CandidateCredential");
+    expect(source).toContain("function Invoke-CandidateBroker");
+    expect(source).toContain("candidate broker must not run as SYSTEM");
+    expect(source).toContain("-Credential $CandidateCredential");
+    expect(source).toContain("-LoadUserProfile");
+    expect(source).toContain("$request.controllerSid");
+    expect(source).toContain("candidate request was not issued by SYSTEM");
+    expect(source).toContain("$response.brokerSid");
+    expect(source).toContain("candidate process principal mismatch");
+    expect(source).toContain("if ($Mode -eq 'Candidate') { exit 92 }");
+  });
+
+  it("accepts only a host-keyed envelope for the SYSTEM lifecycle report transport", async () => {
+    const source = await readFile(lifecycleScript, "utf8");
+
+    expect(source).toContain("$trustedControlRoot = 'C:\\ProgramData\\WhiteLilyLifecycle'");
+    expect(source).toContain("bootstrap-secret.txt");
+    expect(source).toContain(
+      "Remove-Item -LiteralPath 'C:\\WhiteLilyReport\\bootstrap-secret.txt' -Force",
+    );
+    expect(source).toContain("HMACSHA256");
+    expect(source).toContain("transportSchemaVersion");
+    expect(source).toContain("SANDBOX_LIFECYCLE_UNTRUSTED_REPORT");
+    expect(source).toContain("Get-TrustedSandboxEnvelope");
+  });
+
+  it("resolves candidate per-user installation and data beneath the candidate LocalAppData profile", async () => {
+    const source = await readFile(lifecycleScript, "utf8");
+    const forgeProof = source.indexOf("$result.stages.Add('candidate_write_denied')");
+    const refreshedProfile = source.indexOf(
+      "$profileRoot = Get-CandidateProfileRoot -Sid $script:CandidateSid",
+      forgeProof,
+    );
+
+    expect(source).toContain("Join-Path $profileRoot 'AppData\\Local'");
+    expect(forgeProof).toBeGreaterThan(-1);
+    expect(refreshedProfile).toBeGreaterThan(forgeProof);
+  });
+
+  it("retries candidate registry hive unload within a bounded deadline", async () => {
+    const source = await readFile(lifecycleScript, "utf8");
+
+    expect(source).toContain("$unloadDeadline = [DateTime]::UtcNow.AddSeconds(30)");
+    expect(source).toContain("while ([DateTime]::UtcNow -lt $unloadDeadline)");
+    expect(source).toContain("candidate user registry hive remained mounted after bounded unload");
+  });
+
+  it("rejects a candidate-forged lifecycle result when the trusted SYSTEM report is absent", async () => {
+    const fixture = await createRepositoryFixture();
+    const releaseInstaller = await stageLifecycleInstallers(fixture);
+    const fakeWindowsRoot = await createTemporaryRoot("whitelily-fake-windows-");
+    await createDelegatingSandboxLauncher(fakeWindowsRoot);
+    const result = runPowerShell(
+      join(fixture.root, "scripts", "test-installer.ps1"),
+      ["-InstallerPath", releaseInstaller],
+      {
+        cwd: fixture.root,
+        env: {
+          ...fixture.environment,
+          WINDIR: fakeWindowsRoot,
+          WHITELILY_FAKE_SANDBOX_FORGE_ONLY: "1",
+          WHITELILY_SANDBOX_TIMEOUT_SECONDS: "2",
+        },
+        timeout: 120_000,
+      },
+    );
+
+    expect(result.status).not.toBe(0);
+    expect(`${result.stdout}\n${result.stderr}`).toContain("SANDBOX_LIFECYCLE_REPORT_MISSING");
+    await expect(
+      readFile(join(fixture.root, "build", "candidate-forged-result.json"), "utf8"),
+    ).resolves.toContain("AccessDenied");
+    await expect(
+      readFile(
+        join(fixture.root, "release", `WhiteLily-${version}-windows-x64-installer-lifecycle.json`),
+        "utf8",
+      ),
+    ).rejects.toThrow();
+  }, 180_000);
+
+  it("does not enumerate or terminate WindowsSandboxRemoteSession processes", async () => {
+    const source = await readFile(lifecycleScript, "utf8");
+
+    expect(source).not.toContain("WindowsSandboxRemoteSession.exe");
+    expect(source).not.toMatch(/\$sandboxProcess\.Kill\(/u);
+  });
+
+  it("fails removal proof when any installed program artifact remains", async () => {
+    const root = await createTemporaryRoot("whitelily-removal-proof-");
+    const programRoot = join(root, "Programs", "WhiteLily");
+    const dataRoot = join(root, "WhiteLilyData");
+    await mkdir(programRoot, { recursive: true });
+    await mkdir(dataRoot, { recursive: true });
+    await writeFile(join(programRoot, "WhiteLily.exe"), "residual", "utf8");
+    const harness = join(root, "verify-removal-proof.ps1");
+    await writeFile(
+      harness,
+      [
+        "param(",
+        "    [Parameter(Mandatory = $true)][string]$LifecycleScript,",
+        "    [Parameter(Mandatory = $true)][string]$ProgramRoot,",
+        "    [Parameter(Mandatory = $true)][string]$DataRoot",
+        ")",
+        "$ErrorActionPreference = 'Stop'",
+        "$scriptText = [IO.File]::ReadAllText($LifecycleScript)",
+        "$guestMatch = [regex]::Match($scriptText, \"(?s)\\$guestScript = @'\\r?\\n(?<guest>.*?)\\r?\\n'@\")",
+        "if (-not $guestMatch.Success) { throw 'GUEST_SCRIPT_MISSING' }",
+        "$tokens = $null",
+        "$errors = $null",
+        "$ast = [Management.Automation.Language.Parser]::ParseInput($guestMatch.Groups['guest'].Value, [ref]$tokens, [ref]$errors)",
+        "$functionAst = $ast.Find({",
+        "    param($node)",
+        "    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and",
+        "        $node.Name -eq 'Assert-WhiteLilyRemovalState'",
+        "}, $true)",
+        "if ($null -eq $functionAst) { throw 'REMOVAL_PROOF_MISSING' }",
+        "Invoke-Expression $functionAst.Extent.Text",
+        "try {",
+        "    Assert-WhiteLilyRemovalState -ProgramRoot $ProgramRoot -DataRoot $DataRoot -ProductEntryCount 0 -KeepData $true -TimeoutMilliseconds 250",
+        "    throw 'RESIDUAL_WAS_ACCEPTED'",
+        "} catch {",
+        "    if ($_.Exception.Message -eq 'RESIDUAL_WAS_ACCEPTED') { throw }",
+        "    [Console]::Out.WriteLine($_.Exception.Message)",
+        "}",
+        "",
+      ].join("\r\n"),
+      "utf8",
+    );
+    const result = runPowerShell(harness, [
+      "-LifecycleScript",
+      lifecycleScript,
+      "-ProgramRoot",
+      programRoot,
+      "-DataRoot",
+      dataRoot,
+    ]);
+
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(result.stdout).toContain("WhiteLily program artifacts remained after uninstall");
+  });
+
   it("requires a real WhiteLily window and rejects any Error window from the app process", async () => {
     const root = await createTemporaryRoot("whitelily-smoke-window-");
     const sourcePath = join(root, "SmokeWindowFixture.cs");
@@ -849,59 +1053,16 @@ public static class SmokeWindowFixture {
     });
   }, 180_000);
 
-  it("requires stable identity before terminating a bound Sandbox remote session", async () => {
-    const root = await createTemporaryRoot("whitelily-session-identity-");
-    const harness = join(root, "verify-session-identity.ps1");
-    await writeFile(
-      harness,
-      [
-        "param([Parameter(Mandatory = $true)][string]$LifecycleScript)",
-        "$ErrorActionPreference = 'Stop'",
-        "$tokens = $null",
-        "$errors = $null",
-        "$ast = [Management.Automation.Language.Parser]::ParseFile($LifecycleScript, [ref]$tokens, [ref]$errors)",
-        "$functionAst = $ast.Find({",
-        "    param($node)",
-        "    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and",
-        "        $node.Name -eq 'Test-SandboxRemoteSessionIdentity'",
-        "}, $true)",
-        "if ($null -eq $functionAst) { throw 'SESSION_IDENTITY_CHECK_MISSING' }",
-        "Invoke-Expression $functionAst.Extent.Text",
-        "$configuration = 'C:\\build\\run\\WhiteLily-installer-lifecycle.wsb'",
-        "$expected = [pscustomobject]@{",
-        "    ProcessId = 1234",
-        "    Name = 'WindowsSandboxRemoteSession.exe'",
-        "    CreationDate = [datetime]'2026-08-02T12:00:00Z'",
-        "    ExecutablePath = 'C:\\Program Files\\WindowsApps\\WindowsSandboxRemoteSession.exe'",
-        "    CommandLine = '\"C:\\Program Files\\WindowsApps\\WindowsSandboxRemoteSession.exe\" ' + $configuration",
-        "}",
-        "$same = [pscustomobject]@{}",
-        "$expected.psobject.Properties | ForEach-Object { $same | Add-Member -NotePropertyName $_.Name -NotePropertyValue $_.Value }",
-        "$reusedPid = $same.psobject.Copy()",
-        "$reusedPid.CreationDate = [datetime]'2026-08-02T12:00:01Z'",
-        "$differentCommand = $same.psobject.Copy()",
-        "$differentCommand.CommandLine = '\"C:\\Program Files\\WindowsApps\\WindowsSandboxRemoteSession.exe\" C:\\other.wsb'",
-        "$differentExecutable = $same.psobject.Copy()",
-        "$differentExecutable.ExecutablePath = 'C:\\Temp\\WindowsSandboxRemoteSession.exe'",
-        "$values = @(",
-        "    Test-SandboxRemoteSessionIdentity -Expected $expected -Current $same -ConfigurationPath $configuration",
-        "    Test-SandboxRemoteSessionIdentity -Expected $expected -Current $reusedPid -ConfigurationPath $configuration",
-        "    Test-SandboxRemoteSessionIdentity -Expected $expected -Current $differentCommand -ConfigurationPath $configuration",
-        "    Test-SandboxRemoteSessionIdentity -Expected $expected -Current $differentExecutable -ConfigurationPath $configuration",
-        ")",
-        "[Console]::Out.WriteLine(($values -join ','))",
-        "",
-      ].join("\r\n"),
-      "utf8",
-    );
+  it("tracks only the exact WindowsSandbox process returned by Start-Process", async () => {
+    const source = await readFile(lifecycleScript, "utf8");
 
-    const result = runPowerShell(harness, ["-LifecycleScript", lifecycleScript]);
-
-    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
-    expect(result.stdout.trim()).toBe("True,False,False,False");
+    expect(source).toContain("$sandboxProcess.HasExited -and $sandboxProcess.ExitCode -ne 0");
+    expect(source).toContain("$allowSandboxCleanup");
+    expect(source).not.toMatch(/Get-CimInstance[\s\S]*WindowsSandboxRemoteSession/u);
+    expect(source).not.toMatch(/\$sandboxProcess\.Kill\(/u);
   });
 
-  it("waits for a delegated Sandbox session after the launcher exits successfully", async () => {
+  it("accepts only the trusted controller report after the exact Sandbox process exits", async () => {
     const fixture = await createRepositoryFixture();
     const releaseInstaller = await stageLifecycleInstallers(fixture);
     const fakeWindowsRoot = await createTemporaryRoot("whitelily-fake-windows-");
@@ -930,8 +1091,10 @@ public static class SmokeWindowFixture {
     expect(report).toMatchObject({
       success: true,
       stages: [
+        "controller_identity_verified",
         "isolated_path",
         "hashes_verified",
+        "candidate_write_denied",
         "clean_installed",
         "clean_workspace_verified",
         "clean_delete_data",
@@ -942,6 +1105,7 @@ public static class SmokeWindowFixture {
         "keep_data",
         "reinstalled",
         "delete_data",
+        "candidate_principal_removed",
       ],
     });
   }, 180_000);
@@ -1018,7 +1182,7 @@ public static class SmokeWindowFixture {
     );
   }, 180_000);
 
-  it("closes the remote Sandbox session bound to the lifecycle configuration", async () => {
+  it("waits for the exact Sandbox process to release its mapped files", async () => {
     const fixture = await createRepositoryFixture();
     const releaseInstaller = await stageLifecycleInstallers(fixture);
     const fakeWindowsRoot = await createTemporaryRoot("whitelily-fake-windows-");
@@ -1045,7 +1209,7 @@ public static class SmokeWindowFixture {
     );
   }, 180_000);
 
-  it("does not close a Sandbox remote session bound to another configuration", async () => {
+  it("does not terminate an unrelated same-name Sandbox session process", async () => {
     const fixture = await createRepositoryFixture();
     const releaseInstaller = await stageLifecycleInstallers(fixture);
     const fakeWindowsRoot = await createTemporaryRoot("whitelily-fake-windows-");
@@ -1083,14 +1247,7 @@ public static class SmokeWindowFixture {
     );
     const unrelated = spawn(
       join(dirname(sandboxLauncher), "WindowsSandboxRemoteSession.exe"),
-      [
-        "--worker",
-        unrelatedConfiguration,
-        unrelatedReportRoot,
-        "a".repeat(64),
-        version,
-        "b".repeat(64),
-      ],
+      ["--sleeper"],
       {
         env: {
           ...fixture.environment,
@@ -1212,6 +1369,41 @@ public static class SmokeWindowFixture {
       "SANDBOX_LIFECYCLE_FAILED: forced guest failure",
     );
     expect(`${result.stdout}\n${result.stderr}`).toContain("SANDBOX_CLEANUP_FAILED:");
+  }, 180_000);
+
+  it("persists a trusted SYSTEM failure report for diagnosis", async () => {
+    const fixture = await createRepositoryFixture();
+    const releaseInstaller = await stageLifecycleInstallers(fixture);
+    const fakeWindowsRoot = await createTemporaryRoot("whitelily-fake-windows-");
+    await createDelegatingSandboxLauncher(fakeWindowsRoot);
+    const result = runPowerShell(
+      join(fixture.root, "scripts", "test-installer.ps1"),
+      ["-InstallerPath", releaseInstaller],
+      {
+        cwd: fixture.root,
+        env: {
+          ...fixture.environment,
+          WINDIR: fakeWindowsRoot,
+          WHITELILY_FAKE_SANDBOX_REPORT_ERROR: "forced trusted failure",
+        },
+        timeout: 120_000,
+      },
+    );
+
+    expect(result.status).not.toBe(0);
+    expect(`${result.stdout}\n${result.stderr}`).toContain(
+      "SANDBOX_LIFECYCLE_FAILED: forced trusted failure",
+    );
+    const persisted = JSON.parse(
+      await readFile(
+        join(fixture.root, "release", `WhiteLily-${version}-windows-x64-installer-lifecycle.json`),
+        "utf8",
+      ),
+    ) as Record<string, unknown>;
+    expect(persisted.schemaVersion).toBe(2);
+    expect(persisted.controllerSid).toBe("S-1-5-18");
+    expect(persisted.success).toBe(false);
+    expect(persisted.error).toBe("forced trusted failure");
   }, 180_000);
 
   it("embeds a working SHA-256 verifier in the guest lifecycle script", async () => {

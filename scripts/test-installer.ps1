@@ -24,6 +24,65 @@ function Get-Sha256Hex {
     }
 }
 
+function Get-HmacSha256Hex {
+    param(
+        [Parameter(Mandatory = $true)][string]$Payload,
+        [Parameter(Mandatory = $true)][string]$KeyHex
+    )
+    $key = [byte[]]::new($KeyHex.Length / 2)
+    for ($index = 0; $index -lt $key.Length; $index += 1) {
+        $key[$index] = [Convert]::ToByte($KeyHex.Substring($index * 2, 2), 16)
+    }
+    $hmac = [System.Security.Cryptography.HMACSHA256]::new($key)
+    try {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($Payload)
+        return [BitConverter]::ToString($hmac.ComputeHash($bytes)).Replace('-', '').ToLowerInvariant()
+    } finally {
+        $hmac.Dispose()
+        [Array]::Clear($key, 0, $key.Length)
+    }
+}
+
+function Test-FixedTimeHexEqual {
+    param([string]$Left, [string]$Right)
+    if ($null -eq $Left -or $null -eq $Right -or $Left.Length -ne $Right.Length) {
+        return $false
+    }
+    $difference = 0
+    for ($index = 0; $index -lt $Left.Length; $index += 1) {
+        $difference = $difference -bor ([int][char]$Left[$index] -bxor [int][char]$Right[$index])
+    }
+    return $difference -eq 0
+}
+
+function Get-TrustedSandboxEnvelope {
+    param(
+        [Parameter(Mandatory = $true)][string]$LiteralPath,
+        [Parameter(Mandatory = $true)][string]$KeyHex
+    )
+    if (-not (Test-Path -LiteralPath $LiteralPath -PathType Leaf)) { return $null }
+    try {
+        $envelope = Get-Content -LiteralPath $LiteralPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        $payload = [string]$envelope.payload
+        $receivedHmac = [string]$envelope.hmacSha256
+        if (
+            [int]$envelope.transportSchemaVersion -ne 1 -or
+            [string]::IsNullOrWhiteSpace($payload) -or
+            -not (Test-FixedTimeHexEqual `
+                -Left $receivedHmac `
+                -Right (Get-HmacSha256Hex -Payload $payload -KeyHex $KeyHex))
+        ) {
+            return $null
+        }
+        return [pscustomobject]@{
+            Payload = $payload
+            Report = $payload | ConvertFrom-Json
+        }
+    } catch {
+        return $null
+    }
+}
+
 function Resolve-FullPath {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
@@ -38,62 +97,6 @@ function Resolve-FullPath {
 function ConvertTo-XmlEscapedText {
     param([Parameter(Mandatory = $true)][string]$Value)
     return [System.Security.SecurityElement]::Escape($Value)
-}
-
-function Test-SandboxRemoteSessionIdentity {
-    param(
-        [Parameter(Mandatory = $true)]$Expected,
-        [Parameter(Mandatory = $true)]$Current,
-        [Parameter(Mandatory = $true)][string]$ConfigurationPath
-    )
-
-    if ($null -eq $Expected -or $null -eq $Current) {
-        return $false
-    }
-    if ([uint32]$Expected.ProcessId -ne [uint32]$Current.ProcessId) {
-        return $false
-    }
-    if (
-        -not [StringComparer]::OrdinalIgnoreCase.Equals(
-            [string]$Expected.Name,
-            [string]$Current.Name
-        ) -or
-        -not [StringComparer]::OrdinalIgnoreCase.Equals(
-            [string]$Current.Name,
-            'WindowsSandboxRemoteSession.exe'
-        )
-    ) {
-        return $false
-    }
-    if (-not [object]::Equals($Expected.CreationDate, $Current.CreationDate)) {
-        return $false
-    }
-
-    $expectedExecutable = [string]$Expected.ExecutablePath
-    $currentExecutable = [string]$Current.ExecutablePath
-    if (
-        [string]::IsNullOrWhiteSpace($expectedExecutable) -or
-        [string]::IsNullOrWhiteSpace($currentExecutable) -or
-        -not [StringComparer]::OrdinalIgnoreCase.Equals($expectedExecutable, $currentExecutable)
-    ) {
-        return $false
-    }
-
-    $expectedCommandLine = [string]$Expected.CommandLine
-    $currentCommandLine = [string]$Current.CommandLine
-    if (
-        [string]::IsNullOrWhiteSpace($expectedCommandLine) -or
-        [string]::IsNullOrWhiteSpace($currentCommandLine) -or
-        -not [StringComparer]::Ordinal.Equals($expectedCommandLine, $currentCommandLine) -or
-        $currentCommandLine.IndexOf(
-            $ConfigurationPath,
-            [StringComparison]::OrdinalIgnoreCase
-        ) -lt 0
-    ) {
-        return $false
-    }
-
-    return $true
 }
 
 $repositoryRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
@@ -196,25 +199,58 @@ $guestScriptPath = Join-Path $reportRoot 'guest-lifecycle.ps1'
 $sandboxResultPath = Join-Path $reportRoot 'sandbox-result.json'
 $sandboxConfigurationPath = Join-Path $sandboxRoot 'WhiteLily-installer-lifecycle.wsb'
 New-Item -ItemType Directory -Path $reportRoot -Force | Out-Null
+$reportKeyBytes = [byte[]]::new(32)
+$reportKeyGenerator = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+try {
+    $reportKeyGenerator.GetBytes($reportKeyBytes)
+    $reportKeyHex = [BitConverter]::ToString($reportKeyBytes).Replace('-', '').ToLowerInvariant()
+} finally {
+    $reportKeyGenerator.Dispose()
+    [Array]::Clear($reportKeyBytes, 0, $reportKeyBytes.Length)
+}
+$bootstrapSecretPath = Join-Path $reportRoot 'bootstrap-secret.txt'
+[System.IO.File]::WriteAllText(
+    $bootstrapSecretPath,
+    $reportKeyHex + "`n",
+    [System.Text.UTF8Encoding]::new($false)
+)
 
 $guestScript = @'
 [CmdletBinding()]
 param(
+    [ValidateSet('Bootstrap', 'Controller', 'Candidate')]
+    [string]$Mode = 'Bootstrap',
     [Parameter(Mandatory = $true)][string]$InstallerName,
     [Parameter(Mandatory = $true)][string]$InstallerSha256,
     [Parameter(Mandatory = $true)][string]$ExpectedVersion,
     [Parameter(Mandatory = $true)][string]$BaselineInstallerName,
     [Parameter(Mandatory = $true)][string]$BaselineInstallerSha256,
-    [Parameter(Mandatory = $true)][string]$BaselineVersion
+    [Parameter(Mandatory = $true)][string]$BaselineVersion,
+    [Parameter(Mandatory = $true)][string]$CandidateUsername,
+    [string]$CandidatePassword,
+    [string]$ExpectedCandidateSid,
+    [string]$CandidateOperation,
+    [string]$CandidateTarget
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
-$resultPath = 'C:\WhiteLilyReport\sandbox-result.json'
+$trustedControlRoot = 'C:\ProgramData\WhiteLilyLifecycle'
+$resultPath = Join-Path $trustedControlRoot 'sandbox-result.json'
+$brokerRequestPath = Join-Path $trustedControlRoot 'candidate-request.json'
+$brokerResponsePath = Join-Path $trustedControlRoot 'candidate-response.json'
+$brokerStopPath = Join-Path $trustedControlRoot 'candidate-broker.stop'
+$reportSecretPath = Join-Path $trustedControlRoot 'report-secret.txt'
+$mappedResultPath = 'C:\WhiteLilyReport\sandbox-result.json'
 $result = [ordered]@{
-    schemaVersion = 1
+    schemaVersion = 2
+    controllerSid = $null
+    candidateSid = $null
+    candidateReportWriteDenied = $false
     installerSha256 = $InstallerSha256
+    controllerObservedInstallerSha256 = $null
     expectedVersion = $ExpectedVersion
     baselineInstallerSha256 = $BaselineInstallerSha256
+    controllerObservedBaselineInstallerSha256 = $null
     installedVersion = $null
     managedWorkspaceResources = 0
     success = $false
@@ -231,6 +267,25 @@ function Get-Sha256Hex {
     } finally {
         $sha256.Dispose()
         $stream.Dispose()
+    }
+}
+function Get-ReportHmacSha256Hex {
+    param(
+        [Parameter(Mandatory = $true)][string]$Payload,
+        [Parameter(Mandatory = $true)][string]$KeyHex
+    )
+    $key = [byte[]]::new($KeyHex.Length / 2)
+    for ($index = 0; $index -lt $key.Length; $index += 1) {
+        $key[$index] = [Convert]::ToByte($KeyHex.Substring($index * 2, 2), 16)
+    }
+    $hmac = [System.Security.Cryptography.HMACSHA256]::new($key)
+    try {
+        return [BitConverter]::ToString(
+            $hmac.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($Payload))
+        ).Replace('-', '').ToLowerInvariant()
+    } finally {
+        $hmac.Dispose()
+        [Array]::Clear($key, 0, $key.Length)
     }
 }
 function Invoke-Process {
@@ -321,14 +376,14 @@ function Get-Uninstaller {
     return $matches[0].FullName
 }
 function Get-WhiteLilyProductEntries {
-    $entries = [Collections.Generic.List[object]]::new()
-    $registryRoots = @(
-        'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall',
-        'HKCU:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall',
-        'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall',
-        'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+    param(
+        [string[]]$RegistryRoots = @(
+            'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall',
+            'HKCU:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+        )
     )
-    foreach ($registryRoot in $registryRoots) {
+    $entries = [Collections.Generic.List[object]]::new()
+    foreach ($registryRoot in $RegistryRoots) {
         if (-not (Test-Path -LiteralPath $registryRoot -PathType Container)) { continue }
         foreach ($key in @(Get-ChildItem -LiteralPath $registryRoot -ErrorAction Stop)) {
             $entry = Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction Stop
@@ -352,9 +407,13 @@ function Get-WhiteLilyProductEntries {
 function Assert-WhiteLilyProductEntry {
     param(
         [Parameter(Mandatory = $true)][string]$ExpectedVersion,
-        [Parameter(Mandatory = $true)][string]$ProgramRoot
+        [Parameter(Mandatory = $true)][string]$ProgramRoot,
+        [string[]]$RegistryRoots = @(
+            'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall',
+            'HKCU:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+        )
     )
-    $entries = @(Get-WhiteLilyProductEntries)
+    $entries = @(Get-WhiteLilyProductEntries -RegistryRoots $RegistryRoots)
     if ($entries.Count -ne 1) {
         throw "expected exactly one WhiteLily product/uninstall entry, found $($entries.Count)"
     }
@@ -399,9 +458,57 @@ function Assert-WhiteLilyProductEntry {
     }
 }
 function Assert-NoWhiteLilyProductEntry {
-    $entries = @(Get-WhiteLilyProductEntries)
+    param(
+        [string[]]$RegistryRoots = @(
+            'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall',
+            'HKCU:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+        )
+    )
+    $entries = @(Get-WhiteLilyProductEntries -RegistryRoots $RegistryRoots)
     if ($entries.Count -ne 0) {
         throw "WhiteLily product/uninstall entry remained after uninstall: $($entries.Count)"
+    }
+}
+function Assert-WhiteLilyRemovalState {
+    param(
+        [Parameter(Mandatory = $true)][string]$ProgramRoot,
+        [Parameter(Mandatory = $true)][string]$DataRoot,
+        [Parameter(Mandatory = $true)][int]$ProductEntryCount,
+        [Parameter(Mandatory = $true)][bool]$KeepData,
+        [int]$TimeoutMilliseconds = 30000
+    )
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMilliseconds)
+    do {
+        $programRootExists = Test-Path -LiteralPath $ProgramRoot
+        $applicationExists = Test-Path -LiteralPath (Join-Path $ProgramRoot 'WhiteLily.exe')
+        $uninstallerExists = @(
+            Get-ChildItem -LiteralPath $ProgramRoot -File -Filter 'Uninstall*.exe' -ErrorAction SilentlyContinue
+        ).Count -ne 0
+        $dataRootExists = Test-Path -LiteralPath $DataRoot
+        $dataStateMatches = if ($KeepData) { $dataRootExists } else { -not $dataRootExists }
+        if (
+            -not $programRootExists -and
+            -not $applicationExists -and
+            -not $uninstallerExists -and
+            $ProductEntryCount -eq 0 -and
+            $dataStateMatches
+        ) {
+            return
+        }
+        Start-Sleep -Milliseconds 100
+    } while ([DateTime]::UtcNow -lt $deadline)
+
+    if ($programRootExists -or $applicationExists -or $uninstallerExists) {
+        throw 'WhiteLily program artifacts remained after uninstall'
+    }
+    if ($ProductEntryCount -ne 0) {
+        throw "WhiteLily product/uninstall entry remained after uninstall: $ProductEntryCount"
+    }
+    if ($KeepData -and -not $dataRootExists) {
+        throw 'Keep Data uninstall removed the WhiteLily data root'
+    }
+    if (-not $KeepData -and $dataRootExists) {
+        throw 'Delete Data uninstall preserved the WhiteLily data root'
     }
 }
 function Get-PortableWorkspaceFiles {
@@ -526,7 +633,381 @@ function Get-UninstallerUiProcessIds {
     }
     return $ids.ToArray()
 }
+function Get-CurrentPrincipalSid {
+    return [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+}
+function Get-CandidateSid {
+    $account = [Security.Principal.NTAccount]::new("$env:COMPUTERNAME\$CandidateUsername")
+    return $account.Translate([Security.Principal.SecurityIdentifier]).Value
+}
+function Get-CandidateProfileRoot {
+    param([Parameter(Mandatory = $true)][string]$Sid)
+    $profile = Get-CimInstance Win32_UserProfile -Filter "SID = '$Sid'" -ErrorAction SilentlyContinue
+    if ($null -ne $profile -and -not [string]::IsNullOrWhiteSpace([string]$profile.LocalPath)) {
+        return [string]$profile.LocalPath
+    }
+    return Join-Path 'C:\Users' $CandidateUsername
+}
+function Write-AtomicJson {
+    param(
+        [Parameter(Mandatory = $true)][string]$LiteralPath,
+        [Parameter(Mandatory = $true)]$Value
+    )
+    $temporaryPath = $LiteralPath + '.' + [Guid]::NewGuid().ToString('N') + '.tmp'
+    try {
+        [System.IO.File]::WriteAllText(
+            $temporaryPath,
+            ($Value | ConvertTo-Json -Depth 5 -Compress) + "`n",
+            [System.Text.UTF8Encoding]::new($false)
+        )
+        Move-Item -LiteralPath $temporaryPath -Destination $LiteralPath -Force
+    } finally {
+        Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue
+    }
+}
+function Get-CandidateProcessArguments {
+    param(
+        [Parameter(Mandatory = $true)][string]$Operation,
+        [Parameter(Mandatory = $true)][string]$CandidateSid,
+        [string]$Target
+    )
+    $arguments = '-NoProfile -ExecutionPolicy Bypass' +
+        ' -File "C:\WhiteLilyReport\guest-lifecycle.ps1"' +
+        ' -Mode Candidate' +
+        " -InstallerName `"$InstallerName`" -InstallerSha256 `"$InstallerSha256`"" +
+        " -ExpectedVersion `"$ExpectedVersion`"" +
+        " -BaselineInstallerName `"$BaselineInstallerName`"" +
+        " -BaselineInstallerSha256 `"$BaselineInstallerSha256`"" +
+        " -BaselineVersion `"$BaselineVersion`"" +
+        " -CandidateUsername `"$CandidateUsername`"" +
+        " -ExpectedCandidateSid `"$CandidateSid`"" +
+        " -CandidateOperation `"$Operation`""
+    if (-not [string]::IsNullOrWhiteSpace($Target)) {
+        $arguments += " -CandidateTarget `"$Target`""
+    }
+    return $arguments
+}
+function Invoke-CandidateBroker {
+    param(
+        [Parameter(Mandatory = $true)]$CandidateCredential,
+        [Parameter(Mandatory = $true)][string]$CandidateSid
+    )
+    $brokerSid = Get-CurrentPrincipalSid
+    if ([StringComparer]::Ordinal.Equals($brokerSid, 'S-1-5-18')) {
+        throw 'candidate broker must not run as SYSTEM'
+    }
+    $lastRequestId = $null
+    while (-not (Test-Path -LiteralPath $brokerStopPath -PathType Leaf)) {
+        if (-not (Test-Path -LiteralPath $brokerRequestPath -PathType Leaf)) {
+            Start-Sleep -Milliseconds 100
+            continue
+        }
+        $request = $null
+        $requestId = $null
+        try {
+            $request = Get-Content -LiteralPath $brokerRequestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+            $requestId = [string]$request.requestId
+            if (
+                [string]::IsNullOrWhiteSpace($requestId) -or
+                [StringComparer]::Ordinal.Equals($requestId, [string]$lastRequestId)
+            ) {
+                Start-Sleep -Milliseconds 100
+                continue
+            }
+            if (-not [StringComparer]::Ordinal.Equals([string]$request.controllerSid, 'S-1-5-18')) {
+                throw 'candidate request was not issued by SYSTEM'
+            }
+            $arguments = Get-CandidateProcessArguments `
+                -Operation ([string]$request.operation) `
+                -CandidateSid $CandidateSid `
+                -Target ([string]$request.target)
+            $process = Start-Process `
+                -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
+                -ArgumentList $arguments `
+                -Credential $CandidateCredential `
+                -LoadUserProfile `
+                -WorkingDirectory "$env:SystemRoot\Temp" `
+                -WindowStyle Hidden `
+                -Wait `
+                -PassThru
+            $response = [ordered]@{
+                requestId = $requestId
+                brokerSid = $brokerSid
+                exitCode = [int]$process.ExitCode
+                error = $null
+            }
+        } catch {
+            $response = [ordered]@{
+                requestId = $requestId
+                brokerSid = $brokerSid
+                exitCode = $null
+                error = $_.Exception.Message
+            }
+        }
+        Write-AtomicJson -LiteralPath $brokerResponsePath -Value $response
+        $lastRequestId = $requestId
+    }
+}
+function Invoke-CandidateProcess {
+    param(
+        [Parameter(Mandatory = $true)][string]$Operation,
+        [string]$Target,
+        [int]$ExpectedExitCode = 0
+    )
+    $requestId = [Guid]::NewGuid().ToString('N')
+    Remove-Item -LiteralPath $brokerResponsePath -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $brokerRequestPath -Force -ErrorAction SilentlyContinue
+    $request = [ordered]@{
+        requestId = $requestId
+        controllerSid = Get-CurrentPrincipalSid
+        operation = $Operation
+        target = $Target
+    }
+    try {
+        Write-AtomicJson -LiteralPath $brokerRequestPath -Value $request
+        $deadline = [DateTime]::UtcNow.AddMinutes(5)
+        while (-not (Test-Path -LiteralPath $brokerResponsePath -PathType Leaf)) {
+            if ([DateTime]::UtcNow -ge $deadline) {
+                throw "candidate operation $Operation broker response timed out"
+            }
+            Start-Sleep -Milliseconds 100
+        }
+        $response = Get-Content -LiteralPath $brokerResponsePath -Raw -Encoding UTF8 | ConvertFrom-Json
+        if (-not [StringComparer]::Ordinal.Equals([string]$response.requestId, $requestId)) {
+            throw "candidate operation $Operation received a mismatched broker response"
+        }
+        if (
+            [string]::IsNullOrWhiteSpace([string]$response.brokerSid) -or
+            [StringComparer]::Ordinal.Equals([string]$response.brokerSid, 'S-1-5-18') -or
+            [StringComparer]::Ordinal.Equals([string]$response.brokerSid, $script:CandidateSid)
+        ) {
+            throw "candidate operation $Operation received an invalid broker identity"
+        }
+        if (-not [string]::IsNullOrWhiteSpace([string]$response.error)) {
+            throw "candidate operation $Operation broker failed: $([string]$response.error)"
+        }
+        if ([int]$response.exitCode -ne $ExpectedExitCode) {
+            throw "candidate operation $Operation failed with exit code $([int]$response.exitCode)"
+        }
+    } finally {
+        Remove-Item -LiteralPath $brokerRequestPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $brokerResponsePath -Force -ErrorAction SilentlyContinue
+    }
+}
+function Enter-CandidateRegistryHive {
+    $sidRoot = "Registry::HKEY_USERS\$script:CandidateSid"
+    if (Test-Path -LiteralPath $sidRoot -PathType Container) {
+        return [pscustomobject]@{ Root = $sidRoot; Mounted = $false; MountName = $null }
+    }
+    $profileRoot = Get-CandidateProfileRoot -Sid $script:CandidateSid
+    $hivePath = Join-Path $profileRoot 'NTUSER.DAT'
+    if (-not (Test-Path -LiteralPath $hivePath -PathType Leaf)) {
+        throw 'candidate user registry hive is missing'
+    }
+    $mountName = 'WhiteLilyLifecycleHive'
+    $mountRoot = "Registry::HKEY_USERS\$mountName"
+    if (Test-Path -LiteralPath $mountRoot) {
+        & "$env:SystemRoot\System32\reg.exe" unload "HKU\$mountName" | Out-Null
+    }
+    & "$env:SystemRoot\System32\reg.exe" load "HKU\$mountName" $hivePath | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'candidate user registry hive could not be loaded' }
+    return [pscustomobject]@{ Root = $mountRoot; Mounted = $true; MountName = $mountName }
+}
+function Exit-CandidateRegistryHive {
+    param([Parameter(Mandatory = $true)]$Hive)
+    if (-not $Hive.Mounted) { return }
+    $unloadDeadline = [DateTime]::UtcNow.AddSeconds(30)
+    while ([DateTime]::UtcNow -lt $unloadDeadline) {
+        [GC]::Collect()
+        [GC]::WaitForPendingFinalizers()
+        $previousErrorActionPreference = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'Continue'
+            & "$env:SystemRoot\System32\reg.exe" `
+                unload `
+                "HKU\$($Hive.MountName)" 2>$null | Out-Null
+            $unloadExitCode = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $previousErrorActionPreference
+        }
+        if ($unloadExitCode -eq 0) { return }
+        Start-Sleep -Milliseconds 250
+    }
+    throw 'candidate user registry hive remained mounted after bounded unload'
+}
+function Get-CandidateRegistryRoots {
+    param([Parameter(Mandatory = $true)]$Hive)
+    return @(
+        "$($Hive.Root)\Software\Microsoft\Windows\CurrentVersion\Uninstall",
+        "$($Hive.Root)\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
+    )
+}
+function Assert-CandidateProductEntry {
+    param([Parameter(Mandatory = $true)][string]$Version, [Parameter(Mandatory = $true)][string]$ProgramRoot)
+    $hive = Enter-CandidateRegistryHive
+    try {
+        Assert-WhiteLilyProductEntry `
+            -ExpectedVersion $Version `
+            -ProgramRoot $ProgramRoot `
+            -RegistryRoots (Get-CandidateRegistryRoots $hive)
+    } finally {
+        Exit-CandidateRegistryHive $hive
+    }
+}
+function Get-CandidateProductEntryCount {
+    $hive = Enter-CandidateRegistryHive
+    try {
+        return @(Get-WhiteLilyProductEntries -RegistryRoots (Get-CandidateRegistryRoots $hive)).Count
+    } finally {
+        Exit-CandidateRegistryHive $hive
+    }
+}
+function Assert-CandidateRemoval {
+    param(
+        [Parameter(Mandatory = $true)][string]$ProgramRoot,
+        [Parameter(Mandatory = $true)][string]$DataRoot,
+        [Parameter(Mandatory = $true)][bool]$KeepData
+    )
+    Start-Sleep -Milliseconds 500
+    Assert-WhiteLilyRemovalState `
+        -ProgramRoot $ProgramRoot `
+        -DataRoot $DataRoot `
+        -ProductEntryCount (Get-CandidateProductEntryCount) `
+        -KeepData $KeepData
+}
+function Stop-CandidateProcesses {
+    $expectedUser = "$env:COMPUTERNAME\$CandidateUsername"
+    $deadline = [DateTime]::UtcNow.AddSeconds(30)
+    do {
+        $owned = @(
+            Get-Process -IncludeUserName -ErrorAction SilentlyContinue |
+                Where-Object {
+                    [StringComparer]::OrdinalIgnoreCase.Equals([string]$_.UserName, $expectedUser)
+                }
+        )
+        foreach ($process in $owned) {
+            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+        }
+        if ($owned.Count -eq 0) { return }
+        Start-Sleep -Milliseconds 250
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw 'candidate user processes remained after bounded cleanup'
+}
+
+if ($Mode -eq 'Bootstrap') {
+    try {
+        if ([string]::IsNullOrWhiteSpace($CandidatePassword)) {
+            throw 'candidate password is required for bootstrap'
+        }
+        $reportKeyHex = (
+            Get-Content -LiteralPath 'C:\WhiteLilyReport\bootstrap-secret.txt' -Raw -Encoding UTF8
+        ).Trim()
+        if ($reportKeyHex -notmatch '^[0-9a-f]{64}$') {
+            throw 'host lifecycle report key is invalid'
+        }
+        New-Item -ItemType Directory -Path $trustedControlRoot -Force | Out-Null
+        & "$env:SystemRoot\System32\icacls.exe" $trustedControlRoot `
+            '/inheritance:r' `
+            '/grant:r' `
+            '*S-1-5-18:(OI)(CI)F' `
+            '*S-1-5-32-544:(OI)(CI)F' | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw 'could not protect local lifecycle control directory' }
+        [System.IO.File]::WriteAllText(
+            $reportSecretPath,
+            $reportKeyHex + "`n",
+            [System.Text.UTF8Encoding]::new($false)
+        )
+        Remove-Item -LiteralPath 'C:\WhiteLilyReport\bootstrap-secret.txt' -Force
+        $previousErrorActionPreference = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'Continue'
+            $candidateCreationOutput = @(
+                & "$env:SystemRoot\System32\net.exe" `
+                    user `
+                    $CandidateUsername `
+                    $CandidatePassword `
+                    /add `
+                    /expires:never `
+                    /passwordchg:no 2>&1
+            )
+            $candidateCreationExitCode = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $previousErrorActionPreference
+        }
+        if ($candidateCreationExitCode -ne 0) {
+            throw "candidate user creation failed with exit code $candidateCreationExitCode`: $($candidateCreationOutput -join ' | ')"
+        }
+        $candidateSid = Get-CandidateSid
+        $administrators = @(Get-LocalGroupMember -Group 'Administrators' -ErrorAction Stop)
+        if (@($administrators | Where-Object { $_.SID.Value -eq $candidateSid }).Count -ne 0) {
+            throw 'candidate user unexpectedly belongs to Administrators'
+        }
+        $securePassword = ConvertTo-SecureString $CandidatePassword -AsPlainText -Force
+        $candidateCredential = [Management.Automation.PSCredential]::new(
+            "$env:COMPUTERNAME\$CandidateUsername",
+            $securePassword
+        )
+        $controllerArguments = '-NoProfile -ExecutionPolicy Bypass -File "C:\WhiteLilyReport\guest-lifecycle.ps1"' +
+            ' -Mode Controller' +
+            " -InstallerName `"$InstallerName`" -InstallerSha256 `"$InstallerSha256`"" +
+            " -ExpectedVersion `"$ExpectedVersion`"" +
+            " -BaselineInstallerName `"$BaselineInstallerName`"" +
+            " -BaselineInstallerSha256 `"$BaselineInstallerSha256`"" +
+            " -BaselineVersion `"$BaselineVersion`"" +
+            " -CandidateUsername `"$CandidateUsername`""
+        $action = New-ScheduledTaskAction `
+            -Execute "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
+            -Argument $controllerArguments
+        $principal = New-ScheduledTaskPrincipal `
+            -UserId 'SYSTEM' `
+            -LogonType ServiceAccount `
+            -RunLevel Highest
+        $trigger = New-ScheduledTaskTrigger -Once -At ([DateTime]::Now.AddMinutes(1))
+        Register-ScheduledTask `
+            -TaskName 'WhiteLilyInstallerLifecycle' `
+            -Action $action `
+            -Principal $principal `
+            -Trigger $trigger `
+            -Force | Out-Null
+        Start-ScheduledTask -TaskName 'WhiteLilyInstallerLifecycle'
+        Invoke-CandidateBroker `
+            -CandidateCredential $candidateCredential `
+            -CandidateSid $candidateSid
+    } catch {
+        [System.IO.File]::WriteAllText(
+            'C:\WhiteLilyReport\bootstrap-error.txt',
+            $_.Exception.ToString(),
+            [System.Text.UTF8Encoding]::new($false)
+        )
+        Start-Process `
+            -FilePath "$env:SystemRoot\System32\shutdown.exe" `
+            -ArgumentList @('/s', '/t', '0') `
+            -WindowStyle Hidden
+        exit 1
+    }
+    exit 0
+}
 try {
+    if ($Mode -eq 'Controller') {
+        $result.controllerSid = Get-CurrentPrincipalSid
+        if (-not [StringComparer]::Ordinal.Equals([string]$result.controllerSid, 'S-1-5-18')) {
+            throw 'trusted lifecycle controller is not running as SYSTEM'
+        }
+        $script:CandidateSid = Get-CandidateSid
+        $result.candidateSid = $script:CandidateSid
+        $result.stages.Add('controller_identity_verified')
+    }
+    if ($Mode -eq 'Candidate') {
+        if (
+            [string]::IsNullOrWhiteSpace($ExpectedCandidateSid) -or
+            -not [StringComparer]::Ordinal.Equals(
+                (Get-CurrentPrincipalSid),
+                $ExpectedCandidateSid
+            )
+        ) {
+            throw 'candidate process principal mismatch'
+        }
+    }
     $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
     $env:Path = $env:PATH
     foreach ($command in @('node', 'npm', 'git', 'codex')) {
@@ -546,10 +1027,20 @@ try {
     ) {
         throw 'mapped installer hash mismatch'
     }
+    if ($Mode -eq 'Controller') {
+        $result.controllerObservedInstallerSha256 = $actualHash
+        $result.controllerObservedBaselineInstallerSha256 = $actualBaselineHash
+    }
     $result.stages.Add('hashes_verified')
 
-    $programRoot = Join-Path $env:LOCALAPPDATA 'Programs\WhiteLily'
-    $dataRoot = Join-Path $env:LOCALAPPDATA 'WhiteLily'
+    $profileRoot = if ($Mode -eq 'Controller') {
+        Get-CandidateProfileRoot -Sid $script:CandidateSid
+    } else {
+        [Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile)
+    }
+    $localAppDataRoot = Join-Path $profileRoot 'AppData\Local'
+    $programRoot = Join-Path $localAppDataRoot 'Programs\WhiteLily'
+    $dataRoot = Join-Path $localAppDataRoot 'WhiteLily'
     $application = Join-Path $programRoot 'WhiteLily.exe'
 
     Add-Type -TypeDefinition @"
@@ -674,23 +1165,71 @@ public static class WhiteLilyInstallerUi {
         Assert-NoWhiteLilyProductEntry
     }
 
-    Invoke-Process $installer @('/S')
+    if ($Mode -eq 'Candidate') {
+        switch ($CandidateOperation) {
+            'forge_report' {
+                try {
+                    [System.IO.File]::WriteAllText(
+                        $resultPath,
+                        '{"forged":true}',
+                        [System.Text.UTF8Encoding]::new($false)
+                    )
+                    exit 91
+                } catch [System.UnauthorizedAccessException] {
+                    exit 73
+                }
+            }
+            'install' {
+                Invoke-Process $CandidateTarget @('/S')
+                exit 0
+            }
+            'smoke' {
+                Invoke-WhiteLilySmoke $CandidateTarget
+                exit 0
+            }
+            'uninstall_keep' {
+                Invoke-Process $CandidateTarget @('/S')
+                exit 0
+            }
+            'uninstall_delete' {
+                Invoke-DeleteDataUninstall -ProgramRoot $programRoot -DataRoot $dataRoot
+                exit 0
+            }
+            default { throw "unsupported candidate operation: $CandidateOperation" }
+        }
+    }
+
+    Invoke-CandidateProcess -Operation 'forge_report' -ExpectedExitCode 73
+    if (Test-Path -LiteralPath $resultPath) {
+        throw 'candidate user forged the trusted lifecycle report'
+    }
+    $result.candidateReportWriteDenied = $true
+    $result.stages.Add('candidate_write_denied')
+
+    $profileRoot = Get-CandidateProfileRoot -Sid $script:CandidateSid
+    $localAppDataRoot = Join-Path $profileRoot 'AppData\Local'
+    $programRoot = Join-Path $localAppDataRoot 'Programs\WhiteLily'
+    $dataRoot = Join-Path $localAppDataRoot 'WhiteLily'
+    $application = Join-Path $programRoot 'WhiteLily.exe'
+
+    Invoke-CandidateProcess -Operation 'install' -Target $installer
     if (-not (Test-Path -LiteralPath $application -PathType Leaf)) {
         throw 'WhiteLily application was not installed'
     }
-    Assert-WhiteLilyProductEntry -ExpectedVersion $ExpectedVersion -ProgramRoot $programRoot
+    Assert-CandidateProductEntry -Version $ExpectedVersion -ProgramRoot $programRoot
     $result.stages.Add('clean_installed')
-    Invoke-WhiteLilySmoke $application
+    Invoke-CandidateProcess -Operation 'smoke' -Target $application
     $result.managedWorkspaceResources = Assert-ManagedWorkspace `
         -ProgramRoot $programRoot `
         -DataRoot $dataRoot
     $result.stages.Add('clean_workspace_verified')
 
-    Invoke-DeleteDataUninstall -ProgramRoot $programRoot -DataRoot $dataRoot
+    Invoke-CandidateProcess -Operation 'uninstall_delete'
+    Assert-CandidateRemoval -ProgramRoot $programRoot -DataRoot $dataRoot -KeepData $false
     $result.stages.Add('clean_delete_data')
 
-    Invoke-Process $baselineInstaller @('/S')
-    Assert-WhiteLilyProductEntry -ExpectedVersion $BaselineVersion -ProgramRoot $programRoot
+    Invoke-CandidateProcess -Operation 'install' -Target $baselineInstaller
+    Assert-CandidateProductEntry -Version $BaselineVersion -ProgramRoot $programRoot
     $result.stages.Add('beta1_installed')
 
     New-Item -ItemType Directory -Path (Join-Path $dataRoot 'codex-workspace\.codex') -Force | Out-Null
@@ -718,13 +1257,13 @@ public static class WhiteLilyInstallerUi {
     )
     $result.stages.Add('beta1_data_root_prepared')
 
-    Invoke-Process $installer @('/S')
-    Assert-WhiteLilyProductEntry -ExpectedVersion $ExpectedVersion -ProgramRoot $programRoot
+    Invoke-CandidateProcess -Operation 'install' -Target $installer
+    Assert-CandidateProductEntry -Version $ExpectedVersion -ProgramRoot $programRoot
     if (-not (Test-Path -LiteralPath $marker -PathType Leaf)) {
         throw 'beta.1 data marker was removed during upgrade'
     }
     $result.stages.Add('beta1_upgraded')
-    Invoke-WhiteLilySmoke $application
+    Invoke-CandidateProcess -Operation 'smoke' -Target $application
     $result.managedWorkspaceResources = Assert-ManagedWorkspace `
         -ProgramRoot $programRoot `
         -DataRoot $dataRoot
@@ -734,49 +1273,93 @@ public static class WhiteLilyInstallerUi {
     $result.stages.Add('workspace_repaired')
 
     $uninstaller = Get-Uninstaller $programRoot
-    Invoke-Process $uninstaller @('/S')
-    Assert-NoWhiteLilyProductEntry
+    Invoke-CandidateProcess -Operation 'uninstall_keep' -Target $uninstaller
+    Assert-CandidateRemoval -ProgramRoot $programRoot -DataRoot $dataRoot -KeepData $true
     if (-not (Test-Path -LiteralPath $marker -PathType Leaf)) {
         throw 'silent Keep Data uninstall removed the beta.1 data marker'
     }
     $result.stages.Add('keep_data')
 
-    Invoke-Process $installer @('/S')
-    Assert-WhiteLilyProductEntry -ExpectedVersion $ExpectedVersion -ProgramRoot $programRoot
+    Invoke-CandidateProcess -Operation 'install' -Target $installer
+    Assert-CandidateProductEntry -Version $ExpectedVersion -ProgramRoot $programRoot
     if (-not (Test-Path -LiteralPath $marker -PathType Leaf)) {
         throw 'reinstall did not preserve the beta.1 data marker'
     }
-    Invoke-WhiteLilySmoke $application
+    Invoke-CandidateProcess -Operation 'smoke' -Target $application
     $result.managedWorkspaceResources = Assert-ManagedWorkspace `
         -ProgramRoot $programRoot `
         -DataRoot $dataRoot
     $result.installedVersion = $ExpectedVersion
     $result.stages.Add('reinstalled')
 
-    Invoke-DeleteDataUninstall -ProgramRoot $programRoot -DataRoot $dataRoot
+    Invoke-CandidateProcess -Operation 'uninstall_delete'
+    Assert-CandidateRemoval -ProgramRoot $programRoot -DataRoot $dataRoot -KeepData $false
     $result.stages.Add('delete_data')
     $result.success = $true
 } catch {
     $result.error = $_.Exception.Message
+    if ($Mode -eq 'Candidate') { exit 92 }
 } finally {
-    $utf8 = [System.Text.UTF8Encoding]::new($false)
-    [System.IO.File]::WriteAllText(
-        $resultPath,
-        ($result | ConvertTo-Json -Depth 5 -Compress) + "`n",
-        $utf8
-    )
-    Start-Process -FilePath "$env:SystemRoot\System32\shutdown.exe" -ArgumentList @('/s', '/t', '0') -WindowStyle Hidden
+    if ($Mode -eq 'Controller') {
+        try {
+            Stop-CandidateProcesses
+            & "$env:SystemRoot\System32\net.exe" user $CandidateUsername /delete | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'could not remove disposable candidate user' }
+            $result.stages.Add('candidate_principal_removed')
+        } catch {
+            $result.success = $false
+            if ([string]::IsNullOrWhiteSpace([string]$result.error)) {
+                $result.error = $_.Exception.Message
+            }
+        }
+        Unregister-ScheduledTask `
+            -TaskName 'WhiteLilyInstallerLifecycle' `
+            -Confirm:$false `
+            -ErrorAction SilentlyContinue
+        [System.IO.File]::WriteAllText(
+            $brokerStopPath,
+            "stop`n",
+            [System.Text.UTF8Encoding]::new($false)
+        )
+        & "$env:SystemRoot\System32\icacls.exe" $trustedControlRoot `
+            '/inheritance:r' `
+            '/grant:r' `
+            '*S-1-5-18:(OI)(CI)F' `
+            '*S-1-5-32-544:(OI)(CI)F' | Out-Null
+        $utf8 = [System.Text.UTF8Encoding]::new($false)
+        $payload = $result | ConvertTo-Json -Depth 5 -Compress
+        [System.IO.File]::WriteAllText(
+            $resultPath,
+            $payload + "`n",
+            $utf8
+        )
+        $reportKeyHex = (Get-Content -LiteralPath $reportSecretPath -Raw -Encoding UTF8).Trim()
+        $envelope = [ordered]@{
+            transportSchemaVersion = 1
+            payload = $payload
+            hmacSha256 = Get-ReportHmacSha256Hex -Payload $payload -KeyHex $reportKeyHex
+        }
+        Write-AtomicJson -LiteralPath $mappedResultPath -Value $envelope
+        Start-Process `
+            -FilePath "$env:SystemRoot\System32\shutdown.exe" `
+            -ArgumentList @('/s', '/t', '0') `
+            -WindowStyle Hidden
+    }
 }
 '@
 $utf8 = [System.Text.UTF8Encoding]::new($false)
 [System.IO.File]::WriteAllText($guestScriptPath, $guestScript, $utf8)
 
+$candidateUsername = 'WhiteLilyCandidate'
+$candidatePassword = 'WL!' + [Guid]::NewGuid().ToString('N').Substring(0, 11)
 $guestCommand = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\WhiteLilyReport\guest-lifecycle.ps1"' +
+    ' -Mode Bootstrap' +
     " -InstallerName `"$installerName`" -InstallerSha256 `"$installerHash`"" +
     " -ExpectedVersion `"$version`"" +
     " -BaselineInstallerName `"$([System.IO.Path]::GetFileName($resolvedBaselineInstaller))`"" +
     " -BaselineInstallerSha256 `"$baselineInstallerHash`"" +
-    " -BaselineVersion `"$baselineVersion`""
+    " -BaselineVersion `"$baselineVersion`"" +
+    " -CandidateUsername `"$candidateUsername`" -CandidatePassword `"$candidatePassword`""
 $configuration = @"
 <Configuration>
   <MappedFolders>
@@ -807,6 +1390,7 @@ $sandboxProcess = $null
 $lifecycleError = $null
 $cleanupError = $null
 $lifecycleOutput = $null
+$allowSandboxCleanup = $false
 try {
     try {
         $sandboxProcess = Start-Process `
@@ -817,21 +1401,84 @@ try {
         throw 'WINDOWS_SANDBOX_REQUIRED'
     }
 
-    $deadline = [DateTime]::UtcNow.AddMinutes(20)
-    while (-not (Test-Path -LiteralPath $sandboxResultPath -PathType Leaf)) {
+    $sandboxTimeoutSeconds = 1200
+    if (
+        -not [string]::IsNullOrWhiteSpace($env:WHITELILY_SANDBOX_TIMEOUT_SECONDS) -and
+        -not [int]::TryParse(
+            $env:WHITELILY_SANDBOX_TIMEOUT_SECONDS,
+            [ref]$sandboxTimeoutSeconds
+        )
+    ) {
+        throw 'INVALID_SANDBOX_TIMEOUT'
+    }
+    $deadline = [DateTime]::UtcNow.AddSeconds($sandboxTimeoutSeconds)
+    $bootstrapErrorPath = Join-Path $reportRoot 'bootstrap-error.txt'
+    $trustedEnvelope = $null
+    while ($null -eq $trustedEnvelope) {
+        $trustedEnvelope = Get-TrustedSandboxEnvelope `
+            -LiteralPath $sandboxResultPath `
+            -KeyHex $reportKeyHex
+        if ($null -ne $trustedEnvelope) { break }
         if ([DateTime]::UtcNow -ge $deadline) {
-            throw 'SANDBOX_LIFECYCLE_TIMEOUT'
+            if ($sandboxProcess.HasExited) {
+                throw "SANDBOX_LIFECYCLE_REPORT_MISSING: close the Windows Sandbox window manually; mapped lifecycle artifacts were retained at $sandboxRoot"
+            }
+            throw "SANDBOX_LIFECYCLE_TIMEOUT: close the exact Windows Sandbox window manually; mapped lifecycle artifacts were retained at $sandboxRoot"
         }
         if ($sandboxProcess.HasExited -and $sandboxProcess.ExitCode -ne 0) {
-            throw 'SANDBOX_LIFECYCLE_REPORT_MISSING'
+            throw "SANDBOX_LIFECYCLE_PROCESS_FAILED: $($sandboxProcess.ExitCode)"
+        }
+        if (Test-Path -LiteralPath $bootstrapErrorPath -PathType Leaf) {
+            $bootstrapError = Get-Content -LiteralPath $bootstrapErrorPath -Raw -Encoding UTF8
+            throw "SANDBOX_LIFECYCLE_BOOTSTRAP_FAILED: $bootstrapError"
         }
         Start-Sleep -Seconds 2
     }
+    $sandboxProcessDeadline = [DateTime]::UtcNow.AddMinutes(2)
+    while (-not $sandboxProcess.HasExited) {
+        if ([DateTime]::UtcNow -ge $sandboxProcessDeadline) {
+            throw "SANDBOX_PROCESS_TIMEOUT: close the exact Windows Sandbox process manually; mapped lifecycle artifacts were retained at $sandboxRoot"
+        }
+        Start-Sleep -Milliseconds 250
+    }
+    if ($sandboxProcess.ExitCode -ne 0) {
+        throw "SANDBOX_LIFECYCLE_PROCESS_FAILED: $($sandboxProcess.ExitCode)"
+    }
+    $allowSandboxCleanup = $true
 
-    $report = Get-Content -LiteralPath $sandboxResultPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    $report = $trustedEnvelope.Report
+    if (
+        [int]$report.schemaVersion -ne 2 -or
+        -not [StringComparer]::Ordinal.Equals([string]$report.controllerSid, 'S-1-5-18') -or
+        -not ([string]$report.candidateSid).StartsWith('S-1-5-21-', [StringComparison]::Ordinal) -or
+        -not [StringComparer]::Ordinal.Equals([string]$report.installerSha256, $installerHash) -or
+        -not [StringComparer]::Ordinal.Equals(
+            [string]$report.controllerObservedInstallerSha256,
+            $installerHash
+        ) -or
+        -not [StringComparer]::Ordinal.Equals([string]$report.expectedVersion, $version) -or
+        -not [StringComparer]::Ordinal.Equals(
+            [string]$report.baselineInstallerSha256,
+            $baselineInstallerHash
+        ) -or
+        -not [StringComparer]::Ordinal.Equals(
+            [string]$report.controllerObservedBaselineInstallerSha256,
+            $baselineInstallerHash
+        )
+    ) {
+        throw 'SANDBOX_LIFECYCLE_UNTRUSTED_REPORT'
+    }
+    [System.IO.File]::WriteAllText(
+        $resolvedReport,
+        $trustedEnvelope.Payload + "`n",
+        [System.Text.UTF8Encoding]::new($false)
+    )
+
     $expectedStages = @(
+        'controller_identity_verified',
         'isolated_path',
         'hashes_verified',
+        'candidate_write_denied',
         'clean_installed',
         'clean_workspace_verified',
         'clean_delete_data',
@@ -841,17 +1488,12 @@ try {
         'workspace_repaired',
         'keep_data',
         'reinstalled',
-        'delete_data'
+        'delete_data',
+        'candidate_principal_removed'
     )
     $actualStages = @($report.stages | ForEach-Object { [string]$_ })
     if (
-        [int]$report.schemaVersion -ne 1 -or
-        -not [StringComparer]::Ordinal.Equals([string]$report.installerSha256, $installerHash) -or
-        -not [StringComparer]::Ordinal.Equals([string]$report.expectedVersion, $version) -or
-        -not [StringComparer]::Ordinal.Equals(
-            [string]$report.baselineInstallerSha256,
-            $baselineInstallerHash
-        ) -or
+        $report.candidateReportWriteDenied -ne $true -or
         -not [StringComparer]::Ordinal.Equals([string]$report.installedVersion, $version) -or
         [int]$report.managedWorkspaceResources -ne 3 -or
         $report.success -ne $true -or
@@ -859,59 +1501,13 @@ try {
     ) {
         throw "SANDBOX_LIFECYCLE_FAILED: $([string]$report.error)"
     }
-    Copy-Item -LiteralPath $sandboxResultPath -Destination $resolvedReport -Force
     $lifecycleOutput = $report | ConvertTo-Json -Compress
 } catch {
     $lifecycleError = $_
 } finally {
     try {
-        if ($null -ne $sandboxProcess -and -not $sandboxProcess.HasExited) {
-            try {
-                $sandboxProcess.Kill()
-                $sandboxProcess.WaitForExit()
-            } catch {
-                # The launcher may exit between HasExited and Kill.
-            }
-        }
-        $boundRemoteSessions = @(
-            Get-CimInstance Win32_Process `
-                -Filter "Name = 'WindowsSandboxRemoteSession.exe'" `
-                -ErrorAction SilentlyContinue |
-                Where-Object {
-                    -not [string]::IsNullOrWhiteSpace([string]$_.CommandLine) -and
-                    ([string]$_.CommandLine).IndexOf(
-                        $sandboxConfigurationPath,
-                        [StringComparison]::OrdinalIgnoreCase
-                    ) -ge 0
-                }
-        )
-        foreach ($expectedRemoteSession in $boundRemoteSessions) {
-            $remoteProcess = $null
-            try {
-                $remoteProcess = Get-Process -Id $expectedRemoteSession.ProcessId -ErrorAction Stop
-                # Opening Handle binds this object to the current OS process before identity is revalidated.
-                $remoteProcess.Handle | Out-Null
-                $currentRemoteSession = Get-CimInstance Win32_Process `
-                    -Filter "ProcessId = $($expectedRemoteSession.ProcessId)" `
-                    -ErrorAction Stop
-                if (
-                    Test-SandboxRemoteSessionIdentity `
-                        -Expected $expectedRemoteSession `
-                        -Current $currentRemoteSession `
-                        -ConfigurationPath $sandboxConfigurationPath
-                ) {
-                    $remoteProcess.Kill()
-                    $remoteProcess.WaitForExit()
-                }
-            } catch {
-                # A session may exit while the lifecycle report is being processed.
-            } finally {
-                if ($null -ne $remoteProcess) {
-                    $remoteProcess.Dispose()
-                }
-            }
-        }
         if (
+            $allowSandboxCleanup -and
             (Test-Path -LiteralPath $sandboxRoot) -and
             $sandboxRoot.StartsWith($sandboxPrefix, [StringComparison]::OrdinalIgnoreCase)
         ) {

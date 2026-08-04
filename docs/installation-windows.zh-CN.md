@@ -152,7 +152,9 @@ WhiteLily 只做只读发现，不替你安装或启动 PCL2。请从 PCL2 官�
 
 公开的 `v0.1.1` CLI ZIP 是旧版开发者预览，确实要求 Node.js、npm、Git/源码工作区和 Codex CLI。它的要求不适用于 `v0.2.0-beta.2` 桌面安装包。
 
-## 12. 已知 Beta 限制
+维护者验证安装包时，生命周期测试会在 Windows Sandbox 中建立真实的 Windows 主体边界：可信控制器以 `SYSTEM` 运行，交互式引导进程只充当受信任的启动代理，安装包、应用和卸载程序始终以一次性的标准本地候选用户运行。报告与控制状态位于 guest 本地的 SYSTEM/Administrators-only 目录；候选用户的恶意写入探针必须得到 AccessDenied。由于 Sandbox 映射目录不能作为 guest ACL 的安全边界，最终 schema 2 报告通过一次性 256-bit 主机密钥生成 HMAC-SHA256 信封传回，主机只把验签成功的信封视为完成信号，并把解包后的报告持久化。控制器直接核对候选用户的 per-user 安装目录、数据目录、注册表 hive、安装包哈希和全部 15 个阶段，并在候选用户被删除后才签出报告。主机只跟踪它启动的那个 `WindowsSandbox.exe` 进程，不会按进程名枚举或终止其他 Sandbox 会话。保留数据和删除数据两种卸载都必须在有限等待后证明程序目录、`WhiteLily.exe`、卸载器和注册表项已经消失。
+
+## 13. 已知 Beta 限制
 
 - 仅支持同一台电脑上 `127.0.0.1` 的 Minecraft Java 1.21.5 LAN 世界；不支持远程主机。
 - 模型列表、响应速度和使用额度由当前 ChatGPT/Codex 账户决定；没有 Platform API 密钥回退。

@@ -152,7 +152,9 @@ Do not disable system protection. Recheck the official download source and SHA-2
 
 The published `v0.1.1` CLI ZIP is an older developer preview and does require Node.js, npm, a Git/source workspace, and Codex CLI. Those requirements do not apply to the `v0.2.0-beta.2` desktop installer.
 
-## 12. Known Beta limits
+For maintainer installer validation, the lifecycle test establishes a real Windows principal boundary inside Windows Sandbox: the trusted controller runs as `SYSTEM`, an interactive bootstrap process acts only as a trusted launch broker, and the installer, application, and uninstaller always run as a disposable standard local candidate user. Report and control state live in a guest-local SYSTEM/Administrators-only directory, and the candidate's malicious write probe must receive AccessDenied. Because a Sandbox mapped folder is not treated as a guest ACL security boundary, the final schema 2 report returns inside an HMAC-SHA256 envelope made with a one-time 256-bit host key; the host accepts only a verified envelope as the completion signal and persists the decoded report. The controller directly verifies the candidate's per-user installation tree, data tree, registry hive, installer hashes, and all 15 stages, and signs the report only after removing the candidate user. The host tracks only the exact `WindowsSandbox.exe` process it started and never enumerates or terminates other Sandbox sessions by process name. Both Keep Data and Delete Data uninstall paths must prove after a bounded wait that the program root, `WhiteLily.exe`, uninstaller, and registry entry are absent.
+
+## 13. Known Beta limits
 
 - Only same-machine `127.0.0.1` Minecraft Java 1.21.5 LAN worlds are supported; remote hosts are not supported.
 - Model catalog, response latency, and usage limits depend on the current ChatGPT/Codex account; there is no Platform API-key fallback.
