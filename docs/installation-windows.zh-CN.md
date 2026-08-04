@@ -2,7 +2,7 @@
 
 [English](installation-windows.md)
 
-> **状态：`v0.2.0-beta.2` Public Beta 候选。** 它把模型热切换和 Minecraft 动作工作区合并进一个未签名的 Windows x64 安装包。该候选已通过隔离清洁安装、beta.1 原位升级、工作区修复、数据保留、卸载与重装检查；真实游戏动作只在已确认可丢弃的 Minecraft Java 1.21.5 LAN 世界中验收。请严格核对 SHA-256。
+> **状态：`v0.2.0-beta.2` Public Beta 候选。** 它把模型热切换和 Minecraft 动作工作区合并进一个未签名的 Windows x64 安装包。该候选已通过隔离清洁安装、beta.1 原位升级、工作区修复、数据保留、卸载与重装检查；真实游戏动作只在已确认可丢弃的 Minecraft Java 1.21.5 LAN 世界中验收。请严格核对 SHA-256。当前已公开发布的桌面版本仍是 `v0.2.0-beta.1`；beta.2 在完成剩余门禁前不会发布。
 
 已发布的 `v0.1.1` 是面向开发者和早期测试者的旧版 CLI ZIP 预览，需要系统开发工具；它不是下面介绍的桌面 EXE 安装包。
 

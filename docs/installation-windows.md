@@ -2,7 +2,7 @@
 
 [中文](installation-windows.zh-CN.md)
 
-> **Status: `v0.2.0-beta.2` Public Beta candidate.** It combines model hot switching and the Minecraft action workspace in one unsigned Windows x64 installer. This candidate passed isolated clean installation, in-place beta.1 upgrade, workspace repair, data-preservation, uninstall, and reinstall checks. Real game actions are accepted only in a confirmed disposable Minecraft Java 1.21.5 LAN world. Verify its SHA-256.
+> **Status: `v0.2.0-beta.2` Public Beta candidate.** It combines model hot switching and the Minecraft action workspace in one unsigned Windows x64 installer. This candidate passed isolated clean installation, in-place beta.1 upgrade, workspace repair, data-preservation, uninstall, and reinstall checks. Real game actions are accepted only in a confirmed disposable Minecraft Java 1.21.5 LAN world. Verify its SHA-256. The latest publicly released desktop build remains `v0.2.0-beta.1`; beta.2 will not be published before its remaining gates pass.
 
 The published `v0.1.1` is an older CLI ZIP preview for developers and early testers. It requires system development tools and is not the desktop EXE described below.
 

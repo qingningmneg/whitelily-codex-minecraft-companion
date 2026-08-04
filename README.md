@@ -6,9 +6,9 @@
 
 ### Windows 安装包（v0.2.0-beta.2）
 
-> **发布状态：Public Beta 候选。** `v0.2.0-beta.2` 只提供一个 Windows x64 EXE，合并模型热切换与 Minecraft 动作工作区修复。该候选已通过安装包解包校验、Windows Sandbox 清洁安装、beta.1 原位升级、工作区修复、数据保留、卸载与重装验收；真实游戏动作仍必须在已确认可丢弃的 Minecraft Java 1.21.5 LAN 世界中验证。
+> **发布状态：Public Beta 候选。** `v0.2.0-beta.2` 只提供一个 Windows x64 EXE，合并模型热切换与 Minecraft 动作工作区修复。该候选已通过安装包解包校验、Windows Sandbox 清洁安装、beta.1 原位升级、工作区修复、数据保留、卸载与重装验收；真实游戏动作仍必须在已确认可丢弃的 Minecraft Java 1.21.5 LAN 世界中验证。当前已公开发布的桌面版本仍是 [`v0.2.0-beta.1`](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/releases/tag/v0.2.0-beta.1)；beta.2 在完成剩余门禁前不会发布。
 
-从官方 [GitHub Releases](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/releases) 同时下载：
+`v0.2.0-beta.2` 发布后，从官方 [GitHub Releases](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/releases) 同时下载：
 
 - [`WhiteLily-0.2.0-beta.2-windows-x64-setup.exe`](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/releases/download/v0.2.0-beta.2/WhiteLily-0.2.0-beta.2-windows-x64-setup.exe)
 - [`WhiteLily-0.2.0-beta.2-windows-x64-setup.exe.sha256`](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/releases/download/v0.2.0-beta.2/WhiteLily-0.2.0-beta.2-windows-x64-setup.exe.sha256)
@@ -21,7 +21,7 @@
 
 WhiteLily（白百合）是一个面向 Minecraft Java 版的本地 AI 伙伴运行时。它通过 Mineflayer 以机器人身份加入 Minecraft 世界，让主人直接在游戏聊天框中与本机已登录的 Codex 交互。它不是 Minecraft 客户端模组，也不替代启动器。
 
-**当前状态：Public Beta。** 当前发布候选是 **v0.2.0-beta.2**，提供按用户安装的单一 Windows x64 EXE。旧版 [`v0.1.1`](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/releases/tag/v0.1.1) CLI ZIP 仍保留给开发者参考，但它不是桌面安装器。
+**当前状态：Public Beta。** 最新公开版本是 **v0.2.0-beta.1**；当前发布候选是 **v0.2.0-beta.2**，提供按用户安装的单一 Windows x64 EXE。旧版 [`v0.1.1`](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/releases/tag/v0.1.1) CLI ZIP 仍保留给开发者参考，但它不是桌面安装器。
 
 `v0.2.0-beta.2` 包含 Electron 控制中心、ChatGPT 登录与状态恢复、可持久化的模型热切换、只读 PCL2 发现、Minecraft LAN 检测与确认、主人身份在线切换，以及自动部署和修复的 Minecraft 动作工作区。它仍应只在可丢弃世界中试用。
 
@@ -176,9 +176,9 @@ npm run build
 
 ### Windows installer (v0.2.0-beta.2)
 
-> **Release status: Public Beta candidate.** `v0.2.0-beta.2` is one Windows x64 EXE combining persistent model hot switching and Minecraft action-workspace repair. This candidate passed extraction inspection, clean Windows Sandbox installation, in-place beta.1 upgrade, workspace repair, data-preservation, uninstall, and reinstall checks. Real actions must still be accepted only in a confirmed disposable Minecraft Java 1.21.5 LAN world.
+> **Release status: Public Beta candidate.** `v0.2.0-beta.2` is one Windows x64 EXE combining persistent model hot switching and Minecraft action-workspace repair. This candidate passed extraction inspection, clean Windows Sandbox installation, in-place beta.1 upgrade, workspace repair, data-preservation, uninstall, and reinstall checks. Real actions must still be accepted only in a confirmed disposable Minecraft Java 1.21.5 LAN world. The latest publicly released desktop build remains [`v0.2.0-beta.1`](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/releases/tag/v0.2.0-beta.1); beta.2 will not be published before its remaining gates pass.
 
-Download both assets from the official [GitHub Releases](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/releases) page:
+After `v0.2.0-beta.2` is published, download both assets from the official [GitHub Releases](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/releases) page:
 
 - [`WhiteLily-0.2.0-beta.2-windows-x64-setup.exe`](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/releases/download/v0.2.0-beta.2/WhiteLily-0.2.0-beta.2-windows-x64-setup.exe)
 - [`WhiteLily-0.2.0-beta.2-windows-x64-setup.exe.sha256`](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/releases/download/v0.2.0-beta.2/WhiteLily-0.2.0-beta.2-windows-x64-setup.exe.sha256)
@@ -191,7 +191,7 @@ The installer bundles Electron, the WhiteLily child runtime, and an exact Codex 
 
 WhiteLily is a local AI companion runtime for Minecraft Java Edition. It joins a Minecraft world as a Mineflayer bot and lets the configured owner interact with a locally authenticated Codex session from the normal in-game chat. It is not a Minecraft client mod and does not replace the launcher.
 
-**Current status: Public Beta.** The current release candidate is **v0.2.0-beta.2**, with one per-user Windows x64 installer. The older [`v0.1.1`](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/releases/tag/v0.1.1) CLI ZIP remains available for developer reference, but it is not the desktop installer.
+**Current status: Public Beta.** The latest public release is **v0.2.0-beta.1**; the current release candidate is **v0.2.0-beta.2**, with one per-user Windows x64 installer. The older [`v0.1.1`](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/releases/tag/v0.1.1) CLI ZIP remains available for developer reference, but it is not the desktop installer.
 
 `v0.2.0-beta.2` includes the Electron control center, ChatGPT sign-in and recovery, persistent model hot switching, read-only PCL2 discovery, Minecraft LAN detection and confirmation, live owner changes, and automatically provisioned and repaired Minecraft action workspace. It should still be used only with a disposable world.
 
