@@ -52,6 +52,7 @@ interface BotHandlers {
   playerLeft: (player: { username: string }) => void;
   spawn: () => void;
   error: (error: Error) => void;
+  kicked: (reason: string, loggedIn: boolean) => void;
   login: (packet: unknown) => void;
   respawn: (packet: unknown) => void;
   death: () => void;
@@ -75,6 +76,10 @@ function abortError(): Error {
 
 function swallowLateBotError(): void {
   // A detached Mineflayer bot may still forward a delayed client/plugin error.
+}
+
+function swallowLateBotKick(): void {
+  // Keep the protocol rejection payload private and absorb detached repeats.
 }
 
 function trustedResourceIdentity(value: unknown): string | undefined {
@@ -124,6 +129,7 @@ export class MineflayerConnection {
   private botHandlers: BotHandlers | undefined;
   private readonly listeners = new Set<(event: MineflayerConnectionEvent) => void>();
   private readonly activeOperations = new Set<() => void>();
+  private readonly failingBots = new WeakSet<Bot>();
   private retryTimer: unknown;
   private retryIndex = 0;
   private outageNotified = false;
@@ -271,6 +277,7 @@ export class MineflayerConnection {
         this.emitForBot(bot, { kind: "owner_offline", username: player.username }),
       spawn: () => this.handleSpawn(bot),
       error: () => this.handleError(bot),
+      kicked: () => this.handleKicked(bot),
       login: (packet) => this.handleLogin(bot, packet),
       respawn: (packet) => this.handleRespawn(bot, packet),
       death: () => this.emitForBot(bot, { kind: "death" }),
@@ -285,6 +292,8 @@ export class MineflayerConnection {
     this.botHandlers = handlers;
     bot.on("error", swallowLateBotError);
     bot.once("error", handlers.error);
+    bot.on("kicked", swallowLateBotKick);
+    bot.once("kicked", handlers.kicked);
     bot.on("chat", handlers.chat);
     bot.on("playerJoined", handlers.playerJoined);
     bot.on("playerLeft", handlers.playerLeft);
@@ -309,9 +318,11 @@ export class MineflayerConnection {
     this.tryCleanup(() => bot.removeListener("playerLeft", handlers.playerLeft));
     this.tryCleanup(() => bot.removeListener("spawn", handlers.spawn));
     this.tryCleanup(() => bot.removeListener("error", handlers.error));
+    this.tryCleanup(() => bot.removeListener("kicked", handlers.kicked));
     // Keep swallowLateBotError attached after lifecycle teardown. Mineflayer can
     // forward a delayed client/plugin error after the transport begins closing,
-    // and Node throws an `error` event that has no listener.
+    // and Node throws an `error` event that has no listener. The kicked sink is
+    // likewise persistent so repeated or delayed rejection payloads stay inert.
     this.tryCleanup(() => bot.removeListener("death", handlers.death));
     this.tryCleanup(() => bot.removeListener("end", handlers.end));
     this.tryCleanup(() => bot.removeListener("entitySpawn", handlers.entitySpawn));
@@ -365,14 +376,23 @@ export class MineflayerConnection {
   }
 
   private handleError(bot: Bot): void {
+    this.handleConnectionFailure(bot, "Minecraft connection error");
+  }
+
+  private handleKicked(bot: Bot): void {
+    this.handleConnectionFailure(bot, "Minecraft connection rejected");
+  }
+
+  private handleConnectionFailure(bot: Bot, reason: string): void {
     if (
       this.bot !== bot ||
       this.lifecycleState === "stopped" ||
-      this.lifecycleState === "exhausted"
+      this.lifecycleState === "exhausted" ||
+      this.failingBots.has(bot)
     ) {
       return;
     }
-    const reason = "Minecraft connection error";
+    this.failingBots.add(bot);
     this.safelyStopBot(bot);
     const fenceErrors = this.establishTransportFence(bot, reason);
     if (fenceErrors.length > 0) {

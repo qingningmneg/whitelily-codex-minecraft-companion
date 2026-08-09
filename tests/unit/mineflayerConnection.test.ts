@@ -72,6 +72,9 @@ function createMineflayerConnectionHarness(options?: {
     end(reason: string, index = bots.length - 1) {
       bots[index]?.emit("end", reason);
     },
+    kick(reason: string, loggedIn: boolean, index = bots.length - 1) {
+      bots[index]?.emit("kicked", reason, loggedIn);
+    },
     spawn(index = bots.length - 1) {
       bots[index]?.emit("spawn");
     },
@@ -232,6 +235,103 @@ describe("MineflayerConnection", () => {
 
     expect(() => bot.emit("error", new Error("late private stack"))).not.toThrow();
     expect(bot.end).toHaveBeenCalledTimes(1);
+    expect(events).toEqual(["connected", "outage"]);
+    expect(harness.scheduledDelays()).toEqual([1_000]);
+  });
+
+  it("fences every pre-spawn kick, uses bounded retries, and rejects without exposing reasons", async () => {
+    const harness = createMineflayerConnectionHarness();
+    const connection = new MineflayerConnection(harness.dependencies);
+    const events: Array<{ kind: string; reason?: string }> = [];
+    connection.onEvent((event) => events.push(event));
+    const connecting = connection.connect();
+    const rejected = expect(connecting).rejects.toThrow("retries exhausted");
+    const privateReason = '{"translate":"multiplayer.disconnect.private-owner-policy"}';
+
+    for (let attempt = 0; attempt < 6; attempt += 1) {
+      const bot = harness.bots[attempt]!;
+      expect(() => harness.kick(privateReason, false, attempt)).not.toThrow();
+      expect(bot.end).toHaveBeenCalledWith("Minecraft connection rejected");
+
+      expect(() => harness.kick(`late kick ${attempt}`, false, attempt)).not.toThrow();
+      expect(() => bot.emit("error", new Error(`late error ${attempt}`))).not.toThrow();
+      expect(() => harness.end(`late end ${attempt}`, attempt)).not.toThrow();
+      expect(bot.end).toHaveBeenCalledTimes(1);
+
+      if (attempt < 5) harness.runNextTimer();
+    }
+
+    await rejected;
+    expect(harness.scheduledDelays()).toEqual([1_000, 2_000, 4_000, 8_000, 15_000]);
+    expect(events).toEqual([{ kind: "outage", reason: "Minecraft connection rejected" }]);
+    expect(JSON.stringify(events)).not.toContain(privateReason);
+    expect(connection.state()).toBe("exhausted");
+  });
+
+  it("uses the physical socket fallback before retrying a rejected login", () => {
+    const socketEnd = vi.fn();
+    const harness = createMineflayerConnectionHarness({
+      configureBot: (bot) => {
+        bot.end.mockImplementation(() => {
+          throw new Error("bot end failed");
+        });
+        Object.assign(bot._client, { socket: { end: socketEnd, destroy: vi.fn() } });
+      },
+    });
+    const connection = new MineflayerConnection(harness.dependencies);
+    void connection.connect().catch(() => undefined);
+
+    harness.kick("private rejection", false);
+
+    expect(socketEnd).toHaveBeenCalledOnce();
+    expect(connection.state()).toBe("retrying");
+    expect(harness.scheduledDelays()).toEqual([1_000]);
+  });
+
+  it("fails a connected kick closed once despite duplicate and delayed lifecycle events", async () => {
+    const harness = createMineflayerConnectionHarness();
+    const connection = new MineflayerConnection(harness.dependencies);
+    const events: Array<{ kind: string; reason?: string }> = [];
+    connection.onEvent((event) => events.push(event));
+    const connecting = connection.connect();
+    harness.spawn();
+    await connecting;
+    const bot = harness.bots[0]!;
+
+    expect(() => harness.kick("private connected rejection", true)).not.toThrow();
+    expect(() => harness.kick("duplicate private rejection", true)).not.toThrow();
+    expect(() => bot.emit("error", new Error("delayed private error"))).not.toThrow();
+    expect(() => harness.end("delayed private end")).not.toThrow();
+
+    expect(bot.end).toHaveBeenCalledTimes(1);
+    expect(bot.end).toHaveBeenCalledWith("Minecraft connection rejected");
+    expect(events).toEqual([
+      { kind: "connected" },
+      { kind: "outage", reason: "Minecraft connection rejected" },
+    ]);
+    expect(JSON.stringify(events)).not.toContain("private");
+    expect(harness.scheduledDelays()).toEqual([1_000]);
+    expect(connection.state()).toBe("retrying");
+  });
+
+  it("does not close or retry twice when kick fencing synchronously emits an error", async () => {
+    const harness = createMineflayerConnectionHarness({
+      configureBot: (bot) => {
+        bot.end.mockImplementation(() => {
+          bot.emit("error", new Error("private error during close"));
+        });
+      },
+    });
+    const connection = new MineflayerConnection(harness.dependencies);
+    const events: string[] = [];
+    connection.onEvent((event) => events.push(event.kind));
+    const connecting = connection.connect();
+    harness.spawn();
+    await connecting;
+
+    expect(() => harness.kick("private rejection", true)).not.toThrow();
+
+    expect(harness.bots[0]?.end).toHaveBeenCalledOnce();
     expect(events).toEqual(["connected", "outage"]);
     expect(harness.scheduledDelays()).toEqual([1_000]);
   });
@@ -397,8 +497,9 @@ describe("MineflayerConnection", () => {
     await expect(connecting).rejects.toMatchObject({ name: "AbortError" });
     harness.runTimerEvenIfCancelled(0);
     expect(harness.bots).toHaveLength(1);
-    expect(harness.bots[0]?.eventNames()).toEqual(["error"]);
+    expect(harness.bots[0]?.eventNames()).toEqual(["error", "kicked"]);
     expect(() => harness.bots[0]?.emit("error", new Error("late private stack"))).not.toThrow();
+    expect(() => harness.bots[0]?.emit("kicked", "late private rejection", false)).not.toThrow();
     await expect(connection.connect()).rejects.toThrow("adapter is stopped");
   });
 
@@ -419,8 +520,9 @@ describe("MineflayerConnection", () => {
 
     void connection.connect();
 
-    expect(harness.bots[0]?.eventNames()).toEqual(["error"]);
+    expect(harness.bots[0]?.eventNames()).toEqual(["error", "kicked"]);
     expect(() => harness.bots[0]?.emit("error", new Error("late private stack"))).not.toThrow();
+    expect(() => harness.bots[0]?.emit("kicked", "late private rejection", false)).not.toThrow();
     expect(harness.bots[0]?.pathfinder.stop).toHaveBeenCalledOnce();
     expect(harness.bots[0]?.clearControlStates).toHaveBeenCalledOnce();
     expect(harness.bots[0]?.end).toHaveBeenCalledOnce();
@@ -683,8 +785,9 @@ describe("MineflayerConnection", () => {
     expect(connection.currentBot()).toBeUndefined();
     expect(socketEnd).toHaveBeenCalledOnce();
     expect(socketDestroy).toHaveBeenCalledOnce();
-    expect(harness.bots[0]?.eventNames()).toEqual(["error"]);
+    expect(harness.bots[0]?.eventNames()).toEqual(["error", "kicked"]);
     expect(() => harness.bots[0]?.emit("error", new Error("late private stack"))).not.toThrow();
+    expect(() => harness.bots[0]?.emit("kicked", "late private rejection", false)).not.toThrow();
   });
 
   it.each(["client_end", "socket_end", "socket_destroy"] as const)(

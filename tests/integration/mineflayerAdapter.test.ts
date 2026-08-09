@@ -285,6 +285,31 @@ describe("MineflayerAdapter", () => {
     expect(bot.end).toHaveBeenCalledTimes(1);
   });
 
+  it("maps a connected kick to one generic public disconnect without exposing its reason", async () => {
+    const bot = new FakeBot();
+    createBot.mockReturnValue(bot);
+    const adapter = new MineflayerAdapter(config());
+    const events: Array<{ kind: string; reason?: string }> = [];
+    adapter.onEvent((event) => events.push(event));
+    const connecting = adapter.connect();
+    bot.emit("spawn");
+    await connecting;
+    const privateReason = '{"text":"private server rejection"}';
+
+    expect(() => bot.emit("kicked", privateReason, true)).not.toThrow();
+    expect(() => bot.emit("kicked", "late private rejection", true)).not.toThrow();
+    expect(() => bot.emit("error", new Error("late private error"))).not.toThrow();
+    expect(() => bot.emit("end", "late private end")).not.toThrow();
+
+    expect(bot.end).toHaveBeenCalledTimes(1);
+    expect(events).toEqual([
+      { kind: "connected" },
+      { kind: "disconnected", reason: "Minecraft connection rejected" },
+    ]);
+    expect(JSON.stringify(events)).not.toContain(privateReason);
+    await adapter.disconnect();
+  });
+
   it("reports a tab-list owner online even when their entity is outside tracking range", async () => {
     const bot = new FakeBot();
     bot.players.TestOwner = {};
@@ -735,8 +760,9 @@ describe("MineflayerAdapter", () => {
     await rejected;
     for (const bot of bots) {
       expect(bot.end).toHaveBeenCalledOnce();
-      expect(bot.eventNames()).toEqual(["error"]);
+      expect(bot.eventNames()).toEqual(["error", "kicked"]);
       expect(() => bot.emit("error", new Error("late private stack"))).not.toThrow();
+      expect(() => bot.emit("kicked", "late private rejection", false)).not.toThrow();
     }
     vi.useRealTimers();
   });
