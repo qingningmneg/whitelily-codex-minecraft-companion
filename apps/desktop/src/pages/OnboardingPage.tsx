@@ -538,8 +538,12 @@ export function OnboardingPage({ api, locale, active, onReady }: OnboardingPageP
       if (lanPreservedErrorKey.current === null) setErrorKey(null);
       const operation = Promise.resolve().then(async () => {
         try {
-          const candidates = await api.detectLanCandidates();
+          const detectedCandidates = await api.detectLanCandidates();
           if (!isCurrent()) return [];
+          const now = Date.now();
+          const candidates = detectedCandidates.filter(
+            (candidate) => candidate.observedAt <= now && now < candidate.expiresAt,
+          );
           setLanCandidates(candidates);
           setErrorKey(
             lanPreservedErrorKey.current ??
@@ -571,7 +575,6 @@ export function OnboardingPage({ api, locale, active, onReady }: OnboardingPageP
   useEffect(() => {
     if (
       step !== "lan" ||
-      lanCandidates.length > 0 ||
       connectingCandidate !== null ||
       actionRecoveryAvailable ||
       actionRetryPending
@@ -582,6 +585,19 @@ export function OnboardingPage({ api, locale, active, onReady }: OnboardingPageP
     const generation = ++lanDiscoveryGeneration.current;
     let stopped = false;
     let attempts = 0;
+    const clearExpiredCandidates = (): void => {
+      if (stopped || generation !== lanDiscoveryGeneration.current) return;
+      const now = Date.now();
+      const nextExpiry = Math.min(...lanCandidates.map((candidate) => candidate.expiresAt));
+      if (lanCandidates.some((candidate) => now < candidate.observedAt) || now >= nextExpiry) {
+        setLanCandidates([]);
+        return;
+      }
+      lanPollTimer.current = setTimeout(() => {
+        lanPollTimer.current = null;
+        clearExpiredCandidates();
+      }, nextExpiry - now);
+    };
     const run = async (): Promise<void> => {
       if (stopped || generation !== lanDiscoveryGeneration.current) return;
       attempts += 1;
@@ -597,7 +613,11 @@ export function OnboardingPage({ api, locale, active, onReady }: OnboardingPageP
         attempts >= FAST_LAN_POLL_ATTEMPTS ? LAN_IDLE_POLL_INTERVAL_MS : LAN_POLL_INTERVAL_MS,
       );
     };
-    void run();
+    if (lanCandidates.length > 0) {
+      clearExpiredCandidates();
+    } else {
+      void run();
+    }
     return () => {
       stopped = true;
       if (lanPollTimer.current !== null) clearTimeout(lanPollTimer.current);

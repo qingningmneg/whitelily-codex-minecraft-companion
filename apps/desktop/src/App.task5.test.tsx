@@ -598,20 +598,21 @@ describe("Task 5 application routing", () => {
         running: true,
       },
     ]);
+    const candidateObservedAt = Date.now();
     vi.mocked(harness.api.detectLanCandidates).mockResolvedValue([
       {
         id: "lan_candidate_0001",
         port: 51_321,
         version: "1.21.5",
-        observedAt: 1_753_603_200_000,
-        expiresAt: 1_753_603_260_000,
+        observedAt: candidateObservedAt,
+        expiresAt: candidateObservedAt + 60_000,
       },
     ]);
     vi.mocked(harness.api.confirmLanCandidate).mockResolvedValue({
       status: "confirmed",
       port: 51_321,
       version: "1.21.5",
-      confirmedAt: 1_753_603_200_100,
+      confirmedAt: candidateObservedAt + 100,
     });
     render(<App api={harness.api} />);
 

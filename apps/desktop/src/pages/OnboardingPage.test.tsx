@@ -62,12 +62,13 @@ const pcl2Candidate: Pcl2Candidate = {
   running: true,
 };
 
+const lanCandidateObservedAt = Date.now();
 const lanCandidate: LanCandidate = {
   id: "lan_candidate_0001",
   port: 51_321,
   version: "1.21.5",
-  observedAt: 1_753_603_200_000,
-  expiresAt: 1_753_603_260_000,
+  observedAt: lanCandidateObservedAt,
+  expiresAt: lanCandidateObservedAt + 60_000,
 };
 
 const unknownLanCandidate: LanCandidate = {
@@ -175,9 +176,14 @@ function createApiHarness(
       selection.mode === "automatic" ? { mode: "automatic" } : { ...selection, available: true },
   );
   const discoverPcl2 = vi.fn<WhiteLilyDesktopApi["discoverPcl2"]>(async () => options.pcl2 ?? []);
-  const detectLanCandidates = vi.fn<WhiteLilyDesktopApi["detectLanCandidates"]>(
-    async () => lanResults.shift() ?? [],
-  );
+  const detectLanCandidates = vi.fn<WhiteLilyDesktopApi["detectLanCandidates"]>(async () => {
+    const observedAt = Date.now();
+    return (lanResults.shift() ?? []).map((candidate) => ({
+      ...candidate,
+      observedAt,
+      expiresAt: observedAt + 60_000,
+    }));
+  });
   const confirmLanCandidate = vi.fn<WhiteLilyDesktopApi["confirmLanCandidate"]>(async () => {
     if (options.confirm instanceof Error) throw options.confirm;
     return (
@@ -1628,6 +1634,82 @@ describe("first-run onboarding", () => {
     expect(harness.detectLanCandidates).toHaveBeenCalledTimes(2);
   });
 
+  it("expires a visible LAN candidate and refreshes its authority before a later confirmation", async () => {
+    const observedAt = Date.now();
+    let scan = 0;
+    const harness = createApiHarness({
+      pcl2: [pcl2Candidate],
+      owner: {
+        revision: 1,
+        ownerUsername: "CurrentOwner",
+        configured: true,
+        presence: "unknown",
+      },
+    });
+    harness.detectLanCandidates.mockImplementation(async () => {
+      scan += 1;
+      const current = observedAt + (scan - 1) * 60_000;
+      return [
+        {
+          ...lanCandidate,
+          id: `lan_candidate_${String(scan).padStart(4, "0")}`,
+          observedAt: current,
+          expiresAt: current + 60_000,
+        },
+      ];
+    });
+    await resumeLanWithFakeTimers(harness);
+
+    expect(harness.detectLanCandidates).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60_001);
+    });
+
+    expect(harness.detectLanCandidates).toHaveBeenCalledTimes(2);
+    expect(harness.confirmLanCandidate).not.toHaveBeenCalled();
+    expect(harness.start).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: /Confirm and connect.*51321/u }));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(harness.confirmLanCandidate).toHaveBeenCalledWith("lan_candidate_0002");
+  });
+
+  it("throttles repeated scans when the backend returns an already invalid candidate", async () => {
+    const now = Date.now();
+    const harness = createApiHarness({
+      pcl2: [pcl2Candidate],
+      owner: {
+        revision: 1,
+        ownerUsername: "CurrentOwner",
+        configured: true,
+        presence: "unknown",
+      },
+    });
+    harness.detectLanCandidates.mockResolvedValue([
+      {
+        ...lanCandidate,
+        observedAt: now - 60_000,
+        expiresAt: now,
+      },
+    ]);
+    await resumeLanWithFakeTimers(harness);
+
+    expect(harness.detectLanCandidates).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText("Port 51321")).toBeNull();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(999);
+    });
+    expect(harness.detectLanCandidates).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1);
+    });
+    expect(harness.detectLanCandidates).toHaveBeenCalledTimes(2);
+    expect(harness.confirmLanCandidate).not.toHaveBeenCalled();
+    expect(harness.start).not.toHaveBeenCalled();
+  });
+
   it("never overlaps a slow background scan with a timer or manual refresh", async () => {
     const first = deferred<readonly LanCandidate[]>();
     const harness = createApiHarness({
@@ -1754,7 +1836,7 @@ describe("first-run onboarding", () => {
     expect(screen.getByText("Port 51321")).toBeTruthy();
     expect(harness.confirmLanCandidate).not.toHaveBeenCalled();
     expect(harness.start).not.toHaveBeenCalled();
-    expect(vi.getTimerCount()).toBe(0);
+    expect(vi.getTimerCount()).toBeGreaterThan(0);
   });
 
   it("connects only after an explicit candidate confirmation and enters Home only when running", async () => {
