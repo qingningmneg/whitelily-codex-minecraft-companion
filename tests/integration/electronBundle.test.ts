@@ -51,6 +51,7 @@ const bundleRoot = join(repositoryRoot, "build", "electron-bundle");
 const bundleManifestPath = join(bundleRoot, "runtime-manifest.json");
 const prepareScriptPath = join(repositoryRoot, "scripts", "prepare-electron-bundle.ps1");
 const workspaceBuilderPath = join(repositoryRoot, "scripts", "build-codex-workspace.mjs");
+const productVersionVerifierPath = join(repositoryRoot, "scripts", "verify-product-versions.mjs");
 const workspaceBundleRoot = join(bundleRoot, "codex-workspace");
 const execFileAsync = promisify(execFile);
 const require = createRequire(import.meta.url);
@@ -78,6 +79,21 @@ const desktopAsarPolicy = {
     { resourceRoot: "desktop/renderer", asarRoot: "dist-renderer" },
   ],
 };
+
+const APPLICATION_VERSION_PATTERN =
+  /^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/u;
+
+async function readVerifiedProductVersion(): Promise<string> {
+  const { stdout } = await execFileAsync(
+    process.execPath,
+    [productVersionVerifierPath, repositoryRoot],
+    { cwd: repositoryRoot, windowsHide: true },
+  );
+  const version = stdout.endsWith("\n") ? stdout.slice(0, -1) : stdout;
+  expect(stdout).toBe(`${version}\n`);
+  expect(version).toMatch(APPLICATION_VERSION_PATTERN);
+  return version;
+}
 
 async function readManifest(path: string): Promise<RuntimeManifest> {
   return JSON.parse(await readFile(path, "utf8")) as RuntimeManifest;
@@ -1019,6 +1035,7 @@ describe("deterministic Electron resources", () => {
 
   it("starts the prepared child with pinned Electron, becomes ready, and exits on stdin EOF", async () => {
     const manifest = await readManifest(bundleManifestPath);
+    const appVersion = await readVerifiedProductVersion();
     const childEntry = resolve(bundleRoot, ...manifest.paths.childEntry.split("/"));
     const workspaceManifestPath = resolve(
       bundleRoot,
@@ -1053,6 +1070,7 @@ describe("deterministic Electron resources", () => {
             WHITELILY_CODEX_MANIFEST: bundleManifestPath,
             WHITELILY_CODEX_LAYOUT: "packaged",
             WHITELILY_WORKSPACE_VERSION: workspaceManifest.contentVersion,
+            WHITELILY_APP_VERSION: appVersion,
           },
           shell: false,
           stdio: ["pipe", "pipe", "pipe"],
