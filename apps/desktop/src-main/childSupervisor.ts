@@ -5,6 +5,7 @@ import type { Readable, Writable } from "node:stream";
 import { isDeepStrictEqual } from "node:util";
 import {
   DESKTOP_PROTOCOL_VERSION,
+  isAuthorityFreeTerminalRuntimeSnapshot,
   MAX_DESKTOP_LINE_BYTES,
   parseDesktopCommandResult,
   parseDesktopEvent,
@@ -12,6 +13,7 @@ import {
   parseDesktopResponse,
   type DesktopCommand,
   type DesktopCommandResult,
+  type ConnectionInvalidatedEvent,
   type DesktopEvent,
   type DesktopRequest,
 } from "../../../src/desktop/desktopProtocol.js";
@@ -77,6 +79,7 @@ interface ManagedChild {
   readonly process: ChildProcessPort;
   readonly generation: number;
   runtimeRevisionCursor: number;
+  runtimeAuthorityExposed: boolean;
   readonly exitWaiters: Set<() => void>;
   readonly onExit: ExitListener;
   readonly onClose: ExitListener;
@@ -369,6 +372,7 @@ export class ChildSupervisor {
       process: childProcess,
       generation,
       runtimeRevisionCursor: runtimeRevisionSeed,
+      runtimeAuthorityExposed: false,
       exitWaiters: new Set<() => void>(),
       state: "active",
       exitObserved: false,
@@ -563,7 +567,7 @@ export class ChildSupervisor {
         }
         if (response.ok && isRuntimeSnapshotCommand(pending.command)) {
           const runtimeResult = parseDesktopCommandResult(pending.command, response.result);
-          this.#observeRuntimeSnapshot(child, runtimeResult.revision);
+          this.#observeRuntimeSnapshot(child, runtimeResult);
         }
         if (response.ok) {
           const result = parseDesktopCommandResult(pending.command, response.result);
@@ -607,16 +611,13 @@ export class ChildSupervisor {
         if (envelope.event.kind !== "account" && envelope.event.kind !== "owner_identity") {
           this.#observeRuntimeEvent(child, envelope.event.revision);
         }
+        if (envelope.event.kind === "connection_invalidated") {
+          child.runtimeAuthorityExposed = false;
+        }
         if (envelope.event.kind === "owner_identity") {
           this.#acknowledgeOwnerUpdate(child, envelope.event.owner);
         }
-        for (const listener of this.#runtimeListeners) {
-          try {
-            listener(envelope.event, { childGeneration: child.generation });
-          } catch {
-            // Renderer observers cannot interfere with child supervision.
-          }
-        }
+        this.#publishRuntimeEvent(child, envelope.event);
       } catch {
         this.#rejectMalformedProtocol(child);
       }
@@ -637,6 +638,7 @@ export class ChildSupervisor {
     child.restartOnExit = restartOnExit;
     child.process.stdout?.off("data", child.onStdoutData);
     if (this.#child === child) this.#resetProtocolBuffer();
+    this.#revokeExposedRuntimeAuthority(child);
     this.#failPendingForChild(child, error);
     return this.#safeKill(child.process);
   }
@@ -653,6 +655,7 @@ export class ChildSupervisor {
     if (child.state === "terminated") return;
     const error = child.failure ?? terminationError;
     const restartOnExit = child.state === "active" || child.restartOnExit;
+    this.#revokeExposedRuntimeAuthority(child);
     child.state = "terminated";
     child.process.stdout?.off("data", child.onStdoutData);
     const wasCurrent = this.#child === child;
@@ -754,7 +757,7 @@ export class ChildSupervisor {
     this.#lineBytes = 0;
   }
 
-  #observeRuntimeSnapshot(child: ManagedChild, revision: number): void {
+  #observeRuntimeSnapshot(child: ManagedChild, snapshot: RuntimeSnapshot): void {
     if (
       child.state !== "active" ||
       this.#child !== child ||
@@ -762,11 +765,57 @@ export class ChildSupervisor {
     ) {
       return;
     }
-    if (!Number.isSafeInteger(revision) || revision < child.runtimeRevisionCursor || revision < 0) {
+    if (
+      !Number.isSafeInteger(snapshot.revision) ||
+      snapshot.revision < child.runtimeRevisionCursor ||
+      snapshot.revision < 0
+    ) {
       throw new Error("WhiteLily child runtime revision is invalid");
     }
+    child.runtimeRevisionCursor = snapshot.revision;
+    child.runtimeAuthorityExposed = !isAuthorityFreeTerminalRuntimeSnapshot(snapshot);
+    this.#runtimeRevisionHighWater = Math.max(this.#runtimeRevisionHighWater, snapshot.revision);
+  }
+
+  #revokeExposedRuntimeAuthority(child: ManagedChild): void {
+    if (
+      !child.runtimeAuthorityExposed ||
+      this.#shuttingDown ||
+      this.#child !== child ||
+      child.generation !== this.#activeChildGeneration ||
+      this.#runtimeRevisionHighWater >= Number.MAX_SAFE_INTEGER
+    ) {
+      return;
+    }
+    child.runtimeAuthorityExposed = false;
+    const revision = this.#runtimeRevisionHighWater + 1;
     child.runtimeRevisionCursor = revision;
-    this.#runtimeRevisionHighWater = Math.max(this.#runtimeRevisionHighWater, revision);
+    this.#runtimeRevisionHighWater = revision;
+    const event: ConnectionInvalidatedEvent = {
+      kind: "connection_invalidated",
+      revision,
+      reason: "runtime_failed",
+      snapshot: {
+        revision,
+        lifecycle: "stopped",
+        minecraft: { state: "disconnected", sessionId: null },
+        codex: { state: "stopped", model: null },
+        actions: null,
+        task: null,
+        lastError: null,
+      },
+    };
+    this.#publishRuntimeEvent(child, event);
+  }
+
+  #publishRuntimeEvent(child: ManagedChild, event: DesktopEvent["event"]): void {
+    for (const listener of this.#runtimeListeners) {
+      try {
+        listener(event, { childGeneration: child.generation });
+      } catch {
+        // Renderer observers cannot interfere with child supervision.
+      }
+    }
   }
 
   #observeRuntimeEvent(child: ManagedChild, revision: number): void {

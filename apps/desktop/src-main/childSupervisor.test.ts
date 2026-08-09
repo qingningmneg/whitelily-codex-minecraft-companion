@@ -1772,6 +1772,100 @@ describe("ChildSupervisor", () => {
     expect(children).toHaveLength(4);
   });
 
+  it("revokes an exposed running generation before its replacement answers fresh status", async () => {
+    vi.useFakeTimers();
+    const { children, spawnCalls, supervisor } = createHarness();
+    const observed: Array<{
+      event: DesktopEvent["event"];
+      childGeneration: number;
+    }> = [];
+    supervisor.subscribe((event, context) => {
+      observed.push({ event, childGeneration: context.childGeneration });
+    });
+    supervisor.start();
+
+    const confirmation = supervisor.request({
+      kind: "set_confirmed_connection",
+      proof: {
+        nonce: "generation_reconciliation_proof_0001",
+        port: 25565,
+        issuedAt: 10,
+        expiresAt: 5_000,
+      },
+    });
+    const confirmationRequest = children[0]!.requests()[0]!;
+    children[0]!.respond({
+      version: DESKTOP_PROTOCOL_VERSION,
+      id: confirmationRequest.id,
+      ok: true,
+      result: { status: "configured", port: 25565, confirmedAt: 20 },
+    });
+    await expect(confirmation).resolves.toMatchObject({ status: "configured" });
+
+    const oldStatus = supervisor.request({ kind: "get_status" });
+    const oldRequest = children[0]!.requests()[1]!;
+    children[0]!.respond(successResponse(oldRequest.id, runtimeSnapshot(40, "running")));
+    await expect(oldStatus).resolves.toMatchObject({ revision: 40, lifecycle: "running" });
+
+    children[0]!.crash();
+
+    expect(observed).toEqual([
+      {
+        childGeneration: 1,
+        event: {
+          kind: "connection_invalidated",
+          revision: 41,
+          reason: "runtime_failed",
+          snapshot: runtimeSnapshot(41, "stopped"),
+        },
+      },
+    ]);
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(spawnCalls[1]?.[1][2]).toBe("42");
+    expect(children[1]!.requests()).toEqual([]);
+
+    const freshStatus = supervisor.request({ kind: "get_status" });
+    const freshRequest = children[1]!.requests()[0]!;
+    children[1]!.respond(successResponse(freshRequest.id, runtimeSnapshot(42, "idle")));
+    await expect(freshStatus).resolves.toMatchObject({ revision: 42, lifecycle: "idle" });
+  });
+
+  it("publishes one safe invalidation per subscriber when an exposed child is quarantined", async () => {
+    vi.useFakeTimers();
+    const { children, supervisor } = createHarness();
+    const first: DesktopEvent["event"][] = [];
+    const second: DesktopEvent["event"][] = [];
+    supervisor.subscribe((event) => first.push(event));
+    supervisor.subscribe((event) => second.push(event));
+    supervisor.start();
+
+    const status = supervisor.request({ kind: "get_status" });
+    const request = children[0]!.requests()[0]!;
+    children[0]!.respond(successResponse(request.id, runtimeSnapshot(5, "running")));
+    await status;
+
+    writeLifecycleEvent(children[0]!, 5, "running");
+    await Promise.resolve();
+
+    const expected = {
+      kind: "connection_invalidated" as const,
+      revision: 6,
+      reason: "runtime_failed" as const,
+      snapshot: runtimeSnapshot(6, "stopped"),
+    };
+    expect(first).toEqual([expected]);
+    expect(second).toEqual([expected]);
+
+    children[0]!.crash();
+    children[0]!.finishClose();
+    writeLifecycleEvent(children[0]!, 999, "running");
+    await Promise.resolve();
+
+    expect(first).toEqual([expected]);
+    expect(second).toEqual([expected]);
+  });
+
   it("seeds each restarted child above the active generation runtime high-water mark", async () => {
     vi.useFakeTimers();
     const { children, spawnCalls, supervisor } = createHarness();
@@ -1799,27 +1893,27 @@ describe("ChildSupervisor", () => {
     );
     await vi.advanceTimersByTimeAsync(1_000);
 
-    expect(spawnCalls[1]?.[1][2]).toBe("41");
+    expect(spawnCalls[1]?.[1][2]).toBe("42");
     const freshStatus = supervisor.request({ kind: "get_status" });
     const freshStatusRequest = children[1]!.requests()[0]!;
-    children[1]!.respond(successResponse(freshStatusRequest.id, runtimeSnapshot(41, "idle")));
-    await expect(freshStatus).resolves.toMatchObject({ revision: 41, lifecycle: "idle" });
+    children[1]!.respond(successResponse(freshStatusRequest.id, runtimeSnapshot(42, "idle")));
+    await expect(freshStatus).resolves.toMatchObject({ revision: 42, lifecycle: "idle" });
 
     const freshControl = supervisor.request({ kind: "stop_runtime" });
     const freshControlRequest = children[1]!.requests()[1]!;
-    children[1]!.respond(successResponse(freshControlRequest.id, runtimeSnapshot(41, "stopped")));
-    await expect(freshControl).resolves.toMatchObject({ revision: 41, lifecycle: "stopped" });
+    children[1]!.respond(successResponse(freshControlRequest.id, runtimeSnapshot(42, "stopped")));
+    await expect(freshControl).resolves.toMatchObject({ revision: 42, lifecycle: "stopped" });
     children[1]!.stdout.write(
       `${JSON.stringify({
         version: DESKTOP_PROTOCOL_VERSION,
-        event: { kind: "lifecycle", revision: 42, state: "starting" },
+        event: { kind: "lifecycle", revision: 43, state: "starting" },
       })}\n`,
     );
-    await vi.waitFor(() => expect(observedEvents).toEqual([{ revision: 42, state: "starting" }]));
+    await vi.waitFor(() => expect(observedEvents).toEqual([{ revision: 43, state: "starting" }]));
 
     children[1]!.crash();
     await vi.advanceTimersByTimeAsync(2_000);
-    expect(spawnCalls[2]?.[1][2]).toBe("43");
+    expect(spawnCalls[2]?.[1][2]).toBe("44");
   });
 
   it.each([
@@ -1844,17 +1938,17 @@ describe("ChildSupervisor", () => {
       await Promise.resolve();
 
       expect(children[0]!.killCalls).toBe(1);
-      expect(observedKinds).toEqual([]);
+      expect(observedKinds).toEqual(["connection_invalidated"]);
       children[0]!.crash();
       await vi.advanceTimersByTimeAsync(1_000);
-      expect(spawnCalls[1]?.[1][2]).toBe("6");
+      expect(spawnCalls[1]?.[1][2]).toBe("7");
     },
   );
 
   it.each([
-    ["duplicate", 41],
-    ["skipped", 43],
-    ["regressing", 40],
+    ["duplicate", 42],
+    ["skipped", 44],
+    ["regressing", 41],
   ] as const)(
     "quarantines a %s runtime event relative to a fresh restart seed without advancing that seed",
     async (_label, revision) => {
@@ -1869,20 +1963,20 @@ describe("ChildSupervisor", () => {
       await expect(oldStatus).resolves.toMatchObject({ revision: 40 });
       children[0]!.crash();
       await vi.advanceTimersByTimeAsync(1_000);
-      expect(spawnCalls[1]?.[1][2]).toBe("41");
+      expect(spawnCalls[1]?.[1][2]).toBe("42");
 
       writeLifecycleEvent(children[1]!, revision);
       await Promise.resolve();
 
       expect(children[1]!.killCalls).toBe(1);
-      expect(observedKinds).toEqual([]);
+      expect(observedKinds).toEqual(["connection_invalidated"]);
       children[1]!.crash();
       await vi.advanceTimersByTimeAsync(2_000);
-      expect(spawnCalls[2]?.[1][2]).toBe("41");
+      expect(spawnCalls[2]?.[1][2]).toBe("42");
     },
   );
 
-  it("quarantines an event when a fresh restart seed has exhausted the safe revision range", async () => {
+  it("publishes the final safe invalidation and refuses restart when it exhausts revisions", async () => {
     vi.useFakeTimers();
     const { children, spawnCalls, supervisor } = createHarness();
     const observedKinds: string[] = [];
@@ -1897,17 +1991,11 @@ describe("ChildSupervisor", () => {
       revision: Number.MAX_SAFE_INTEGER - 1,
     });
     children[0]!.crash();
-    await vi.advanceTimersByTimeAsync(1_000);
-    expect(spawnCalls[1]?.[1][2]).toBe(String(Number.MAX_SAFE_INTEGER));
+    await vi.advanceTimersByTimeAsync(60_000);
 
-    writeLifecycleEvent(children[1]!, Number.MAX_SAFE_INTEGER);
-    await Promise.resolve();
-
-    expect(children[1]!.killCalls).toBe(1);
-    expect(observedKinds).toEqual([]);
-    children[1]!.crash();
-    await vi.advanceTimersByTimeAsync(2_000);
-    expect(spawnCalls[2]?.[1][2]).toBe(String(Number.MAX_SAFE_INTEGER));
+    expect(observedKinds).toEqual(["connection_invalidated"]);
+    expect(spawnCalls).toHaveLength(1);
+    expect(() => supervisor.start()).toThrow(/revision.*exhausted/iu);
   });
 
   it("keeps owner identity revisions separate from the runtime revision fence", async () => {
@@ -1943,7 +2031,7 @@ describe("ChildSupervisor", () => {
     expect(observedKinds).toEqual(["owner_identity", "lifecycle"]);
     children[0]!.crash();
     await vi.advanceTimersByTimeAsync(1_000);
-    expect(spawnCalls[1]?.[1][2]).toBe("7");
+    expect(spawnCalls[1]?.[1][2]).toBe("8");
   });
 
   it("tags owner events with the managed child generation across restart", async () => {
@@ -2014,7 +2102,7 @@ describe("ChildSupervisor", () => {
     expect(observedRevisions).toEqual([9]);
     children[0]!.crash();
     await vi.advanceTimersByTimeAsync(1_000);
-    expect(spawnCalls[1]?.[1][2]).toBe("10");
+    expect(spawnCalls[1]?.[1][2]).toBe("11");
   });
 
   it("preserves authoritative invalidation revision high-water across child restart", async () => {
@@ -2073,10 +2161,10 @@ describe("ChildSupervisor", () => {
     await Promise.resolve();
 
     expect(children[0]!.killCalls).toBe(1);
-    expect(observed).not.toContain("connection_invalidated");
+    expect(observed).toEqual(["connection_invalidated"]);
     children[0]!.crash();
     await vi.advanceTimersByTimeAsync(1_000);
-    expect(spawnCalls[1]?.[1][2]).toBe("6");
+    expect(spawnCalls[1]?.[1][2]).toBe("7");
   });
 
   it("quarantines a correlated full snapshot that regresses the current process cursor", async () => {
@@ -2098,7 +2186,7 @@ describe("ChildSupervisor", () => {
     expect(children[0]!.killCalls).toBe(1);
     children[0]!.crash();
     await vi.advanceTimersByTimeAsync(1_000);
-    expect(spawnCalls[1]?.[1][2]).toBe("6");
+    expect(spawnCalls[1]?.[1][2]).toBe("7");
   });
 
   it("does not let an uncorrelated full snapshot advance the next child seed", async () => {

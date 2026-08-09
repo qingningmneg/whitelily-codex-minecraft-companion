@@ -1167,7 +1167,7 @@ describe("IPC registry", () => {
     const signal = {
       kind: "connection_invalidated" as const,
       revision: 8,
-      reason: "lan_changed" as const,
+      reason: "runtime_failed" as const,
       snapshot: {
         ...idleSnapshot,
         revision: 8,

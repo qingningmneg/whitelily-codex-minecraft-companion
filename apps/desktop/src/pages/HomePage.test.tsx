@@ -324,7 +324,7 @@ describe("bilingual control-center home", () => {
     harness.emit({
       kind: "connection_invalidated",
       revision: 11,
-      reason: "account_lost",
+      reason: "runtime_failed",
       snapshot: {
         ...stoppedSnapshot,
         revision: 11,
