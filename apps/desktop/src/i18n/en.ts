@@ -77,7 +77,7 @@ export const en = {
     "WhiteLily checks this computer's loopback interface only and waits for your explicit confirmation.",
   "onboarding.lan.instructionsTitle": "Open the world to LAN first",
   "onboarding.lan.instructionsBody":
-    "Use PCL2 to launch Minecraft Java 1.21.5, enter the intended world, open it to LAN manually, then refresh.",
+    "Use PCL2 to launch Minecraft Java 1.21.5, enter the intended world, and open it to LAN manually. WhiteLily detects it automatically, and manual refresh remains available.",
   "onboarding.lan.port": "Port {port}",
   "onboarding.lan.version": "Minecraft {version}",
   "onboarding.lan.versionUnknown": "Minecraft version unknown",
@@ -97,9 +97,9 @@ export const en = {
     "The model catalog or selected model is unavailable. Refresh and choose again.",
   "onboarding.error.PCL2_NOT_FOUND": "PCL2 was not found. Install or start it, then retry.",
   "onboarding.error.LAN_NOT_FOUND":
-    "No local LAN world was found. Open the world to LAN and refresh.",
+    "No local LAN world was found. Open the world to LAN; WhiteLily keeps detecting automatically, and you can also refresh manually.",
   "onboarding.error.LAN_CANDIDATE_EXPIRED":
-    "The candidate expired. Open the world to LAN again and refresh.",
+    "The candidate expired. Open the world to LAN again; WhiteLily keeps detecting automatically, and you can also refresh manually.",
   "onboarding.error.MINECRAFT_VERSION_UNVERIFIED":
     "The Minecraft version could not be verified. Confirm the target world is 1.21.5.",
   "onboarding.error.MINECRAFT_CONNECT_FAILED":

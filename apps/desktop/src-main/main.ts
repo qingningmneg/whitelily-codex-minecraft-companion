@@ -56,6 +56,18 @@ export interface DesktopCodexResources {
   layout: "development" | "packaged";
 }
 
+const APPLICATION_VERSION_PATTERN =
+  /^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/u;
+
+export function createDesktopAppVersionEnvironment(
+  appVersion: string,
+): Readonly<{ WHITELILY_APP_VERSION: string }> {
+  if (!APPLICATION_VERSION_PATTERN.test(appVersion)) {
+    throw new Error("WhiteLily application version is invalid");
+  }
+  return Object.freeze({ WHITELILY_APP_VERSION: appVersion });
+}
+
 export function resolveDesktopCodexResources(options: {
   appPath: string;
   resourcesPath: string;
@@ -478,6 +490,7 @@ export async function runElectronMain(): Promise<void> {
                 WHITELILY_CODEX_RESOURCE_ROOT: codexResources.resourceRoot,
                 WHITELILY_CODEX_MANIFEST: codexResources.manifestPath,
                 WHITELILY_CODEX_LAYOUT: codexResources.layout,
+                ...createDesktopAppVersionEnvironment(app.getVersion()),
                 ...createWorkspaceVersionEnvironment(workspaceProvision),
               },
               development,

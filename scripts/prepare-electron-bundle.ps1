@@ -36,6 +36,10 @@ $sourceManifest = Get-Content -LiteralPath $sourceManifestPath -Raw -Encoding UT
 $policySha256 = Get-Sha256Hex $sourceManifestPath
 $rootPackage = Get-Content -LiteralPath (Join-Path $repositoryRoot 'package.json') -Raw -Encoding UTF8 | ConvertFrom-Json
 $desktopPackage = Get-Content -LiteralPath (Join-Path $repositoryRoot 'apps/desktop/package.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+$verifiedProductVersion = & node (Join-Path $PSScriptRoot 'verify-product-versions.mjs') $repositoryRoot
+if ($LASTEXITCODE -ne 0) {
+    throw "product version verification failed with exit code $LASTEXITCODE"
+}
 $lockVersionsJson = & node -e @'
 const lock = require('./package-lock.json');
 process.stdout.write(JSON.stringify({
@@ -59,8 +63,7 @@ function Assert-ExactValue {
     }
 }
 
-Assert-ExactValue $rootPackage.version $sourceManifest.productVersion 'root package'
-Assert-ExactValue $desktopPackage.version $sourceManifest.productVersion 'desktop package'
+Assert-ExactValue $verifiedProductVersion $sourceManifest.productVersion 'verified product'
 Assert-ExactValue $desktopPackage.devDependencies.electron $sourceManifest.versions.electron 'Electron'
 Assert-ExactValue $desktopPackage.devDependencies.'electron-builder' $sourceManifest.versions.electronBuilder 'electron-builder'
 Assert-ExactValue $rootPackage.dependencies.'@openai/codex' $sourceManifest.versions.codex 'Codex'

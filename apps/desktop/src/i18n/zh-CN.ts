@@ -68,7 +68,7 @@ export const zhCN = {
   "onboarding.lan.body": "WhiteLily 只检查本机回环地址，并在连接前等你明确确认。",
   "onboarding.lan.instructionsTitle": "请先在游戏中开放 LAN",
   "onboarding.lan.instructionsBody":
-    "请先用 PCL2 启动 Minecraft Java 1.21.5，进入目标世界并手动开放局域网，然后刷新候选。",
+    "请先用 PCL2 启动 Minecraft Java 1.21.5，进入目标世界并手动开放局域网。白百合会自动检测，也可以随时手动刷新。",
   "onboarding.lan.port": "端口 {port}",
   "onboarding.lan.version": "Minecraft {version}",
   "onboarding.lan.versionUnknown": "Minecraft 版本未知",
@@ -85,8 +85,10 @@ export const zhCN = {
   "onboarding.error.CODEX_NOT_LOGGED_IN": "尚未登录 ChatGPT，请在系统浏览器中完成登录。",
   "onboarding.error.MODEL_UNAVAILABLE": "模型列表或所选模型当前不可用，请刷新后重新选择。",
   "onboarding.error.PCL2_NOT_FOUND": "未发现 PCL2。请自行安装或启动后重试。",
-  "onboarding.error.LAN_NOT_FOUND": "尚未发现本机 LAN 世界，请开放 LAN 后刷新。",
-  "onboarding.error.LAN_CANDIDATE_EXPIRED": "候选已过期，请重新开放 LAN 后刷新。",
+  "onboarding.error.LAN_NOT_FOUND":
+    "尚未发现本机 LAN 世界。请开放 LAN，白百合会继续自动检测；也可手动刷新。",
+  "onboarding.error.LAN_CANDIDATE_EXPIRED":
+    "候选已过期。请重新开放 LAN，白百合会继续自动检测；也可手动刷新。",
   "onboarding.error.MINECRAFT_VERSION_UNVERIFIED":
     "无法确认 Minecraft 版本；请确认目标世界为 1.21.5。",
   "onboarding.error.MINECRAFT_CONNECT_FAILED": "无法连接 Minecraft，请确认世界仍开放 LAN 后重试。",

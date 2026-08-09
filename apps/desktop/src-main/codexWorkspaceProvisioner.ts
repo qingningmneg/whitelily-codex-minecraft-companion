@@ -104,7 +104,7 @@ export function resolveDesktopCodexWorkspaceResources(options: {
 }): DesktopCodexWorkspaceResources {
   const repositoryRoot = resolve(options.appPath, "..", "..");
   const resourceDirectory = options.development
-    ? resolve(repositoryRoot, TARGET_NAME)
+    ? resolve(repositoryRoot, "build", "desktop-development", TARGET_NAME)
     : resolve(options.resourcesPath, TARGET_NAME);
   return {
     resourceDirectory,

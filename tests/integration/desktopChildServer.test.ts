@@ -541,6 +541,11 @@ describe("DesktopChildServer", () => {
 
   it("uses one default owner service for child reads, updates, and events", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "whitelily-owner-child-"));
+    const productVersion = (
+      JSON.parse(await readFile(join(import.meta.dirname, "..", "..", "package.json"), "utf8")) as {
+        version: string;
+      }
+    ).version;
     await writeFile(
       join(cwd, "config.toml"),
       validConfig.replace('owner_username = "TestOwner"', 'owner_username = "YourMcName"'),
@@ -553,7 +558,7 @@ describe("DesktopChildServer", () => {
     output.on("data", (chunk: string) => {
       rawOutput += chunk;
     });
-    const running = runDesktopChild([], { input, output, cwd });
+    const running = runDesktopChild([], { input, output, cwd, appVersion: productVersion });
 
     input.write(
       `${JSON.stringify(commandRequest("default-owner-read", { kind: "read_owner_identity" }))}\n`,

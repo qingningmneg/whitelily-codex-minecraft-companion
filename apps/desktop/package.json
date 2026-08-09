@@ -6,7 +6,7 @@
   "type": "module",
   "main": "dist/main/main.js",
   "scripts": {
-    "predev": "npm run build:desktop-child --prefix ../..",
+    "predev": "npm run build:desktop-child --prefix ../.. && npm run build:desktop-dev-workspace --prefix ../..",
     "dev": "npm run build:main && npm run build:preload && concurrently --kill-others \"vite\" \"wait-on http://127.0.0.1:5173 && electron .\"",
     "build": "npm run build:renderer && npm run build:main && npm run build:preload",
     "build:renderer": "vite build",

@@ -18,6 +18,8 @@ const STORAGE_VERSION = 3;
 const MAX_STORAGE_BYTES = 2_048;
 const MAX_LOGIN_POLL_MS = 10 * 60_000;
 const LOGIN_POLL_INTERVAL_MS = 250;
+const LAN_POLL_INTERVAL_MS = 1_000;
+const MAX_LAN_POLL_ATTEMPTS = 60;
 const MODEL_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const EFFORT_PATTERN = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/u;
 
@@ -63,6 +65,12 @@ interface OwnerUpdateIntent {
   readonly generation: number;
 }
 
+interface LanDiscoveryIntent {
+  readonly requestId: number;
+  readonly generation: number;
+  readonly promise: Promise<readonly LanCandidate[]>;
+}
+
 const defaultPreferences: SafePreferences = {
   version: STORAGE_VERSION,
   locale: "zh-CN",
@@ -77,6 +85,7 @@ export function OnboardingPage({ api, locale, active, onReady }: OnboardingPageP
   const [pcl2Loading, setPcl2Loading] = useState(false);
   const [lanCandidates, setLanCandidates] = useState<readonly LanCandidate[]>([]);
   const [lanLoading, setLanLoading] = useState(false);
+  const [lanRefreshEpoch, setLanRefreshEpoch] = useState(0);
   const [loginPending, setLoginPending] = useState(false);
   const [ownerDraft, setOwnerDraft] = useState("");
   const [ownerRevision, setOwnerRevision] = useState<number | null>(null);
@@ -96,6 +105,11 @@ export function OnboardingPage({ api, locale, active, onReady }: OnboardingPageP
   const catalogInFlight = useRef<CatalogLoadIntent | null>(null);
   const ownerUpdateRequestId = useRef(0);
   const activeOwnerUpdate = useRef<OwnerUpdateIntent | null>(null);
+  const lanDiscoveryGeneration = useRef(0);
+  const lanDiscoveryRequestId = useRef(0);
+  const lanDiscoveryInFlight = useRef<LanDiscoveryIntent | null>(null);
+  const lanPollTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lanPreservedErrorKey = useRef<MessageKey | null>(null);
   const observedLocale = useRef(locale);
   const heading = useRef<HTMLHeadingElement>(null);
   const ownerAlert = useRef<HTMLParagraphElement>(null);
@@ -157,6 +171,11 @@ export function OnboardingPage({ api, locale, active, onReady }: OnboardingPageP
         mounted.current && generation === flowGeneration.current && authorityIsCurrent();
       if (!isCurrent()) return;
       activeOwnerUpdate.current = null;
+      lanDiscoveryGeneration.current += 1;
+      lanDiscoveryInFlight.current = null;
+      lanPreservedErrorKey.current = null;
+      if (lanPollTimer.current !== null) clearTimeout(lanPollTimer.current);
+      lanPollTimer.current = null;
       setOwnerPending(false);
       setStep("owner");
       persist({ progressHint: "owner" });
@@ -272,6 +291,11 @@ export function OnboardingPage({ api, locale, active, onReady }: OnboardingPageP
   useEffect(() => {
     if (!active) {
       flowGeneration.current += 1;
+      lanDiscoveryGeneration.current += 1;
+      lanDiscoveryInFlight.current = null;
+      lanPreservedErrorKey.current = null;
+      if (lanPollTimer.current !== null) clearTimeout(lanPollTimer.current);
+      lanPollTimer.current = null;
       activeOwnerUpdate.current = null;
       setOwnerPending(false);
       invalidateCatalogLoad();
@@ -475,6 +499,7 @@ export function OnboardingPage({ api, locale, active, onReady }: OnboardingPageP
       ) {
         resumedPcl2.current = true;
         setStep("lan");
+        lanPreservedErrorKey.current = null;
         persist({ progressHint: "lan" });
       }
     } catch (error) {
@@ -492,30 +517,114 @@ export function OnboardingPage({ api, locale, active, onReady }: OnboardingPageP
     void refreshPcl2();
   }, [persist, refreshPcl2, step]);
 
-  const refreshLan = useCallback(async (): Promise<void> => {
-    const generation = flowGeneration.current;
-    setActionRecoveryAvailable(false);
-    setLanLoading(true);
-    setErrorKey(null);
-    try {
-      const candidates = await api.detectLanCandidates();
-      if (!mounted.current || generation !== flowGeneration.current) return;
-      setLanCandidates(candidates);
-      if (candidates.length === 0) setErrorKey("onboarding.error.LAN_NOT_FOUND");
-    } catch (error) {
-      if (!mounted.current || generation !== flowGeneration.current) return;
-      setLanCandidates([]);
-      setErrorKey(safeOnboardingErrorKey(asStableError(error, "LAN_NOT_FOUND")));
-    } finally {
-      if (mounted.current && generation === flowGeneration.current) setLanLoading(false);
-    }
-  }, [api]);
+  const scanLan = useCallback(
+    (generation: number): Promise<readonly LanCandidate[]> => {
+      if (!mounted.current || generation !== lanDiscoveryGeneration.current) {
+        return Promise.resolve([]);
+      }
+      const pending = lanDiscoveryInFlight.current;
+      if (pending?.generation === generation) return pending.promise;
+      const flow = flowGeneration.current;
+      const requestId = ++lanDiscoveryRequestId.current;
+      const isCurrent = (): boolean =>
+        mounted.current &&
+        flow === flowGeneration.current &&
+        generation === lanDiscoveryGeneration.current &&
+        requestId === lanDiscoveryRequestId.current &&
+        lanDiscoveryInFlight.current?.requestId === requestId;
+      setActionRecoveryAvailable(false);
+      setLanLoading(true);
+      if (lanPreservedErrorKey.current === null) setErrorKey(null);
+      const operation = Promise.resolve().then(async () => {
+        try {
+          const candidates = await api.detectLanCandidates();
+          if (!isCurrent()) return [];
+          setLanCandidates(candidates);
+          setErrorKey(
+            lanPreservedErrorKey.current ??
+              (candidates.length === 0 ? "onboarding.error.LAN_NOT_FOUND" : null),
+          );
+          return candidates;
+        } catch (error) {
+          if (!isCurrent()) return [];
+          setLanCandidates([]);
+          setErrorKey(
+            lanPreservedErrorKey.current ??
+              safeOnboardingErrorKey(asStableError(error, "LAN_NOT_FOUND")),
+          );
+          return [];
+        } finally {
+          if (lanDiscoveryInFlight.current?.requestId === requestId) {
+            const current = isCurrent();
+            lanDiscoveryInFlight.current = null;
+            if (current) setLanLoading(false);
+          }
+        }
+      });
+      lanDiscoveryInFlight.current = { requestId, generation, promise: operation };
+      return operation;
+    },
+    [api],
+  );
 
   useEffect(() => {
-    if (step !== "lan") return;
+    if (
+      step !== "lan" ||
+      lanCandidates.length > 0 ||
+      connectingCandidate !== null ||
+      actionRecoveryAvailable ||
+      actionRetryPending
+    ) {
+      return;
+    }
     persist({ progressHint: "lan" });
-    void refreshLan();
-  }, [persist, refreshLan, step]);
+    const generation = ++lanDiscoveryGeneration.current;
+    let stopped = false;
+    let attempts = 0;
+    const run = async (): Promise<void> => {
+      if (stopped || generation !== lanDiscoveryGeneration.current) return;
+      attempts += 1;
+      const candidates = await scanLan(generation);
+      if (
+        stopped ||
+        generation !== lanDiscoveryGeneration.current ||
+        candidates.length > 0 ||
+        attempts >= MAX_LAN_POLL_ATTEMPTS
+      ) {
+        return;
+      }
+      lanPollTimer.current = setTimeout(() => {
+        lanPollTimer.current = null;
+        void run();
+      }, LAN_POLL_INTERVAL_MS);
+    };
+    void run();
+    return () => {
+      stopped = true;
+      if (lanPollTimer.current !== null) clearTimeout(lanPollTimer.current);
+      lanPollTimer.current = null;
+      if (lanDiscoveryGeneration.current === generation) {
+        lanDiscoveryGeneration.current += 1;
+        lanDiscoveryRequestId.current += 1;
+        lanDiscoveryInFlight.current = null;
+      }
+    };
+  }, [
+    actionRecoveryAvailable,
+    actionRetryPending,
+    connectingCandidate,
+    lanCandidates.length,
+    lanRefreshEpoch,
+    persist,
+    scanLan,
+    step,
+  ]);
+
+  const restartLanDiscovery = (preservedErrorKey: MessageKey | null = null): void => {
+    lanPreservedErrorKey.current = preservedErrorKey;
+    setLanCandidates([]);
+    setLanRefreshEpoch((current) => current + 1);
+  };
 
   const confirmAndConnect = async (candidateId: string): Promise<void> => {
     if (connectingCandidate) return;
@@ -541,11 +650,8 @@ export function OnboardingPage({ api, locale, active, onReady }: OnboardingPageP
       if (candidateConfirmed && isActionRecoveryErrorKey(key)) {
         setActionRecoveryAvailable(true);
       } else if (key === "onboarding.error.LAN_CANDIDATE_EXPIRED" || candidateConfirmed) {
-        setLanCandidates([]);
-        await refreshLan();
-        if (mounted.current && generation === flowGeneration.current) {
-          setErrorKey(key);
-        }
+        restartLanDiscovery(key);
+        setErrorKey(key);
       }
     } finally {
       if (mounted.current && generation === flowGeneration.current) {
@@ -573,9 +679,8 @@ export function OnboardingPage({ api, locale, active, onReady }: OnboardingPageP
       setErrorKey(key);
       if (!isActionRecoveryErrorKey(key)) {
         setActionRecoveryAvailable(false);
-        setLanCandidates([]);
-        await refreshLan();
-        if (mounted.current && generation === flowGeneration.current) setErrorKey(key);
+        restartLanDiscovery(key);
+        setErrorKey(key);
       }
     } finally {
       if (mounted.current && generation === flowGeneration.current) setActionRetryPending(false);
@@ -781,6 +886,7 @@ export function OnboardingPage({ api, locale, active, onReady }: OnboardingPageP
                   className="primary-button"
                   type="button"
                   onClick={() => {
+                    lanPreservedErrorKey.current = null;
                     setStep("lan");
                     persist({ progressHint: "lan" });
                   }}
@@ -828,7 +934,7 @@ export function OnboardingPage({ api, locale, active, onReady }: OnboardingPageP
                 actionRecoveryAvailable ||
                 actionRetryPending
               }
-              onClick={() => void refreshLan()}
+              onClick={() => restartLanDiscovery()}
             >
               {translate(locale, lanLoading ? "onboarding.refreshing" : "onboarding.refresh")}
             </button>

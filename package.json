@@ -16,6 +16,7 @@
     "start": "node dist/src/index.js",
     "dev": "tsx src/index.ts",
     "build:desktop-child": "node scripts/build-desktop-child.mjs",
+    "build:desktop-dev-workspace": "node scripts/prepare-development-codex-workspace.mjs",
     "desktop:dev": "npm run dev --workspace @whitelily/desktop",
     "desktop:build": "npm run build --workspace @whitelily/desktop",
     "desktop:prepare": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/prepare-electron-bundle.ps1",

@@ -289,6 +289,26 @@ async function reachLan(harness: ApiHarness): Promise<void> {
   await screen.findByRole("heading", { name: "连接局域网世界" });
 }
 
+async function resumeLanWithFakeTimers(harness: ApiHarness): Promise<ReturnType<typeof render>> {
+  window.localStorage.setItem(
+    ONBOARDING_STORAGE_KEY,
+    JSON.stringify({ version: 3, locale: "en", progressHint: "lan" }),
+  );
+  vi.useFakeTimers();
+  const view = render(<OnboardingPage api={harness.api} locale="en" active onReady={vi.fn()} />);
+  for (
+    let attempt = 0;
+    attempt < 20 && harness.detectLanCandidates.mock.calls.length === 0;
+    attempt += 1
+  ) {
+    await act(async () => {
+      await Promise.resolve();
+    });
+  }
+  expect(screen.getByRole("heading", { name: "Connect to a LAN world" })).toBeTruthy();
+  return view;
+}
+
 afterEach(() => {
   cleanup();
   window.localStorage.clear();
@@ -1556,6 +1576,8 @@ describe("first-run onboarding", () => {
     await reachLan(harness);
 
     expect(screen.getByText(/请先用 PCL2 启动 Minecraft Java 1\.21\.5/u)).toBeTruthy();
+    expect(screen.getByText(/白百合会自动检测/u)).toBeTruthy();
+    expect(screen.getByText(/白百合会自动检测/u).textContent).not.toContain("然后刷新");
     expect(await screen.findByText("端口 51321")).toBeTruthy();
     expect(screen.getByText("Minecraft 1.21.5")).toBeTruthy();
     expect(screen.getByText("端口 51322")).toBeTruthy();
@@ -1572,6 +1594,152 @@ describe("first-run onboarding", () => {
     expect(document.body.textContent).not.toContain("lan_candidate_0001");
     expect(harness.confirmLanCandidate).not.toHaveBeenCalled();
     expect(harness.start).not.toHaveBeenCalled();
+  });
+
+  it("polls after an empty LAN scan, reveals a later candidate, then waits for explicit confirmation", async () => {
+    const harness = createApiHarness({
+      pcl2: [pcl2Candidate],
+      lan: [[], [lanCandidate]],
+      owner: {
+        revision: 1,
+        ownerUsername: "CurrentOwner",
+        configured: true,
+        presence: "unknown",
+      },
+    });
+    await resumeLanWithFakeTimers(harness);
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(harness.detectLanCandidates).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText("Port 51321")).toBeNull();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+
+    expect(harness.detectLanCandidates).toHaveBeenCalledTimes(2);
+    expect(screen.getByText("Port 51321")).toBeTruthy();
+    expect(harness.confirmLanCandidate).not.toHaveBeenCalled();
+    expect(harness.start).not.toHaveBeenCalled();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_000);
+    });
+    expect(harness.detectLanCandidates).toHaveBeenCalledTimes(2);
+  });
+
+  it("never overlaps a slow background scan with a timer or manual refresh", async () => {
+    const first = deferred<readonly LanCandidate[]>();
+    const harness = createApiHarness({
+      pcl2: [pcl2Candidate],
+      owner: {
+        revision: 1,
+        ownerUsername: "CurrentOwner",
+        configured: true,
+        presence: "unknown",
+      },
+    });
+    harness.detectLanCandidates
+      .mockImplementationOnce(() => first.promise)
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([lanCandidate]);
+    await resumeLanWithFakeTimers(harness);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5_000);
+    });
+    expect(harness.detectLanCandidates).toHaveBeenCalledTimes(1);
+    expect((screen.getByRole("button", { name: "Refreshing" }) as HTMLButtonElement).disabled).toBe(
+      true,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Refreshing" }));
+    expect(harness.detectLanCandidates).toHaveBeenCalledTimes(1);
+
+    first.resolve([]);
+    await act(async () => {
+      await first.promise;
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(harness.detectLanCandidates).toHaveBeenCalledTimes(2);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    expect(harness.detectLanCandidates).toHaveBeenCalledTimes(3);
+    expect(screen.getByText("Port 51321")).toBeTruthy();
+  });
+
+  it("cancels LAN polling and fences a late result when onboarding becomes inactive", async () => {
+    const late = deferred<readonly LanCandidate[]>();
+    const harness = createApiHarness({
+      pcl2: [pcl2Candidate],
+      owner: {
+        revision: 1,
+        ownerUsername: "CurrentOwner",
+        configured: true,
+        presence: "unknown",
+      },
+    });
+    harness.detectLanCandidates.mockImplementationOnce(() => late.promise);
+    const view = await resumeLanWithFakeTimers(harness);
+
+    view.rerender(
+      <OnboardingPage api={harness.api} locale="en" active={false} onReady={vi.fn()} />,
+    );
+    late.resolve([lanCandidate]);
+    await act(async () => {
+      await late.promise;
+      await vi.advanceTimersByTimeAsync(5_000);
+    });
+
+    expect(screen.queryByText("Port 51321")).toBeNull();
+    expect(harness.detectLanCandidates).toHaveBeenCalledTimes(1);
+  });
+
+  it("clears its bounded LAN poll timer on unmount", async () => {
+    const harness = createApiHarness({
+      pcl2: [pcl2Candidate],
+      lan: [],
+      owner: {
+        revision: 1,
+        ownerUsername: "CurrentOwner",
+        configured: true,
+        presence: "unknown",
+      },
+    });
+    const view = await resumeLanWithFakeTimers(harness);
+    await act(async () => {
+      await Promise.resolve();
+    });
+    const timersBeforeUnmount = vi.getTimerCount();
+    expect(timersBeforeUnmount).toBeGreaterThan(0);
+
+    view.unmount();
+    expect(vi.getTimerCount()).toBeLessThan(timersBeforeUnmount);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(harness.detectLanCandidates).toHaveBeenCalledTimes(1);
+  });
+
+  it("stops polling after the bounded empty-scan limit", async () => {
+    const harness = createApiHarness({
+      pcl2: [pcl2Candidate],
+      lan: [],
+      owner: {
+        revision: 1,
+        ownerUsername: "CurrentOwner",
+        configured: true,
+        presence: "unknown",
+      },
+    });
+    await resumeLanWithFakeTimers(harness);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(120_000);
+    });
+    expect(harness.detectLanCandidates).toHaveBeenCalledTimes(60);
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it("connects only after an explicit candidate confirmation and enters Home only when running", async () => {
@@ -1604,7 +1772,9 @@ describe("first-run onboarding", () => {
 
     await user.click(await screen.findByRole("button", { name: /确认并连接.*51321/u }));
 
-    expect(await screen.findByText("候选已过期，请重新开放 LAN 后刷新。")).toBeTruthy();
+    expect(
+      await screen.findByText("候选已过期。请重新开放 LAN，白百合会继续自动检测；也可手动刷新。"),
+    ).toBeTruthy();
     expect(harness.detectLanCandidates).toHaveBeenCalledTimes(2);
     expect(screen.queryByRole("button", { name: /确认并连接/u })).toBeNull();
     expect(document.body.textContent).not.toContain("private://config");

@@ -4,9 +4,18 @@ import {
   createWorkspaceVersionEnvironment,
   resolveDesktopCodexWorkspaceResources,
 } from "./codexWorkspaceProvisioner.js";
-import { resolveDesktopCodexResources } from "./main.js";
+import { createDesktopAppVersionEnvironment, resolveDesktopCodexResources } from "./main.js";
 
 describe("resolveDesktopCodexResources", () => {
+  it("passes only a bounded Electron application version to the child", () => {
+    expect(createDesktopAppVersionEnvironment("0.2.0-beta.2")).toEqual({
+      WHITELILY_APP_VERSION: "0.2.0-beta.2",
+    });
+    expect(() => createDesktopAppVersionEnvironment("../private")).toThrow(
+      "WhiteLily application version is invalid",
+    );
+  });
+
   it("uses the reviewed node_modules native package explicitly during development", () => {
     const appPath = String.raw`C:\source\whitelily\apps\desktop`;
 
@@ -51,7 +60,7 @@ describe("resolveDesktopCodexResources", () => {
 });
 
 describe("resolveDesktopCodexWorkspaceResources", () => {
-  it("resolves the reviewed repository workspace during development", () => {
+  it("resolves the generated attested workspace during development", () => {
     const appPath = String.raw`C:\source\whitelily\apps\desktop`;
 
     expect(
@@ -61,9 +70,16 @@ describe("resolveDesktopCodexWorkspaceResources", () => {
         development: true,
       }),
     ).toEqual({
-      resourceDirectory: resolve(String.raw`C:\source\whitelily`, "codex-workspace"),
+      resourceDirectory: resolve(
+        String.raw`C:\source\whitelily`,
+        "build",
+        "desktop-development",
+        "codex-workspace",
+      ),
       manifestPath: resolve(
         String.raw`C:\source\whitelily`,
+        "build",
+        "desktop-development",
         "codex-workspace",
         "workspace-manifest.json",
       ),

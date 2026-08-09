@@ -29,6 +29,8 @@ import {
 } from "./childServer.js";
 
 const WORKSPACE_VERSION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u;
+const APPLICATION_VERSION_PATTERN =
+  /^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/u;
 
 export interface DesktopChildServices {
   ownerIdentity: OwnerIdentityAccess;
@@ -72,6 +74,7 @@ export interface DesktopChildMainDependencies {
     context: DesktopChildServiceContext,
   ) => DesktopChildServices | Promise<DesktopChildServices>;
   cwd?: string;
+  appVersion?: string;
 }
 
 export async function runDesktopChild(
@@ -105,7 +108,11 @@ export async function runDesktopChild(
     services = await (
       dependencies.createServices ??
       ((context: DesktopChildServiceContext) =>
-        createDefaultDesktopChildServices(context, dependencies.createRuntime))
+        createDefaultDesktopChildServices(
+          context,
+          resolveApplicationVersion(dependencies.appVersion ?? process.env.WHITELILY_APP_VERSION),
+          dependencies.createRuntime,
+        ))
     )({
       configPath,
       cwd,
@@ -168,8 +175,16 @@ function parseRuntimeRevisionSeed(value: string | undefined): number {
   return seed;
 }
 
+function resolveApplicationVersion(value: string | undefined): string {
+  if (value === undefined || !APPLICATION_VERSION_PATTERN.test(value)) {
+    throw new Error("WhiteLily application version is invalid");
+  }
+  return value;
+}
+
 async function createDefaultDesktopChildServices(
   context: DesktopChildServiceContext,
+  appVersion: string,
   injectedRuntimeFactory?: (
     configPath: string,
     connection: ConfirmedRuntimeConnection,
@@ -213,7 +228,7 @@ async function createDefaultDesktopChildServices(
   const memoryMigration = new MemoryMigration(memories, memories);
   const diagnostics = new DiagnosticExporter({
     dataRoot: paths.dataRoot,
-    appVersion: "0.2.0-beta.1",
+    appVersion,
     osSummary: { platform: platform(), release: release(), arch: arch() },
     dependencyVersions: {
       node: process.versions.node,
