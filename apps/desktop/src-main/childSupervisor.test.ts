@@ -2164,7 +2164,11 @@ describe("ChildSupervisor", () => {
       expect.objectContaining({ kind: "connection_invalidated", revision: 1 }),
     ]);
     children[0]!.crash();
+    children[0]!.finishClose();
     await vi.advanceTimersByTimeAsync(1_000);
+    expect(observed).toEqual([
+      expect.objectContaining({ kind: "connection_invalidated", revision: 1 }),
+    ]);
     expect(spawnCalls[1]?.[1][2]).toBe("2");
   });
 
@@ -2238,24 +2242,84 @@ describe("ChildSupervisor", () => {
     expect(spawnCalls[1]?.[1][2]).toBe("1");
   });
 
-  it("fails closed instead of restarting past the safe revision range", async () => {
+  it("rejects a first non-terminal snapshot at the final revision before exposing it", async () => {
     vi.useFakeTimers();
     const { children, spawnCalls, supervisor } = createHarness();
+    const observed: DesktopEvent["event"][] = [];
+    supervisor.subscribe((event) => observed.push(event));
     supervisor.start();
-    const status = supervisor.request({ kind: "get_status" });
+    const status = caught(supervisor.request({ kind: "get_status" }));
     const request = children[0]!.requests()[0]!;
     children[0]!.respond(
       successResponse(request.id, runtimeSnapshot(Number.MAX_SAFE_INTEGER, "running")),
     );
-    await expect(status).resolves.toMatchObject({ revision: Number.MAX_SAFE_INTEGER });
+
+    await expect(status).resolves.toMatchObject({
+      message: expect.stringContaining("malformed protocol"),
+    });
+    expect(observed).toEqual([]);
+    expect(children[0]!.killCalls).toBe(1);
 
     children[0]!.crash();
-    await vi.advanceTimersByTimeAsync(60_000);
+    await vi.advanceTimersByTimeAsync(1_000);
 
-    expect(children).toHaveLength(1);
-    expect(spawnCalls).toHaveLength(1);
-    expect(() => supervisor.start()).toThrow(/revision.*exhausted/iu);
-    expect(spawnCalls).toHaveLength(1);
+    expect(spawnCalls[1]?.[1][2]).toBe("1");
+    expect(children[1]!.requests()).toEqual([]);
+  });
+
+  it("reserves the final revision for invalidation instead of a non-terminal snapshot", async () => {
+    const { children, supervisor } = createHarness();
+    const observed: DesktopEvent["event"][] = [];
+    supervisor.subscribe((event) => observed.push(event));
+    supervisor.start();
+    const baseline = supervisor.request({ kind: "get_status" });
+    const baselineRequest = children[0]!.requests()[0]!;
+    children[0]!.respond(
+      successResponse(baselineRequest.id, runtimeSnapshot(Number.MAX_SAFE_INTEGER - 1, "running")),
+    );
+    await baseline;
+
+    const exhausted = caught(supervisor.request({ kind: "get_status" }));
+    const exhaustedRequest = children[0]!.requests()[1]!;
+    children[0]!.respond(
+      successResponse(exhaustedRequest.id, runtimeSnapshot(Number.MAX_SAFE_INTEGER, "running")),
+    );
+
+    await expect(exhausted).resolves.toMatchObject({
+      message: expect.stringContaining("malformed protocol"),
+    });
+    expect(observed).toEqual([
+      expect.objectContaining({
+        kind: "connection_invalidated",
+        revision: Number.MAX_SAFE_INTEGER,
+        reason: "runtime_failed",
+      }),
+    ]);
+  });
+
+  it("reserves the final revision for invalidation instead of a runtime delta", async () => {
+    const { children, supervisor } = createHarness();
+    const observed: DesktopEvent["event"][] = [];
+    supervisor.subscribe((event) => observed.push(event));
+    supervisor.start();
+    const baseline = supervisor.request({ kind: "get_status" });
+    const baselineRequest = children[0]!.requests()[0]!;
+    children[0]!.respond(
+      successResponse(baselineRequest.id, runtimeSnapshot(Number.MAX_SAFE_INTEGER - 1, "running")),
+    );
+    await baseline;
+
+    writeLifecycleEvent(children[0]!, Number.MAX_SAFE_INTEGER, "running");
+    await Promise.resolve();
+
+    expect(observed).toEqual([
+      expect.objectContaining({
+        kind: "connection_invalidated",
+        revision: Number.MAX_SAFE_INTEGER,
+        reason: "runtime_failed",
+      }),
+    ]);
+    expect(children[0]!.killCalls).toBe(1);
   });
 
   it("never replays start_runtime after a crash restart", async () => {
@@ -2438,12 +2502,19 @@ describe("ChildSupervisor", () => {
 
     it("handles child exit while the emergency request is pending", async () => {
       const { children, supervisor } = createHarness();
+      const observed: DesktopEvent["event"][] = [];
+      supervisor.subscribe((event) => observed.push(event));
       supervisor.start();
+      const status = supervisor.request({ kind: "get_status" });
+      const statusRequest = children[0]!.requests()[0]!;
+      children[0]!.respond(successResponse(statusRequest.id, runtimeSnapshot(5, "running")));
+      await status;
 
       const shutdown = supervisor.shutdown();
       children[0]!.crash(0);
 
       await expect(shutdown).resolves.toBeUndefined();
+      expect(observed).toEqual([]);
       expect(children[0]!.killCalls).toBe(0);
     });
 

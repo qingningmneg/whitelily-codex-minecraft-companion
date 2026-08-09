@@ -609,6 +609,12 @@ export class ChildSupervisor {
       try {
         const envelope = parseDesktopEvent(value);
         if (envelope.event.kind !== "account" && envelope.event.kind !== "owner_identity") {
+          if (
+            envelope.event.kind !== "connection_invalidated" &&
+            envelope.event.revision === Number.MAX_SAFE_INTEGER
+          ) {
+            throw new Error("WhiteLily child runtime revision is exhausted");
+          }
           this.#observeRuntimeEvent(child, envelope.event.revision);
         }
         if (envelope.event.kind === "connection_invalidated") {
@@ -777,8 +783,12 @@ export class ChildSupervisor {
     ) {
       throw new Error("WhiteLily child runtime revision is invalid");
     }
+    const exposesRuntimeAuthority = !isAuthorityFreeTerminalRuntimeSnapshot(snapshot);
+    if (exposesRuntimeAuthority && snapshot.revision === Number.MAX_SAFE_INTEGER) {
+      throw new Error("WhiteLily child runtime revision is exhausted");
+    }
     child.runtimeRevisionCursor = snapshot.revision;
-    child.runtimeAuthorityExposed = !isAuthorityFreeTerminalRuntimeSnapshot(snapshot);
+    child.runtimeAuthorityExposed = exposesRuntimeAuthority;
     this.#runtimeRevisionHighWater = Math.max(this.#runtimeRevisionHighWater, snapshot.revision);
   }
 
