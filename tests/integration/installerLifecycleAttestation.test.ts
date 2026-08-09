@@ -106,7 +106,7 @@ async function fixture(options: { localArtifacts?: boolean } = {}): Promise<{
   await writeJson(attestationPath, {
     attestationSchemaVersion: 1,
     productVersion,
-    packageSourceCommit: "d229b92b3ffc879d5114f7a72927bf5b036844c4",
+    packageSourceCommit: "090d68dc687c5759708b895bd6340b0bf9cd77c0",
     lifecycleValidationCommit: "0c45623fcbe7345fc9fe484a56dfb36f7cc0c68f",
     canonicalLifecyclePath: `build/electron-installer/${lifecycleName}`,
     lifecycleSha256: sha256(lifecycleText),

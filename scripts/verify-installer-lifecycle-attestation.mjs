@@ -4,7 +4,7 @@ import { lstat, readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 
 const productVersion = "0.2.0-beta.2";
-const packageSourceCommit = "d229b92b3ffc879d5114f7a72927bf5b036844c4";
+const packageSourceCommit = "090d68dc687c5759708b895bd6340b0bf9cd77c0";
 const lifecycleValidationCommit = "0c45623fcbe7345fc9fe484a56dfb36f7cc0c68f";
 const installerName = `WhiteLily-${productVersion}-windows-x64-setup.exe`;
 const lifecycleName = `WhiteLily-${productVersion}-windows-x64-installer-lifecycle.json`;
