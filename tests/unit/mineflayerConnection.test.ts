@@ -229,6 +229,57 @@ describe("MineflayerConnection", () => {
     expect(events).toEqual(["connected", "outage"]);
     expect(connection.state()).toBe("retrying");
     expect(harness.scheduledDelays()).toEqual([1_000]);
+
+    expect(() => bot.emit("error", new Error("late private stack"))).not.toThrow();
+    expect(bot.end).toHaveBeenCalledTimes(1);
+    expect(events).toEqual(["connected", "outage"]);
+    expect(harness.scheduledDelays()).toEqual([1_000]);
+  });
+
+  it("keeps a terminally fenced bot error-safe without repeating outage or retry", async () => {
+    const harness = createMineflayerConnectionHarness({
+      configureBot: (bot) => {
+        bot.end.mockImplementation(() => {
+          throw new Error("bot end failed");
+        });
+      },
+    });
+    const connection = new MineflayerConnection(harness.dependencies);
+    const events: string[] = [];
+    connection.onEvent((event) => events.push(event.kind));
+    const connecting = connection.connect();
+    harness.spawn();
+    await connecting;
+    const bot = harness.bots[0]!;
+
+    expect(() => bot.emit("error", new Error("first private stack"))).not.toThrow();
+    expect(connection.state()).toBe("exhausted");
+    expect(events).toEqual(["connected", "outage"]);
+    expect(harness.pendingTimers()).toBe(0);
+
+    expect(() => bot.emit("error", new Error("late private stack"))).not.toThrow();
+    expect(bot.end).toHaveBeenCalledTimes(1);
+    expect(events).toEqual(["connected", "outage"]);
+    expect(harness.pendingTimers()).toBe(0);
+  });
+
+  it("keeps a detached old bot error-safe after a normal end", async () => {
+    const harness = createMineflayerConnectionHarness();
+    const connection = new MineflayerConnection(harness.dependencies);
+    const events: string[] = [];
+    connection.onEvent((event) => events.push(event.kind));
+    const connecting = connection.connect();
+    harness.spawn();
+    await connecting;
+    const bot = harness.bots[0]!;
+
+    harness.end("socket closed");
+    expect(connection.state()).toBe("retrying");
+
+    expect(() => bot.emit("error", new Error("late private stack"))).not.toThrow();
+    expect(bot.end).not.toHaveBeenCalled();
+    expect(events).toEqual(["connected", "outage"]);
+    expect(harness.scheduledDelays()).toEqual([1_000]);
   });
 
   it("cancels every retry and active operation on disconnect", async () => {
@@ -346,7 +397,8 @@ describe("MineflayerConnection", () => {
     await expect(connecting).rejects.toMatchObject({ name: "AbortError" });
     harness.runTimerEvenIfCancelled(0);
     expect(harness.bots).toHaveLength(1);
-    expect(harness.bots[0]?.eventNames()).toEqual([]);
+    expect(harness.bots[0]?.eventNames()).toEqual(["error"]);
+    expect(() => harness.bots[0]?.emit("error", new Error("late private stack"))).not.toThrow();
     await expect(connection.connect()).rejects.toThrow("adapter is stopped");
   });
 
@@ -367,7 +419,8 @@ describe("MineflayerConnection", () => {
 
     void connection.connect();
 
-    expect(harness.bots[0]?.eventNames()).toEqual([]);
+    expect(harness.bots[0]?.eventNames()).toEqual(["error"]);
+    expect(() => harness.bots[0]?.emit("error", new Error("late private stack"))).not.toThrow();
     expect(harness.bots[0]?.pathfinder.stop).toHaveBeenCalledOnce();
     expect(harness.bots[0]?.clearControlStates).toHaveBeenCalledOnce();
     expect(harness.bots[0]?.end).toHaveBeenCalledOnce();
@@ -630,7 +683,8 @@ describe("MineflayerConnection", () => {
     expect(connection.currentBot()).toBeUndefined();
     expect(socketEnd).toHaveBeenCalledOnce();
     expect(socketDestroy).toHaveBeenCalledOnce();
-    expect(harness.bots[0]?.eventNames()).toEqual([]);
+    expect(harness.bots[0]?.eventNames()).toEqual(["error"]);
+    expect(() => harness.bots[0]?.emit("error", new Error("late private stack"))).not.toThrow();
   });
 
   it.each(["client_end", "socket_end", "socket_destroy"] as const)(

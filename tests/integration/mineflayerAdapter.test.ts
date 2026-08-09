@@ -253,9 +253,11 @@ describe("MineflayerAdapter", () => {
     await expect(secondConnect).resolves.toBeUndefined();
   });
 
-  it("keeps Mineflayer error stacks off the desktop protocol stdout and fails the connection closed", async () => {
+  it("passes the pinned Mineflayer logging opt-out and fails repeated bot errors closed once", async () => {
     const bot = new FakeBot();
     const protocolStdoutLines: string[] = [];
+    // This mock mirrors the pinned loader's logErrors branch; the separate loader
+    // boundary test below exercises the installed dependency itself.
     createBot.mockImplementation((options: { logErrors?: boolean }) => {
       if (options.logErrors !== false) {
         bot.on("error", (error: Error) => {
@@ -276,6 +278,11 @@ describe("MineflayerAdapter", () => {
     expect(protocolStdoutLines).toEqual([]);
     expect(events).toEqual(["connected", "disconnected"]);
     expect(bot.end).toHaveBeenCalledWith("Minecraft connection error");
+
+    expect(() => bot.emit("error", new Error("late private stack"))).not.toThrow();
+    expect(protocolStdoutLines).toEqual([]);
+    expect(events).toEqual(["connected", "disconnected"]);
+    expect(bot.end).toHaveBeenCalledTimes(1);
   });
 
   it("reports a tab-list owner online even when their entity is outside tracking range", async () => {
@@ -728,7 +735,8 @@ describe("MineflayerAdapter", () => {
     await rejected;
     for (const bot of bots) {
       expect(bot.end).toHaveBeenCalledOnce();
-      expect(bot.eventNames()).toEqual([]);
+      expect(bot.eventNames()).toEqual(["error"]);
+      expect(() => bot.emit("error", new Error("late private stack"))).not.toThrow();
     }
     vi.useRealTimers();
   });
@@ -1842,5 +1850,35 @@ describe("MineflayerAdapter", () => {
     await vi.advanceTimersByTimeAsync(60_000);
     expect(createBot).toHaveBeenCalledTimes(1);
     vi.useRealTimers();
+  });
+});
+
+describe("pinned Mineflayer loader logging boundary", () => {
+  it("does not call console.log for an owned bot error when logErrors is false", async () => {
+    const mineflayer = await vi.importActual<typeof import("mineflayer")>("mineflayer");
+    const client = Object.assign(new EventEmitter(), {
+      wait_connect: true,
+      end: vi.fn(),
+    });
+    const consoleLog = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    try {
+      const bot = mineflayer.createBot({
+        username: "WhiteLily",
+        auth: "offline",
+        client: client as never,
+        loadInternalPlugins: false,
+        hideErrors: false,
+        logErrors: false,
+      });
+      const ownedError = vi.fn();
+      bot.on("error", ownedError);
+
+      expect(() => client.emit("error", new Error("private stack"))).not.toThrow();
+
+      expect(ownedError).toHaveBeenCalledOnce();
+      expect(consoleLog).not.toHaveBeenCalled();
+    } finally {
+      consoleLog.mockRestore();
+    }
   });
 });

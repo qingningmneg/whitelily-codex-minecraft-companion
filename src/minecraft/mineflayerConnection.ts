@@ -73,6 +73,10 @@ function abortError(): Error {
   return error;
 }
 
+function swallowLateBotError(): void {
+  // A detached Mineflayer bot may still forward a delayed client/plugin error.
+}
+
 function trustedResourceIdentity(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
   const normalized = value.trim().toLowerCase();
@@ -243,8 +247,8 @@ export class MineflayerConnection {
       this.bot = bot;
       this.sessionGeneration += 1;
       this.worldIdentity = undefined;
-      bot.loadPlugin(this.dependencies.plugin);
       this.attach(bot);
+      bot.loadPlugin(this.dependencies.plugin);
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
       if (this.bot) {
@@ -279,11 +283,12 @@ export class MineflayerConnection {
       spawnPosition: (packet) => this.emitForBot(bot, { kind: "spawn_position", bot, packet }),
     };
     this.botHandlers = handlers;
+    bot.on("error", swallowLateBotError);
+    bot.once("error", handlers.error);
     bot.on("chat", handlers.chat);
     bot.on("playerJoined", handlers.playerJoined);
     bot.on("playerLeft", handlers.playerLeft);
     bot.once("spawn", handlers.spawn);
-    bot.once("error", handlers.error);
     bot.on("death", handlers.death);
     bot.once("end", handlers.end);
     bot.on("entitySpawn", handlers.entitySpawn);
@@ -304,6 +309,9 @@ export class MineflayerConnection {
     this.tryCleanup(() => bot.removeListener("playerLeft", handlers.playerLeft));
     this.tryCleanup(() => bot.removeListener("spawn", handlers.spawn));
     this.tryCleanup(() => bot.removeListener("error", handlers.error));
+    // Keep swallowLateBotError attached after lifecycle teardown. Mineflayer can
+    // forward a delayed client/plugin error after the transport begins closing,
+    // and Node throws an `error` event that has no listener.
     this.tryCleanup(() => bot.removeListener("death", handlers.death));
     this.tryCleanup(() => bot.removeListener("end", handlers.end));
     this.tryCleanup(() => bot.removeListener("entitySpawn", handlers.entitySpawn));
@@ -357,7 +365,13 @@ export class MineflayerConnection {
   }
 
   private handleError(bot: Bot): void {
-    if (this.bot !== bot) return;
+    if (
+      this.bot !== bot ||
+      this.lifecycleState === "stopped" ||
+      this.lifecycleState === "exhausted"
+    ) {
+      return;
+    }
     const reason = "Minecraft connection error";
     this.safelyStopBot(bot);
     const fenceErrors = this.establishTransportFence(bot, reason);
