@@ -1,0 +1,52 @@
+{
+  "attestationSchemaVersion": 1,
+  "productVersion": "0.2.0-beta.2",
+  "sourceCommit": "0c45623fcbe7345fc9fe484a56dfb36f7cc0c68f",
+  "canonicalLifecyclePath": "build/electron-installer/WhiteLily-0.2.0-beta.2-windows-x64-installer-lifecycle.json",
+  "lifecycleSha256": "122d959cfe6375e7139e3b2877004ff4a3b68c9ddb33e31eaa8fb3c3d2625361",
+  "recordedAt": "2026-08-09T11:50:46.5851270Z",
+  "recordedAtSource": "Authenticated lifecycle report LastWriteTimeUtc captured after host verification.",
+  "candidate": {
+    "filename": "WhiteLily-0.2.0-beta.2-windows-x64-setup.exe",
+    "bytes": 226375960,
+    "sha256": "fea355f591095ff9bd4659ac454fbe75a31a605a4791912d53b37c85ce95f86d",
+    "signature": "unsigned"
+  },
+  "publicBaseline": {
+    "releaseTag": "v0.2.0-beta.1",
+    "filename": "WhiteLily-0.2.0-beta.1-windows-x64-setup.exe",
+    "bytes": 226359624,
+    "sha256": "e3ba23e37d62eee8697c7a3af94206357acf3bae0755a61e8b92702aa60a8cd4"
+  },
+  "lifecycle": {
+    "schemaVersion": 2,
+    "success": true,
+    "stageCount": 15,
+    "stages": [
+      "controller_identity_verified",
+      "isolated_path",
+      "hashes_verified",
+      "candidate_write_denied",
+      "clean_installed",
+      "clean_workspace_verified",
+      "clean_delete_data",
+      "beta1_installed",
+      "beta1_data_root_prepared",
+      "beta1_upgraded",
+      "workspace_repaired",
+      "keep_data",
+      "reinstalled",
+      "delete_data",
+      "candidate_principal_removed"
+    ],
+    "controllerSid": "S-1-5-18",
+    "candidateReportWriteDenied": true,
+    "managedWorkspaceResources": 3
+  },
+  "zeroResidue": {
+    "windowsSandbox": 0,
+    "windowsSandboxServer": 0,
+    "windowsSandboxRemoteSession": 0,
+    "sandboxMappings": 0
+  }
+}

@@ -1,4 +1,6 @@
-import { access, readFile } from "node:fs/promises";
+import { createReadStream } from "node:fs";
+import { access, readFile, stat } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { TaskController, type ActiveTask } from "../../src/companion/taskController.js";
 import { RuntimeFacade } from "../../src/runtime/runtimeFacade.js";
@@ -32,7 +34,153 @@ const required = [
   "docs/smartscreen.md",
 ];
 
+interface InstallerLifecycleAttestation {
+  attestationSchemaVersion: number;
+  productVersion: string;
+  sourceCommit: string;
+  canonicalLifecyclePath: string;
+  lifecycleSha256: string;
+  recordedAt: string;
+  recordedAtSource: string;
+  candidate: { filename: string; bytes: number; sha256: string; signature: string };
+  publicBaseline: {
+    releaseTag: string;
+    filename: string;
+    bytes: number;
+    sha256: string;
+  };
+  lifecycle: {
+    schemaVersion: number;
+    success: boolean;
+    stageCount: number;
+    stages: string[];
+    controllerSid: string;
+    candidateReportWriteDenied: boolean;
+    managedWorkspaceResources: number;
+  };
+  zeroResidue: {
+    windowsSandbox: number;
+    windowsSandboxServer: number;
+    windowsSandboxRemoteSession: number;
+    sandboxMappings: number;
+  };
+}
+
+function assertAttestationShape(value: unknown): asserts value is InstallerLifecycleAttestation {
+  if (!value || typeof value !== "object") throw new Error("attestation object required");
+  const attestation = value as Partial<InstallerLifecycleAttestation>;
+  if (attestation.attestationSchemaVersion !== 1) throw new Error("attestation schema required");
+  if (!/^[0-9a-f]{64}$/u.test(attestation.lifecycleSha256 ?? "")) {
+    throw new Error("attestation lifecycle hash required");
+  }
+  if (!attestation.canonicalLifecyclePath?.startsWith("build/electron-installer/")) {
+    throw new Error("attestation canonical lifecycle path required");
+  }
+  const serialized = JSON.stringify(attestation);
+  if (
+    /candidate(?:Sid|User|Username)|\b(?:pid|processId)\b|S-1-5-21-|[A-Z]:\\|\/Users\//iu.test(
+      serialized,
+    )
+  ) {
+    throw new Error("attestation must not contain personal paths or candidate identity");
+  }
+}
+
+async function sha256File(path: string): Promise<string> {
+  const hash = createHash("sha256");
+  for await (const chunk of createReadStream(path)) hash.update(chunk);
+  return hash.digest("hex");
+}
+
+async function assertAttestationMatchesLocalEvidence(
+  attestation: InstallerLifecycleAttestation,
+): Promise<void> {
+  try {
+    await access(attestation.canonicalLifecyclePath);
+    if ((await sha256File(attestation.canonicalLifecyclePath)) !== attestation.lifecycleSha256) {
+      throw new Error("attestation lifecycle hash mismatch");
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  const candidatePath = `build/electron-installer/${attestation.candidate.filename}`;
+  try {
+    if ((await stat(candidatePath)).size !== attestation.candidate.bytes) {
+      throw new Error("attestation candidate byte size mismatch");
+    }
+    if ((await sha256File(candidatePath)) !== attestation.candidate.sha256) {
+      throw new Error("attestation candidate hash mismatch");
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+}
+
 describe("public release readiness", () => {
+  it("attests the canonical installer lifecycle without personal host details", async () => {
+    const attestationPath =
+      "docs/release-evidence/WhiteLily-0.2.0-beta.2-installer-lifecycle.attestation.json";
+    const attestation = JSON.parse(await readFile(attestationPath, "utf8")) as unknown;
+    assertAttestationShape(attestation);
+    const tampered = { ...attestation, lifecycleSha256: "0".repeat(64) };
+    assertAttestationShape(tampered);
+
+    const record = attestation as InstallerLifecycleAttestation;
+    expect(Number.isNaN(Date.parse(record.recordedAt))).toBe(false);
+    expect(record).toMatchObject({
+      productVersion: "0.2.0-beta.2",
+      sourceCommit: "0c45623fcbe7345fc9fe484a56dfb36f7cc0c68f",
+      candidate: {
+        filename: "WhiteLily-0.2.0-beta.2-windows-x64-setup.exe",
+        bytes: 226_375_960,
+        sha256: "fea355f591095ff9bd4659ac454fbe75a31a605a4791912d53b37c85ce95f86d",
+        signature: "unsigned",
+      },
+      publicBaseline: {
+        releaseTag: "v0.2.0-beta.1",
+        filename: "WhiteLily-0.2.0-beta.1-windows-x64-setup.exe",
+        bytes: 226_359_624,
+        sha256: "e3ba23e37d62eee8697c7a3af94206357acf3bae0755a61e8b92702aa60a8cd4",
+      },
+      lifecycle: {
+        schemaVersion: 2,
+        success: true,
+        stageCount: 15,
+        controllerSid: "S-1-5-18",
+        candidateReportWriteDenied: true,
+        managedWorkspaceResources: 3,
+      },
+      zeroResidue: {
+        windowsSandbox: 0,
+        windowsSandboxServer: 0,
+        windowsSandboxRemoteSession: 0,
+        sandboxMappings: 0,
+      },
+    });
+
+    const [rootPackage, desktopPackage, runtimeManifest, baselineContract] = await Promise.all([
+      readFile("package.json", "utf8"),
+      readFile("apps/desktop/package.json", "utf8"),
+      readFile("packaging/electron/runtime-manifest.json", "utf8"),
+      readFile("packaging/electron/public-installer-baselines.json", "utf8"),
+    ]);
+    expect(JSON.parse(rootPackage).version).toBe(record.productVersion);
+    expect(JSON.parse(desktopPackage).version).toBe(record.productVersion);
+    expect(JSON.parse(runtimeManifest).productVersion).toBe(record.productVersion);
+    expect(JSON.parse(baselineContract).baselines).toContainEqual({
+      version: "0.2.0-beta.1",
+      releaseTag: record.publicBaseline.releaseTag,
+      assetName: record.publicBaseline.filename,
+      bytes: record.publicBaseline.bytes,
+      sha256: record.publicBaseline.sha256,
+    });
+
+    await assertAttestationMatchesLocalEvidence(record);
+    await expect(assertAttestationMatchesLocalEvidence(tampered)).rejects.toThrow(
+      "attestation lifecycle hash mismatch",
+    );
+  });
+
   it("contains every public distribution file", async () => {
     await Promise.all(required.map((path) => access(path)));
   });
