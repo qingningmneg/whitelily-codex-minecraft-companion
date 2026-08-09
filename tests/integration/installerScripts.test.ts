@@ -587,6 +587,27 @@ async function createRepositoryFixture(options: FixtureOptions = {}): Promise<{
   const installer = await createInstallerFixture(root, options);
   const baselineInstaller = join(root, "fixture", baselineInstallerName);
   await writeFile(baselineInstaller, "fixture beta.1 baseline installer\n", "utf8");
+  const baselineContents = await readFile(baselineInstaller);
+  await writeFile(
+    join(root, "packaging", "electron", "public-installer-baselines.json"),
+    `${JSON.stringify(
+      {
+        schemaVersion: 1,
+        baselines: [
+          {
+            version: baselineVersion,
+            releaseTag: "v0.2.0-beta.1",
+            assetName: baselineInstallerName,
+            bytes: baselineContents.length,
+            sha256: createHash("sha256").update(baselineContents).digest("hex"),
+          },
+        ],
+      },
+      null,
+      2,
+    )}\n`,
+    "utf8",
+  );
 
   const tools = join(root, "fixture-tools");
   await mkdir(tools, { recursive: true });
@@ -2035,6 +2056,53 @@ public static class FakeUninstallerWizard {
     expect(verification.status, `${verification.stdout}\n${verification.stderr}`).toBe(0);
     expect(verification.stdout.trim()).toBe("0");
   }, 180_000);
+
+  it("rejects a beta.1 baseline that diverges from the public release contract before Sandbox", async () => {
+    const fixture = await createRepositoryFixture();
+    const publicBaselineContract = join(
+      fixture.root,
+      "packaging",
+      "electron",
+      "public-installer-baselines.json",
+    );
+    await writeFile(
+      publicBaselineContract,
+      `${JSON.stringify(
+        {
+          schemaVersion: 1,
+          baselines: [
+            {
+              version: baselineVersion,
+              releaseTag: "v0.2.0-beta.1",
+              assetName: baselineInstallerName,
+              bytes: 226_359_624,
+              sha256: "e3ba23e37d62eee8697c7a3af94206357acf3bae0755a61e8b92702aa60a8cd4",
+            },
+          ],
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+    const releaseInstaller = await stageLifecycleInstallers(fixture);
+
+    const result = runPowerShell(
+      join(fixture.root, "scripts", "test-installer.ps1"),
+      ["-InstallerPath", releaseInstaller],
+      {
+        cwd: fixture.root,
+        env: {
+          ...fixture.environment,
+          WHITELILY_FORCE_SANDBOX_UNAVAILABLE: "1",
+        },
+      },
+    );
+
+    expect(result.status).not.toBe(0);
+    expect(`${result.stdout}\n${result.stderr}`).toContain("BETA1_PUBLIC_BASELINE_REQUIRED");
+    expect(`${result.stdout}\n${result.stderr}`).not.toContain("WINDOWS_SANDBOX_REQUIRED");
+  });
 
   it("fails closed when Windows Sandbox is unavailable and never falls back to this profile", async () => {
     const fixture = await createRepositoryFixture();

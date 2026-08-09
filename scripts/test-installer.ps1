@@ -308,6 +308,35 @@ if (-not $nameMatch.Success) {
 }
 $version = $nameMatch.Groups['version'].Value
 $baselineVersion = '0.2.0-beta.1'
+$publicBaselineContractPath = Join-Path $repositoryRoot 'packaging\electron\public-installer-baselines.json'
+if (-not (Test-Path -LiteralPath $publicBaselineContractPath -PathType Leaf)) {
+    throw 'PUBLIC_BASELINE_CONTRACT_REQUIRED'
+}
+try {
+    $publicBaselineContract = Get-Content -LiteralPath $publicBaselineContractPath -Raw -Encoding UTF8 | ConvertFrom-Json
+} catch {
+    throw 'PUBLIC_BASELINE_CONTRACT_INVALID'
+}
+$publicBaselineEntries = @($publicBaselineContract.baselines | Where-Object {
+    [string]$_.version -eq $baselineVersion
+})
+if (
+    [int]$publicBaselineContract.schemaVersion -ne 1 -or
+    $publicBaselineEntries.Count -ne 1 -or
+    -not [StringComparer]::Ordinal.Equals(
+        [string]$publicBaselineEntries[0].releaseTag,
+        'v0.2.0-beta.1'
+    ) -or
+    -not [StringComparer]::Ordinal.Equals(
+        [string]$publicBaselineEntries[0].assetName,
+        "WhiteLily-$baselineVersion-windows-x64-setup.exe"
+    ) -or
+    [int64]$publicBaselineEntries[0].bytes -le 0 -or
+    [string]$publicBaselineEntries[0].sha256 -cnotmatch '^[0-9a-f]{64}$'
+) {
+    throw 'PUBLIC_BASELINE_CONTRACT_INVALID'
+}
+$publicBaseline = $publicBaselineEntries[0]
 $installerDirectory = [System.IO.Path]::GetFullPath((Split-Path -Parent $resolvedInstaller))
 $expectedBaselineInstaller = [System.IO.Path]::GetFullPath(
     (Join-Path $installerDirectory "WhiteLily-$baselineVersion-windows-x64-setup.exe")
@@ -327,6 +356,12 @@ if (
     throw 'BETA1_BASELINE_INSTALLER_REQUIRED'
 }
 $baselineInstallerHash = Get-Sha256Hex $resolvedBaselineInstaller
+if (
+    (Get-Item -LiteralPath $resolvedBaselineInstaller).Length -ne [int64]$publicBaseline.bytes -or
+    -not [StringComparer]::Ordinal.Equals($baselineInstallerHash, [string]$publicBaseline.sha256)
+) {
+    throw 'BETA1_PUBLIC_BASELINE_REQUIRED'
+}
 $candidateInstallerHash = Get-Sha256Hex $resolvedInstaller
 if (
     [StringComparer]::Ordinal.Equals($version, $baselineVersion) -or
