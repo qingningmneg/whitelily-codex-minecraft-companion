@@ -7,6 +7,7 @@ import type { ConfirmedWorldBinding } from "../../../../src/world/worldProfileSt
 import type { ConfirmedConnectionProof, LanDetector } from "./lanDetector.js";
 
 const execFile = promisify(nodeExecFile);
+const MAX_JAVA_PROCESS_SNAPSHOT_BYTES = 65_536;
 const strictUtf8Decoder = new TextDecoder("utf-8", { fatal: true });
 
 export interface JavaProcessSnapshot {
@@ -108,13 +109,25 @@ async function readJavaProcessSnapshot(pid: number): Promise<JavaProcessSnapshot
   const { stdout } = await execFile(
     "powershell.exe",
     ["-NoProfile", "-NonInteractive", "-Command", command],
-    { encoding: "buffer", maxBuffer: 65_536, shell: false, timeout: 5_000, windowsHide: true },
+    {
+      encoding: "buffer",
+      maxBuffer: MAX_JAVA_PROCESS_SNAPSHOT_BYTES,
+      shell: false,
+      timeout: 5_000,
+      windowsHide: true,
+    },
   );
   if (!Buffer.isBuffer(stdout)) throw new Error("invalid Java process snapshot encoding");
   return parseJavaProcessSnapshotOutput(stdout);
 }
 
 export function parseJavaProcessSnapshotOutput(output: Uint8Array): JavaProcessSnapshot {
+  if (output.byteLength < 1 || output.byteLength > MAX_JAVA_PROCESS_SNAPSHOT_BYTES) {
+    throw new Error("invalid Java process snapshot");
+  }
+  if (output[0] === 0xef && output[1] === 0xbb && output[2] === 0xbf) {
+    throw new Error("invalid Java process snapshot encoding");
+  }
   let decoded: string;
   try {
     decoded = strictUtf8Decoder.decode(output);

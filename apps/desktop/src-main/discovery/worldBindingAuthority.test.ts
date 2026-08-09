@@ -58,6 +58,42 @@ describe("WorldBindingAuthority", () => {
     );
   });
 
+  it("rejects a UTF-8 BOM instead of silently accepting a prefixed snapshot", () => {
+    const encoded = Buffer.from(JSON.stringify(snapshot), "utf8");
+    expect(() =>
+      parseJavaProcessSnapshotOutput(Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), encoded])),
+    ).toThrow("invalid Java process snapshot encoding");
+  });
+
+  it("rejects a valid JSON snapshot beyond the PowerShell stdout byte limit", () => {
+    const encoded = Buffer.from(
+      JSON.stringify({ ...snapshot, commandLine: "x".repeat(65_536) }),
+      "utf8",
+    );
+    expect(encoded.byteLength).toBeGreaterThan(65_536);
+
+    expect(() => parseJavaProcessSnapshotOutput(encoded)).toThrow("invalid Java process snapshot");
+  });
+
+  it("accepts a valid snapshot at the exact PowerShell stdout byte limit", () => {
+    const emptyCommandLine = Buffer.from(JSON.stringify({ ...snapshot, commandLine: "" }), "utf8");
+    const commandLine = "x".repeat(65_536 - emptyCommandLine.byteLength);
+    const encoded = Buffer.from(JSON.stringify({ ...snapshot, commandLine }), "utf8");
+    expect(encoded.byteLength).toBe(65_536);
+
+    expect(parseJavaProcessSnapshotOutput(encoded).commandLine).toBe(commandLine);
+  });
+
+  it.each([
+    ["empty output", Buffer.alloc(0)],
+    [
+      "mixed JSON and diagnostic output",
+      Buffer.concat([Buffer.from(JSON.stringify(snapshot), "utf8"), Buffer.from("\r\ndiagnostic")]),
+    ],
+  ])("rejects %s", (_label, output) => {
+    expect(() => parseJavaProcessSnapshotOutput(output)).toThrow("invalid Java process snapshot");
+  });
+
   it.skipIf(process.platform !== "win32")(
     "round-trips a real CJK --gameDir through Windows PowerShell before canonicalizing it",
     async () => {
