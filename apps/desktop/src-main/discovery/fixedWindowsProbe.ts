@@ -135,6 +135,492 @@ ConvertTo-Json -InputObject $payload -Compress -Depth 3
 export const FIXED_JAVA_LISTENER_PROBE_SCRIPT = `${FIXED_UTF8_POWERSHELL_PREAMBLE}
 ${String.raw`
 $ErrorActionPreference = 'Stop'
+Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
+using Microsoft.Win32.SafeHandles;
+
+public static class WhiteLilyWindowsCommandLine
+{
+    private const uint GenericRead = 0x80000000;
+    private const uint FileShareRead = 0x00000001;
+    private const uint OpenExisting = 3;
+    private const uint FileAttributeNormal = 0x00000080;
+    private const uint FileAttributeDirectory = 0x00000010;
+    private const uint FileAttributeReparsePoint = 0x00000400;
+    private static readonly IntPtr InvalidHandleValue = new IntPtr(-1);
+
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr CommandLineToArgvW(string commandLine, out int argumentCount);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr LocalFree(IntPtr memory);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr CreateFile(
+        string fileName,
+        uint desiredAccess,
+        uint shareMode,
+        IntPtr securityAttributes,
+        uint creationDisposition,
+        uint flagsAndAttributes,
+        IntPtr templateFile);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern uint GetFinalPathNameByHandle(
+        SafeFileHandle file,
+        StringBuilder filePath,
+        uint filePathLength,
+        uint flags);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetFileInformationByHandleEx(
+        SafeFileHandle file,
+        int informationClass,
+        out FileAttributeTagInfo information,
+        uint bufferSize);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct FileAttributeTagInfo
+    {
+        internal uint FileAttributes;
+        internal uint ReparseTag;
+    }
+
+    public static string[] Split(string commandLine)
+    {
+        if (String.IsNullOrWhiteSpace(commandLine)) return null;
+        int argumentCount;
+        IntPtr arguments = CommandLineToArgvW(commandLine, out argumentCount);
+        if (arguments == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error());
+        try
+        {
+            if (argumentCount <= 0 || argumentCount > 4096) return null;
+            string[] result = new string[argumentCount];
+            for (int index = 0; index < argumentCount; index++)
+            {
+                IntPtr value = Marshal.ReadIntPtr(arguments, index * IntPtr.Size);
+                result[index] = Marshal.PtrToStringUni(value);
+            }
+            return result;
+        }
+        finally
+        {
+            LocalFree(arguments);
+        }
+    }
+
+    public static int CountTopLevelProperty(string json, string propertyName)
+    {
+        if (String.IsNullOrEmpty(json) || String.IsNullOrEmpty(propertyName)) return -1;
+        int objectDepth = 0;
+        int arrayDepth = 0;
+        int count = 0;
+        char previousSignificant = '\0';
+        for (int index = 0; index < json.Length; index++)
+        {
+            char current = json[index];
+            if (current == ' ' || current == '\t' || current == '\r' || current == '\n') continue;
+            if (current == '"')
+            {
+                string value;
+                if (!TryReadJsonString(json, ref index, out value)) return -1;
+                if (objectDepth == 1 && arrayDepth == 0 &&
+                    (previousSignificant == '{' || previousSignificant == ','))
+                {
+                    int colonIndex = index + 1;
+                    while (colonIndex < json.Length &&
+                           (json[colonIndex] == ' ' || json[colonIndex] == '\t' ||
+                            json[colonIndex] == '\r' || json[colonIndex] == '\n'))
+                    {
+                        colonIndex++;
+                    }
+                    if (colonIndex >= json.Length || json[colonIndex] != ':') return -1;
+                    if (String.Equals(value, propertyName, StringComparison.OrdinalIgnoreCase)) count++;
+                }
+                previousSignificant = '"';
+                continue;
+            }
+            if (current == '{') objectDepth++;
+            if (current == '}')
+            {
+                objectDepth--;
+                if (objectDepth < 0) return -1;
+                if (objectDepth == 0)
+                {
+                    if (arrayDepth != 0) return -1;
+                    for (int trailing = index + 1; trailing < json.Length; trailing++)
+                    {
+                        char extra = json[trailing];
+                        if (extra != ' ' && extra != '\t' && extra != '\r' && extra != '\n') return -1;
+                    }
+                    return count;
+                }
+            }
+            if (current == '[') arrayDepth++;
+            if (current == ']')
+            {
+                arrayDepth--;
+                if (arrayDepth < 0) return -1;
+            }
+            previousSignificant = current;
+        }
+        return -1;
+    }
+
+    internal static string ReadBoundedUtf8FromHandle(SafeFileHandle file, long maximumBytes)
+    {
+        if (file == null || file.IsInvalid || file.IsClosed || maximumBytes <= 0) return null;
+        FileStream stream = null;
+        try
+        {
+            stream = new FileStream(file, FileAccess.Read, 4096, false);
+            if (stream.Length <= 0 || stream.Length > maximumBytes) return null;
+            using (StreamReader reader = new StreamReader(
+                stream,
+                new UTF8Encoding(false, true),
+                false,
+                4096,
+                true))
+            {
+                string contents = reader.ReadToEnd();
+                if (contents.Length > 0 && contents[0] == '\uFEFF')
+                {
+                    contents = contents.Substring(1);
+                }
+                return contents;
+            }
+        }
+        catch
+        {
+            return null;
+        }
+        finally
+        {
+            if (stream != null) stream.Dispose();
+            else file.Dispose();
+        }
+    }
+
+    internal static SafeFileHandle OpenVerifiedOrdinaryFile(string path)
+    {
+        if (String.IsNullOrWhiteSpace(path)) return null;
+        IntPtr rawHandle = CreateFile(
+            path,
+            GenericRead,
+            FileShareRead,
+            IntPtr.Zero,
+            OpenExisting,
+            FileAttributeNormal,
+            IntPtr.Zero);
+        if (rawHandle == InvalidHandleValue) return null;
+        SafeFileHandle file = new SafeFileHandle(rawHandle, true);
+        try
+        {
+            FileAttributeTagInfo attributes;
+            if (!GetFileInformationByHandleEx(
+                    file,
+                    9,
+                    out attributes,
+                    (uint)Marshal.SizeOf(typeof(FileAttributeTagInfo))) ||
+                (attributes.FileAttributes & FileAttributeDirectory) != 0 ||
+                (attributes.FileAttributes & FileAttributeReparsePoint) != 0 ||
+                !HasExpectedFinalPath(file, path))
+            {
+                file.Dispose();
+                return null;
+            }
+            return file;
+        }
+        catch
+        {
+            file.Dispose();
+            return null;
+        }
+    }
+
+    private static bool HasExpectedFinalPath(SafeFileHandle file, string requestedPath)
+    {
+        string expected = Path.GetFullPath(requestedPath);
+        uint capacity = 512;
+        while (capacity <= 32768)
+        {
+            StringBuilder path = new StringBuilder((int)capacity);
+            uint length = GetFinalPathNameByHandle(file, path, capacity, 0);
+            if (length == 0) return false;
+            if (length < capacity)
+            {
+                string actual = path.ToString();
+                const string devicePrefix = @"\\?\";
+                if (actual.StartsWith(devicePrefix, StringComparison.Ordinal))
+                {
+                    actual = actual.Substring(devicePrefix.Length);
+                }
+                return String.Equals(actual, expected, StringComparison.OrdinalIgnoreCase);
+            }
+            capacity = length + 1;
+        }
+        return false;
+    }
+
+    private static bool TryReadJsonString(string json, ref int index, out string value)
+    {
+        StringBuilder builder = new StringBuilder();
+        for (int cursor = index + 1; cursor < json.Length; cursor++)
+        {
+            char current = json[cursor];
+            if (current == '"')
+            {
+                index = cursor;
+                value = builder.ToString();
+                return true;
+            }
+            if (current < 0x20)
+            {
+                value = null;
+                return false;
+            }
+            if (current != '\\')
+            {
+                builder.Append(current);
+                continue;
+            }
+            if (++cursor >= json.Length)
+            {
+                value = null;
+                return false;
+            }
+            char escaped = json[cursor];
+            switch (escaped)
+            {
+                case '"': builder.Append('"'); break;
+                case '\\': builder.Append('\\'); break;
+                case '/': builder.Append('/'); break;
+                case 'b': builder.Append('\b'); break;
+                case 'f': builder.Append('\f'); break;
+                case 'n': builder.Append('\n'); break;
+                case 'r': builder.Append('\r'); break;
+                case 't': builder.Append('\t'); break;
+                case 'u':
+                    if (cursor + 4 >= json.Length)
+                    {
+                        value = null;
+                        return false;
+                    }
+                    int codePoint = 0;
+                    for (int offset = 1; offset <= 4; offset++)
+                    {
+                        int digit = HexValue(json[cursor + offset]);
+                        if (digit < 0)
+                        {
+                            value = null;
+                            return false;
+                        }
+                        codePoint = (codePoint << 4) | digit;
+                    }
+                    builder.Append((char)codePoint);
+                    cursor += 4;
+                    break;
+                default:
+                    value = null;
+                    return false;
+            }
+        }
+        value = null;
+        return false;
+    }
+
+    private static int HexValue(char value)
+    {
+        if (value >= '0' && value <= '9') return value - '0';
+        if (value >= 'a' && value <= 'f') return value - 'a' + 10;
+        if (value >= 'A' && value <= 'F') return value - 'A' + 10;
+        return -1;
+    }
+}
+
+public sealed class WhiteLilyVersionEvidence : IDisposable
+{
+    private SafeFileHandle versionJar;
+    private SafeFileHandle metadata;
+    private readonly long maximumMetadataBytes;
+    private bool metadataRead;
+    private bool disposed;
+
+    private WhiteLilyVersionEvidence(
+        SafeFileHandle versionJar,
+        SafeFileHandle metadata,
+        long maximumMetadataBytes)
+    {
+        this.versionJar = versionJar;
+        this.metadata = metadata;
+        this.maximumMetadataBytes = maximumMetadataBytes;
+    }
+
+    public static WhiteLilyVersionEvidence Open(
+        string versionJarPath,
+        string metadataPath,
+        long maximumMetadataBytes)
+    {
+        if (maximumMetadataBytes <= 0) return null;
+        SafeFileHandle versionJar = WhiteLilyWindowsCommandLine.OpenVerifiedOrdinaryFile(versionJarPath);
+        if (versionJar == null) return null;
+        SafeFileHandle metadata = WhiteLilyWindowsCommandLine.OpenVerifiedOrdinaryFile(metadataPath);
+        if (metadata == null)
+        {
+            versionJar.Dispose();
+            return null;
+        }
+        return new WhiteLilyVersionEvidence(versionJar, metadata, maximumMetadataBytes);
+    }
+
+    public string ReadMetadataUtf8()
+    {
+        if (disposed || metadataRead) return null;
+        metadataRead = true;
+        return WhiteLilyWindowsCommandLine.ReadBoundedUtf8FromHandle(
+            metadata,
+            maximumMetadataBytes);
+    }
+
+    public void Dispose()
+    {
+        if (disposed) return;
+        disposed = true;
+        if (metadata != null) metadata.Dispose();
+        if (versionJar != null) versionJar.Dispose();
+    }
+}
+'@
+
+function Test-WhiteLilySafeDrivePath {
+  param([string] $PathValue)
+  if ([string]::IsNullOrWhiteSpace($PathValue) -or $PathValue.Length -gt 1024) { return $false }
+  if ($PathValue -notmatch '\A[A-Za-z]:[\\/]' -or $PathValue -match '[\x00-\x1f\x7f]') { return $false }
+  if ($PathValue.StartsWith('\\') -or $PathValue.StartsWith('\\?\')) { return $false }
+  try {
+    $fullPath = [IO.Path]::GetFullPath($PathValue)
+    return $fullPath -eq $PathValue -or $fullPath -eq $PathValue.Replace('/', '\')
+  } catch {
+    return $false
+  }
+}
+
+function Test-WhiteLilySafeInstanceId {
+  param([string] $InstanceId)
+  if (
+    [string]::IsNullOrWhiteSpace($InstanceId) -or
+    $InstanceId.Length -gt 128 -or
+    $InstanceId -eq '.' -or
+    $InstanceId -eq '..' -or
+    $InstanceId.EndsWith('.') -or
+    $InstanceId.EndsWith(' ') -or
+    $InstanceId -match '[<>:"/\\|?*\x00-\x1f\x7f]'
+  ) {
+    return $false
+  }
+  try {
+    if ([IO.Path]::GetFileName($InstanceId) -cne $InstanceId) { return $false }
+  } catch {
+    return $false
+  }
+  $baseName = $InstanceId.Split('.')[0]
+  if ($baseName -match '\A(?i:CON|PRN|AUX|NUL|CLOCK\$|COM[1-9]|LPT[1-9])\z') { return $false }
+  for ($index = 0; $index -lt $InstanceId.Length; $index += 1) {
+    $character = $InstanceId[$index]
+    if ([char]::IsHighSurrogate($character)) {
+      if ($index + 1 -ge $InstanceId.Length -or -not [char]::IsLowSurrogate($InstanceId[$index + 1])) {
+        return $false
+      }
+      $index += 1
+    } elseif ([char]::IsLowSurrogate($character)) {
+      return $false
+    }
+  }
+  return $true
+}
+
+function Get-WhiteLilyMinecraftVersion {
+  param([string] $CommandLine)
+  if ([string]::IsNullOrWhiteSpace($CommandLine) -or $CommandLine.Length -gt 131072) { return $null }
+  try {
+    $tokens = [WhiteLilyWindowsCommandLine]::Split($CommandLine)
+  } catch {
+    return $null
+  }
+  if ($null -eq $tokens -or $tokens.Count -eq 0) { return $null }
+
+  $versionIndexes = [System.Collections.Generic.List[int]]::new()
+  $classPathIndexes = [System.Collections.Generic.List[int]]::new()
+  for ($index = 0; $index -lt $tokens.Count; $index += 1) {
+    if ($tokens[$index] -ceq '--version') { $versionIndexes.Add($index) }
+    if ($tokens[$index] -ceq '-cp' -or $tokens[$index] -ceq '-classpath' -or $tokens[$index] -ceq '--class-path') {
+      $classPathIndexes.Add($index)
+    }
+  }
+
+  if ($versionIndexes.Count -ne 1 -or $classPathIndexes.Count -ne 1) { return $null }
+  $versionIndex = $versionIndexes[0]
+  $classPathIndex = $classPathIndexes[0]
+  if ($versionIndex + 1 -ge $tokens.Count -or $classPathIndex + 1 -ge $tokens.Count) { return $null }
+  $instanceId = [string]$tokens[$versionIndex + 1]
+  if (-not (Test-WhiteLilySafeInstanceId -InstanceId $instanceId)) { return $null }
+
+  $matchingVersionJars = [System.Collections.Generic.List[string]]::new()
+  $expectedSuffix = "\versions\$instanceId\$instanceId.jar"
+  foreach ($entry in ([string]$tokens[$classPathIndex + 1]).Split([IO.Path]::PathSeparator)) {
+    if (-not (Test-WhiteLilySafeDrivePath -PathValue $entry)) { continue }
+    $fullEntry = [IO.Path]::GetFullPath($entry).Replace('/', '\')
+    if ($fullEntry.EndsWith($expectedSuffix, [StringComparison]::OrdinalIgnoreCase)) {
+      $matchingVersionJars.Add($fullEntry)
+    }
+  }
+  if ($matchingVersionJars.Count -ne 1) { return $null }
+
+  $versionJarPath = $matchingVersionJars[0]
+  $metadataPath = [IO.Path]::ChangeExtension($versionJarPath, '.json')
+  $versionEvidence = [WhiteLilyVersionEvidence]::Open($versionJarPath, $metadataPath, 1048576)
+  if ($null -eq $versionEvidence) { return $null }
+  try {
+    $metadataJson = $versionEvidence.ReadMetadataUtf8()
+    if ($null -eq $metadataJson) { return $null }
+    if (
+      [WhiteLilyWindowsCommandLine]::CountTopLevelProperty($metadataJson, 'id') -ne 1 -or
+      [WhiteLilyWindowsCommandLine]::CountTopLevelProperty($metadataJson, 'clientVersion') -gt 1
+    ) {
+      return $null
+    }
+    $metadata = $metadataJson | ConvertFrom-Json -ErrorAction Stop
+  } catch {
+    return $null
+  } finally {
+    $versionEvidence.Dispose()
+  }
+  if ($null -eq $metadata -or $metadata -is [Array]) { return $null }
+  $metadataPropertyNames = @($metadata.PSObject.Properties | ForEach-Object { $_.Name })
+  $idPropertyCount = @($metadataPropertyNames | Where-Object { $_ -ceq 'id' }).Count
+  $clientVersionPropertyCount = @($metadataPropertyNames | Where-Object { $_ -ceq 'clientVersion' }).Count
+  if (
+    $idPropertyCount -ne 1 -or
+    $clientVersionPropertyCount -gt 1 -or
+    -not ($metadata.id -is [string]) -or
+    $metadata.id -cne $instanceId
+  ) {
+    return $null
+  }
+  if ($clientVersionPropertyCount -eq 1) {
+    if (-not ($metadata.clientVersion -is [string]) -or $metadata.clientVersion -cne '1.21.5') {
+      return $null
+    }
+  } elseif ($instanceId -cne '1.21.5') {
+    return $null
+  }
+  return '1.21.5'
+}
+
 $records = [System.Collections.Generic.List[object]]::new()
 $listeners = @(Get-NetTCPConnection -State Listen)
 $processes = @{}
@@ -144,11 +630,8 @@ foreach ($process in @(Get-CimInstance Win32_Process -Filter "Name = 'java.exe' 
   $processName = [string]$process.Name
   $startedAt = ([DateTimeOffset]$process.CreationDate).ToUnixTimeMilliseconds()
   if ($startedAt -le 0) { continue }
-  $safeVersion = $null
   $commandLine = [string]$process.CommandLine
-  if ($commandLine -match '(?i)[\\/]versions[\\/]1\.21\.5[\\/]') {
-    $safeVersion = '1.21.5'
-  }
+  $safeVersion = Get-WhiteLilyMinecraftVersion -CommandLine $commandLine
   $processes[$pidValue] = [pscustomobject]@{
     processName = $processName.ToLowerInvariant()
     processStartedAt = $startedAt
