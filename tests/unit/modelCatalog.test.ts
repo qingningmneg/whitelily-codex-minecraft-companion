@@ -168,7 +168,7 @@ describe("ModelCatalog", () => {
   it("fails an in-flight model refresh closed when the signed-in account identity changes", async () => {
     let liveAccount = {
       type: "chatgpt" as const,
-      email: "account-a@example.test",
+      email: "account-a@example.com",
       planType: "plus" as const,
     };
     const account = new AccountService({
@@ -223,7 +223,7 @@ describe("ModelCatalog", () => {
       await modelRequestEntered.promise;
       liveAccount = {
         type: "chatgpt",
-        email: "account-b@example.test",
+        email: "account-b@example.com",
         planType: "plus",
       };
       await account.getAccount();
