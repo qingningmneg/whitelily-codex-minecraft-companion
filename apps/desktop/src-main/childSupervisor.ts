@@ -613,6 +613,11 @@ export class ChildSupervisor {
         }
         if (envelope.event.kind === "connection_invalidated") {
           child.runtimeAuthorityExposed = false;
+        } else if (envelope.event.kind !== "account" && envelope.event.kind !== "owner_identity") {
+          // A delta cannot prove that every other runtime field is terminal.
+          // Once published, revoke it on child loss unless a full terminal
+          // snapshot or authoritative invalidation subsequently clears it.
+          child.runtimeAuthorityExposed = true;
         }
         if (envelope.event.kind === "owner_identity") {
           this.#acknowledgeOwnerUpdate(child, envelope.event.owner);

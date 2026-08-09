@@ -1831,6 +1831,41 @@ describe("ChildSupervisor", () => {
     await expect(freshStatus).resolves.toMatchObject({ revision: 42, lifecycle: "idle" });
   });
 
+  it("revokes a generation exposed only through a non-terminal runtime event", async () => {
+    vi.useFakeTimers();
+    const { children, supervisor } = createHarness();
+    const first: DesktopEvent["event"][] = [];
+    const second: DesktopEvent["event"][] = [];
+    supervisor.subscribe((event) => {
+      if (event.kind === "connection_invalidated") first.push(event);
+    });
+    supervisor.subscribe((event) => {
+      if (event.kind === "connection_invalidated") second.push(event);
+    });
+    supervisor.start();
+
+    writeLifecycleEvent(children[0]!, 1, "running");
+    await Promise.resolve();
+    children[0]!.crash();
+
+    const expected = {
+      kind: "connection_invalidated" as const,
+      revision: 2,
+      reason: "runtime_failed" as const,
+      snapshot: runtimeSnapshot(2, "stopped"),
+    };
+    expect(first).toEqual([expected]);
+    expect(second).toEqual([expected]);
+
+    writeLifecycleEvent(children[0]!, 999, "running");
+    children[0]!.finishClose();
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(first).toEqual([expected]);
+    expect(second).toEqual([expected]);
+    expect(children[1]!.requests()).toEqual([]);
+  });
+
   it("publishes one safe invalidation per subscriber when an exposed child is quarantined", async () => {
     vi.useFakeTimers();
     const { children, supervisor } = createHarness();
@@ -1913,7 +1948,7 @@ describe("ChildSupervisor", () => {
 
     children[1]!.crash();
     await vi.advanceTimersByTimeAsync(2_000);
-    expect(spawnCalls[2]?.[1][2]).toBe("44");
+    expect(spawnCalls[2]?.[1][2]).toBe("45");
   });
 
   it.each([
