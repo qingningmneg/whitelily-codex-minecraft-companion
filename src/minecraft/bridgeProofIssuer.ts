@@ -1,7 +1,7 @@
 import { createHash, randomBytes as nodeRandomBytes } from "node:crypto";
 import type { Stats } from "node:fs";
-import { lstat, mkdir, open, realpath, rename, rm, type FileHandle } from "node:fs/promises";
-import { basename, isAbsolute, join, resolve } from "node:path";
+import { link, lstat, mkdir, open, realpath, rm, type FileHandle } from "node:fs/promises";
+import { basename, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
 
 const TTL_MS = 30_000;
 const MAX_REQUEST_BYTES = 4_096;
@@ -24,6 +24,10 @@ interface BridgeRequestDocument {
   issuedAt: number;
   expiresAt: number;
   nonce: string;
+}
+
+interface BridgeProofIssuerTestOptions {
+  readonly beforePublish?: () => void | Promise<void>;
 }
 
 interface PathIdentity {
@@ -106,6 +110,7 @@ export function createBridgeProofIssuer(options: {
     resolve(options.dataRoot),
     options.now ?? Date.now,
     options.randomBytes ?? nodeRandomBytes,
+    (options as BridgeProofIssuerTestOptions).beforePublish,
   );
 }
 
@@ -113,13 +118,20 @@ class FileBridgeProofIssuer implements BridgeProofIssuer {
   readonly #dataRoot: string;
   readonly #now: () => number;
   readonly #randomBytes: (size: number) => Buffer;
+  readonly #beforePublish: () => Promise<void>;
   readonly #owned = new Map<string, OwnedRequest>();
   #closed = false;
 
-  constructor(dataRoot: string, now: () => number, randomBytes: (size: number) => Buffer) {
+  constructor(
+    dataRoot: string,
+    now: () => number,
+    randomBytes: (size: number) => Buffer,
+    beforePublish: (() => void | Promise<void>) | undefined,
+  ) {
     this.#dataRoot = dataRoot;
     this.#now = now;
     this.#randomBytes = randomBytes;
+    this.#beforePublish = async () => beforePublish?.();
   }
 
   async issue(port: number): Promise<BridgeAttemptProof> {
@@ -189,13 +201,13 @@ class FileBridgeProofIssuer implements BridgeProofIssuer {
   }
 
   async #ensureRoot(): Promise<PathIdentity> {
-    try {
-      await lstat(this.#dataRoot);
-    } catch (error) {
-      if (!isMissing(error)) throw error;
-      await mkdir(this.#dataRoot, { recursive: true });
+    const volumeRoot = parse(this.#dataRoot).root;
+    let current = await this.#inspectDirectory(volumeRoot, volumeRoot);
+    const parts = relative(volumeRoot, this.#dataRoot).split(sep).filter(Boolean);
+    for (const part of parts) {
+      current = await this.#ensureChildDirectory(current, part);
     }
-    return this.#inspectDirectory(this.#dataRoot, undefined);
+    return current;
   }
 
   async #ensureChildDirectory(parent: PathIdentity, childName: string): Promise<PathIdentity> {
@@ -261,6 +273,7 @@ class FileBridgeProofIssuer implements BridgeProofIssuer {
     const temp = join(requests.operationPath, `.${filename}.tmp`);
     let handle: FileHandle | undefined;
     let opened: PathIdentity | undefined;
+    let published: PathIdentity | undefined;
     try {
       await this.#assertMissing(target);
       await this.#assertDirectoryUnchanged(requests);
@@ -284,12 +297,19 @@ class FileBridgeProofIssuer implements BridgeProofIssuer {
         throw new BridgeProofIssuerError("bridge proof rejected");
       await this.#assertDirectoryUnchanged(requests);
       await this.#assertMissing(target);
-      await rename(temp, target);
-      const published = await this.#inspectFile(target, requests);
+      await this.#beforePublish();
+      await link(temp, target);
+      published = await this.#inspectFile(target, requests);
       if (!sameFileIdentity(opened, published))
         throw new BridgeProofIssuerError("bridge proof rejected");
-      return { ...published, expiresAt, closed: false };
+      await this.#removeExact(opened, requests);
+      const final = await this.#inspectFile(target, requests);
+      if (!sameFileIdentity(published, final))
+        throw new BridgeProofIssuerError("bridge proof rejected");
+      return { ...final, expiresAt, closed: false };
     } catch (error) {
+      if (published !== undefined)
+        await this.#removeExact(published, requests).catch(() => undefined);
       if (opened !== undefined) await this.#removeExact(opened, requests).catch(() => undefined);
       throw error;
     }
