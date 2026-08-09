@@ -1,15 +1,15 @@
 {
   "attestationSchemaVersion": 1,
   "productVersion": "0.2.0-beta.2",
-  "packageSourceCommit": "d9379d5671153d0ab7aa0067125370656a7ee743",
+  "packageSourceCommit": "e79eacac0b7ba114a48e42299bb777aba62da988",
   "lifecycleValidationCommit": "0c45623fcbe7345fc9fe484a56dfb36f7cc0c68f",
   "canonicalLifecyclePath": "build/electron-installer/WhiteLily-0.2.0-beta.2-windows-x64-installer-lifecycle.json",
-  "lifecycleSha256": "a1794a02546b178e98e7f94f0547b668b4bde7e9a3ab21f47ad460f333fc3b81",
-  "hostPersistedLastWriteTimeUtc": "2026-08-09T18:22:21.9538269Z",
+  "lifecycleSha256": "1d6c10e911ef39d9e555b3347ec57a24ceb86430b8b703f0ab54aa905a814862",
+  "hostPersistedLastWriteTimeUtc": "2026-08-09T21:32:58.4304799Z",
   "candidate": {
     "filename": "WhiteLily-0.2.0-beta.2-windows-x64-setup.exe",
-    "bytes": 226379686,
-    "sha256": "dc8e8a16667466766b5aadc5b386df4e09a4984632d63604b41b98707ea4bc35",
+    "bytes": 226380179,
+    "sha256": "d0c9f5250ca0b3258a603a067f1e28308c9123b856a07b87e34c8f4b50a47f59",
     "signature": "unsigned"
   },
   "publicBaseline": {
@@ -39,8 +39,8 @@
       "delete_data",
       "candidate_principal_removed"
     ],
-    "candidateSha256": "dc8e8a16667466766b5aadc5b386df4e09a4984632d63604b41b98707ea4bc35",
-    "controllerObservedCandidateSha256": "dc8e8a16667466766b5aadc5b386df4e09a4984632d63604b41b98707ea4bc35",
+    "candidateSha256": "d0c9f5250ca0b3258a603a067f1e28308c9123b856a07b87e34c8f4b50a47f59",
+    "controllerObservedCandidateSha256": "d0c9f5250ca0b3258a603a067f1e28308c9123b856a07b87e34c8f4b50a47f59",
     "baselineSha256": "e3ba23e37d62eee8697c7a3af94206357acf3bae0755a61e8b92702aa60a8cd4",
     "controllerObservedBaselineSha256": "e3ba23e37d62eee8697c7a3af94206357acf3bae0755a61e8b92702aa60a8cd4",
     "controllerSid": "S-1-5-18",
