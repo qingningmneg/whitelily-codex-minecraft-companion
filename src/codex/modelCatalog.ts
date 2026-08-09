@@ -80,6 +80,11 @@ interface NormalizedModels {
   readonly automaticSelection: ResolvedModelSelection | undefined;
 }
 
+interface FetchedModels {
+  readonly normalized: NormalizedModels;
+  readonly accountGeneration: number;
+}
+
 export class ModelCatalog {
   readonly #appServer: ModelCatalogAppServerPort;
   readonly #account: ModelCatalogAccountPort;
@@ -134,8 +139,7 @@ export class ModelCatalog {
 
   migrateLegacyPreference(candidate: ModelSelectionInput | null): Promise<ModelCatalogSnapshot> {
     return this.#queue(async () => {
-      const generation = this.#accountGeneration;
-      const normalized = await this.#fetchModels();
+      const { normalized, accountGeneration: generation } = await this.#fetchModels();
       let preference = await this.#readPreference();
       let pendingMigrationUpdate: RecoverableModelPreferenceUpdate | undefined;
       await this.#assertCurrentAccount(generation);
@@ -215,14 +219,13 @@ export class ModelCatalog {
   }
 
   async #refresh(signal?: AbortSignal): Promise<ModelCatalogSnapshot> {
-    const generation = this.#accountGeneration;
-    const normalized = await this.#fetchModels(signal);
+    const { normalized, accountGeneration: generation } = await this.#fetchModels(signal);
     const preference = await this.#readPreference();
     await this.#assertCurrentAccount(generation, signal);
     return this.#applyRefresh(normalized, preference, true, generation, signal);
   }
 
-  async #fetchModels(signal?: AbortSignal): Promise<NormalizedModels> {
+  async #fetchModels(signal?: AbortSignal): Promise<FetchedModels> {
     throwIfAborted(signal);
     await this.#assertSignedIn(signal);
     const generation = this.#accountGeneration;
@@ -235,12 +238,14 @@ export class ModelCatalog {
     }
     await this.#assertSignedIn(signal);
     throwIfAborted(signal);
-    return normalizeModels(records);
+    return {
+      normalized: normalizeModels(records),
+      accountGeneration: generation,
+    };
   }
 
   async #prepare(input: ModelSelectionInput): Promise<PreparedModelSelection> {
-    const generation = this.#accountGeneration;
-    const normalized = await this.#fetchModels();
+    const { normalized, accountGeneration: generation } = await this.#fetchModels();
     const preference = await this.#readPreference();
     await this.#assertCurrentAccount(generation);
     return Object.freeze({

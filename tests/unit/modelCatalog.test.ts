@@ -85,6 +85,42 @@ function gate(): { promise: Promise<void>; release(): void } {
 }
 
 describe("ModelCatalog", () => {
+  it("resolves the first runtime model without account or catalog prewarming", async () => {
+    const account = new AccountService({
+      startAccountSession: async () => undefined,
+      readAccount: async () => ({
+        account: {
+          type: "chatgpt",
+          email: null,
+          planType: "plus",
+        },
+        requiresOpenaiAuth: true,
+      }),
+      startChatGptLogin: async () => ({ type: "apiKey" }),
+      cancelChatGptLogin: async () => ({ status: "notFound" }),
+      subscribeAccountNotifications: () => () => undefined,
+      stop: async () => undefined,
+    });
+    const catalog = new ModelCatalog(
+      {
+        listModelRecords: async () => [
+          model("cold-live", "Cold Live", ["medium"], { isDefault: true }),
+        ],
+      },
+      account,
+    );
+
+    try {
+      await expect(catalog.resolveRuntimeSelection()).resolves.toEqual({
+        modelId: "cold-live",
+        reasoningEffort: "medium",
+      });
+    } finally {
+      catalog.stop();
+      await account.stop();
+    }
+  });
+
   it("keeps an in-flight model fetch valid across equivalent signed-in account refreshes", async () => {
     const accountPort: AccountAppServerPort = {
       startAccountSession: async () => undefined,
