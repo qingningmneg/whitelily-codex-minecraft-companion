@@ -245,11 +245,37 @@ describe("MineflayerAdapter", () => {
       username: "WhiteLily",
       auth: "offline",
       hideErrors: false,
+      logErrors: false,
     });
     expect(bot.loadPlugin).toHaveBeenCalledWith(pathfinder);
     expect(events).toEqual(["owner_online", "chat", "connected", "owner_offline"]);
     expect(createBot).toHaveBeenCalledTimes(1);
     await expect(secondConnect).resolves.toBeUndefined();
+  });
+
+  it("keeps Mineflayer error stacks off the desktop protocol stdout and fails the connection closed", async () => {
+    const bot = new FakeBot();
+    const protocolStdoutLines: string[] = [];
+    createBot.mockImplementation((options: { logErrors?: boolean }) => {
+      if (options.logErrors !== false) {
+        bot.on("error", (error: Error) => {
+          protocolStdoutLines.push(...(error.stack ?? error.message).split(/\r?\n/u));
+        });
+      }
+      return bot;
+    });
+    const adapter = new MineflayerAdapter(config());
+    const events: string[] = [];
+    adapter.onEvent((event) => events.push(event.kind));
+    const connecting = adapter.connect();
+    bot.emit("spawn");
+    await connecting;
+
+    expect(() => bot.emit("error", new Error("private stack"))).not.toThrow();
+
+    expect(protocolStdoutLines).toEqual([]);
+    expect(events).toEqual(["connected", "disconnected"]);
+    expect(bot.end).toHaveBeenCalledWith("Minecraft connection error");
   });
 
   it("reports a tab-list owner online even when their entity is outside tracking range", async () => {

@@ -26,6 +26,7 @@ export interface MineflayerConnectionDependencies {
     username: "WhiteLily";
     auth: "offline";
     hideErrors: false;
+    logErrors: false;
   }): Bot;
   plugin: Parameters<Bot["loadPlugin"]>[0];
   retryDelaysMs: readonly number[];
@@ -50,6 +51,7 @@ interface BotHandlers {
   playerJoined: (player: { username: string }) => void;
   playerLeft: (player: { username: string }) => void;
   spawn: () => void;
+  error: (error: Error) => void;
   login: (packet: unknown) => void;
   respawn: (packet: unknown) => void;
   death: () => void;
@@ -236,6 +238,7 @@ export class MineflayerConnection {
         username: this.dependencies.config.botUsername,
         auth: "offline",
         hideErrors: false,
+        logErrors: false,
       });
       this.bot = bot;
       this.sessionGeneration += 1;
@@ -263,6 +266,7 @@ export class MineflayerConnection {
       playerLeft: (player) =>
         this.emitForBot(bot, { kind: "owner_offline", username: player.username }),
       spawn: () => this.handleSpawn(bot),
+      error: () => this.handleError(bot),
       login: (packet) => this.handleLogin(bot, packet),
       respawn: (packet) => this.handleRespawn(bot, packet),
       death: () => this.emitForBot(bot, { kind: "death" }),
@@ -279,6 +283,7 @@ export class MineflayerConnection {
     bot.on("playerJoined", handlers.playerJoined);
     bot.on("playerLeft", handlers.playerLeft);
     bot.once("spawn", handlers.spawn);
+    bot.once("error", handlers.error);
     bot.on("death", handlers.death);
     bot.once("end", handlers.end);
     bot.on("entitySpawn", handlers.entitySpawn);
@@ -298,6 +303,7 @@ export class MineflayerConnection {
     this.tryCleanup(() => bot.removeListener("playerJoined", handlers.playerJoined));
     this.tryCleanup(() => bot.removeListener("playerLeft", handlers.playerLeft));
     this.tryCleanup(() => bot.removeListener("spawn", handlers.spawn));
+    this.tryCleanup(() => bot.removeListener("error", handlers.error));
     this.tryCleanup(() => bot.removeListener("death", handlers.death));
     this.tryCleanup(() => bot.removeListener("end", handlers.end));
     this.tryCleanup(() => bot.removeListener("entitySpawn", handlers.entitySpawn));
@@ -348,6 +354,18 @@ export class MineflayerConnection {
     this.emit({ kind: "connected" });
     this.resolveConnection?.();
     this.clearConnectionPromise();
+  }
+
+  private handleError(bot: Bot): void {
+    if (this.bot !== bot) return;
+    const reason = "Minecraft connection error";
+    this.safelyStopBot(bot);
+    const fenceErrors = this.establishTransportFence(bot, reason);
+    if (fenceErrors.length > 0) {
+      this.handleFenceFailure(bot, this.createTransportFenceError(reason, fenceErrors));
+      return;
+    }
+    this.handleEnd(bot, reason);
   }
 
   private handleLogin(bot: Bot, packet: unknown): void {

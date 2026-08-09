@@ -211,6 +211,26 @@ describe("MineflayerConnection", () => {
     expect(harness.scheduledDelays()).toEqual([1_000]);
   });
 
+  it("owns bot errors and fences the transport without writing through Mineflayer's logger", async () => {
+    const harness = createMineflayerConnectionHarness();
+    const connection = new MineflayerConnection(harness.dependencies);
+    const events: string[] = [];
+    connection.onEvent((event) => events.push(event.kind));
+    const connecting = connection.connect();
+    harness.spawn();
+    await connecting;
+    const bot = harness.bots[0]!;
+
+    expect(() =>
+      bot.emit("error", new Error("private stack must stay off protocol stdout")),
+    ).not.toThrow();
+
+    expect(bot.end).toHaveBeenCalledWith("Minecraft connection error");
+    expect(events).toEqual(["connected", "outage"]);
+    expect(connection.state()).toBe("retrying");
+    expect(harness.scheduledDelays()).toEqual([1_000]);
+  });
+
   it("cancels every retry and active operation on disconnect", async () => {
     const harness = createMineflayerConnectionHarness();
     const connection = new MineflayerConnection(harness.dependencies);
