@@ -1,6 +1,6 @@
-import { createReadStream } from "node:fs";
-import { access, readFile, stat } from "node:fs/promises";
-import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
+import { access, readFile } from "node:fs/promises";
+import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import { TaskController, type ActiveTask } from "../../src/companion/taskController.js";
 import { RuntimeFacade } from "../../src/runtime/runtimeFacade.js";
@@ -37,11 +37,11 @@ const required = [
 interface InstallerLifecycleAttestation {
   attestationSchemaVersion: number;
   productVersion: string;
-  sourceCommit: string;
+  packageSourceCommit: string;
+  lifecycleValidationCommit: string;
   canonicalLifecyclePath: string;
   lifecycleSha256: string;
-  recordedAt: string;
-  recordedAtSource: string;
+  hostPersistedLastWriteTimeUtc: string;
   candidate: { filename: string; bytes: number; sha256: string; signature: string };
   publicBaseline: {
     releaseTag: string;
@@ -73,7 +73,10 @@ function assertAttestationShape(value: unknown): asserts value is InstallerLifec
   if (!/^[0-9a-f]{64}$/u.test(attestation.lifecycleSha256 ?? "")) {
     throw new Error("attestation lifecycle hash required");
   }
-  if (!attestation.canonicalLifecyclePath?.startsWith("build/electron-installer/")) {
+  if (
+    attestation.canonicalLifecyclePath !==
+    "build/electron-installer/WhiteLily-0.2.0-beta.2-windows-x64-installer-lifecycle.json"
+  ) {
     throw new Error("attestation canonical lifecycle path required");
   }
   const serialized = JSON.stringify(attestation);
@@ -86,50 +89,18 @@ function assertAttestationShape(value: unknown): asserts value is InstallerLifec
   }
 }
 
-async function sha256File(path: string): Promise<string> {
-  const hash = createHash("sha256");
-  for await (const chunk of createReadStream(path)) hash.update(chunk);
-  return hash.digest("hex");
-}
-
-async function assertAttestationMatchesLocalEvidence(
-  attestation: InstallerLifecycleAttestation,
-): Promise<void> {
-  try {
-    await access(attestation.canonicalLifecyclePath);
-    if ((await sha256File(attestation.canonicalLifecyclePath)) !== attestation.lifecycleSha256) {
-      throw new Error("attestation lifecycle hash mismatch");
-    }
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-  }
-  const candidatePath = `build/electron-installer/${attestation.candidate.filename}`;
-  try {
-    if ((await stat(candidatePath)).size !== attestation.candidate.bytes) {
-      throw new Error("attestation candidate byte size mismatch");
-    }
-    if ((await sha256File(candidatePath)) !== attestation.candidate.sha256) {
-      throw new Error("attestation candidate hash mismatch");
-    }
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-  }
-}
-
 describe("public release readiness", () => {
   it("attests the canonical installer lifecycle without personal host details", async () => {
     const attestationPath =
       "docs/release-evidence/WhiteLily-0.2.0-beta.2-installer-lifecycle.attestation.json";
     const attestation = JSON.parse(await readFile(attestationPath, "utf8")) as unknown;
     assertAttestationShape(attestation);
-    const tampered = { ...attestation, lifecycleSha256: "0".repeat(64) };
-    assertAttestationShape(tampered);
-
     const record = attestation as InstallerLifecycleAttestation;
-    expect(Number.isNaN(Date.parse(record.recordedAt))).toBe(false);
+    expect(Number.isNaN(Date.parse(record.hostPersistedLastWriteTimeUtc))).toBe(false);
     expect(record).toMatchObject({
       productVersion: "0.2.0-beta.2",
-      sourceCommit: "0c45623fcbe7345fc9fe484a56dfb36f7cc0c68f",
+      packageSourceCommit: "d229b92b3ffc879d5114f7a72927bf5b036844c4",
+      lifecycleValidationCommit: "0c45623fcbe7345fc9fe484a56dfb36f7cc0c68f",
       candidate: {
         filename: "WhiteLily-0.2.0-beta.2-windows-x64-setup.exe",
         bytes: 226_375_960,
@@ -175,10 +146,22 @@ describe("public release readiness", () => {
       sha256: record.publicBaseline.sha256,
     });
 
-    await assertAttestationMatchesLocalEvidence(record);
-    await expect(assertAttestationMatchesLocalEvidence(tampered)).rejects.toThrow(
-      "attestation lifecycle hash mismatch",
+    const verification = spawnSync(
+      process.execPath,
+      [
+        resolve(
+          import.meta.dirname,
+          "..",
+          "..",
+          "scripts",
+          "verify-installer-lifecycle-attestation.mjs",
+        ),
+        "--repo-root",
+        process.cwd(),
+      ],
+      { encoding: "utf8" },
     );
+    expect(verification.status, `${verification.stdout}\n${verification.stderr}`).toBe(0);
   });
 
   it("contains every public distribution file", async () => {
