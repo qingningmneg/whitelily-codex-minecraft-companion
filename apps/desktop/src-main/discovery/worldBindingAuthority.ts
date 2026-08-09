@@ -7,6 +7,7 @@ import type { ConfirmedWorldBinding } from "../../../../src/world/worldProfileSt
 import type { ConfirmedConnectionProof, LanDetector } from "./lanDetector.js";
 
 const execFile = promisify(nodeExecFile);
+const strictUtf8Decoder = new TextDecoder("utf-8", { fatal: true });
 
 export interface JavaProcessSnapshot {
   readonly pid: number;
@@ -96,6 +97,9 @@ function isJavaExecutable(executablePath: string): boolean {
 async function readJavaProcessSnapshot(pid: number): Promise<JavaProcessSnapshot> {
   if (!Number.isSafeInteger(pid) || pid < 1) throw new Error("invalid Java process id");
   const command = [
+    "$WhiteLilyUtf8NoBom = [System.Text.UTF8Encoding]::new($false)",
+    "[Console]::OutputEncoding = $WhiteLilyUtf8NoBom",
+    "$OutputEncoding = $WhiteLilyUtf8NoBom",
     "$p = Get-CimInstance Win32_Process -Filter 'ProcessId = " + pid + "'",
     "if ($null -eq $p) { exit 3 }",
     "$started = [DateTimeOffset](Get-Process -Id $p.ProcessId).StartTime.ToUniversalTime()",
@@ -104,9 +108,25 @@ async function readJavaProcessSnapshot(pid: number): Promise<JavaProcessSnapshot
   const { stdout } = await execFile(
     "powershell.exe",
     ["-NoProfile", "-NonInteractive", "-Command", command],
-    { windowsHide: true, timeout: 5_000, maxBuffer: 65_536 },
+    { encoding: "buffer", maxBuffer: 65_536, shell: false, timeout: 5_000, windowsHide: true },
   );
-  const parsed: unknown = JSON.parse(stdout);
+  if (!Buffer.isBuffer(stdout)) throw new Error("invalid Java process snapshot encoding");
+  return parseJavaProcessSnapshotOutput(stdout);
+}
+
+export function parseJavaProcessSnapshotOutput(output: Uint8Array): JavaProcessSnapshot {
+  let decoded: string;
+  try {
+    decoded = strictUtf8Decoder.decode(output);
+  } catch {
+    throw new Error("invalid Java process snapshot encoding");
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(decoded);
+  } catch {
+    throw new Error("invalid Java process snapshot");
+  }
   if (
     typeof parsed !== "object" ||
     parsed === null ||
