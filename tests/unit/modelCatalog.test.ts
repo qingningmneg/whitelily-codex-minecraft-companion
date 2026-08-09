@@ -165,6 +165,80 @@ describe("ModelCatalog", () => {
     await account.stop();
   });
 
+  it("fails an in-flight model refresh closed when the signed-in account identity changes", async () => {
+    let liveAccount = {
+      type: "chatgpt" as const,
+      email: "account-a@example.test",
+      planType: "plus" as const,
+    };
+    const account = new AccountService({
+      startAccountSession: async () => undefined,
+      readAccount: async () => ({
+        account: liveAccount,
+        requiresOpenaiAuth: true,
+      }),
+      startChatGptLogin: async () => ({ type: "apiKey" }),
+      cancelChatGptLogin: async () => ({ status: "notFound" }),
+      subscribeAccountNotifications: () => () => undefined,
+      stop: async () => undefined,
+    });
+    const store = await preferenceStore();
+    const modelRequestEntered = gate();
+    const allowModelResponse = gate();
+    let deferModelResponse = false;
+    const catalog = new ModelCatalog(
+      {
+        listModelRecords: async () => {
+          if (!deferModelResponse) {
+            return [model("account-a-model", "Account A Model", ["medium"])];
+          }
+          modelRequestEntered.release();
+          await allowModelResponse.promise;
+          return [model("account-b-model", "Account B Model", ["high"])];
+        },
+      },
+      account,
+      {
+        store,
+        legacyConfigCandidate: {
+          mode: "explicit",
+          modelId: "legacy-config",
+          reasoningEffort: "medium",
+        },
+      },
+    );
+
+    try {
+      await catalog.selectModel({
+        mode: "explicit",
+        modelId: "account-a-model",
+        reasoningEffort: "medium",
+      });
+      const durableBefore = await store.read();
+      const events: ModelCatalogEvent[] = [];
+      catalog.subscribe((event) => events.push(event));
+      deferModelResponse = true;
+
+      const resolving = catalog.resolveRuntimeSelection();
+      await modelRequestEntered.promise;
+      liveAccount = {
+        type: "chatgpt",
+        email: "account-b@example.test",
+        planType: "plus",
+      };
+      await account.getAccount();
+      allowModelResponse.release();
+
+      await expect(resolving).rejects.toThrow("ChatGPT authentication is required");
+      expect(events).toEqual([]);
+      await expect(store.read()).resolves.toEqual(durableBefore);
+    } finally {
+      allowModelResponse.release();
+      catalog.stop();
+      await account.stop();
+    }
+  });
+
   it("preserves live order while safely deduplicating model IDs and efforts", async () => {
     const account = signedInAccount();
     const appServer: ModelCatalogAppServerPort = {
