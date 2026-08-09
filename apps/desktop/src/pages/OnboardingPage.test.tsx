@@ -1698,7 +1698,7 @@ describe("first-run onboarding", () => {
     expect(harness.detectLanCandidates).toHaveBeenCalledTimes(1);
   });
 
-  it("clears its bounded LAN poll timer on unmount", async () => {
+  it("clears its active LAN poll timer on unmount", async () => {
     const harness = createApiHarness({
       pcl2: [pcl2Candidate],
       lan: [],
@@ -1722,10 +1722,10 @@ describe("first-run onboarding", () => {
     expect(harness.detectLanCandidates).toHaveBeenCalledTimes(1);
   });
 
-  it("stops polling after the bounded empty-scan limit", async () => {
+  it("keeps detecting after the fast-scan window and finds a later candidate without manual refresh", async () => {
     const harness = createApiHarness({
       pcl2: [pcl2Candidate],
-      lan: [],
+      lan: [...Array.from({ length: 60 }, () => [] as readonly LanCandidate[]), [lanCandidate]],
       owner: {
         revision: 1,
         ownerUsername: "CurrentOwner",
@@ -1736,9 +1736,24 @@ describe("first-run onboarding", () => {
     await resumeLanWithFakeTimers(harness);
 
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(120_000);
+      await vi.advanceTimersByTimeAsync(59_000);
     });
     expect(harness.detectLanCandidates).toHaveBeenCalledTimes(60);
+    expect(screen.queryByText("Port 51321")).toBeNull();
+    expect(vi.getTimerCount()).toBeGreaterThan(0);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(4_999);
+    });
+    expect(harness.detectLanCandidates).toHaveBeenCalledTimes(60);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1);
+    });
+    expect(harness.detectLanCandidates).toHaveBeenCalledTimes(61);
+    expect(screen.getByText("Port 51321")).toBeTruthy();
+    expect(harness.confirmLanCandidate).not.toHaveBeenCalled();
+    expect(harness.start).not.toHaveBeenCalled();
     expect(vi.getTimerCount()).toBe(0);
   });
 

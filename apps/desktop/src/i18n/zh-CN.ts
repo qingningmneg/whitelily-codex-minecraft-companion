@@ -68,7 +68,7 @@ export const zhCN = {
   "onboarding.lan.body": "WhiteLily 只检查本机回环地址，并在连接前等你明确确认。",
   "onboarding.lan.instructionsTitle": "请先在游戏中开放 LAN",
   "onboarding.lan.instructionsBody":
-    "请先用 PCL2 启动 Minecraft Java 1.21.5，进入目标世界并手动开放局域网。白百合会自动检测，也可以随时手动刷新。",
+    "请先用 PCL2 启动 Minecraft Java 1.21.5，进入目标世界并手动开放局域网。白百合会自动检测：先每秒检测，随后降低频率并持续检测；也可以随时手动刷新。",
   "onboarding.lan.port": "端口 {port}",
   "onboarding.lan.version": "Minecraft {version}",
   "onboarding.lan.versionUnknown": "Minecraft 版本未知",

@@ -77,7 +77,7 @@ export const en = {
     "WhiteLily checks this computer's loopback interface only and waits for your explicit confirmation.",
   "onboarding.lan.instructionsTitle": "Open the world to LAN first",
   "onboarding.lan.instructionsBody":
-    "Use PCL2 to launch Minecraft Java 1.21.5, enter the intended world, and open it to LAN manually. WhiteLily detects it automatically, and manual refresh remains available.",
+    "Use PCL2 to launch Minecraft Java 1.21.5, enter the intended world, and open it to LAN manually. WhiteLily scans every second at first, then continues automatically at a lower frequency; manual refresh remains available.",
   "onboarding.lan.port": "Port {port}",
   "onboarding.lan.version": "Minecraft {version}",
   "onboarding.lan.versionUnknown": "Minecraft version unknown",

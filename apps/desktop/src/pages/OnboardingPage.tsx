@@ -19,7 +19,8 @@ const MAX_STORAGE_BYTES = 2_048;
 const MAX_LOGIN_POLL_MS = 10 * 60_000;
 const LOGIN_POLL_INTERVAL_MS = 250;
 const LAN_POLL_INTERVAL_MS = 1_000;
-const MAX_LAN_POLL_ATTEMPTS = 60;
+const LAN_IDLE_POLL_INTERVAL_MS = 5_000;
+const FAST_LAN_POLL_ATTEMPTS = 60;
 const MODEL_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const EFFORT_PATTERN = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/u;
 
@@ -585,18 +586,16 @@ export function OnboardingPage({ api, locale, active, onReady }: OnboardingPageP
       if (stopped || generation !== lanDiscoveryGeneration.current) return;
       attempts += 1;
       const candidates = await scanLan(generation);
-      if (
-        stopped ||
-        generation !== lanDiscoveryGeneration.current ||
-        candidates.length > 0 ||
-        attempts >= MAX_LAN_POLL_ATTEMPTS
-      ) {
+      if (stopped || generation !== lanDiscoveryGeneration.current || candidates.length > 0) {
         return;
       }
-      lanPollTimer.current = setTimeout(() => {
-        lanPollTimer.current = null;
-        void run();
-      }, LAN_POLL_INTERVAL_MS);
+      lanPollTimer.current = setTimeout(
+        () => {
+          lanPollTimer.current = null;
+          void run();
+        },
+        attempts >= FAST_LAN_POLL_ATTEMPTS ? LAN_IDLE_POLL_INTERVAL_MS : LAN_POLL_INTERVAL_MS,
+      );
     };
     void run();
     return () => {
