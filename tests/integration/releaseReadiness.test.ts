@@ -99,12 +99,12 @@ describe("public release readiness", () => {
     expect(Number.isNaN(Date.parse(record.hostPersistedLastWriteTimeUtc))).toBe(false);
     expect(record).toMatchObject({
       productVersion: "0.2.0-beta.2",
-      packageSourceCommit: "090d68dc687c5759708b895bd6340b0bf9cd77c0",
+      packageSourceCommit: "b9ccc744dfe795dec9bad095580292d316ee6077",
       lifecycleValidationCommit: "0c45623fcbe7345fc9fe484a56dfb36f7cc0c68f",
       candidate: {
         filename: "WhiteLily-0.2.0-beta.2-windows-x64-setup.exe",
-        bytes: 226_376_252,
-        sha256: "eeb0a16fd64fbd7ec57f3b8baa591c3f86f43c0a8ef0bdc4b05c7d4aa1c674dd",
+        bytes: 226_376_326,
+        sha256: "46d46c53675015a6a6d456326199017d2d96873688cb8087066c3ce59ce37fad",
         signature: "unsigned",
       },
       publicBaseline: {
