@@ -14,6 +14,7 @@
 - Never read, copy, log, export, or reuse PCL2/Microsoft/Minecraft credentials or access tokens.
 - Never change global online authentication, `online-mode`, whitelist, scoreboard/team, or persistent world data.
 - A Bridge approval requires integrated server + loopback source + exact current port + exact username `WhiteLily` + unexpired 256-bit proof + successful one-time atomic consumption.
+- The filesystem boundary assumes WhiteLily's current-user data root and the verified PCL2 instance are not under continuous hostile mutation by code already running as that same Windows user. Reject pre-existing links/reparse points, path escapes, collisions, and identity drift at every documented boundary, but do not claim that Node pathname APIs can defeat an attacker who can inspect local process/request state, race every syscall, rewrite ACLs, or terminate the app. The Bridge proof protects the LAN authentication boundary; it is not a defense against compromise of the local Windows account.
 - Renderer input may contain only opaque IDs and bounded enum choices; no renderer path, PID, command line, URL, shell, script, hash, or filename becomes authority.
 - Installing components never starts, clicks, closes, or restarts PCL2/Minecraft. A component written after Java start produces `restart_required`.
 - Manage only fixed manifest-bound JARs in the exact verified gameDir `mods` child. Reject links, reparse aliases, path escape, unknown same-name files, non-Fabric instances, and identity races.
@@ -137,7 +138,7 @@ Expected: FAIL because `bridgeProofIssuer.ts` does not exist.
 
 - [ ] **Step 3: Implement the minimal issuer**
 
-Use `mkdir`, `lstat`, `realpath`, `open("wx", 0o600)`, `FileHandle.sync`, `rename`, and before/after directory/file identity checks. Serialize with `JSON.stringify(document) + "\n"`; reject files larger than 4,096 bytes. Cleanup uses only issuer-owned exact absolute paths and never recursive deletion or globbing.
+Use `mkdir`, `lstat`, `realpath`, `open("wx", 0o600)`, `FileHandle.sync`, same-directory atomic no-replace hard-link publication, and before/after directory/file identity checks. Serialize with `JSON.stringify(document) + "\n"`; reject files larger than 4,096 bytes. Cleanup uses only issuer-owned exact absolute paths and never recursive deletion or globbing. Under the stated local-account threat boundary, a detected parent identity change fails closed without following the changed path; the implementation does not pretend that an additional pathname recheck is a handle-relative Windows filesystem primitive.
 
 - [ ] **Step 4: Run GREEN and mutation checks**
 
