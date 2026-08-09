@@ -6,6 +6,7 @@ import {
   mkdtemp,
   readFile,
   readdir,
+  rename,
   rm,
   symlink,
   writeFile,
@@ -13,7 +14,10 @@ import {
 import { isAbsolute, join, sep } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it } from "vitest";
-import { createBridgeProofIssuer } from "../../src/minecraft/bridgeProofIssuer.js";
+import {
+  createBridgeProofIssuer,
+  createBridgeProofIssuerForTesting,
+} from "../../src/minecraft/bridgeProofIssuer.js";
 
 interface BridgeRequestDocument {
   schemaVersion: 1;
@@ -101,16 +105,18 @@ describe("BridgeProofIssuer", () => {
     const target = requestPath(dataRoot, nonce);
     const unrelated = join(dataRoot, "bridge", "requests", "unrelated.txt");
     let attackerIdentity: Awaited<ReturnType<typeof lstat>> | undefined;
-    const issuer = createBridgeProofIssuer({
-      dataRoot,
-      randomBytes: () => Buffer.alloc(32, 11),
-      beforePublish: async () => {
-        await writeFile(target, "attacker-target", "utf8");
-        attackerIdentity = await lstat(target);
+    const issuer = createBridgeProofIssuerForTesting(
+      {
+        dataRoot,
+        randomBytes: () => Buffer.alloc(32, 11),
       },
-    } as Parameters<typeof createBridgeProofIssuer>[0] & {
-      beforePublish: () => Promise<void>;
-    });
+      {
+        beforePublish: async () => {
+          await writeFile(target, "attacker-target", "utf8");
+          attackerIdentity = await lstat(target);
+        },
+      },
+    );
     await mkdir(join(dataRoot, "bridge", "requests"), { recursive: true });
     await writeFile(unrelated, "unrelated", "utf8");
 
@@ -124,6 +130,127 @@ describe("BridgeProofIssuer", () => {
     expect((await readdir(join(dataRoot, "bridge", "requests"))).sort()).toEqual(
       ["unrelated.txt", target.split(sep).at(-1)!].sort(),
     );
+  });
+
+  it("removes a final-name hard-link alias of its own temporary proof after rejecting publication", async () => {
+    const dataRoot = await createDataRoot();
+    const nonce = nonceFor(15);
+    const target = requestPath(dataRoot, nonce);
+    const temporary = join(dataRoot, "bridge", "requests", `.${target.split(sep).at(-1)!}.tmp`);
+    const unrelated = join(dataRoot, "bridge", "requests", "unrelated.txt");
+    const issuer = createBridgeProofIssuerForTesting(
+      {
+        dataRoot,
+        randomBytes: () => Buffer.alloc(32, 15),
+      },
+      {
+        beforePublish: async () => {
+          await link(temporary, target);
+        },
+      },
+    );
+    await mkdir(join(dataRoot, "bridge", "requests"), { recursive: true });
+    await writeFile(unrelated, "unrelated", "utf8");
+
+    await expect(issuer.issue(25_565)).rejects.toThrow("bridge proof rejected");
+
+    await expect(lstat(target)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(lstat(temporary)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(unrelated, "utf8")).resolves.toBe("unrelated");
+  });
+
+  it("rejects pre-open request-directory junction drift without creating an outside temporary or final target", async () => {
+    const dataRoot = await createDataRoot();
+    const outside = await createDataRoot();
+    const nonce = nonceFor(18);
+    const target = requestPath(dataRoot, nonce);
+    const requests = join(dataRoot, "bridge", "requests");
+    const parkedRequests = join(dataRoot, "bridge", "requests-parked");
+    const temporaryName = `.${target.split(sep).at(-1)!}.tmp`;
+    const outsideTemporary = join(outside, temporaryName);
+    const outsideTarget = join(outside, target.split(sep).at(-1)!);
+    const outsideUnrelated = join(outside, "unrelated.txt");
+    await mkdir(requests, { recursive: true });
+    const issuer = createBridgeProofIssuerForTesting(
+      {
+        dataRoot,
+        randomBytes: () => Buffer.alloc(32, 18),
+      },
+      {
+        beforeTempOpen: async () => {
+          await rename(requests, parkedRequests);
+          await symlink(outside, requests, process.platform === "win32" ? "junction" : "dir");
+          await writeFile(outsideUnrelated, "outside-unrelated", "utf8");
+        },
+      },
+    );
+
+    await expect(issuer.issue(25_565)).rejects.toThrow("bridge proof rejected");
+
+    await expect(lstat(outsideTemporary)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(lstat(outsideTarget)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(outsideUnrelated, "utf8")).resolves.toBe("outside-unrelated");
+  });
+
+  it("rejects pre-link request-directory junction drift without creating an outside final target", async () => {
+    const dataRoot = await createDataRoot();
+    const outside = await createDataRoot();
+    const nonce = nonceFor(17);
+    const target = requestPath(dataRoot, nonce);
+    const requests = join(dataRoot, "bridge", "requests");
+    const parkedRequests = join(dataRoot, "bridge", "requests-parked");
+    const temporaryName = `.${target.split(sep).at(-1)!}.tmp`;
+    const outsideTemporary = join(outside, temporaryName);
+    const outsideTarget = join(outside, target.split(sep).at(-1)!);
+    const outsideUnrelated = join(outside, "unrelated.txt");
+    const issuer = createBridgeProofIssuerForTesting(
+      {
+        dataRoot,
+        randomBytes: () => Buffer.alloc(32, 17),
+      },
+      {
+        beforePublish: async () => {
+          await rename(requests, parkedRequests);
+          await symlink(outside, requests, process.platform === "win32" ? "junction" : "dir");
+          await writeFile(outsideTemporary, "outside-temporary", "utf8");
+          await writeFile(outsideUnrelated, "outside-unrelated", "utf8");
+        },
+      },
+    );
+
+    await expect(issuer.issue(25_565)).rejects.toThrow("bridge proof rejected");
+
+    await expect(lstat(outsideTarget)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(outsideTemporary, "utf8")).resolves.toBe("outside-temporary");
+    await expect(readFile(outsideUnrelated, "utf8")).resolves.toBe("outside-unrelated");
+    expect((await lstat(join(parkedRequests, temporaryName))).isFile()).toBe(true);
+  });
+
+  it("preserves an attacker replacement made after the issuer links its temporary proof", async () => {
+    const dataRoot = await createDataRoot();
+    const nonce = nonceFor(16);
+    const target = requestPath(dataRoot, nonce);
+    let attackerIdentity: Awaited<ReturnType<typeof lstat>> | undefined;
+    const issuer = createBridgeProofIssuerForTesting(
+      {
+        dataRoot,
+        randomBytes: () => Buffer.alloc(32, 16),
+      },
+      {
+        afterPublishLink: async () => {
+          await rm(target);
+          await writeFile(target, "attacker-replacement", "utf8");
+          attackerIdentity = await lstat(target);
+        },
+      },
+    );
+
+    await expect(issuer.issue(25_565)).rejects.toThrow("bridge proof rejected");
+
+    const targetAfter = await lstat(target);
+    expect(await readFile(target, "utf8")).toBe("attacker-replacement");
+    expect(targetAfter.dev).toBe(attackerIdentity?.dev);
+    expect(targetAfter.ino).toBe(attackerIdentity?.ino);
   });
 
   it.each([0, -1, 65_536, 1.5, Number.NaN, Number.POSITIVE_INFINITY])(
@@ -213,7 +340,7 @@ describe("BridgeProofIssuer", () => {
     expect(sourceAfter.ino).toBe(targetAfter.ino);
   });
 
-  it("rejects a real file symlink when the environment permits file-symlink creation", async () => {
+  it("rejects a real file symlink when the environment permits file-symlink creation", async (context) => {
     const dataRoot = await createDataRoot();
     const outside = await createDataRoot();
     const nonce = nonceFor(14);
@@ -224,7 +351,10 @@ describe("BridgeProofIssuer", () => {
     try {
       await symlink(source, target, "file");
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "EPERM") return;
+      if ((error as NodeJS.ErrnoException).code === "EPERM") {
+        context.skip("file symlink creation is unavailable in this Windows environment");
+        return;
+      }
       throw error;
     }
     const issuer = createBridgeProofIssuer({ dataRoot, randomBytes: () => Buffer.alloc(32, 14) });
@@ -233,7 +363,7 @@ describe("BridgeProofIssuer", () => {
     await expect(readFile(source, "utf8")).resolves.toBe("symlink-source");
   });
 
-  it("bounds duplicate-nonce collision retries and preserves the existing request", async () => {
+  it("rejects a duplicate-nonce collision and preserves the existing request", async () => {
     const dataRoot = await createDataRoot();
     const nonce = nonceFor(4);
     const target = requestPath(dataRoot, nonce);

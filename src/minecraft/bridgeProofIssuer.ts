@@ -26,8 +26,10 @@ interface BridgeRequestDocument {
   nonce: string;
 }
 
-interface BridgeProofIssuerTestOptions {
+export interface BridgeProofIssuerTestHooks {
+  readonly beforeTempOpen?: () => void | Promise<void>;
   readonly beforePublish?: () => void | Promise<void>;
+  readonly afterPublishLink?: () => void | Promise<void>;
 }
 
 interface PathIdentity {
@@ -103,6 +105,32 @@ export function createBridgeProofIssuer(options: {
   now?: () => number;
   randomBytes?: (size: number) => Buffer;
 }): BridgeProofIssuer {
+  return createFileBridgeProofIssuer(options, {});
+}
+
+/**
+ * Test-only factory for deterministic filesystem race orchestration.
+ * Product composition uses createBridgeProofIssuer and cannot supply these hooks.
+ */
+export function createBridgeProofIssuerForTesting(
+  options: {
+    dataRoot: string;
+    now?: () => number;
+    randomBytes?: (size: number) => Buffer;
+  },
+  hooks: BridgeProofIssuerTestHooks,
+): BridgeProofIssuer {
+  return createFileBridgeProofIssuer(options, hooks);
+}
+
+function createFileBridgeProofIssuer(
+  options: {
+    dataRoot: string;
+    now?: () => number;
+    randomBytes?: (size: number) => Buffer;
+  },
+  hooks: BridgeProofIssuerTestHooks,
+): BridgeProofIssuer {
   if (!isAbsolute(options.dataRoot) || hasUnsafeTraversal(options.dataRoot)) {
     throw new BridgeProofIssuerError("bridge proof root is invalid");
   }
@@ -110,7 +138,7 @@ export function createBridgeProofIssuer(options: {
     resolve(options.dataRoot),
     options.now ?? Date.now,
     options.randomBytes ?? nodeRandomBytes,
-    (options as BridgeProofIssuerTestOptions).beforePublish,
+    hooks,
   );
 }
 
@@ -118,7 +146,9 @@ class FileBridgeProofIssuer implements BridgeProofIssuer {
   readonly #dataRoot: string;
   readonly #now: () => number;
   readonly #randomBytes: (size: number) => Buffer;
+  readonly #beforeTempOpen: () => Promise<void>;
   readonly #beforePublish: () => Promise<void>;
+  readonly #afterPublishLink: () => Promise<void>;
   readonly #owned = new Map<string, OwnedRequest>();
   #closed = false;
 
@@ -126,12 +156,14 @@ class FileBridgeProofIssuer implements BridgeProofIssuer {
     dataRoot: string,
     now: () => number,
     randomBytes: (size: number) => Buffer,
-    beforePublish: (() => void | Promise<void>) | undefined,
+    hooks: BridgeProofIssuerTestHooks,
   ) {
     this.#dataRoot = dataRoot;
     this.#now = now;
     this.#randomBytes = randomBytes;
-    this.#beforePublish = async () => beforePublish?.();
+    this.#beforeTempOpen = async () => hooks.beforeTempOpen?.();
+    this.#beforePublish = async () => hooks.beforePublish?.();
+    this.#afterPublishLink = async () => hooks.afterPublishLink?.();
   }
 
   async issue(port: number): Promise<BridgeAttemptProof> {
@@ -278,6 +310,8 @@ class FileBridgeProofIssuer implements BridgeProofIssuer {
       await this.#assertMissing(target);
       await this.#assertDirectoryUnchanged(requests);
       try {
+        await this.#beforeTempOpen();
+        await this.#assertDirectoryUnchanged(requests);
         handle = await open(temp, "wx", 0o600);
         const handleStats = await handle.stat();
         if (!isRegularFile(handleStats)) throw new BridgeProofIssuerError("bridge proof rejected");
@@ -298,19 +332,23 @@ class FileBridgeProofIssuer implements BridgeProofIssuer {
       await this.#assertDirectoryUnchanged(requests);
       await this.#assertMissing(target);
       await this.#beforePublish();
+      await this.#assertDirectoryUnchanged(requests);
       await link(temp, target);
-      published = await this.#inspectFile(target, requests);
-      if (!sameFileIdentity(opened, published))
+      await this.#afterPublishLink();
+      const targetAfterLink = await this.#inspectFile(target, requests);
+      if (!sameFileIdentity(opened, targetAfterLink))
         throw new BridgeProofIssuerError("bridge proof rejected");
+      published = targetAfterLink;
       await this.#removeExact(opened, requests);
       const final = await this.#inspectFile(target, requests);
       if (!sameFileIdentity(published, final))
         throw new BridgeProofIssuerError("bridge proof rejected");
       return { ...final, expiresAt, closed: false };
     } catch (error) {
-      if (published !== undefined)
-        await this.#removeExact(published, requests).catch(() => undefined);
-      if (opened !== undefined) await this.#removeExact(opened, requests).catch(() => undefined);
+      if (opened !== undefined) {
+        await this.#removeTargetIfSameFile(opened, target, requests).catch(() => undefined);
+        await this.#removeExact(opened, requests).catch(() => undefined);
+      }
       throw error;
     }
   }
@@ -353,5 +391,21 @@ class FileBridgeProofIssuer implements BridgeProofIssuer {
     }
     if (!sameIdentity(file, current)) return;
     await rm(file.operationPath, { force: false });
+  }
+
+  async #removeTargetIfSameFile(
+    issuerFile: PathIdentity,
+    target: string,
+    parent: PathIdentity,
+  ): Promise<void> {
+    let current: PathIdentity;
+    try {
+      current = await this.#inspectFile(target, parent);
+    } catch (error) {
+      if (isMissing(error)) return;
+      throw error;
+    }
+    if (!sameFileIdentity(issuerFile, current)) return;
+    await this.#removeExact(current, parent);
   }
 }
