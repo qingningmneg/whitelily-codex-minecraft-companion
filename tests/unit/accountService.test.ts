@@ -45,6 +45,36 @@ function createPort(
 }
 
 describe("AccountService", () => {
+  it("notifies only when signed-in account authority semantics change", async () => {
+    let email: string | null = null;
+    let planType: "plus" | "pro" = "plus";
+    const service = new AccountService(
+      createPort({
+        readAccount: async () => ({
+          account: { type: "chatgpt" as const, email, planType },
+          requiresOpenaiAuth: true,
+        }),
+      }),
+    );
+    const snapshots: unknown[] = [];
+    service.subscribe((snapshot) => snapshots.push(snapshot));
+
+    await service.getAccount();
+    await service.getAccount();
+    expect(snapshots).toEqual([{ status: "signed_in", auth: "chatgpt" }]);
+
+    planType = "pro";
+    await service.getAccount();
+    email = "different-account@example.invalid";
+    await service.getAccount();
+    expect(snapshots).toEqual([
+      { status: "signed_in", auth: "chatgpt" },
+      { status: "signed_in", auth: "chatgpt" },
+      { status: "signed_in", auth: "chatgpt" },
+    ]);
+    await service.stop();
+  });
+
   it("reports signed out without exposing account details", async () => {
     const service = new AccountService(createPort());
 

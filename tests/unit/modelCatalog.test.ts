@@ -2,7 +2,11 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { AccountSnapshot } from "../../src/codex/accountService.js";
+import {
+  AccountService,
+  type AccountAppServerPort,
+  type AccountSnapshot,
+} from "../../src/codex/accountService.js";
 import type { Model } from "../../src/codex/generated/v2/Model.js";
 import { ModelPreferenceStore } from "../../src/codex/modelPreferenceStore.js";
 import {
@@ -81,6 +85,50 @@ function gate(): { promise: Promise<void>; release(): void } {
 }
 
 describe("ModelCatalog", () => {
+  it("keeps an in-flight model fetch valid across equivalent signed-in account refreshes", async () => {
+    const accountPort: AccountAppServerPort = {
+      startAccountSession: async () => undefined,
+      readAccount: async () => ({
+        account: {
+          type: "chatgpt",
+          email: null,
+          planType: "plus",
+        },
+        requiresOpenaiAuth: true,
+      }),
+      startChatGptLogin: async () => ({ type: "apiKey" }),
+      cancelChatGptLogin: async () => ({ status: "notFound" }),
+      subscribeAccountNotifications: () => () => undefined,
+      stop: async () => undefined,
+    };
+    const account = new AccountService(accountPort);
+    await account.getAccount();
+    const modelRequestEntered = gate();
+    const allowModelResponse = gate();
+    const catalog = new ModelCatalog(
+      {
+        listModelRecords: async () => {
+          modelRequestEntered.release();
+          await allowModelResponse.promise;
+          return [model("live", "Live", ["medium"])];
+        },
+      },
+      account,
+    );
+
+    const listing = catalog.listModels();
+    await modelRequestEntered.promise;
+    await account.getAccount();
+    allowModelResponse.release();
+
+    await expect(listing).resolves.toMatchObject({
+      models: [{ id: "live", displayName: "Live" }],
+      selection: { mode: "automatic" },
+    });
+    catalog.stop();
+    await account.stop();
+  });
+
   it("preserves live order while safely deduplicating model IDs and efforts", async () => {
     const account = signedInAccount();
     const appServer: ModelCatalogAppServerPort = {

@@ -1,5 +1,6 @@
 import { randomBytes } from "node:crypto";
 import type { AuthMode } from "./generated/AuthMode.js";
+import type { Account } from "./generated/v2/Account.js";
 import type { AccountLoginCompletedNotification } from "./generated/v2/AccountLoginCompletedNotification.js";
 import type { AccountUpdatedNotification } from "./generated/v2/AccountUpdatedNotification.js";
 import type { CancelLoginAccountResponse } from "./generated/v2/CancelLoginAccountResponse.js";
@@ -49,6 +50,9 @@ interface CurrentAttempt extends LoginAttempt {
   generation: number;
 }
 
+type ChatGptAccount = Extract<Account, { type: "chatgpt" }>;
+type NonSignedInAccountSnapshot = Exclude<AccountSnapshot, { status: "signed_in" }>;
+
 class AccountStatusUnavailableError extends Error {
   constructor(cause: unknown) {
     super("Account status is unavailable", { cause });
@@ -64,6 +68,7 @@ export class AccountService {
   readonly #listeners = new Set<(snapshot: AccountSnapshot) => void>();
   readonly #unsubscribeNotifications: () => void;
   #snapshot: AccountSnapshot = { status: "signed_out" };
+  #signedInAccount: ChatGptAccount | undefined;
   #attempt: CurrentAttempt | undefined;
   #expiryTimer: ReturnType<typeof setTimeout> | undefined;
   #operationTail: Promise<void> = Promise.resolve();
@@ -200,6 +205,7 @@ export class AccountService {
     this.#lifecycleGeneration += 1;
     this.#attemptGeneration += 1;
     this.#attempt = undefined;
+    this.#signedInAccount = undefined;
     this.#clearExpiryTimer();
     this.#unsubscribeNotifications();
     this.#listeners.clear();
@@ -233,7 +239,7 @@ export class AccountService {
     this.#attempt = undefined;
     this.#attemptGeneration += 1;
     this.#clearExpiryTimer();
-    return this.#setSnapshot({ status: "signed_in", auth: "chatgpt" });
+    return this.#setSignedInSnapshot(response.account);
   }
 
   async #handleNotification(
@@ -303,8 +309,28 @@ export class AccountService {
     this.#expiryTimer = undefined;
   }
 
-  #setSnapshot(snapshot: AccountSnapshot): AccountSnapshot {
+  #setSnapshot(snapshot: NonSignedInAccountSnapshot): AccountSnapshot {
+    const unchanged = sameAccountSnapshot(this.#snapshot, snapshot);
     this.#snapshot = snapshot;
+    this.#signedInAccount = undefined;
+    if (unchanged) return snapshot;
+    this.#notifySnapshot(snapshot);
+    return snapshot;
+  }
+
+  #setSignedInSnapshot(account: ChatGptAccount): AccountSnapshot {
+    const snapshot = { status: "signed_in", auth: "chatgpt" } as const;
+    const unchanged =
+      sameAccountSnapshot(this.#snapshot, snapshot) &&
+      sameChatGptAccount(this.#signedInAccount, account);
+    this.#snapshot = snapshot;
+    this.#signedInAccount = { ...account };
+    if (unchanged) return snapshot;
+    this.#notifySnapshot(snapshot);
+    return snapshot;
+  }
+
+  #notifySnapshot(snapshot: AccountSnapshot): void {
     for (const listener of this.#listeners) {
       try {
         listener(snapshot);
@@ -312,7 +338,6 @@ export class AccountService {
         // Account observers cannot change authentication state.
       }
     }
-    return snapshot;
   }
 
   #queueOperation<T>(operation: (generation: number) => Promise<T>): Promise<T> {
@@ -368,6 +393,30 @@ function publicLoginAttempt(attempt: CurrentAttempt): LoginAttempt {
     expiresAt: attempt.expiresAt,
     loginUrl: attempt.loginUrl,
   };
+}
+
+function sameAccountSnapshot(left: AccountSnapshot, right: AccountSnapshot): boolean {
+  if (left.status !== right.status) return false;
+  switch (left.status) {
+    case "signed_out":
+      return true;
+    case "signed_in":
+      return right.status === "signed_in" && left.auth === right.auth;
+    case "pending":
+      return (
+        right.status === "pending" &&
+        left.attemptId === right.attemptId &&
+        left.expiresAt === right.expiresAt
+      );
+    case "cancelled":
+      return right.status === "cancelled" && left.attemptId === right.attemptId;
+    case "expired":
+      return right.status === "expired" && left.attemptId === right.attemptId;
+  }
+}
+
+function sameChatGptAccount(left: ChatGptAccount | undefined, right: ChatGptAccount): boolean {
+  return left !== undefined && left.email === right.email && left.planType === right.planType;
 }
 
 function validateChatGptLoginUrl(value: string): string | undefined {
