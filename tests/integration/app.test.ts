@@ -2122,6 +2122,10 @@ describe("WhiteLilyApp composition", () => {
       active.lease.id,
     );
 
+    minecraftListener?.({
+      kind: "bridge_failed",
+      code: "MINECRAFT_BRIDGE_REJECTED",
+    });
     await runtime.stop("emergency_stop");
     expect(events.slice(-5)).toEqual([
       "companion:stop",
@@ -2131,10 +2135,14 @@ describe("WhiteLilyApp composition", () => {
       "minecraft:disconnect",
     ]);
     expect(runtime.snapshot()).toMatchObject({
-      lifecycle: "stopped",
+      lifecycle: "failed",
       minecraft: { state: "disconnected", sessionId: null },
       codex: { state: "stopped", model: null },
       task: null,
+      lastError: {
+        code: "MINECRAFT_BRIDGE_REJECTED",
+        message: "Minecraft Bridge rejected the connection",
+      },
     });
   });
 

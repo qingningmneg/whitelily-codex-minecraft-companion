@@ -703,6 +703,8 @@ const desktopErrorSchema = z.union([
       code: z.enum([
         "INVALID_REQUEST",
         "RUNTIME_START_FAILED",
+        "MINECRAFT_BRIDGE_REQUIRED",
+        "MINECRAFT_BRIDGE_REJECTED",
         "MCP_PORT_UNAVAILABLE",
         "MCP_TOOL_CATALOG_INVALID",
         "MCP_READINESS_TIMEOUT",
@@ -907,6 +909,8 @@ export type DesktopResponse =
             code:
               | "INVALID_REQUEST"
               | "RUNTIME_START_FAILED"
+              | "MINECRAFT_BRIDGE_REQUIRED"
+              | "MINECRAFT_BRIDGE_REJECTED"
               | "MCP_PORT_UNAVAILABLE"
               | "MCP_TOOL_CATALOG_INVALID"
               | "MCP_READINESS_TIMEOUT"

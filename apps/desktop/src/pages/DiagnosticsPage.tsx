@@ -146,7 +146,12 @@ function omissionLabel(locale: Locale, value: string): string {
 }
 
 interface ActionDiagnosticRecovery {
-  readonly code: "MCP_PORT_UNAVAILABLE" | "MCP_TOOL_CATALOG_INVALID" | "MCP_READINESS_TIMEOUT";
+  readonly code:
+    | "MCP_PORT_UNAVAILABLE"
+    | "MCP_TOOL_CATALOG_INVALID"
+    | "MCP_READINESS_TIMEOUT"
+    | "MINECRAFT_BRIDGE_REQUIRED"
+    | "MINECRAFT_BRIDGE_REJECTED";
   readonly messageKey: MessageKey;
 }
 
@@ -176,6 +181,16 @@ function actionDiagnosticRecovery(errorCode: string | null): ActionDiagnosticRec
       return {
         code: "MCP_READINESS_TIMEOUT",
         messageKey: "diagnostics.action.error.MCP_READINESS_TIMEOUT",
+      };
+    case "MINECRAFT_BRIDGE_REQUIRED":
+      return {
+        code: errorCode,
+        messageKey: "diagnostics.action.error.MINECRAFT_BRIDGE_REQUIRED",
+      };
+    case "MINECRAFT_BRIDGE_REJECTED":
+      return {
+        code: errorCode,
+        messageKey: "diagnostics.action.error.MINECRAFT_BRIDGE_REJECTED",
       };
     default:
       return null;

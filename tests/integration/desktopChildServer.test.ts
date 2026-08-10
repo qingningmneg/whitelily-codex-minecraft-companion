@@ -17,6 +17,7 @@ import {
 import { runDesktopChild, type DesktopChildServices } from "../../src/desktop/childMain.js";
 import { RuntimeFacade } from "../../src/runtime/runtimeFacade.js";
 import { ActionCapabilityError } from "../../src/app.js";
+import { MineflayerBridgeError } from "../../src/minecraft/mineflayerConnection.js";
 import type { AccountSnapshot } from "../../src/codex/accountService.js";
 import type { Model } from "../../src/codex/generated/v2/Model.js";
 import {
@@ -676,7 +677,7 @@ describe("DesktopChildServer", () => {
     });
     expect(JSON.stringify(response)).not.toContain("C:\\private");
     expect(preview).toHaveBeenCalledOnce();
-    expect(preview).toHaveBeenCalledWith(readyActions);
+    expect(preview).toHaveBeenCalledWith(readyActions, null);
     expect(createArchive).toHaveBeenCalledWith("diagnostic_1234567890");
   });
 
@@ -3006,6 +3007,43 @@ describe("DesktopChildServer", () => {
       } finally {
         process.exitCode = priorExitCode;
       }
+    },
+  );
+
+  it.each([
+    ["MINECRAFT_BRIDGE_REQUIRED", "Minecraft Bridge is required"],
+    ["MINECRAFT_BRIDGE_REJECTED", "Minecraft Bridge rejected the connection"],
+  ] as const)(
+    "maps %s startup errors without exposing private Bridge data",
+    async (code, message) => {
+      const failure = new MineflayerBridgeError(code);
+      Object.defineProperty(failure, "cause", {
+        value: new Error(
+          "nonce-secret 127.0.0.1:25565 C:\\Users\\Owner\\WhiteLily\\bridge\\requests\\private.json",
+        ),
+      });
+      const harness = createHarness({
+        runtime: {
+          ...throwingRuntime("get_status"),
+          start: async () => {
+            throw failure;
+          },
+          snapshot: () => idleSnapshot,
+        },
+      });
+
+      harness.send(request(`bridge-${code}`, "start_runtime"));
+      const response = await harness.nextResponse();
+
+      expect(response).toEqual({
+        version: 1,
+        id: `bridge-${code}`,
+        ok: false,
+        error: { code, message },
+      });
+      expect(JSON.stringify({ response, lines: harness.lines() })).not.toMatch(
+        /nonce-secret|25565|bridge\\requests|C:\\Users/iu,
+      );
     },
   );
 

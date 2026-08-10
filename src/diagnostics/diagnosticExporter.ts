@@ -88,8 +88,11 @@ export class DiagnosticExporter {
     };
   }
 
-  async preview(actions: RuntimeSnapshot["actions"] = null): Promise<DiagnosticPreview> {
-    const actionCapability = snapshotDiagnosticActionCapability(actions);
+  async preview(
+    actions: RuntimeSnapshot["actions"] = null,
+    lastError: RuntimeSnapshot["lastError"] = null,
+  ): Promise<DiagnosticPreview> {
+    const actionCapability = snapshotDiagnosticActionCapability(actions, lastError);
     await this.#releaseRetained();
     const exportId = this.#createExportId();
     if (!exportIdPattern.test(exportId)) throw new Error("diagnostic export id is invalid");

@@ -2432,6 +2432,8 @@ describe("safe onboarding error mapping", () => {
     ["MCP_PORT_UNAVAILABLE", "本地动作端口被占用；"],
     ["MCP_TOOL_CATALOG_INVALID", "Minecraft 动作组件不完整；"],
     ["MCP_READINESS_TIMEOUT", "Minecraft 动作组件响应超时。"],
+    ["MINECRAFT_BRIDGE_REQUIRED", "需要安装并启用 WhiteLily Bridge；请安装组件并重启 Minecraft。"],
+    ["MINECRAFT_BRIDGE_REJECTED", "WhiteLily Bridge 拒绝了本次连接；请检查组件并重启 Minecraft。"],
   ] as const)("renders bounded Chinese-first recovery copy for %s", (code, expected) => {
     const key = safeOnboardingErrorKey(
       new Error(`${code} raw response ${String.raw`C:\private\token`}`),
@@ -2453,6 +2455,8 @@ describe("safe onboarding error mapping", () => {
     ["MCP_PORT_UNAVAILABLE", "onboarding.error.MCP_PORT_UNAVAILABLE"],
     ["MCP_TOOL_CATALOG_INVALID", "onboarding.error.MCP_TOOL_CATALOG_INVALID"],
     ["MCP_READINESS_TIMEOUT", "onboarding.error.MCP_READINESS_TIMEOUT"],
+    ["MINECRAFT_BRIDGE_REQUIRED", "onboarding.error.MINECRAFT_BRIDGE_REQUIRED"],
+    ["MINECRAFT_BRIDGE_REJECTED", "onboarding.error.MINECRAFT_BRIDGE_REJECTED"],
   ] as const)("maps %s without returning raw error text", (code, expected) => {
     expect(safeOnboardingErrorKey(new Error(`${code} ${String.raw`C:\private\token`}`))).toBe(
       expected,

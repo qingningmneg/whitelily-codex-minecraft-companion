@@ -57,6 +57,7 @@ import type {
 import type { DiagnosticPreview } from "../diagnostics/diagnosticManifest.js";
 import { OwnerIdentityError, type OwnerIdentityAccess } from "../identity/ownerIdentity.js";
 import { ActionCapabilityError } from "../app.js";
+import { MineflayerBridgeError } from "../minecraft/mineflayerConnection.js";
 
 export interface DesktopChildRuntime {
   start(): Promise<void>;
@@ -216,7 +217,10 @@ export interface DesktopChildMemoryStore {
 }
 
 export interface DesktopChildDiagnostics {
-  preview(actions: RuntimeSnapshot["actions"]): Promise<DiagnosticPreview>;
+  preview(
+    actions: RuntimeSnapshot["actions"],
+    lastError: RuntimeSnapshot["lastError"],
+  ): Promise<DiagnosticPreview>;
   createArchive(exportId: string): Promise<PreparedDiagnosticArchive>;
   dispose(): Promise<void>;
 }
@@ -247,6 +251,8 @@ type RetainedMemoryMigration =
 type DesktopErrorCode =
   | "INVALID_REQUEST"
   | "RUNTIME_START_FAILED"
+  | "MINECRAFT_BRIDGE_REQUIRED"
+  | "MINECRAFT_BRIDGE_REJECTED"
   | "MCP_PORT_UNAVAILABLE"
   | "MCP_TOOL_CATALOG_INVALID"
   | "MCP_READINESS_TIMEOUT"
@@ -275,6 +281,8 @@ class ProfileRuntimeContainmentError extends Error {
 const errorMessages = {
   INVALID_REQUEST: "Invalid desktop request",
   RUNTIME_START_FAILED: "Runtime failed to start",
+  MINECRAFT_BRIDGE_REQUIRED: "Minecraft Bridge is required",
+  MINECRAFT_BRIDGE_REJECTED: "Minecraft Bridge rejected the connection",
   MCP_PORT_UNAVAILABLE: "Minecraft action port is unavailable",
   MCP_TOOL_CATALOG_INVALID: "Minecraft action tool catalog is invalid",
   MCP_READINESS_TIMEOUT: "Minecraft action readiness timed out",
@@ -995,12 +1003,14 @@ export class DesktopChildServer {
             createRedactedMemoryExport(await this.#requireMemories().export()),
           );
           return;
-        case "preview_diagnostics":
+        case "preview_diagnostics": {
+          const snapshot = this.#snapshot();
           await this.#writeCommandResult(
             request,
-            await this.#requireDiagnostics().preview(this.#snapshot().actions),
+            await this.#requireDiagnostics().preview(snapshot.actions, snapshot.lastError),
           );
           return;
+        }
         case "prepare_diagnostic_archive": {
           const prepared = await this.#requireDiagnostics().createArchive(request.command.exportId);
           await this.#writeCommandResult(request, {
@@ -1202,6 +1212,8 @@ export class DesktopChildServer {
       }
       const actionRecoveryError =
         request.command.kind === "start_runtime" ? actionRecoveryDesktopError(error) : undefined;
+      const bridgeError =
+        request.command.kind === "start_runtime" ? minecraftBridgeDesktopError(error) : undefined;
       const preserveModelRecovery =
         request.command.kind === "start_runtime" &&
         this.#currentConfirmedConnectionProof !== undefined &&
@@ -1231,7 +1243,8 @@ export class DesktopChildServer {
         request.id,
         error instanceof OwnerIdentityError
           ? error.code
-          : (actionRecoveryError ??
+          : (bridgeError ??
+              actionRecoveryError ??
               (request.command.kind === "select_model"
                 ? "MODEL_OPERATION_FAILED"
                 : error instanceof DocumentStoreError && error.code === "DOCUMENT_CONFLICT"
@@ -2279,6 +2292,10 @@ function actionRecoveryDesktopError(error: unknown): DesktopErrorCode | undefine
     case "startup_stopped":
       return "MCP_READINESS_TIMEOUT";
   }
+}
+
+function minecraftBridgeDesktopError(error: unknown): DesktopErrorCode | undefined {
+  return error instanceof MineflayerBridgeError ? error.code : undefined;
 }
 
 function isActionRecoveryRuntimeError(errorCode: string): boolean {

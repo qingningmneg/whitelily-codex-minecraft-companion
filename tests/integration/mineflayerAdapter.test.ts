@@ -1,7 +1,15 @@
 import { EventEmitter } from "node:events";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const { createBot, pathfinder, GoalNear, GoalFollow } = vi.hoisted(() => {
+const {
+  createBot,
+  pathfinder,
+  GoalNear,
+  GoalFollow,
+  createBridgeProofIssuer,
+  issueProof,
+  closeIssuer,
+} = vi.hoisted(() => {
   class NearGoal {
     constructor(
       readonly x: number,
@@ -21,6 +29,9 @@ const { createBot, pathfinder, GoalNear, GoalFollow } = vi.hoisted(() => {
     pathfinder: vi.fn(),
     GoalNear: NearGoal,
     GoalFollow: FollowGoal,
+    createBridgeProofIssuer: vi.fn(),
+    issueProof: vi.fn(),
+    closeIssuer: vi.fn(),
   };
 });
 
@@ -33,6 +44,7 @@ vi.mock("mineflayer-pathfinder", () => {
     goals,
   };
 });
+vi.mock("../../src/minecraft/bridgeProofIssuer.js", () => ({ createBridgeProofIssuer }));
 
 import { MineflayerAdapter } from "../../src/minecraft/mineflayerAdapter.js";
 import { ActionExecutor } from "../../src/actions/actionExecutor.js";
@@ -146,11 +158,23 @@ function config() {
     port: 25565,
     botUsername: "WhiteLily" as const,
     ownerUsername: "TestOwner",
+    dataRoot: "C:\\WhiteLilyData",
   };
 }
 
-function flush(): Promise<void> {
-  return Promise.resolve();
+async function flush(): Promise<void> {
+  await Promise.resolve();
+  await Promise.resolve();
+}
+
+function deferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
 }
 
 afterEach(() => vi.useRealTimers());
@@ -222,6 +246,16 @@ describe("MineflayerAdapter", () => {
   beforeEach(() => {
     createBot.mockReset();
     pathfinder.mockReset();
+    issueProof.mockReset();
+    closeIssuer.mockReset();
+    createBridgeProofIssuer.mockReset();
+    let proofIndex = 0;
+    issueProof.mockImplementation(async () => ({
+      fakeHost: `127.0.0.1\0WL1\0adapter-proof-${++proofIndex}`,
+      close: vi.fn(async () => undefined),
+    }));
+    closeIssuer.mockResolvedValue(undefined);
+    createBridgeProofIssuer.mockReturnValue({ issue: issueProof, close: closeIssuer });
   });
 
   it("uses the fixed offline LAN connection and emits lifecycle and owner events once", async () => {
@@ -232,6 +266,7 @@ describe("MineflayerAdapter", () => {
     adapter.onEvent((event) => events.push(event.kind));
 
     const connecting = adapter.connect();
+    await vi.waitFor(() => expect(createBot).toHaveBeenCalledOnce());
     bot.emit("playerJoined", { username: "TestOwner" });
     bot.emit("chat", "TestOwner", "hello");
     bot.emit("spawn");
@@ -246,11 +281,97 @@ describe("MineflayerAdapter", () => {
       auth: "offline",
       hideErrors: false,
       logErrors: false,
+      fakeHost: "127.0.0.1\0WL1\0adapter-proof-1",
     });
+    expect(createBridgeProofIssuer).toHaveBeenCalledWith({ dataRoot: "C:\\WhiteLilyData" });
+    expect(issueProof).toHaveBeenCalledWith(25565);
     expect(bot.loadPlugin).toHaveBeenCalledWith(pathfinder);
     expect(events).toEqual(["owner_online", "chat", "connected", "owner_offline"]);
     expect(createBot).toHaveBeenCalledTimes(1);
     await expect(secondConnect).resolves.toBeUndefined();
+  });
+
+  it("forwards one stable terminal Bridge event after post-connect automatic rejections", async () => {
+    vi.useFakeTimers();
+    const bots: FakeBot[] = [];
+    createBot.mockImplementation(() => {
+      const bot = new FakeBot();
+      bots.push(bot);
+      return bot;
+    });
+    const adapter = new MineflayerAdapter(config());
+    const events: unknown[] = [];
+    adapter.onEvent((event) => events.push(event));
+    const connecting = adapter.connect();
+    await flush();
+    bots[0]?.emit("spawn");
+    await connecting;
+
+    bots[0]?.emit("end", "private connected end");
+    await flush();
+    for (let rejectionIndex = 0; rejectionIndex < 5; rejectionIndex += 1) {
+      await vi.advanceTimersToNextTimerAsync();
+      await flush();
+      bots.at(-1)?.emit("kicked", `private rejection ${rejectionIndex}`, false);
+      await flush();
+    }
+
+    expect(createBot).toHaveBeenCalledTimes(6);
+    expect(events).toContainEqual({
+      kind: "bridge_failed",
+      code: "MINECRAFT_BRIDGE_REJECTED",
+    });
+    expect(JSON.stringify(events)).not.toContain("private rejection");
+    await adapter.disconnect().catch(() => undefined);
+  });
+
+  it("maps issuer preparation failure without creating a bot or exposing issuer details", async () => {
+    const secret =
+      "nonce-secret C:\\Users\\Owner\\WhiteLily\\bridge\\requests\\private.json 127.0.0.1:25565";
+    issueProof.mockRejectedValueOnce(new Error(secret));
+    const adapter = new MineflayerAdapter(config());
+
+    const rejection = await adapter.connect().catch((error: unknown) => error);
+
+    expect(rejection).toMatchObject({ code: "MINECRAFT_BRIDGE_REQUIRED" });
+    expect(String(rejection)).not.toContain(secret);
+    expect(createBot).not.toHaveBeenCalled();
+    await adapter.disconnect();
+    expect(closeIssuer).toHaveBeenCalledOnce();
+  });
+
+  it("drains pending preparation and proof close before shutting down the issuer", async () => {
+    const issueGate = deferred<{
+      fakeHost: string;
+      close: ReturnType<typeof vi.fn>;
+    }>();
+    const closeGate = deferred();
+    const proof = {
+      fakeHost: "127.0.0.1\0WL1\0adapter-disconnect-drain",
+      close: vi.fn(() => closeGate.promise),
+    };
+    issueProof.mockReturnValueOnce(issueGate.promise);
+    const adapter = new MineflayerAdapter(config());
+    const connecting = adapter.connect().catch((error: unknown) => error);
+
+    let disconnectSettled = false;
+    const disconnecting = adapter.disconnect().finally(() => {
+      disconnectSettled = true;
+    });
+    await flush();
+    expect(disconnectSettled).toBe(false);
+    expect(closeIssuer).not.toHaveBeenCalled();
+
+    issueGate.resolve(proof);
+    await flush();
+    expect(proof.close).toHaveBeenCalledOnce();
+    expect(disconnectSettled).toBe(false);
+    expect(closeIssuer).not.toHaveBeenCalled();
+
+    closeGate.resolve();
+    await disconnecting;
+    await connecting;
+    expect(closeIssuer).toHaveBeenCalledOnce();
   });
 
   it("passes the pinned Mineflayer logging opt-out and fails repeated bot errors closed once", async () => {
@@ -270,6 +391,7 @@ describe("MineflayerAdapter", () => {
     const events: string[] = [];
     adapter.onEvent((event) => events.push(event.kind));
     const connecting = adapter.connect();
+    await flush();
     bot.emit("spawn");
     await connecting;
 
@@ -292,6 +414,7 @@ describe("MineflayerAdapter", () => {
     const events: Array<{ kind: string; reason?: string }> = [];
     adapter.onEvent((event) => events.push(event));
     const connecting = adapter.connect();
+    await flush();
     bot.emit("spawn");
     await connecting;
     const privateReason = '{"text":"private server rejection"}';
@@ -316,6 +439,7 @@ describe("MineflayerAdapter", () => {
     createBot.mockReturnValue(bot);
     const adapter = new MineflayerAdapter(config());
     const connecting = adapter.connect();
+    await flush();
     bot.emit("spawn");
     await connecting;
 
@@ -330,6 +454,7 @@ describe("MineflayerAdapter", () => {
     const events: string[] = [];
     adapter.onEvent((event) => events.push(event.kind));
     const connecting = adapter.connect();
+    await flush();
     bot._client.emit("login", { worldName: "minecraft:overworld" });
     bot.emit("spawn");
     await connecting;
@@ -347,6 +472,7 @@ describe("MineflayerAdapter", () => {
     createBot.mockReturnValue(bot);
     const adapter = new MineflayerAdapter(config());
     const connecting = adapter.connect();
+    await flush();
     bot.emit("spawn");
     await connecting;
 
@@ -371,6 +497,7 @@ describe("MineflayerAdapter", () => {
       createBot.mockReturnValue(bot);
       const adapter = new MineflayerAdapter(config());
       const connecting = adapter.connect();
+      await flush();
       bot.emit("spawn");
       await connecting;
 
@@ -395,6 +522,7 @@ describe("MineflayerAdapter", () => {
       if (event.kind === "hostile_nearby") threats.push(event);
     });
     const connecting = adapter.connect();
+    await flush();
     bot.emit("spawn");
     await connecting;
     const zombie: FakeEntity = {
@@ -439,6 +567,7 @@ describe("MineflayerAdapter", () => {
       if (event.kind === "hostile_nearby") threatIds.push(event.entityId);
     });
     const connecting = adapter.connect();
+    await flush();
     bot.emit("spawn");
     await connecting;
     const stationaryZombie: FakeEntity = {
@@ -473,6 +602,7 @@ describe("MineflayerAdapter", () => {
       if (event.kind === "hostile_nearby") threatIds.push(event.entityId);
     });
     const connecting = adapter.connect();
+    await flush();
     bot.emit("spawn");
     await connecting;
 
@@ -516,6 +646,7 @@ describe("MineflayerAdapter", () => {
       if (event.kind === "hostile_nearby") threatIds.push(event.entityId);
     });
     const connecting = adapter.connect();
+    await flush();
     first.emit("spawn");
     await connecting;
     const oldZombie: FakeEntity = {
@@ -557,6 +688,7 @@ describe("MineflayerAdapter", () => {
     createBot.mockReturnValue(bot);
     const adapter = new MineflayerAdapter(config());
     const connecting = adapter.connect();
+    await flush();
     bot.emit("spawn");
     await connecting;
 
@@ -570,6 +702,7 @@ describe("MineflayerAdapter", () => {
     createBot.mockReturnValue(bot);
     const adapter = new MineflayerAdapter(config());
     const connecting = adapter.connect();
+    await flush();
     bot.emit("spawn");
     await connecting;
 
@@ -595,6 +728,7 @@ describe("MineflayerAdapter", () => {
     createBot.mockReturnValue(bot);
     const adapter = new MineflayerAdapter(config());
     const connecting = adapter.connect();
+    await flush();
     bot.emit("spawn");
     await connecting;
 
@@ -639,12 +773,14 @@ describe("MineflayerAdapter", () => {
     createBot.mockReturnValueOnce(first).mockReturnValueOnce(second);
     const adapter = new MineflayerAdapter(config());
     const connecting = adapter.connect();
+    await flush();
     first.emit("spawn");
     await connecting;
     await adapter.snapshot("TestOwner");
     first.emit("end", "lost");
     await vi.advanceTimersByTimeAsync(1_000);
     second.emit("spawn");
+    await flush();
 
     await expect(adapter.attackHostile(7, new AbortController().signal)).rejects.toThrow(
       "snapshot",
@@ -658,6 +794,7 @@ describe("MineflayerAdapter", () => {
     for (const bot of bots) createBot.mockReturnValueOnce(bot);
     const adapter = new MineflayerAdapter(config());
     const connecting = adapter.connect();
+    await flush();
 
     for (let attempt = 0; attempt < 5; attempt += 1) {
       bots[attempt]?.emit("end", "lost");
@@ -680,6 +817,7 @@ describe("MineflayerAdapter", () => {
     createBot.mockReturnValue(bot);
     const adapter = new MineflayerAdapter(config());
     const connecting = adapter.connect();
+    await flush();
 
     await adapter.disconnect();
 
@@ -721,6 +859,7 @@ describe("MineflayerAdapter", () => {
       const events: string[] = [];
       adapter.onEvent((event) => events.push(event.kind));
       const connecting = adapter.connect();
+      await flush();
       bot.emit("spawn");
       await connecting;
 
@@ -750,6 +889,7 @@ describe("MineflayerAdapter", () => {
     }
     const adapter = new MineflayerAdapter(config());
     const connecting = adapter.connect();
+    await flush();
     const rejected = expect(connecting).rejects.toThrow("retries exhausted");
 
     for (let attempt = 0; attempt < 5; attempt += 1) {
@@ -775,6 +915,7 @@ describe("MineflayerAdapter", () => {
     createBot.mockReturnValueOnce(partial).mockReturnValueOnce(succeeding);
     const adapter = new MineflayerAdapter(config());
     const connecting = adapter.connect();
+    await flush();
 
     expect(partial.listenerCount("chat")).toBe(0);
     expect(partial.listenerCount("playerJoined")).toBe(0);
@@ -792,6 +933,7 @@ describe("MineflayerAdapter", () => {
     createBot.mockReturnValueOnce(first).mockReturnValueOnce(retry);
     const adapter = new MineflayerAdapter(config());
     const initial = adapter.connect();
+    await flush();
     first.emit("spawn");
     await initial;
     first.emit("end", "lost");
@@ -822,6 +964,7 @@ describe("MineflayerAdapter", () => {
     for (const bot of bots) createBot.mockReturnValueOnce(bot);
     const adapter = new MineflayerAdapter(config());
     const initial = adapter.connect();
+    await flush();
     bots[0]?.emit("spawn");
     await initial;
     bots[0]?.emit("end", "lost");
@@ -839,6 +982,7 @@ describe("MineflayerAdapter", () => {
     createBot.mockReturnValue(active);
     const stopping = new MineflayerAdapter(config());
     const started = stopping.connect();
+    await flush();
     active.emit("spawn");
     await started;
     active.emit("end", "lost");
@@ -863,6 +1007,7 @@ describe("MineflayerAdapter", () => {
     createBot.mockReturnValue(bot);
     const adapter = new MineflayerAdapter(config());
     const connecting = adapter.connect();
+    await flush();
     bot.emit("spawn");
     await connecting;
 
@@ -886,6 +1031,7 @@ describe("MineflayerAdapter", () => {
     createBot.mockReturnValue(bot);
     const adapter = new MineflayerAdapter(config());
     const connecting = adapter.connect();
+    await flush();
     bot.emit("spawn");
     await connecting;
 
@@ -920,6 +1066,7 @@ describe("MineflayerAdapter", () => {
       createBot.mockReturnValue(bot);
       const adapter = new MineflayerAdapter(config());
       const connecting = adapter.connect();
+      await flush();
       bot.emit("spawn");
       await connecting;
 
@@ -978,6 +1125,7 @@ describe("MineflayerAdapter", () => {
     createBot.mockReturnValue(bot);
     const adapter = new MineflayerAdapter(config());
     const connecting = adapter.connect();
+    await flush();
     bot.emit("spawn");
     await connecting;
     const controller = new AbortController();
@@ -1001,6 +1149,7 @@ describe("MineflayerAdapter", () => {
     createBot.mockReturnValue(bot);
     const adapter = new MineflayerAdapter(config());
     const connecting = adapter.connect();
+    await flush();
     bot.emit("spawn");
     await connecting;
     const controller = new AbortController();
@@ -1022,6 +1171,7 @@ describe("MineflayerAdapter", () => {
     createBot.mockReturnValue(bot);
     const adapter = new MineflayerAdapter(config());
     const connecting = adapter.connect();
+    await flush();
     bot.emit("spawn");
     await connecting;
     const controller = new AbortController();
@@ -1046,6 +1196,7 @@ describe("MineflayerAdapter", () => {
     createBot.mockReturnValue(bot);
     const adapter = new MineflayerAdapter(config());
     const connecting = adapter.connect();
+    await flush();
     bot.emit("spawn");
     await connecting;
     const controller = new AbortController();
@@ -1086,6 +1237,7 @@ describe("MineflayerAdapter", () => {
     createBot.mockReturnValue(bot);
     const adapter = new MineflayerAdapter(config());
     const connecting = adapter.connect();
+    await flush();
     bot.emit("spawn");
     await connecting;
     const controller = new AbortController();
@@ -1137,6 +1289,7 @@ describe("MineflayerAdapter", () => {
     createBot.mockReturnValue(bot);
     const adapter = new MineflayerAdapter(config());
     const connecting = adapter.connect();
+    await flush();
     bot.emit("spawn");
     await connecting;
     const controller = new AbortController();
@@ -1180,6 +1333,7 @@ describe("MineflayerAdapter", () => {
     createBot.mockReturnValue(bot);
     const adapter = new MineflayerAdapter(config());
     const connecting = adapter.connect();
+    await flush();
     bot.emit("spawn");
     await connecting;
 
@@ -1197,6 +1351,7 @@ describe("MineflayerAdapter", () => {
     createBot.mockReturnValue(bot);
     const adapter = new MineflayerAdapter(config());
     const connecting = adapter.connect();
+    await flush();
     bot.emit("spawn");
     await connecting;
     const controller = new AbortController();
@@ -1230,6 +1385,7 @@ describe("MineflayerAdapter", () => {
       createBot.mockReturnValue(bot);
       const adapter = new MineflayerAdapter(config());
       const connecting = adapter.connect();
+      await flush();
       bot.emit("spawn");
       await connecting;
       if (kind === "collect") await adapter.snapshot("TestOwner");
@@ -1277,6 +1433,7 @@ describe("MineflayerAdapter", () => {
       if (event.kind === "world_changed") executor?.stopAll();
     });
     const connecting = adapter.connect();
+    await flush();
     first._client.emit("login", { worldState: { name: "minecraft:overworld" } });
     first.emit("spawn");
     await connecting;
@@ -1349,6 +1506,7 @@ describe("MineflayerAdapter", () => {
     createBot.mockReturnValue(bot);
     const adapter = new MineflayerAdapter(config());
     const connecting = adapter.connect();
+    await flush();
     bot.emit("spawn");
     await connecting;
     const confirmations = new ConfirmationStore();
@@ -1413,6 +1571,7 @@ describe("MineflayerAdapter", () => {
     createBot.mockReturnValue(bot);
     const adapter = new MineflayerAdapter(config());
     const connecting = adapter.connect();
+    await flush();
     bot.emit("spawn");
     await connecting;
     const confirmations = new ConfirmationStore();
@@ -1472,6 +1631,7 @@ describe("MineflayerAdapter", () => {
       createBot.mockReturnValue(bot);
       const adapter = new MineflayerAdapter(config());
       const connecting = adapter.connect();
+      await flush();
       bot.emit("spawn");
       await connecting;
       const moving = adapter.moveTo({ x: 10, y: 64, z: 10 }, new AbortController().signal);
@@ -1510,6 +1670,7 @@ describe("MineflayerAdapter", () => {
     createBot.mockReturnValue(bot);
     const adapter = new MineflayerAdapter(config());
     const connecting = adapter.connect();
+    await flush();
     bot.emit("spawn");
     await connecting;
     const controller = new AbortController();
@@ -1555,6 +1716,7 @@ describe("MineflayerAdapter", () => {
     createBot.mockReturnValue(bot);
     const adapter = new MineflayerAdapter(config());
     const connecting = adapter.connect();
+    await flush();
     bot.emit("spawn");
     await connecting;
     const controller = new AbortController();
@@ -1603,6 +1765,7 @@ describe("MineflayerAdapter", () => {
     createBot.mockReturnValue(bot);
     const adapter = new MineflayerAdapter(config());
     const connecting = adapter.connect();
+    await flush();
     bot.emit("spawn");
     await connecting;
 
@@ -1649,6 +1812,7 @@ describe("MineflayerAdapter", () => {
     createBot.mockReturnValue(bot);
     const adapter = new MineflayerAdapter(config());
     const connecting = adapter.connect();
+    await flush();
     bot.emit("spawn");
     await connecting;
 
@@ -1678,6 +1842,7 @@ describe("MineflayerAdapter", () => {
     createBot.mockReturnValue(bot);
     const adapter = new MineflayerAdapter(config());
     const connecting = adapter.connect();
+    await flush();
     bot.emit("spawn");
     await connecting;
 
@@ -1710,6 +1875,7 @@ describe("MineflayerAdapter", () => {
     createBot.mockReturnValue(inputBot);
     const inputAdapter = new MineflayerAdapter(config());
     const inputConnecting = inputAdapter.connect();
+    await flush();
     inputBot.emit("spawn");
     await inputConnecting;
     const inputController = new AbortController();
@@ -1736,6 +1902,7 @@ describe("MineflayerAdapter", () => {
     createBot.mockReturnValue(bot);
     const adapter = new MineflayerAdapter(config());
     const connecting = adapter.connect();
+    await flush();
     bot.emit("spawn");
     await connecting;
 
@@ -1778,6 +1945,7 @@ describe("MineflayerAdapter", () => {
     createBot.mockReturnValue(waitingBot);
     const waitingAdapter = new MineflayerAdapter(config());
     const waitingConnecting = waitingAdapter.connect();
+    await flush();
     waitingBot.emit("spawn");
     await waitingConnecting;
     const waitingController = new AbortController();
@@ -1814,6 +1982,7 @@ describe("MineflayerAdapter", () => {
     createBot.mockReturnValue(bot);
     const adapter = new MineflayerAdapter(config());
     const connecting = adapter.connect();
+    await flush();
     bot.emit("spawn");
     await connecting;
     const smelting = adapter.smeltItem("iron_ore", 1, new AbortController().signal);
@@ -1852,6 +2021,7 @@ describe("MineflayerAdapter", () => {
     const events: string[] = [];
     adapter.onEvent((event) => events.push(event.kind));
     const connected = adapter.connect();
+    await flush();
     bots[0]?.emit("spawn");
     await connected;
 
@@ -1870,6 +2040,7 @@ describe("MineflayerAdapter", () => {
     createBot.mockReturnValue(cancellingBot);
     const cancelling = new MineflayerAdapter(config());
     const cancelled = cancelling.connect();
+    await flush();
     cancellingBot.emit("end", "lost");
     await cancelling.disconnect();
     await expect(cancelled).rejects.toMatchObject({ name: "AbortError" });

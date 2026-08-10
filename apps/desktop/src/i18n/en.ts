@@ -148,6 +148,10 @@ export const en = {
   "onboarding.error.MCP_PORT_UNAVAILABLE": "The local action port is already in use.",
   "onboarding.error.MCP_TOOL_CATALOG_INVALID": "The Minecraft action component is incomplete.",
   "onboarding.error.MCP_READINESS_TIMEOUT": "The Minecraft action component timed out.",
+  "onboarding.error.MINECRAFT_BRIDGE_REQUIRED":
+    "WhiteLily Bridge must be installed and enabled. Install the component, then restart Minecraft.",
+  "onboarding.error.MINECRAFT_BRIDGE_REJECTED":
+    "WhiteLily Bridge rejected the connection. Check the component, then restart Minecraft.",
   "onboarding.action.retry": "Retry action component",
   "onboarding.error.UNKNOWN": "The operation could not be completed. Please retry.",
   "section.systemStatus": "System status",
@@ -353,6 +357,10 @@ export const en = {
   "diagnostics.action.error.MCP_TOOL_CATALOG_INVALID":
     "The Minecraft action component is incomplete.",
   "diagnostics.action.error.MCP_READINESS_TIMEOUT": "The Minecraft action component timed out.",
+  "diagnostics.action.error.MINECRAFT_BRIDGE_REQUIRED":
+    "WhiteLily Bridge must be installed and enabled. Install the component, then restart Minecraft.",
+  "diagnostics.action.error.MINECRAFT_BRIDGE_REJECTED":
+    "WhiteLily Bridge rejected the connection. Check the component, then restart Minecraft.",
   "diagnostics.omission.authentication-data": "Authentication data",
   "diagnostics.omission.minecraft-saves": "Minecraft saves",
   "diagnostics.omission.pcl2-account-data": "PCL2 account data",

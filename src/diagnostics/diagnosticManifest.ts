@@ -34,6 +34,8 @@ export const DIAGNOSTIC_ACTION_ERROR_CODES = Object.freeze([
   "server_start_failed",
   "server_closed",
   "startup_stopped",
+  "MINECRAFT_BRIDGE_REQUIRED",
+  "MINECRAFT_BRIDGE_REJECTED",
 ] as const);
 
 export type DiagnosticLogicalName = (typeof DIAGNOSTIC_ENTRY_NAMES)[number];
@@ -58,7 +60,18 @@ const workspaceVersionPattern = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u;
 
 export function snapshotDiagnosticActionCapability(
   actions: RuntimeSnapshot["actions"],
+  lastError: RuntimeSnapshot["lastError"] = null,
 ): DiagnosticActionCapability {
+  const bridgeErrorCode = diagnosticBridgeErrorCode(lastError?.code);
+  if (bridgeErrorCode !== null) {
+    return Object.freeze({
+      workspaceVersion: null,
+      state: "failed",
+      mcpListening: false,
+      discoveredToolCount: 0,
+      errorCode: bridgeErrorCode,
+    });
+  }
   if (actions === null) {
     return Object.freeze({
       workspaceVersion: null,
@@ -96,6 +109,12 @@ export function snapshotDiagnosticActionCapability(
     discoveredToolCount: boundedToolCount(actions.discoveredToolCount),
     errorCode: diagnosticActionErrorCode(actions.errorCode),
   });
+}
+
+function diagnosticBridgeErrorCode(value: unknown): DiagnosticActionErrorCode | null {
+  return value === "MINECRAFT_BRIDGE_REQUIRED" || value === "MINECRAFT_BRIDGE_REJECTED"
+    ? value
+    : null;
 }
 
 function diagnosticActionErrorCode(value: unknown): DiagnosticActionErrorCode | null {

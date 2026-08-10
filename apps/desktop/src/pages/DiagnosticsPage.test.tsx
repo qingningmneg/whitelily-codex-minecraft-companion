@@ -82,6 +82,16 @@ describe("DiagnosticsPage", () => {
       "The Minecraft action component is incomplete.",
     ],
     ["connection_failed", "MCP_READINESS_TIMEOUT", "The Minecraft action component timed out."],
+    [
+      "MINECRAFT_BRIDGE_REQUIRED",
+      "MINECRAFT_BRIDGE_REQUIRED",
+      "WhiteLily Bridge must be installed and enabled. Install the component, then restart Minecraft.",
+    ],
+    [
+      "MINECRAFT_BRIDGE_REJECTED",
+      "MINECRAFT_BRIDGE_REJECTED",
+      "WhiteLily Bridge rejected the connection. Check the component, then restart Minecraft.",
+    ],
   ])("renders bounded recovery for %s", async (errorCode, stableCode, recoveryMessage) => {
     render(<DiagnosticsPage api={api(errorCode)} locale="en" />);
 

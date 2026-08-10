@@ -67,6 +67,16 @@ function serializedError(error: unknown): string {
   return JSON.stringify(value);
 }
 
+function deferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 afterEach(async () => {
   await Promise.all(
     temporaryRoots.splice(0).map((root) => rm(root, { recursive: true, force: true })),
@@ -386,6 +396,60 @@ describe("BridgeProofIssuer", () => {
 
     await expect(readOnlyRequestDocuments(dataRoot)).resolves.toEqual([]);
     expect(proof.fakeHost).toBe(`127.0.0.1\0WL1\0${nonce}`);
+  });
+
+  it("makes issuer shutdown join an individual close that is still removing its request", async () => {
+    const dataRoot = await createDataRoot();
+    const removeEntered = deferred();
+    const removeGate = deferred();
+    const issuer = createBridgeProofIssuerForTesting(
+      { dataRoot, randomBytes: () => Buffer.alloc(32, 22) },
+      {
+        beforeOwnedRemove: async () => {
+          removeEntered.resolve();
+          await removeGate.promise;
+        },
+      },
+    );
+    const proof = await issuer.issue(25_565);
+    const proofClosing = proof.close();
+    await removeEntered.promise;
+
+    let issuerCloseSettled = false;
+    const issuerClosing = issuer.close().finally(() => {
+      issuerCloseSettled = true;
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(issuerCloseSettled).toBe(false);
+
+    removeGate.resolve();
+    await Promise.all([proofClosing, issuerClosing]);
+    await expect(readOnlyRequestDocuments(dataRoot)).resolves.toEqual([]);
+  });
+
+  it("retains ownership after a failed individual close so issuer shutdown can retry cleanup", async () => {
+    const dataRoot = await createDataRoot();
+    const secret = "private unlink failure C:\\Users\\Owner\\bridge\\requests\\secret.json";
+    let removeAttempts = 0;
+    const issuer = createBridgeProofIssuerForTesting(
+      { dataRoot, randomBytes: () => Buffer.alloc(32, 23) },
+      {
+        beforeOwnedRemove: () => {
+          removeAttempts += 1;
+          if (removeAttempts === 1) throw new Error(secret);
+        },
+      },
+    );
+    const proof = await issuer.issue(25_565);
+
+    const rejection = await proof.close().catch((error: unknown) => error);
+    expect(serializedError(rejection)).not.toContain(secret);
+    await expect(readOnlyRequestDocuments(dataRoot)).resolves.toHaveLength(1);
+
+    await issuer.close();
+    expect(removeAttempts).toBe(2);
+    await expect(readOnlyRequestDocuments(dataRoot)).resolves.toEqual([]);
   });
 
   it("closes all issuer-owned proofs and refuses later issues", async () => {

@@ -3,6 +3,7 @@ import pathfinderPackage from "mineflayer-pathfinder";
 import { Vec3 as PrismarineVec3 } from "vec3";
 import type { GameAction, Vec3, WorldSnapshot } from "../domain/types.js";
 import { classifyActionRisk } from "../safety/actionRisk.js";
+import { createBridgeProofIssuer, type BridgeProofIssuer } from "./bridgeProofIssuer.js";
 import {
   MineflayerConnection,
   type MineflayerConnectionEvent,
@@ -28,6 +29,7 @@ export interface MineflayerAdapterConfig {
   port: number;
   botUsername: "WhiteLily";
   ownerUsername: string;
+  dataRoot: string;
 }
 
 function abortError(): Error {
@@ -90,6 +92,7 @@ function packetSpawnPosition(bot: Bot, packet: unknown): Vec3 | undefined {
 
 export class MineflayerAdapter implements MinecraftPort {
   private readonly connection: MineflayerConnection;
+  private readonly proofIssuer: BridgeProofIssuer;
   private readonly listeners = new Set<(event: MinecraftEvent) => void>();
   private readonly hostileEntityIds = new Set<number>();
   private readonly droppedItemEntityIds = new Set<number>();
@@ -98,8 +101,14 @@ export class MineflayerAdapter implements MinecraftPort {
   private worldSpawn: Vec3 | undefined;
 
   constructor(config: MineflayerAdapterConfig) {
+    this.proofIssuer = createBridgeProofIssuer({ dataRoot: config.dataRoot });
     this.connection = new MineflayerConnection({
-      config,
+      config: {
+        host: config.host,
+        port: config.port,
+        botUsername: config.botUsername,
+      },
+      prepareAttempt: (port) => this.proofIssuer.issue(port),
       createBot,
       plugin: pathfinder,
       retryDelaysMs: RETRY_DELAYS_MS,
@@ -113,8 +122,12 @@ export class MineflayerAdapter implements MinecraftPort {
     return this.connection.connect();
   }
 
-  disconnect(): Promise<void> {
-    return this.connection.disconnect();
+  async disconnect(): Promise<void> {
+    try {
+      await this.connection.disconnect();
+    } finally {
+      await this.proofIssuer.close();
+    }
   }
 
   onEvent(listener: (event: MinecraftEvent) => void): () => void {
@@ -375,6 +388,11 @@ export class MineflayerAdapter implements MinecraftPort {
         this.clearSnapshotAuthorizations();
         this.clearHostileProximity();
         this.emit({ kind: "disconnected", reason: event.reason });
+        return;
+      case "bridge_failed":
+        this.clearSnapshotAuthorizations();
+        this.clearHostileProximity();
+        this.emit(event);
         return;
       case "world_changed":
         this.clearSnapshotAuthorizations();

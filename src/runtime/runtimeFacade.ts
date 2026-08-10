@@ -4,6 +4,7 @@ import { isModelId } from "../codex/modelId.js";
 import type { ActiveTask, TaskDisclosure } from "../companion/taskController.js";
 import { redactPublicText } from "../memory/redaction.js";
 import type { MinecraftEvent } from "../minecraft/minecraftPort.js";
+import { MineflayerBridgeError } from "../minecraft/mineflayerConnection.js";
 import type { TaskBudgetSnapshot, TaskLimits, TaskStopReason } from "../safety/taskBudget.js";
 import type { CompanionProfile } from "../profile/profileSchema.js";
 import type { MemoryContextScope } from "../memory/scopedMemoryStore.js";
@@ -389,17 +390,20 @@ export class RuntimeFacade {
       this.#clearTask(false);
       await this.#dependencies.lifecycle.stop().catch(() => undefined);
       const actionErrorCode = boundedActionRuntimeErrorCode(error);
+      const bridgeError = error instanceof MineflayerBridgeError ? error : undefined;
       if (actionErrorCode !== undefined) {
         this.#recordError(actionErrorCode, "Minecraft action capability is unavailable");
+      } else if (bridgeError !== undefined) {
+        this.#recordError(bridgeError.code, bridgeError.message);
       }
       this.#setMinecraft("disconnected");
       this.#setCodex("failed", null);
-      if (actionErrorCode === undefined) {
+      if (actionErrorCode === undefined && bridgeError === undefined) {
         this.#recordError("RUNTIME_START_FAILED", "Runtime failed to start");
       }
       this.#setLifecycle("failed");
       this.#teardownObservers();
-      if (isBoundedActionCapabilityError(error)) throw error;
+      if (isBoundedActionCapabilityError(error) || bridgeError !== undefined) throw error;
       throw new Error("Runtime failed to start");
     }
   }
@@ -491,6 +495,15 @@ export class RuntimeFacade {
               : "disconnected",
           );
           return;
+        case "bridge_failed": {
+          if (event.kind !== "bridge_failed") {
+            this.#failMinecraftState();
+            return;
+          }
+          const bridgeError = new MineflayerBridgeError(event.code);
+          this.#failOperationalState(bridgeError.code, bridgeError.message, true);
+          return;
+        }
         case "chat":
         case "owner_online":
         case "owner_offline":
@@ -844,6 +857,11 @@ function validateMinecraftEvent(value: unknown): MinecraftEvent["kind"] | null {
       if (!isExactRecord(value, hasReason ? ["kind", "reason"] : ["kind"])) return null;
       return !hasReason || isBoundedMinecraftString(value.reason, 256, true) ? kind : null;
     }
+    case "bridge_failed":
+      return isExactRecord(value, ["kind", "code"]) &&
+        (value.code === "MINECRAFT_BRIDGE_REQUIRED" || value.code === "MINECRAFT_BRIDGE_REJECTED")
+        ? kind
+        : null;
     case "world_changed":
     case "death":
       return isExactRecord(value, ["kind"]) ? kind : null;

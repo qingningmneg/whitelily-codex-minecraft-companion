@@ -1329,6 +1329,8 @@ export function safeOnboardingErrorKey(error: unknown): MessageKey {
     ["MCP_PORT_UNAVAILABLE", "onboarding.error.MCP_PORT_UNAVAILABLE"],
     ["MCP_TOOL_CATALOG_INVALID", "onboarding.error.MCP_TOOL_CATALOG_INVALID"],
     ["MCP_READINESS_TIMEOUT", "onboarding.error.MCP_READINESS_TIMEOUT"],
+    ["MINECRAFT_BRIDGE_REQUIRED", "onboarding.error.MINECRAFT_BRIDGE_REQUIRED"],
+    ["MINECRAFT_BRIDGE_REJECTED", "onboarding.error.MINECRAFT_BRIDGE_REJECTED"],
   ];
   return mappings.find(([code]) => message.includes(code))?.[1] ?? "onboarding.error.UNKNOWN";
 }

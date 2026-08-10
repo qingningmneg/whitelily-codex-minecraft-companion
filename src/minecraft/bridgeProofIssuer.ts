@@ -30,6 +30,7 @@ export interface BridgeProofIssuerTestHooks {
   readonly beforeTempOpen?: () => void | Promise<void>;
   readonly beforePublish?: () => void | Promise<void>;
   readonly afterPublishLink?: () => void | Promise<void>;
+  readonly beforeOwnedRemove?: () => void | Promise<void>;
 }
 
 interface PathIdentity {
@@ -42,6 +43,7 @@ interface PathIdentity {
 interface OwnedRequest extends PathIdentity {
   readonly expiresAt: number;
   closed: boolean;
+  closing?: Promise<void>;
 }
 
 class BridgeProofIssuerError extends Error {
@@ -149,8 +151,10 @@ class FileBridgeProofIssuer implements BridgeProofIssuer {
   readonly #beforeTempOpen: () => Promise<void>;
   readonly #beforePublish: () => Promise<void>;
   readonly #afterPublishLink: () => Promise<void>;
+  readonly #beforeOwnedRemove: () => Promise<void>;
   readonly #owned = new Map<string, OwnedRequest>();
   #closed = false;
+  #closeOperation: Promise<void> | undefined;
 
   constructor(
     dataRoot: string,
@@ -164,6 +168,7 @@ class FileBridgeProofIssuer implements BridgeProofIssuer {
     this.#beforeTempOpen = async () => hooks.beforeTempOpen?.();
     this.#beforePublish = async () => hooks.beforePublish?.();
     this.#afterPublishLink = async () => hooks.afterPublishLink?.();
+    this.#beforeOwnedRemove = async () => hooks.beforeOwnedRemove?.();
   }
 
   async issue(port: number): Promise<BridgeAttemptProof> {
@@ -213,10 +218,18 @@ class FileBridgeProofIssuer implements BridgeProofIssuer {
     }
   }
 
-  async close(): Promise<void> {
-    if (this.#closed) return;
+  close(): Promise<void> {
     this.#closed = true;
-    await Promise.all([...this.#owned.values()].map((owned) => this.#closeOwned(owned)));
+    this.#closeOperation ??= this.#closeAllOwned();
+    return this.#closeOperation;
+  }
+
+  async #closeAllOwned(): Promise<void> {
+    try {
+      await Promise.all([...this.#owned.values()].map((owned) => this.#closeOwned(owned)));
+    } finally {
+      this.#closeOperation = undefined;
+    }
   }
 
   async #cleanExpired(now: number): Promise<void> {
@@ -369,15 +382,23 @@ class FileBridgeProofIssuer implements BridgeProofIssuer {
       throw new BridgeProofIssuerError("bridge proof rejected");
   }
 
-  async #closeOwned(owned: OwnedRequest): Promise<void> {
-    if (owned.closed) return;
-    owned.closed = true;
-    this.#owned.delete(owned.operationPath);
+  #closeOwned(owned: OwnedRequest): Promise<void> {
+    if (owned.closed) return Promise.resolve();
+    owned.closing ??= this.#removeOwned(owned);
+    return owned.closing;
+  }
+
+  async #removeOwned(owned: OwnedRequest): Promise<void> {
     try {
+      await this.#beforeOwnedRemove();
       await this.#removeExact(owned, await this.#trustedRequestDirectory());
+      owned.closed = true;
+      this.#owned.delete(owned.operationPath);
     } catch (error) {
       if (error instanceof BridgeProofIssuerError) throw error;
       throw new BridgeProofIssuerError("bridge proof rejected");
+    } finally {
+      delete owned.closing;
     }
   }
 

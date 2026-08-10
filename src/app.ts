@@ -645,7 +645,7 @@ export function createProductionRuntime(
   const safety = new SafetyEngine(confirmations, config.safety, (lease) =>
     taskController.isLeaseLive(lease),
   );
-  const minecraft = new MineflayerAdapter(config.minecraft);
+  const minecraft = new MineflayerAdapter({ ...config.minecraft, dataRoot: paths.dataRoot });
   const executor = new ActionExecutor(
     minecraft,
     safety,

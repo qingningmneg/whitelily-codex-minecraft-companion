@@ -5,6 +5,7 @@ import type { ResolvedModelSelection } from "../../src/codex/modelCatalog.js";
 import { snapshotDiagnosticActionCapability } from "../../src/diagnostics/diagnosticManifest.js";
 import type { McpReadinessSnapshot } from "../../src/mcp/mcpReadiness.js";
 import type { RunningMcpServer } from "../../src/mcp/mcpServer.js";
+import { MineflayerBridgeError } from "../../src/minecraft/mineflayerConnection.js";
 import { RuntimeFacade } from "../../src/runtime/runtimeFacade.js";
 import type { RuntimeEvent } from "../../src/runtime/runtimeEvents.js";
 import type { ActionCapabilitySnapshot } from "../../src/runtime/runtimeEvents.js";
@@ -155,6 +156,12 @@ const malformedMinecraftCases: ReadonlyArray<readonly [string, unknown]> = [
   ["connected reason has the wrong type", { kind: "connected", reason: 42 }],
   ["connected reason exceeds its bound", { kind: "connected", reason: "r".repeat(257) }],
   ["disconnected has an extra field", { kind: "disconnected", extra: true }],
+  ["bridge_failed is missing its code", { kind: "bridge_failed" }],
+  ["bridge_failed has an unknown code", { kind: "bridge_failed", code: "PRIVATE_BRIDGE_ERROR" }],
+  [
+    "bridge_failed has an extra field",
+    { kind: "bridge_failed", code: "MINECRAFT_BRIDGE_REQUIRED", privatePath: "C:\\private" },
+  ],
   ["world_changed has a symbol field", { kind: "world_changed", [Symbol("private")]: true }],
   ["chat has a non-string message", { kind: "chat", username: "owner", message: 42 }],
   ["chat username exceeds its bound", { kind: "chat", username: "u".repeat(65), message: "hi" }],
@@ -854,6 +861,111 @@ describe("RuntimeFacade", () => {
     expect(serialized).not.toContain("lease-super-secret");
     await expect(runtime.start()).rejects.toThrow("create a new runtime");
   });
+
+  it.each([
+    ["MINECRAFT_BRIDGE_REQUIRED", "Minecraft Bridge is required"],
+    ["MINECRAFT_BRIDGE_REJECTED", "Minecraft Bridge rejected the connection"],
+  ] as const)(
+    "preserves the stable %s startup failure in snapshots, events, and diagnostics",
+    async (code, message) => {
+      const runtime = new RuntimeFacade({
+        lifecycle: {
+          start: async () => {
+            throw new MineflayerBridgeError(code);
+          },
+          stop: async () => undefined,
+        },
+      });
+      const events: RuntimeEvent[] = [];
+      runtime.subscribe((event) => events.push(event));
+
+      await expect(runtime.start()).rejects.toMatchObject({ code, message });
+      const snapshot = runtime.snapshot();
+
+      expect(snapshot).toMatchObject({
+        lifecycle: "failed",
+        minecraft: { state: "disconnected", sessionId: null },
+        lastError: { code, message },
+      });
+      expect(events).toContainEqual({
+        kind: "error",
+        revision: expect.any(Number),
+        error: { code, message },
+      });
+      expect(snapshotDiagnosticActionCapability(snapshot.actions, snapshot.lastError)).toEqual({
+        workspaceVersion: null,
+        state: "failed",
+        mcpListening: false,
+        discoveredToolCount: 0,
+        errorCode: code,
+      });
+      expect(JSON.stringify({ snapshot, events })).not.toMatch(
+        /nonce|fakeHost|bridge-requests|25565|C:\\Users/iu,
+      );
+    },
+  );
+
+  it.each([
+    ["MINECRAFT_BRIDGE_REQUIRED", "Minecraft Bridge is required"],
+    ["MINECRAFT_BRIDGE_REJECTED", "Minecraft Bridge rejected the connection"],
+  ] as const)(
+    "fails a running runtime and diagnostics on one post-connect %s event",
+    async (code, message) => {
+      let minecraftListener:
+        ((event: { kind: string; code?: string; reason?: string }) => void) | undefined;
+      let lifecycleStops = 0;
+      const runtime = new RuntimeFacade({
+        lifecycle: {
+          start: async () => undefined,
+          stop: async () => {
+            lifecycleStops += 1;
+          },
+        },
+        minecraft: {
+          subscribe: (listener) => {
+            minecraftListener = listener as typeof minecraftListener;
+            return () => {
+              minecraftListener = undefined;
+            };
+          },
+        },
+      });
+      const events: RuntimeEvent[] = [];
+      runtime.subscribe((event) => events.push(event));
+      await runtime.start();
+      minecraftListener?.({ kind: "connected" });
+      minecraftListener?.({ kind: "disconnected", reason: "Minecraft connection rejected" });
+
+      minecraftListener?.({ kind: "bridge_failed", code });
+      minecraftListener?.({ kind: "bridge_failed", code });
+      await runtime.stop("process_exit");
+      const snapshot = runtime.snapshot();
+
+      expect(snapshot).toMatchObject({
+        lifecycle: "failed",
+        minecraft: { state: "disconnected", sessionId: null },
+        lastError: { code, message },
+      });
+      expect(lifecycleStops).toBe(1);
+      expect(events.filter((event) => event.kind === "error")).toEqual([
+        {
+          kind: "error",
+          revision: expect.any(Number),
+          error: { code, message },
+        },
+      ]);
+      expect(snapshotDiagnosticActionCapability(snapshot.actions, snapshot.lastError)).toEqual({
+        workspaceVersion: null,
+        state: "failed",
+        mcpListening: false,
+        discoveredToolCount: 0,
+        errorCode: code,
+      });
+      expect(JSON.stringify({ snapshot, events })).not.toMatch(
+        /nonce|fakeHost|bridge-requests|25565|C:\\Users/iu,
+      );
+    },
+  );
 
   it("shares concurrent stop, preserves the first exact reason, and rejects restart", async () => {
     const gate = deferred();

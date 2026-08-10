@@ -130,6 +130,10 @@ export const zhCN = {
   "onboarding.error.MCP_PORT_UNAVAILABLE": "本地动作端口被占用；",
   "onboarding.error.MCP_TOOL_CATALOG_INVALID": "Minecraft 动作组件不完整；",
   "onboarding.error.MCP_READINESS_TIMEOUT": "Minecraft 动作组件响应超时。",
+  "onboarding.error.MINECRAFT_BRIDGE_REQUIRED":
+    "需要安装并启用 WhiteLily Bridge；请安装组件并重启 Minecraft。",
+  "onboarding.error.MINECRAFT_BRIDGE_REJECTED":
+    "WhiteLily Bridge 拒绝了本次连接；请检查组件并重启 Minecraft。",
   "onboarding.action.retry": "重试动作组件",
   "onboarding.error.UNKNOWN": "操作未能完成，请重试。",
   "section.systemStatus": "系统状态",
@@ -331,6 +335,10 @@ export const zhCN = {
   "diagnostics.action.error.MCP_PORT_UNAVAILABLE": "本地动作端口被占用；",
   "diagnostics.action.error.MCP_TOOL_CATALOG_INVALID": "Minecraft 动作组件不完整；",
   "diagnostics.action.error.MCP_READINESS_TIMEOUT": "Minecraft 动作组件响应超时。",
+  "diagnostics.action.error.MINECRAFT_BRIDGE_REQUIRED":
+    "需要安装并启用 WhiteLily Bridge；请安装组件并重启 Minecraft。",
+  "diagnostics.action.error.MINECRAFT_BRIDGE_REJECTED":
+    "WhiteLily Bridge 拒绝了本次连接；请检查组件并重启 Minecraft。",
   "diagnostics.omission.authentication-data": "身份验证数据",
   "diagnostics.omission.minecraft-saves": "Minecraft 存档",
   "diagnostics.omission.pcl2-account-data": "PCL2 账号数据",

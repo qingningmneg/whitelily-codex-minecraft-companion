@@ -2,6 +2,10 @@ import type { Vec3, WorldSnapshot } from "../domain/types.js";
 
 export type MinecraftEvent =
   | { kind: "connected" | "disconnected"; reason?: string }
+  | {
+      kind: "bridge_failed";
+      code: "MINECRAFT_BRIDGE_REQUIRED" | "MINECRAFT_BRIDGE_REJECTED";
+    }
   | { kind: "world_changed" }
   | { kind: "chat"; username: string; message: string }
   | { kind: "owner_online" | "owner_offline"; username: string }
