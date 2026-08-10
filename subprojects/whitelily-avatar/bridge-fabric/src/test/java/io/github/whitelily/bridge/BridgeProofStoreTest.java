@@ -441,6 +441,95 @@ class BridgeProofStoreTest {
   }
 
   @Test
+  void replacementClaimAfterRequestRemovalSurvivesAndBlocksReplay() throws Exception {
+    Path request = writeRequest(temporaryDirectory, validJson());
+    Path claim = request.resolveSibling(request.getFileName() + ".claim");
+    Path anchor = request.resolveSibling(request.getFileName() + ".anchor");
+    Path foreign = temporaryDirectory.resolve("foreign-claim");
+    Path retainedForeign = temporaryDirectory.resolve("retained-foreign-claim");
+    Files.writeString(foreign, "foreign-claim-content", UTF_8, StandardOpenOption.CREATE_NEW);
+    Files.createLink(retainedForeign, foreign);
+    WindowsOwnedFile.Identity foreignIdentity =
+        WindowsOwnedFile.identity(foreign, false).orElseThrow();
+    Field hook = BridgeProofStore.class.getDeclaredField("afterRequestRemovalHook");
+    hook.setAccessible(true);
+    hook.set(
+        null,
+        (Runnable)
+            () -> {
+              try {
+                Files.delete(claim);
+                Files.move(foreign, claim, java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+              } catch (java.io.IOException failure) {
+                throw new RuntimeException(failure);
+              }
+            });
+    try {
+      BridgeProofStore store = new BridgeProofStore(temporaryDirectory);
+
+      assertEquals(Optional.empty(), store.consume(NONCE, CONTEXT));
+      assertFalse(Files.exists(request));
+      assertEquals(foreignIdentity, WindowsOwnedFile.identity(claim, false).orElseThrow());
+      assertEquals("foreign-claim-content", Files.readString(claim, UTF_8));
+      assertTrue(Files.isSameFile(claim, retainedForeign));
+      assertTrue(Files.exists(anchor));
+
+      hook.set(null, null);
+      writeRequest(temporaryDirectory, validJson());
+      assertEquals(Optional.empty(), store.consume(NONCE, CONTEXT));
+      assertTrue(Files.exists(request));
+      assertEquals(foreignIdentity, WindowsOwnedFile.identity(claim, false).orElseThrow());
+      assertEquals("foreign-claim-content", Files.readString(claim, UTF_8));
+      assertTrue(Files.exists(anchor));
+    } finally {
+      hook.set(null, null);
+    }
+  }
+
+  @Test
+  void replacementAnchorAfterClaimRemovalSurvivesAndBlocksReplay() throws Exception {
+    Path request = writeRequest(temporaryDirectory, validJson());
+    Path claim = request.resolveSibling(request.getFileName() + ".claim");
+    Path anchor = request.resolveSibling(request.getFileName() + ".anchor");
+    Path foreign = temporaryDirectory.resolve("foreign-anchor-after-claim");
+    Files.writeString(foreign, "foreign-anchor-content", UTF_8, StandardOpenOption.CREATE_NEW);
+    WindowsOwnedFile.Identity foreignIdentity =
+        WindowsOwnedFile.identity(foreign, false).orElseThrow();
+    Field hook = BridgeProofStore.class.getDeclaredField("afterClaimRemovalHook");
+    hook.setAccessible(true);
+    hook.set(
+        null,
+        (Runnable)
+            () -> {
+              try {
+                Files.delete(anchor);
+                Files.move(foreign, anchor, java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+              } catch (java.io.IOException failure) {
+                throw new RuntimeException(failure);
+              }
+            });
+    try {
+      BridgeProofStore store = new BridgeProofStore(temporaryDirectory);
+
+      assertEquals(Optional.empty(), store.consume(NONCE, CONTEXT));
+      assertFalse(Files.exists(request));
+      assertFalse(Files.exists(claim));
+      assertEquals(foreignIdentity, WindowsOwnedFile.identity(anchor, false).orElseThrow());
+      assertEquals("foreign-anchor-content", Files.readString(anchor, UTF_8));
+
+      hook.set(null, null);
+      writeRequest(temporaryDirectory, validJson());
+      assertEquals(Optional.empty(), store.consume(NONCE, CONTEXT));
+      assertTrue(Files.exists(request));
+      assertFalse(Files.exists(claim));
+      assertEquals(foreignIdentity, WindowsOwnedFile.identity(anchor, false).orElseThrow());
+      assertEquals("foreign-anchor-content", Files.readString(anchor, UTF_8));
+    } finally {
+      hook.set(null, null);
+    }
+  }
+
+  @Test
   void rejectsAReparsePointInTheConfiguredRootAncestorChain() throws Exception {
     Path target = Files.createTempDirectory(temporaryDirectory, "ancestor-target-");
     Path ancestor = temporaryDirectory.resolve("ancestor-link");

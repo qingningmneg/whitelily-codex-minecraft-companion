@@ -271,6 +271,22 @@ class BridgeJarContractTest {
   }
 
   @Test
+  void exactContractRejectsALocalHeaderOnlyEqualLengthNameMutation() throws Exception {
+    Path source = Path.of(System.getProperty("whitelily.bridge.jar"));
+    Path license = Path.of(System.getProperty("whitelily.license"));
+    Path renamed =
+        Files.createDirectory(temporaryDirectory.resolve("local-entry-name"))
+            .resolve(EXPECTED_JAR);
+    rewriteJarWithOneLocalName(source, renamed, "fabric.mod.json", "fabric.moe.json");
+
+    AssertionError rejection =
+        assertThrows(
+            AssertionError.class,
+            () -> BridgeJarContractAssertions.assertExact(renamed, license));
+    assertTrue(rejection.getMessage().contains("local entry name: fabric.mod.json"));
+  }
+
+  @Test
   void exactContractRejectsARealDuplicateCentralDirectoryEntry() throws Exception {
     Path source = Path.of(System.getProperty("whitelily.bridge.jar"));
     Path mutated = Files.createDirectory(temporaryDirectory.resolve("duplicate-entry")).resolve(EXPECTED_JAR);
@@ -428,6 +444,34 @@ class BridgeJarContractTest {
         int localOffset = littleEndianInt(archive, offset + 42);
         assertEquals(0x04034b50, littleEndianInt(archive, localOffset));
         putLittleEndianShort(archive, localOffset + 10, timestamp);
+        Files.write(target, archive);
+        return;
+      }
+      offset += 46 + nameLength + extraLength + commentLength;
+    }
+    throw new AssertionError("missing archive entry: " + entryName);
+  }
+
+  private static void rewriteJarWithOneLocalName(
+      Path source, Path target, String entryName, String replacementName) throws Exception {
+    byte[] archive = Files.readAllBytes(source);
+    byte[] replacement = replacementName.getBytes(UTF_8);
+    int eocd = endOfCentralDirectory(archive);
+    assertTrue(eocd >= 0, "end of central directory");
+    int count = littleEndianShort(archive, eocd + 10);
+    int offset = littleEndianInt(archive, eocd + 16);
+    for (int index = 0; index < count; index++) {
+      assertEquals(0x02014b50, littleEndianInt(archive, offset));
+      int nameLength = littleEndianShort(archive, offset + 28);
+      int extraLength = littleEndianShort(archive, offset + 30);
+      int commentLength = littleEndianShort(archive, offset + 32);
+      String name = new String(archive, offset + 46, nameLength, UTF_8);
+      if (name.equals(entryName)) {
+        int localOffset = littleEndianInt(archive, offset + 42);
+        assertEquals(0x04034b50, littleEndianInt(archive, localOffset));
+        int localNameLength = littleEndianShort(archive, localOffset + 26);
+        assertEquals(localNameLength, replacement.length, "replacement name length");
+        System.arraycopy(replacement, 0, archive, localOffset + 30, replacement.length);
         Files.write(target, archive);
         return;
       }
