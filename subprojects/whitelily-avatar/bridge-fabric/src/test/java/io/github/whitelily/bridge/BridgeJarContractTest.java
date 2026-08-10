@@ -12,6 +12,9 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.jar.JarEntry;
@@ -128,6 +131,106 @@ class BridgeJarContractTest {
   }
 
   @Test
+  void exactContractRejectsTheFirstWrongSemanticWithItsSpecificReason() throws Exception {
+    Path source = Path.of(System.getProperty("whitelily.bridge.jar"));
+    Path license = Path.of(System.getProperty("whitelily.license"));
+
+    JsonObject dependencyMetadata;
+    JsonObject mixinConfig;
+    JsonObject refmap;
+    byte[] manifest;
+    try (JarFile jar = new JarFile(source.toFile())) {
+      dependencyMetadata = json(jar, "fabric.mod.json");
+      mixinConfig = json(jar, "whitelily_bridge.mixins.json");
+      refmap = json(jar, "whitelily-bridge-fabric-refmap.json");
+      manifest = jar.getInputStream(jar.getJarEntry("META-INF/MANIFEST.MF")).readAllBytes();
+    }
+
+    dependencyMetadata
+        .getAsJsonObject("depends")
+        .addProperty("fabricloader", ">=0.16.13");
+    assertRejectedWithReason(
+        source,
+        license,
+        "dependency",
+        Map.of("fabric.mod.json", dependencyMetadata.toString().getBytes(UTF_8)),
+        Map.of(),
+        Set.of(),
+        "fabricloader dependency");
+
+    mixinConfig.getAsJsonObject("injectors").addProperty("defaultRequire", 2);
+    assertRejectedWithReason(
+        source,
+        license,
+        "mixin-content",
+        Map.of("whitelily_bridge.mixins.json", mixinConfig.toString().getBytes(UTF_8)),
+        Map.of(),
+        Set.of(),
+        "mixin defaultRequire");
+
+    refmap
+        .getAsJsonObject("mappings")
+        .getAsJsonObject("io/github/whitelily/bridge/ConnectionMixin")
+        .addProperty(
+            "disconnect(Lnet/minecraft/network/DisconnectionDetails;)V", "foreign");
+    assertRejectedWithReason(
+        source,
+        license,
+        "refmap-content",
+        Map.of("whitelily-bridge-fabric-refmap.json", refmap.toString().getBytes(UTF_8)),
+        Map.of(),
+        Set.of(),
+        "connection disconnect refmap");
+
+    byte[] changedManifest =
+        new String(manifest, UTF_8)
+            .replace("Manifest-Version: 1.0", "Manifest-Version: 1.1")
+            .getBytes(UTF_8);
+    assertRejectedWithReason(
+        source,
+        license,
+        "manifest-content",
+        Map.of("META-INF/MANIFEST.MF", changedManifest),
+        Map.of(),
+        Set.of(),
+        "manifest bytes");
+
+    assertRejectedWithReason(
+        source,
+        license,
+        "license-content",
+        Map.of("LICENSE", "foreign".getBytes(UTF_8)),
+        Map.of(),
+        Set.of(),
+        "license bytes");
+  }
+
+  @Test
+  void exactContractRejectsEntryOrderAndTimestampIndependently() throws Exception {
+    Path source = Path.of(System.getProperty("whitelily.bridge.jar"));
+    Path license = Path.of(System.getProperty("whitelily.license"));
+
+    Path reordered =
+        Files.createDirectory(temporaryDirectory.resolve("entry-order")).resolve(EXPECTED_JAR);
+    rewriteJarInReverseOrder(source, reordered);
+    AssertionError orderFailure =
+        assertThrows(
+            AssertionError.class,
+            () -> BridgeJarContractAssertions.assertExact(reordered, license));
+    assertTrue(orderFailure.getMessage().contains("ordered entries"));
+
+    Path timestamped =
+        Files.createDirectory(temporaryDirectory.resolve("entry-timestamp"))
+            .resolve(EXPECTED_JAR);
+    rewriteJarWithOneTimestamp(source, timestamped, "fabric.mod.json", 0L);
+    AssertionError timestampFailure =
+        assertThrows(
+            AssertionError.class,
+            () -> BridgeJarContractAssertions.assertExact(timestamped, license));
+    assertTrue(timestampFailure.getMessage().contains("entry timestamp: fabric.mod.json"));
+  }
+
+  @Test
   void exactContractRejectsARealDuplicateCentralDirectoryEntry() throws Exception {
     Path source = Path.of(System.getProperty("whitelily.bridge.jar"));
     Path mutated = Files.createDirectory(temporaryDirectory.resolve("duplicate-entry")).resolve(EXPECTED_JAR);
@@ -182,7 +285,7 @@ class BridgeJarContractTest {
           continue;
         }
         JarEntry copied = new JarEntry(entry.getName());
-        copied.setTime(0L);
+        copied.setTime(entry.getTime());
         rewritten.putNextEntry(copied);
         if (!entry.isDirectory()) {
           byte[] replacement = replacements.get(entry.getName());
@@ -195,7 +298,7 @@ class BridgeJarContractTest {
       }
       for (Map.Entry<String, byte[]> addition : additions.entrySet()) {
         JarEntry entry = new JarEntry(addition.getKey());
-        entry.setTime(0L);
+        entry.setTime(315504000000L);
         rewritten.putNextEntry(entry);
         rewritten.write(addition.getValue());
         rewritten.closeEntry();
@@ -215,6 +318,79 @@ class BridgeJarContractTest {
     rewriteJar(source, mutated, replacements, additions, omissions);
     assertThrows(AssertionError.class, () -> BridgeJarContractAssertions.assertExact(mutated, license));
   }
+
+  private void assertRejectedWithReason(
+      Path source,
+      Path license,
+      String name,
+      Map<String, byte[]> replacements,
+      Map<String, byte[]> additions,
+      Set<String> omissions,
+      String reason)
+      throws Exception {
+    Path mutated = Files.createDirectory(temporaryDirectory.resolve(name)).resolve(EXPECTED_JAR);
+    rewriteJar(source, mutated, replacements, additions, omissions);
+    AssertionError rejection =
+        assertThrows(
+            AssertionError.class,
+            () -> BridgeJarContractAssertions.assertExact(mutated, license));
+    assertTrue(
+        rejection.getMessage() != null && rejection.getMessage().contains(reason),
+        "expected rejection reason '" + reason + "' but got: " + rejection.getMessage());
+  }
+
+  private static void rewriteJarInReverseOrder(Path source, Path target) throws Exception {
+    List<EntryCopy> entries = readEntries(source);
+    Collections.reverse(entries);
+    writeEntries(target, entries);
+  }
+
+  private static void rewriteJarWithOneTimestamp(
+      Path source, Path target, String entryName, long timestamp) throws Exception {
+    List<EntryCopy> entries = readEntries(source);
+    List<EntryCopy> changed = new ArrayList<>();
+    for (EntryCopy entry : entries) {
+      changed.add(
+          entry.name().equals(entryName)
+              ? new EntryCopy(entry.name(), entry.directory(), timestamp, entry.contents())
+              : entry);
+    }
+    writeEntries(target, changed);
+  }
+
+  private static List<EntryCopy> readEntries(Path source) throws Exception {
+    List<EntryCopy> entries = new ArrayList<>();
+    try (JarFile jar = new JarFile(source.toFile())) {
+      for (JarEntry entry : java.util.Collections.list(jar.entries())) {
+        entries.add(
+            new EntryCopy(
+                entry.getName(),
+                entry.isDirectory(),
+                entry.getTime(),
+                entry.isDirectory()
+                    ? new byte[0]
+                    : jar.getInputStream(entry).readAllBytes()));
+      }
+    }
+    return entries;
+  }
+
+  private static void writeEntries(Path target, List<EntryCopy> entries) throws Exception {
+    try (OutputStream output = Files.newOutputStream(target);
+        JarOutputStream rewritten = new JarOutputStream(output)) {
+      for (EntryCopy entry : entries) {
+        JarEntry copied = new JarEntry(entry.name());
+        copied.setTime(entry.timestamp());
+        rewritten.putNextEntry(copied);
+        if (!entry.directory()) {
+          rewritten.write(entry.contents());
+        }
+        rewritten.closeEntry();
+      }
+    }
+  }
+
+  private record EntryCopy(String name, boolean directory, long timestamp, byte[] contents) {}
 
   private static void duplicateFirstCentralDirectoryEntry(Path source, Path target) throws Exception {
     byte[] archive = Files.readAllBytes(source);

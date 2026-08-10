@@ -10,12 +10,15 @@ import com.sun.jna.ptr.IntByReference;
 import java.nio.file.Path;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Function;
 
 final class WindowsProofHandle implements AutoCloseable {
   private static final int FILE_STANDARD_INFO_CLASS = 1;
   private static final int FILE_DISPOSITION_INFO_CLASS = 4;
   private static final int SHARING =
       WinNT.FILE_SHARE_READ | WinNT.FILE_SHARE_WRITE | WinNT.FILE_SHARE_DELETE;
+  private static volatile Function<HANDLE, Optional<WindowsOwnedFile.Identity>> identityReader =
+      WindowsOwnedFile::identity;
 
   private final HANDLE handle;
   private final WindowsOwnedFile.Identity identity;
@@ -42,12 +45,19 @@ final class WindowsProofHandle implements AutoCloseable {
     if (WindowsOwnedFile.invalid(handle)) {
       return Optional.empty();
     }
-    Optional<WindowsOwnedFile.Identity> identity = WindowsOwnedFile.identity(handle);
-    if (identity.isEmpty()) {
-      Kernel32.INSTANCE.CloseHandle(handle);
-      return Optional.empty();
+    boolean accepted = false;
+    try {
+      Optional<WindowsOwnedFile.Identity> identity = identityReader.apply(handle);
+      if (identity.isEmpty()) {
+        return Optional.empty();
+      }
+      accepted = true;
+      return Optional.of(new WindowsProofHandle(handle, identity.orElseThrow()));
+    } finally {
+      if (!accepted) {
+        Kernel32.INSTANCE.CloseHandle(handle);
+      }
     }
-    return Optional.of(new WindowsProofHandle(handle, identity.orElseThrow()));
   }
 
   boolean matches(Path path) {

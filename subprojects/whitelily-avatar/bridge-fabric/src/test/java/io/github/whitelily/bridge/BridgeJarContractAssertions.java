@@ -2,6 +2,7 @@ package io.github.whitelily.bridge;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -20,14 +21,12 @@ import java.util.stream.Collectors;
 
 final class BridgeJarContractAssertions {
   private static final String EXPECTED_JAR = "whitelily-bridge-fabric-1.21.5-0.1.0.jar";
-  private static final Set<String> EXACT_ENTRIES =
-      Set.of(
-          "META-INF/",
+  private static final List<String> ORDERED_ENTRIES =
+      List.of(
           "META-INF/MANIFEST.MF",
           "LICENSE",
+          "META-INF/",
           "fabric.mod.json",
-          "whitelily_bridge.mixins.json",
-          "whitelily-bridge-fabric-refmap.json",
           "io/",
           "io/github/",
           "io/github/whitelily/",
@@ -61,7 +60,25 @@ final class BridgeJarContractAssertions {
           "io/github/whitelily/bridge/WhiteLilyBridgeClient.class",
           "io/github/whitelily/bridge/WindowsOwnedFile$Identity.class",
           "io/github/whitelily/bridge/WindowsOwnedFile.class",
-          "io/github/whitelily/bridge/WindowsProofHandle.class");
+          "io/github/whitelily/bridge/WindowsProofHandle.class",
+          "whitelily-bridge-fabric-refmap.json",
+          "whitelily_bridge.mixins.json");
+  private static final Set<String> EXACT_ENTRIES = Set.copyOf(ORDERED_ENTRIES);
+  private static final byte[] EXACT_MANIFEST =
+      ("Manifest-Version: 1.0\r\n"
+              + "Fabric-Jar-Type: classes\r\n"
+              + "Fabric-Loom-Mixin-Remap-Type: mixin\r\n"
+              + "Fabric-Gradle-Version: 8.12\r\n"
+              + "Fabric-Loom-Version: 1.10.5\r\n"
+              + "Fabric-Mixin-Compile-Extensions-Version: 0.6.0\r\n"
+              + "Fabric-Minecraft-Version: 1.21.5\r\n"
+              + "Fabric-Tiny-Remapper-Version: 0.11.1\r\n"
+              + "Fabric-Loader-Version: 0.16.14\r\n"
+              + "Fabric-Mixin-Version: 0.15.5+mixin.0.8.7\r\n"
+              + "Fabric-Mixin-Group: net.fabricmc\r\n"
+              + "Fabric-Mapping-Namespace: intermediary\r\n"
+              + "\r\n")
+          .getBytes(UTF_8);
 
   private BridgeJarContractAssertions() {}
 
@@ -69,14 +86,17 @@ final class BridgeJarContractAssertions {
     assertEquals(EXPECTED_JAR, jarPath.getFileName().toString());
     try (JarFile jar = new JarFile(jarPath.toFile())) {
       List<java.util.jar.JarEntry> orderedEntries = jar.stream().toList();
-      Set<String> entries = orderedEntries.stream().map(entry -> entry.getName()).collect(Collectors.toSet());
+      List<String> entryNames = orderedEntries.stream().map(entry -> entry.getName()).toList();
+      Set<String> entries = new HashSet<>(entryNames);
       assertForbiddenPackagesAbsent(entries);
       assertEquals(EXACT_ENTRIES, entries);
       assertEquals(EXACT_ENTRIES.size(), jar.size());
       assertNoDuplicateCentralDirectoryEntry(jarPath);
+      assertEquals(ORDERED_ENTRIES, entryNames, "ordered entries");
       for (java.util.jar.JarEntry entry : orderedEntries) {
-        assertEquals(315504000000L, entry.getTime(), "non-reproducible entry timestamp: " + entry.getName());
+        assertEquals(315504000000L, entry.getTime(), "entry timestamp: " + entry.getName());
       }
+      assertArrayEquals(EXACT_MANIFEST, readBytes(jar, "META-INF/MANIFEST.MF"), "manifest bytes");
 
       JsonObject metadata = json(jar, "fabric.mod.json");
       assertEquals(
@@ -105,7 +125,10 @@ final class BridgeJarContractAssertions {
       JsonObject dependencies = metadata.getAsJsonObject("depends");
       assertEquals(Set.of("minecraft", "fabricloader"), dependencies.keySet());
       assertEquals("=1.21.5", dependencies.get("minecraft").getAsString());
-      assertEquals(">=0.16.14", dependencies.get("fabricloader").getAsString());
+      assertEquals(
+          ">=0.16.14",
+          dependencies.get("fabricloader").getAsString(),
+          "fabricloader dependency");
 
       JsonObject mixins = json(jar, "whitelily_bridge.mixins.json");
       assertEquals(
@@ -125,7 +148,7 @@ final class BridgeJarContractAssertions {
               "PlayerListMixin"));
       JsonObject injectors = mixins.getAsJsonObject("injectors");
       assertEquals(Set.of("defaultRequire"), injectors.keySet());
-      assertEquals(1, injectors.get("defaultRequire").getAsInt());
+      assertEquals(1, injectors.get("defaultRequire").getAsInt(), "mixin defaultRequire");
 
       JsonObject refmap = json(jar, "whitelily-bridge-fabric-refmap.json");
       assertEquals(Set.of("mappings", "data"), refmap.keySet());
@@ -150,7 +173,8 @@ final class BridgeJarContractAssertions {
           mapping(
               mappings,
               "io/github/whitelily/bridge/ConnectionMixin",
-              "disconnect(Lnet/minecraft/network/DisconnectionDetails;)V"));
+              "disconnect(Lnet/minecraft/network/DisconnectionDetails;)V"),
+          "connection disconnect refmap");
       assertEquals(
           Set.of(
               "placeNewPlayer(Lnet/minecraft/network/Connection;Lnet/minecraft/server/level/ServerPlayer;Lnet/minecraft/server/network/CommonListenerCookie;)V",
@@ -209,7 +233,7 @@ final class BridgeJarContractAssertions {
               .getAsJsonObject("data")
               .getAsJsonObject("named:intermediary"));
       assertEquals(Set.of("named:intermediary"), refmap.getAsJsonObject("data").keySet());
-      assertEquals(Files.readString(licensePath, UTF_8), read(jar, "LICENSE"));
+      assertArrayEquals(Files.readAllBytes(licensePath), readBytes(jar, "LICENSE"), "license bytes");
     }
   }
 
@@ -229,8 +253,12 @@ final class BridgeJarContractAssertions {
   }
 
   private static String read(JarFile jar, String name) throws Exception {
+    return new String(readBytes(jar, name), UTF_8);
+  }
+
+  private static byte[] readBytes(JarFile jar, String name) throws Exception {
     try (InputStream input = jar.getInputStream(jar.getJarEntry(name))) {
-      return new String(input.readAllBytes(), UTF_8);
+      return input.readAllBytes();
     }
   }
 
