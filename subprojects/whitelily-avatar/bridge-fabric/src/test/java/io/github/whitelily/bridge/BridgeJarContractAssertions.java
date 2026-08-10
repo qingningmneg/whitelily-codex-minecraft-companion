@@ -93,9 +93,7 @@ final class BridgeJarContractAssertions {
       assertEquals(EXACT_ENTRIES.size(), jar.size());
       assertNoDuplicateCentralDirectoryEntry(jarPath);
       assertEquals(ORDERED_ENTRIES, entryNames, "ordered entries");
-      for (java.util.jar.JarEntry entry : orderedEntries) {
-        assertEquals(315504000000L, entry.getTime(), "entry timestamp: " + entry.getName());
-      }
+      assertExactDosTimestamps(jarPath);
       assertArrayEquals(EXACT_MANIFEST, readBytes(jar, "META-INF/MANIFEST.MF"), "manifest bytes");
 
       JsonObject metadata = json(jar, "fabric.mod.json");
@@ -297,6 +295,33 @@ final class BridgeJarContractAssertions {
       assertTrue(names.add(name), "duplicate archive entry: " + name);
       offset += 46 + nameLength + extraLength + commentLength;
     }
+  }
+
+  private static void assertExactDosTimestamps(Path jarPath) throws Exception {
+    byte[] archive = Files.readAllBytes(jarPath);
+    int eocd = endOfCentralDirectory(archive);
+    assertTrue(eocd >= 0, "end of central directory");
+    int count = littleEndianShort(archive, eocd + 10);
+    int offset = littleEndianInt(archive, eocd + 16);
+    for (int index = 0; index < count; index++) {
+      assertEquals(0x02014b50, littleEndianInt(archive, offset));
+      int nameLength = littleEndianShort(archive, offset + 28);
+      int extraLength = littleEndianShort(archive, offset + 30);
+      int commentLength = littleEndianShort(archive, offset + 32);
+      String name = new String(archive, offset + 46, nameLength, UTF_8);
+      assertEquals(0, littleEndianShort(archive, offset + 12), "entry timestamp: " + name);
+      assertEquals(0x21, littleEndianShort(archive, offset + 14), "entry date: " + name);
+      offset += 46 + nameLength + extraLength + commentLength;
+    }
+  }
+
+  private static int endOfCentralDirectory(byte[] archive) {
+    for (int index = archive.length - 22; index >= Math.max(0, archive.length - 65_557); index--) {
+      if (littleEndianInt(archive, index) == 0x06054b50) {
+        return index;
+      }
+    }
+    return -1;
   }
 
   private static int littleEndianShort(byte[] bytes, int offset) {

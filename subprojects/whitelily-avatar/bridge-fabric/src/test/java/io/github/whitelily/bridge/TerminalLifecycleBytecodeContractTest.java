@@ -10,6 +10,7 @@ import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import net.minecraft.network.Connection;
+import net.minecraft.server.network.ServerCommonPacketListenerImpl;
 import net.minecraft.server.network.ServerConfigurationPacketListenerImpl;
 import net.minecraft.server.network.ServerLoginPacketListenerImpl;
 import org.junit.jupiter.api.Test;
@@ -95,6 +96,28 @@ class TerminalLifecycleBytecodeContractTest {
     assertEquals(
         "(" + DETAILS + "Lorg/spongepowered/asm/mixin/injection/callback/CallbackInfo;)V",
         injection.callbackDescriptor());
+  }
+
+  @Test
+  void real1215InheritedConfigurationDisconnectOverloadsReachTheConnectionDetailsTarget()
+      throws Exception {
+    String listener = "net/minecraft/server/network/ServerCommonPacketListenerImpl";
+    MethodCode componentDisconnect =
+        methodCode(ServerCommonPacketListenerImpl.class, "disconnect", "(" + COMPONENT + ")V");
+    assertTrue(
+        componentDisconnect.hasInvocation(listener, "disconnect", "(" + DETAILS + ")V"),
+        "inherited disconnect(Component) must delegate to inherited disconnect(DisconnectionDetails)");
+
+    MethodCode detailsDisconnect =
+        methodCode(ServerCommonPacketListenerImpl.class, "disconnect", "(" + DETAILS + ")V");
+    org.objectweb.asm.Handle callback = detailsDisconnect.connectionDetailsCallback();
+    assertEquals(listener, callback.getOwner());
+    assertEquals("(" + DETAILS + ")V", callback.getDesc());
+    MethodCode callbackCode =
+        methodCode(ServerCommonPacketListenerImpl.class, callback.getName(), callback.getDesc());
+    assertTrue(
+        callbackCode.hasInvocation(CONNECTION, "disconnect", "(" + DETAILS + ")V"),
+        "inherited disconnect(DisconnectionDetails) callback must reach Connection.disconnect(DisconnectionDetails)");
   }
 
   private static MethodCode methodCode(
@@ -204,6 +227,7 @@ class TerminalLifecycleBytecodeContractTest {
 
   private static final class MethodCode extends MethodVisitor {
     private final List<Invocation> invocations = new ArrayList<>();
+    private final List<org.objectweb.asm.Handle> invokedynamicTargets = new ArrayList<>();
     private final List<PendingTryRange> pendingTryRanges = new ArrayList<>();
     private final Map<Label, Integer> labels = new IdentityHashMap<>();
     private int instruction;
@@ -282,7 +306,27 @@ class TerminalLifecycleBytecodeContractTest {
         String descriptor,
         org.objectweb.asm.Handle bootstrapMethodHandle,
         Object... bootstrapMethodArguments) {
+      for (Object argument : bootstrapMethodArguments) {
+        if (argument instanceof org.objectweb.asm.Handle handle) {
+          invokedynamicTargets.add(handle);
+        }
+      }
       instruction++;
+    }
+
+    org.objectweb.asm.Handle connectionDetailsCallback() {
+      return invokedynamicTargets.stream()
+          .filter(
+              target ->
+                  target
+                      .getOwner()
+                      .equals("net/minecraft/server/network/ServerCommonPacketListenerImpl")
+                      && target.getDesc().equals("(" + DETAILS + ")V"))
+          .findFirst()
+          .orElseThrow(
+              () ->
+                  new AssertionError(
+                      "disconnect(DisconnectionDetails) must retain a Connection-details callback"));
     }
 
     boolean hasInvocation(String owner, String name, String descriptor) {

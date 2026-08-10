@@ -2,6 +2,7 @@ package io.github.whitelily.bridge;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -17,6 +18,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TimeZone;
 import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
 import java.util.jar.JarOutputStream;
@@ -222,12 +224,34 @@ class BridgeJarContractTest {
     Path timestamped =
         Files.createDirectory(temporaryDirectory.resolve("entry-timestamp"))
             .resolve(EXPECTED_JAR);
-    rewriteJarWithOneTimestamp(source, timestamped, "fabric.mod.json", 0L);
+    rewriteJarWithOneDosTimestamp(source, timestamped, "fabric.mod.json", 1);
     AssertionError timestampFailure =
         assertThrows(
             AssertionError.class,
             () -> BridgeJarContractAssertions.assertExact(timestamped, license));
     assertTrue(timestampFailure.getMessage().contains("entry timestamp: fabric.mod.json"));
+  }
+
+  @Test
+  void exactContractUsesTimezoneNeutralZipTimestamps() throws Exception {
+    Path source = Path.of(System.getProperty("whitelily.bridge.jar"));
+    Path license = Path.of(System.getProperty("whitelily.license"));
+    Path timestamped =
+        Files.createDirectory(temporaryDirectory.resolve("utc-timestamp"))
+            .resolve(EXPECTED_JAR);
+    rewriteJarWithOneDosTimestamp(source, timestamped, "fabric.mod.json", 1);
+    TimeZone original = TimeZone.getDefault();
+    TimeZone.setDefault(TimeZone.getTimeZone("UTC"));
+    try {
+      assertDoesNotThrow(() -> BridgeJarContractAssertions.assertExact(source, license));
+      AssertionError rejection =
+          assertThrows(
+              AssertionError.class,
+              () -> BridgeJarContractAssertions.assertExact(timestamped, license));
+      assertTrue(rejection.getMessage().contains("entry timestamp: fabric.mod.json"));
+    } finally {
+      TimeZone.setDefault(original);
+    }
   }
 
   @Test
@@ -345,17 +369,30 @@ class BridgeJarContractTest {
     writeEntries(target, entries);
   }
 
-  private static void rewriteJarWithOneTimestamp(
-      Path source, Path target, String entryName, long timestamp) throws Exception {
-    List<EntryCopy> entries = readEntries(source);
-    List<EntryCopy> changed = new ArrayList<>();
-    for (EntryCopy entry : entries) {
-      changed.add(
-          entry.name().equals(entryName)
-              ? new EntryCopy(entry.name(), entry.directory(), timestamp, entry.contents())
-              : entry);
+  private static void rewriteJarWithOneDosTimestamp(
+      Path source, Path target, String entryName, int timestamp) throws Exception {
+    byte[] archive = Files.readAllBytes(source);
+    int eocd = endOfCentralDirectory(archive);
+    assertTrue(eocd >= 0, "end of central directory");
+    int count = littleEndianShort(archive, eocd + 10);
+    int offset = littleEndianInt(archive, eocd + 16);
+    for (int index = 0; index < count; index++) {
+      assertEquals(0x02014b50, littleEndianInt(archive, offset));
+      int nameLength = littleEndianShort(archive, offset + 28);
+      int extraLength = littleEndianShort(archive, offset + 30);
+      int commentLength = littleEndianShort(archive, offset + 32);
+      String name = new String(archive, offset + 46, nameLength, UTF_8);
+      if (name.equals(entryName)) {
+        int localOffset = littleEndianInt(archive, offset + 42);
+        assertEquals(0x04034b50, littleEndianInt(archive, localOffset));
+        putLittleEndianShort(archive, offset + 12, timestamp);
+        putLittleEndianShort(archive, localOffset + 10, timestamp);
+        Files.write(target, archive);
+        return;
+      }
+      offset += 46 + nameLength + extraLength + commentLength;
     }
-    writeEntries(target, changed);
+    throw new AssertionError("missing archive entry: " + entryName);
   }
 
   private static List<EntryCopy> readEntries(Path source) throws Exception {
@@ -394,13 +431,7 @@ class BridgeJarContractTest {
 
   private static void duplicateFirstCentralDirectoryEntry(Path source, Path target) throws Exception {
     byte[] archive = Files.readAllBytes(source);
-    int eocd = -1;
-    for (int index = archive.length - 22; index >= Math.max(0, archive.length - 65_557); index--) {
-      if (littleEndianInt(archive, index) == 0x06054b50) {
-        eocd = index;
-        break;
-      }
-    }
+    int eocd = endOfCentralDirectory(archive);
     assertTrue(eocd >= 0, "end of central directory");
     int directoryOffset = littleEndianInt(archive, eocd + 16);
     int directorySize = littleEndianInt(archive, eocd + 12);
@@ -421,6 +452,15 @@ class BridgeJarContractTest {
 
   private static int littleEndianShort(byte[] bytes, int offset) {
     return (bytes[offset] & 0xff) | ((bytes[offset + 1] & 0xff) << 8);
+  }
+
+  private static int endOfCentralDirectory(byte[] archive) {
+    for (int index = archive.length - 22; index >= Math.max(0, archive.length - 65_557); index--) {
+      if (littleEndianInt(archive, index) == 0x06054b50) {
+        return index;
+      }
+    }
+    return -1;
   }
 
   private static int littleEndianInt(byte[] bytes, int offset) {
