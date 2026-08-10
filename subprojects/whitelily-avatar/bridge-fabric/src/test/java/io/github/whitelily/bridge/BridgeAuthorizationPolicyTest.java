@@ -20,12 +20,12 @@ class BridgeAuthorizationPolicyTest {
 
     PolicyCase accepted = new PolicyCase(validRequest(), validContext());
     PolicyCase[] rejected = {
-      new PolicyCase(new BridgeRequest(2, "WhiteLily", 49152, 1000, 2000, NONCE), validContext()),
-      new PolicyCase(new BridgeRequest(1, "whiteLily", 49152, 1000, 2000, NONCE), validContext()),
-      new PolicyCase(new BridgeRequest(1, "WhiteLily", 49153, 1000, 2000, NONCE), validContext()),
-      new PolicyCase(new BridgeRequest(1, "WhiteLily", 49152, 1501, 2000, NONCE), validContext()),
+      new PolicyCase(new BridgeRequest(2, "WhiteLily", 49152, 1000, 31000, NONCE), validContext()),
+      new PolicyCase(new BridgeRequest(1, "whiteLily", 49152, 1000, 31000, NONCE), validContext()),
+      new PolicyCase(new BridgeRequest(1, "WhiteLily", 49153, 1000, 31000, NONCE), validContext()),
+      new PolicyCase(new BridgeRequest(1, "WhiteLily", 49152, 1501, 31501, NONCE), validContext()),
       new PolicyCase(new BridgeRequest(1, "WhiteLily", 49152, 1000, 1000, NONCE), validContext()),
-      new PolicyCase(new BridgeRequest(1, "WhiteLily", 49152, 1000, 2000, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"), validContext()),
+      new PolicyCase(new BridgeRequest(1, "WhiteLily", 49152, 1000, 31000, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"), validContext()),
       new PolicyCase(validRequest(), new BridgeAuthorizationContext(false, true, 49152, 49152, "WhiteLily", 1500)),
       new PolicyCase(validRequest(), new BridgeAuthorizationContext(true, false, 49152, 49152, "WhiteLily", 1500)),
       new PolicyCase(validRequest(), new BridgeAuthorizationContext(true, true, 49153, 49152, "WhiteLily", 1500)),

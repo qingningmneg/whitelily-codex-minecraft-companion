@@ -10,6 +10,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.lang.reflect.Method;
+import java.lang.reflect.Field;
 import java.security.MessageDigest;
 import java.util.HexFormat;
 import java.util.Optional;
@@ -18,6 +19,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.io.TempDir;
 
 class BridgeProofStoreTest {
@@ -196,6 +198,39 @@ class BridgeProofStoreTest {
   }
 
   @Test
+  void crashStatesAfterClaimAfterAnchorAndAfterRequestRemovalBlockReuse() throws Exception {
+    Path afterClaimRoot = Files.createTempDirectory(temporaryDirectory, "after-claim-");
+    Path afterClaimRequest = writeRequest(afterClaimRoot, validJson());
+    Path afterClaim = afterClaimRequest.resolveSibling(afterClaimRequest.getFileName() + ".claim");
+    Files.createLink(afterClaim, afterClaimRequest);
+    assertEquals(Optional.empty(), new BridgeProofStore(afterClaimRoot).consume(NONCE, CONTEXT));
+    assertTrue(Files.exists(afterClaimRequest));
+    assertTrue(Files.exists(afterClaim));
+
+    Path afterAnchorRoot = Files.createTempDirectory(temporaryDirectory, "after-anchor-");
+    Path afterAnchorRequest = writeRequest(afterAnchorRoot, validJson());
+    Path afterAnchorClaim = afterAnchorRequest.resolveSibling(afterAnchorRequest.getFileName() + ".claim");
+    Path afterAnchor = afterAnchorRequest.resolveSibling(afterAnchorRequest.getFileName() + ".anchor");
+    Files.createLink(afterAnchorClaim, afterAnchorRequest);
+    Files.createLink(afterAnchor, afterAnchorClaim);
+    assertEquals(Optional.empty(), new BridgeProofStore(afterAnchorRoot).consume(NONCE, CONTEXT));
+    assertTrue(Files.exists(afterAnchorRequest));
+    assertTrue(Files.exists(afterAnchorClaim));
+    assertTrue(Files.exists(afterAnchor));
+
+    Path afterRemovalRoot = Files.createTempDirectory(temporaryDirectory, "after-removal-");
+    Path afterRemovalRequest = writeRequest(afterRemovalRoot, validJson());
+    Path afterRemovalClaim = afterRemovalRequest.resolveSibling(afterRemovalRequest.getFileName() + ".claim");
+    Path afterRemovalAnchor = afterRemovalRequest.resolveSibling(afterRemovalRequest.getFileName() + ".anchor");
+    Files.createLink(afterRemovalClaim, afterRemovalRequest);
+    Files.createLink(afterRemovalAnchor, afterRemovalClaim);
+    Files.delete(afterRemovalRequest);
+    assertEquals(Optional.empty(), new BridgeProofStore(afterRemovalRoot).consume(NONCE, CONTEXT));
+    assertTrue(Files.exists(afterRemovalClaim));
+    assertTrue(Files.exists(afterRemovalAnchor));
+  }
+
+  @Test
   void anchorCollisionBlocksConsumptionAndPreservesTheForeignAnchor() throws Exception {
     Path request = writeRequest(temporaryDirectory, validJson());
     Path anchor = request.resolveSibling(request.getFileName() + ".anchor");
@@ -226,6 +261,51 @@ class BridgeProofStoreTest {
     cleanup.invoke(null, claim, request);
     assertEquals("replacement", Files.readString(claim, UTF_8));
     assertTrue(Files.exists(claim));
+  }
+
+  @Test
+  void replacementBetweenParsingAndClaimFailsClosedAndSurvives() throws Exception {
+    Path request = writeRequest(temporaryDirectory, validJson());
+    Path replacement = temporaryDirectory.resolve("replacement.json");
+    String replacementDocument = validJson().replace("\"issuedAt\":1000", "\"issuedAt\":1001").replace("\"expiresAt\":31000", "\"expiresAt\":31001");
+    Files.writeString(replacement, replacementDocument, UTF_8, StandardOpenOption.CREATE_NEW);
+    Field hook = BridgeProofStore.class.getDeclaredField("beforeClaimHook");
+    hook.setAccessible(true);
+    hook.set(null, (Runnable) () -> {
+      try {
+        Files.move(replacement, request, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+      } catch (java.io.IOException failure) {
+        throw new RuntimeException(failure);
+      }
+    });
+    try {
+      assertEquals(Optional.empty(), new BridgeProofStore(temporaryDirectory).consume(NONCE, CONTEXT));
+      assertEquals(replacementDocument, Files.readString(request, UTF_8));
+    } finally {
+      hook.set(null, null);
+    }
+  }
+
+  @Test
+  void successCleanupPreservesAnAnchorReplacementAtItsBoundary() throws Exception {
+    Path request = writeRequest(temporaryDirectory, validJson());
+    Path anchor = request.resolveSibling(request.getFileName() + ".anchor");
+    Field hook = BridgeProofStore.class.getDeclaredField("beforeSuccessCleanupHook");
+    hook.setAccessible(true);
+    hook.set(null, (Runnable) () -> {
+      try {
+        Files.delete(anchor);
+        Files.writeString(anchor, "anchor-replacement", UTF_8, StandardOpenOption.CREATE_NEW);
+      } catch (java.io.IOException failure) {
+        throw new RuntimeException(failure);
+      }
+    });
+    try {
+      assertEquals(Optional.empty(), new BridgeProofStore(temporaryDirectory).consume(NONCE, CONTEXT));
+      assertEquals("anchor-replacement", Files.readString(anchor, UTF_8));
+    } finally {
+      hook.set(null, null);
+    }
   }
 
   @Test
@@ -262,6 +342,20 @@ class BridgeProofStoreTest {
   }
 
   @Test
+  void rejectsAFileSymlinkRequestWhenWindowsPermitsIt() throws Exception {
+    Path sourceRoot = Files.createTempDirectory(temporaryDirectory, "symlink-source-");
+    Path source = writeRequest(sourceRoot, validJson());
+    Path root = Files.createTempDirectory(temporaryDirectory, "symlink-root-");
+    Path link = root.resolve(source.getFileName());
+    try {
+      Files.createSymbolicLink(link, source);
+    } catch (FileSystemException | UnsupportedOperationException unavailable) {
+      Assumptions.abort("symbolic-link privilege unavailable");
+    }
+    assertEquals(Optional.empty(), new BridgeProofStore(root).consume(NONCE, CONTEXT));
+    assertTrue(Files.exists(link, java.nio.file.LinkOption.NOFOLLOW_LINKS));
+  }
+
   private static Path writeRequest(Path root, String document) throws Exception {
     return writeRequestBytes(root, document.getBytes(UTF_8));
   }

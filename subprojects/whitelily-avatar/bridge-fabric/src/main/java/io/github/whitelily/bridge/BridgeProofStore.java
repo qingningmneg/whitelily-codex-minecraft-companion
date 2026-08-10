@@ -28,6 +28,8 @@ public final class BridgeProofStore {
   private static final int MAX_REQUEST_BYTES = 4096;
   private static final Set<String> REQUIRED_KEYS =
       Set.of("schemaVersion", "username", "port", "issuedAt", "expiresAt", "nonce");
+  private static volatile Runnable beforeClaimHook;
+  private static volatile Runnable beforeSuccessCleanupHook;
 
   private final Path root;
 
@@ -47,47 +49,52 @@ public final class BridgeProofStore {
       if (!request.getParent().equals(root)) {
         return Optional.empty();
       }
-      BasicFileAttributes original = ordinaryFile(request);
-      if (original == null) {
-        return Optional.empty();
-      }
-      byte[] bytes = readStable(request, original);
-      if (bytes == null) {
-        return Optional.empty();
-      }
-      BridgeRequest parsed = parseStrict(bytes);
-      if (parsed == null || !nonce.equals(parsed.nonce())) {
-        return Optional.empty();
-      }
-      Optional<BridgeRequest> authorized = BridgeAuthorizationPolicy.authorize(parsed, context);
-      if (authorized.isEmpty()) {
-        return Optional.empty();
-      }
-
       Path claim = request.resolveSibling(request.getFileName() + ".claim");
       Path anchor = request.resolveSibling(request.getFileName() + ".anchor");
       boolean claimCreated = false;
       boolean anchorCreated = false;
       boolean requestRemoved = false;
+      boolean successCleaned = false;
       try {
         Files.createLink(claim, request);
         claimCreated = true;
         Files.createLink(anchor, claim);
         anchorCreated = true;
+        BasicFileAttributes captured = ordinaryFile(claim);
+        if (captured == null || !sameOwnedFile(request, claim, anchor)) {
+          return Optional.empty();
+        }
+        byte[] bytes = readStable(claim, captured);
+        if (bytes == null) {
+          return Optional.empty();
+        }
+        BridgeRequest parsed = parseStrict(bytes);
+        if (parsed == null || !nonce.equals(parsed.nonce())) {
+          return Optional.empty();
+        }
+        Optional<BridgeRequest> authorized = BridgeAuthorizationPolicy.authorize(parsed, context);
+        if (authorized.isEmpty()) {
+          return Optional.empty();
+        }
+        runHook(beforeClaimHook);
         if (!sameOwnedFile(request, claim, anchor)
-            || !sameAttributes(original, ordinaryFile(request))
+            || !sameAttributes(captured, ordinaryFile(claim))
             || !ordinaryAncestorChain(root)
             || !sameOwnedFile(request, claim, anchor)) {
           return Optional.empty();
         }
         Files.delete(request);
         requestRemoved = true;
+        if (!deleteSuccessfulPair(claim, anchor)) {
+          return Optional.empty();
+        }
+        successCleaned = true;
         return authorized;
       } catch (FileAlreadyExistsException ignored) {
         return Optional.empty();
       } finally {
-        if (claimCreated && anchorCreated && requestRemoved) {
-          deleteOwnedPair(claim, anchor);
+        if (claimCreated && anchorCreated && requestRemoved && !successCleaned) {
+          deleteSuccessfulPair(claim, anchor);
         } else {
           if (anchorCreated) {
             deleteOwnedLink(anchor, claim);
@@ -168,16 +175,25 @@ public final class BridgeProofStore {
     }
   }
 
-  private static void deleteOwnedPair(Path claim, Path anchor) {
+  private static boolean deleteSuccessfulPair(Path claim, Path anchor) {
     try {
-      if (Files.exists(claim, LinkOption.NOFOLLOW_LINKS)
-          && Files.exists(anchor, LinkOption.NOFOLLOW_LINKS)
-          && Files.isSameFile(claim, anchor)) {
-        Files.delete(claim);
-        Files.delete(anchor);
+      runHook(beforeSuccessCleanupHook);
+      if (!Files.exists(claim, LinkOption.NOFOLLOW_LINKS)
+          || !Files.exists(anchor, LinkOption.NOFOLLOW_LINKS)
+          || !Files.isSameFile(claim, anchor)) {
+        return false;
       }
+      Files.delete(claim);
+      Files.delete(anchor);
+      return true;
     } catch (IOException | SecurityException ignored) {
-      // An ambiguous or replaced link remains in place and fails closed.
+      return false;
+    }
+  }
+
+  private static void runHook(Runnable hook) {
+    if (hook != null) {
+      hook.run();
     }
   }
 
