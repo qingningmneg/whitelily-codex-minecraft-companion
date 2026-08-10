@@ -86,11 +86,15 @@ public final class BridgeProofStore {
       } catch (FileAlreadyExistsException ignored) {
         return Optional.empty();
       } finally {
-        if (anchorCreated) {
-          deleteOwnedLink(anchor, claim);
-        }
-        if (claimCreated && !requestRemoved) {
-          deleteOwnedLink(claim, request);
+        if (claimCreated && anchorCreated && requestRemoved) {
+          deleteOwnedPair(claim, anchor);
+        } else {
+          if (anchorCreated) {
+            deleteOwnedLink(anchor, claim);
+          }
+          if (claimCreated) {
+            deleteOwnedLink(claim, request);
+          }
         }
       }
     } catch (IOException | IllegalArgumentException | SecurityException ignored) {
@@ -161,6 +165,19 @@ public final class BridgeProofStore {
       }
     } catch (IOException | SecurityException ignored) {
       // A collision or replacement remains in place and blocks reuse.
+    }
+  }
+
+  private static void deleteOwnedPair(Path claim, Path anchor) {
+    try {
+      if (Files.exists(claim, LinkOption.NOFOLLOW_LINKS)
+          && Files.exists(anchor, LinkOption.NOFOLLOW_LINKS)
+          && Files.isSameFile(claim, anchor)) {
+        Files.delete(claim);
+        Files.delete(anchor);
+      }
+    } catch (IOException | SecurityException ignored) {
+      // An ambiguous or replaced link remains in place and fails closed.
     }
   }
 

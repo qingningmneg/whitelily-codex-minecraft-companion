@@ -36,7 +36,8 @@ class BridgeProofStoreTest {
 
     assertEquals(Optional.of(new BridgeRequest(1, "WhiteLily", 49152, 1000, 31000, NONCE)), store.consume(NONCE, CONTEXT));
     assertFalse(Files.exists(request));
-    assertTrue(Files.exists(request.resolveSibling(request.getFileName() + ".claim")));
+    assertFalse(Files.exists(request.resolveSibling(request.getFileName() + ".claim")));
+    assertFalse(Files.exists(request.resolveSibling(request.getFileName() + ".anchor")));
     assertEquals("keep", Files.readString(unrelated, UTF_8));
     assertEquals(Optional.empty(), store.consume(NONCE, CONTEXT));
   }
