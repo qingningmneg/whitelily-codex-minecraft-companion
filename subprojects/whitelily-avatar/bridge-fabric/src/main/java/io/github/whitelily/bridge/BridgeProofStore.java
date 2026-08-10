@@ -3,6 +3,7 @@ package io.github.whitelily.bridge;
 import com.google.gson.Strictness;
 import com.google.gson.stream.JsonReader;
 import com.google.gson.stream.JsonToken;
+import java.io.InputStream;
 import java.io.IOException;
 import java.io.StringReader;
 import java.nio.ByteBuffer;
@@ -25,11 +26,15 @@ import java.util.HexFormat;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 public final class BridgeProofStore {
   private static final int MAX_REQUEST_BYTES = 4096;
   private static final Set<String> REQUIRED_KEYS =
       Set.of("schemaVersion", "username", "port", "issuedAt", "expiresAt", "nonce");
+  private static final Pattern WINDOWS_FILE_ID = Pattern.compile("0x([0-9A-Fa-f]+)");
 
   private final Path root;
   private final AtomicMover mover;
@@ -61,7 +66,11 @@ public final class BridgeProofStore {
       if (original == null) {
         return Optional.empty();
       }
-      byte[] bytes = readStable(request, original);
+      String identity = stableIdentity(request, original);
+      if (identity == null) {
+        return Optional.empty();
+      }
+      byte[] bytes = readStable(request, original, identity);
       if (bytes == null) {
         return Optional.empty();
       }
@@ -70,7 +79,7 @@ public final class BridgeProofStore {
         return Optional.empty();
       }
       Optional<BridgeRequest> authorized = BridgeAuthorizationPolicy.authorize(parsed, context);
-      if (authorized.isEmpty() || !sameFile(original, ordinaryFile(request))) {
+      if (authorized.isEmpty() || !sameStableFile(original, identity, request)) {
         return Optional.empty();
       }
 
@@ -87,6 +96,9 @@ public final class BridgeProofStore {
           reserved = true;
         }
         if (Files.exists(consumed, LinkOption.NOFOLLOW_LINKS)) {
+          return Optional.empty();
+        }
+        if (!sameStableFile(original, identity, request)) {
           return Optional.empty();
         }
         mover.move(request, consumed);
@@ -132,7 +144,7 @@ public final class BridgeProofStore {
     return attributes;
   }
 
-  private static byte[] readStable(Path path, BasicFileAttributes before) throws IOException {
+  private static byte[] readStable(Path path, BasicFileAttributes before, String identity) throws IOException {
     int size = Math.toIntExact(before.size());
     ByteBuffer bytes = ByteBuffer.allocate(size);
     try (FileChannel channel = FileChannel.open(path, StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS)) {
@@ -145,17 +157,69 @@ public final class BridgeProofStore {
         }
       }
     }
-    BasicFileAttributes after = ordinaryFile(path);
-    if (!sameFile(before, after)) {
+    if (!sameStableFile(before, identity, path)) {
       return null;
     }
     return bytes.array();
   }
 
-  private static boolean sameFile(BasicFileAttributes expected, BasicFileAttributes actual) {
+  static boolean sameFile(BasicFileAttributes expected, BasicFileAttributes actual) {
     return actual != null
+        && expected.fileKey() != null
+        && actual.fileKey() != null
         && expected.size() == actual.size()
         && Objects.equals(expected.fileKey(), actual.fileKey());
+  }
+
+  private static boolean sameStableFile(BasicFileAttributes expected, String identity, Path path)
+      throws IOException {
+    BasicFileAttributes actual = ordinaryFile(path);
+    if (actual == null || expected.size() != actual.size()) {
+      return false;
+    }
+    if (expected.fileKey() != null || actual.fileKey() != null) {
+      return sameFile(expected, actual);
+    }
+    String actualIdentity = stableIdentity(path, actual);
+    return actualIdentity != null && identity.equals(actualIdentity);
+  }
+
+  private static String stableIdentity(Path path, BasicFileAttributes attributes) {
+    Object basicKey = attributes.fileKey();
+    if (basicKey != null) {
+      return "basic:" + basicKey;
+    }
+    if (!System.getProperty("os.name", "").startsWith("Windows")) {
+      return null;
+    }
+    String systemRoot = System.getenv("SystemRoot");
+    if (systemRoot == null || systemRoot.isBlank()) {
+      return null;
+    }
+    Path fsutil = Path.of(systemRoot, "System32", "fsutil.exe");
+    try {
+      Process process = new ProcessBuilder(fsutil.toString(), "file", "queryFileID", path.toString())
+          .redirectErrorStream(true)
+          .start();
+      if (!process.waitFor(2, TimeUnit.SECONDS)) {
+        process.destroyForcibly();
+        return null;
+      }
+      byte[] output;
+      try (InputStream stream = process.getInputStream()) {
+        output = stream.readNBytes(256);
+      }
+      if (process.exitValue() != 0) {
+        return null;
+      }
+      Matcher match = WINDOWS_FILE_ID.matcher(new String(output, StandardCharsets.US_ASCII));
+      return match.find() ? "windows:" + match.group(1).toLowerCase(java.util.Locale.ROOT) : null;
+    } catch (IOException ignored) {
+      return null;
+    } catch (InterruptedException interrupted) {
+      Thread.currentThread().interrupt();
+      return null;
+    }
   }
 
   private static BridgeRequest parseStrict(byte[] bytes) {
