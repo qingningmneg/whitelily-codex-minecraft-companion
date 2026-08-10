@@ -41,7 +41,7 @@ WhiteLily 为每次 Mineflayer 连接生成短时一次性证明，并通过 Min
 模块包含四个小边界：
 
 1. `BridgePresencePublisher`：客户端启动后写入有界 presence 记录，绑定当前 Java PID、进程启动时间、Minecraft 版本和 Bridge 版本；退出时尽力删除。记录没有凭据或玩家身份。
-2. `BridgeProofStore`：用稳定文件句柄读取一次性请求，拒绝链接、重解析点、超限、过期、端口不符或格式异常的记录，并通过同目录原子移动确保只有一个登录线程能消费。
+2. `BridgeProofStore`：用稳定文件句柄读取一次性请求，拒绝链接、重解析点、超限、非规范整数、非 30 秒 TTL、过期、端口不符或格式异常的记录。消费时不用 Windows 上可能覆盖目标的 `ATOMIC_MOVE`；它以同目录固定名称原子创建不可替换的 hard-link claim，再建立所有权 hard-link 锚点，证明 request/claim/anchor 是同一文件后删除原 request 链接。只有完成该删除的线程可以批准；碰撞或崩溃保持 fail closed，清理也只删除仍能由另一条自有 hard link 证明身份的精确路径。
 3. `HandshakeProofMixin`：读取 `ClientIntentionPacket.hostName()` 中的固定格式证明，只在远端地址为 loopback 时把候选证明附加到该 `Connection`；不修改普通 hostname 的处理。
 4. `LoginAuthorizationMixin`：在 `ServerLoginPacketListenerImpl` 的 hello 边界重新检查集成服、loopback、当前发布端口、精确用户名和已消费证明。通过时仅为该 listener 调用原版后续登录流程；失败时完全回落到原版在线认证。
 

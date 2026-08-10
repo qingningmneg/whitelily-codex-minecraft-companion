@@ -194,7 +194,7 @@ Use literal fixtures. The only accepted row is integrated=true, loopback=true, h
 
 - [ ] **Step 2: Write RED real-store tests**
 
-Create ordinary request files and assert exactly one of two concurrent consumers succeeds. Add duplicate JSON keys, BOM, malformed UTF-8, empty/over-4096 bytes, mismatched digest filename, symlink/junction request, linked parent, expired record, non-atomic move failure, and second consumption.
+Create ordinary request files and assert exactly one of two concurrent consumers succeeds. Add duplicate JSON keys, non-canonical numeric tokens, BOM, malformed UTF-8, empty/over-4096 bytes, mismatched digest filename, symlink/junction request, linked parent, expired or non-30,000-ms record, claim-link collision/failure, cleanup replacement, and second consumption.
 
 - [ ] **Step 3: Run RED**
 
@@ -204,7 +204,7 @@ Expected: FAIL because the module and classes do not exist.
 
 - [ ] **Step 4: Implement minimal strict parser/store/policy**
 
-Use a strict UTF-8 `CharsetDecoder` with malformed/unmappable reporting; reject UTF-8/UTF-16 BOMs. Parse one top-level object with Gson `JsonReader`, explicitly count keys case-sensitively, reject duplicate/unknown/missing keys, and read at most 4,096 bytes from one stable `FileChannel` opened with `READ` and `LinkOption.NOFOLLOW_LINKS`. Recheck `BasicFileAttributes.fileKey`, size, regular-file, and non-symbolic-link before atomic move. Move to a fixed sibling consumed name with `ATOMIC_MOVE`; approve only after the move succeeds, then delete that exact consumed file in `finally`.
+Use a strict UTF-8 `CharsetDecoder` with malformed/unmappable reporting; reject UTF-8/UTF-16 BOMs. Parse one top-level object with Gson `JsonReader`, explicitly count keys case-sensitively, reject duplicate/unknown/missing keys, and accept only canonical integer number lexemes. Read at most 4,096 bytes from one stable `FileChannel` opened with `READ` and `LinkOption.NOFOLLOW_LINKS`. Recheck size, regular-file, non-symbolic-link, the complete ordinary ancestor chain, and stable identity before consumption. Do not use Windows `ATOMIC_MOVE` as a no-replace primitive: OpenJDK may replace an existing target. Instead, atomically create a fixed same-directory hard-link claim without replacement, create a fixed ownership hard-link anchor, prove the request/claim/anchor are the same file with `Files.isSameFile`, and remove the original request link before approving. A crash or collision fails closed and leaves the fixed claim blocking reuse. In `finally`, remove a claim or anchor only while its current identity still matches the other owned hard-link; never delete a merely observed replacement. Production composition exposes no injectable mover or filesystem seam.
 
 - [ ] **Step 5: Run GREEN**
 
