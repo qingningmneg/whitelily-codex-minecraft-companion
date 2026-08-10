@@ -41,6 +41,9 @@ final class BridgeRuntime {
   }
 
   private static Path bridgeRoot() {
+    if (!WindowsOwnedFile.isWindows()) {
+      return null;
+    }
     String localAppData = System.getenv("LOCALAPPDATA");
     if (localAppData == null || localAppData.isBlank()) {
       return null;

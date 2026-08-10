@@ -102,6 +102,32 @@ class BridgeLoginSelectorTest {
     assertTrue(connection.whitelily$takeHandshakeProof().isEmpty());
   }
 
+  @Test
+  void nonCanonicalBase64UrlNonceIsNeverRetainedAsACandidate() {
+    HandshakeProofSlot connection = new HandshakeProofSlot();
+    String nonCanonical = NONCE.substring(0, NONCE.length() - 1) + "B";
+
+    assertFalse(BridgeLoginSelector.captureHandshake("127.0.0.1\0WL1\0" + nonCanonical, 49_152, true, connection));
+    assertTrue(connection.whitelily$takeHandshakeProof().isEmpty());
+  }
+
+  @Test
+  void nonWindowsHostNeverRetainsABridgeCandidateEvenWhenLocalAppDataIsConfigured() {
+    String previousOs = System.getProperty("os.name");
+    String previousLocalAppData = System.getProperty("LOCALAPPDATA");
+    try {
+      System.setProperty("os.name", "Linux");
+      System.setProperty("LOCALAPPDATA", temporaryDirectory.toString());
+      HandshakeProofSlot connection = new HandshakeProofSlot();
+
+      assertFalse(BridgeLoginSelector.captureHandshake(BRIDGE_HOST, 49_152, true, connection));
+      assertTrue(connection.whitelily$takeHandshakeProof().isEmpty());
+    } finally {
+      restoreProperty("os.name", previousOs);
+      restoreProperty("LOCALAPPDATA", previousLocalAppData);
+    }
+  }
+
   private void assertRejected(
       boolean integratedServer,
       boolean loopbackRemote,
@@ -146,5 +172,13 @@ class BridgeLoginSelectorTest {
   private static String digest(String value) throws Exception {
     return HexFormat.of()
         .formatHex(MessageDigest.getInstance("SHA-256").digest(value.getBytes(UTF_8)));
+  }
+
+  private static void restoreProperty(String name, String value) {
+    if (value == null) {
+      System.clearProperty(name);
+    } else {
+      System.setProperty(name, value);
+    }
   }
 }

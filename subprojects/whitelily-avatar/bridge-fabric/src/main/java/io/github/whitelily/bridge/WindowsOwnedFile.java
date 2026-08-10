@@ -12,6 +12,7 @@ import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 final class WindowsOwnedFile implements AutoCloseable {
   private static final int FILE_ID_INFO_CLASS = 18;
@@ -22,6 +23,7 @@ final class WindowsOwnedFile implements AutoCloseable {
   private final HANDLE handle;
   private final Identity identity;
   private final AtomicBoolean closed = new AtomicBoolean();
+  private final AtomicReference<Boolean> dispositionResult = new AtomicReference<>();
 
   private WindowsOwnedFile(HANDLE handle, Identity identity) {
     this.handle = handle;
@@ -60,13 +62,17 @@ final class WindowsOwnedFile implements AutoCloseable {
       return Optional.of(new WindowsOwnedFile(handle, identity.orElseThrow()));
     } finally {
       if (!accepted) {
-        disposeAndClose(handle);
+        disposeAndClose(handle, null);
       }
     }
   }
 
   Identity identity() {
     return identity;
+  }
+
+  Optional<Boolean> dispositionResult() {
+    return Optional.ofNullable(dispositionResult.get());
   }
 
   static Optional<Identity> identity(Path path, boolean directory) {
@@ -99,11 +105,11 @@ final class WindowsOwnedFile implements AutoCloseable {
   @Override
   public void close() {
     if (closed.compareAndSet(false, true)) {
-      disposeAndClose(handle);
+      disposeAndClose(handle, dispositionResult);
     }
   }
 
-  private static Optional<Identity> identity(HANDLE handle) {
+  static Optional<Identity> identity(HANDLE handle) {
     FILE_ID_INFO information = new FILE_ID_INFO();
     if (!Kernel32.INSTANCE.GetFileInformationByHandleEx(
         handle,
@@ -120,24 +126,30 @@ final class WindowsOwnedFile implements AutoCloseable {
     return Optional.of(new Identity(information.VolumeSerialNumber, fileId));
   }
 
-  private static void disposeAndClose(HANDLE handle) {
+  private static void disposeAndClose(HANDLE handle, AtomicReference<Boolean> result) {
     FILE_DISPOSITION_INFO disposition = new FILE_DISPOSITION_INFO(true);
     disposition.write();
-    Kernel32.INSTANCE.SetFileInformationByHandle(
-        handle,
-        FILE_DISPOSITION_INFO_CLASS,
-        disposition.getPointer(),
-        new DWORD(disposition.size()));
-    Kernel32.INSTANCE.CloseHandle(handle);
+    try {
+      boolean deleted = Kernel32.INSTANCE.SetFileInformationByHandle(
+          handle,
+          FILE_DISPOSITION_INFO_CLASS,
+          disposition.getPointer(),
+          new DWORD(disposition.size()));
+      if (result != null) {
+        result.set(deleted);
+      }
+    } finally {
+      Kernel32.INSTANCE.CloseHandle(handle);
+    }
   }
 
-  private static boolean invalid(HANDLE handle) {
+  static boolean invalid(HANDLE handle) {
     return handle == null
         || Pointer.nativeValue(handle.getPointer())
             == Pointer.nativeValue(WinNT.INVALID_HANDLE_VALUE.getPointer());
   }
 
-  private static boolean isWindows() {
+  static boolean isWindows() {
     return System.getProperty("os.name", "").startsWith("Windows");
   }
 

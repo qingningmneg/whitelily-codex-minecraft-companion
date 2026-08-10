@@ -17,6 +17,11 @@ final class HandshakeProofSlot implements BridgeConnectionAccess {
   }
 
   @Override
+  public void whitelily$clearHandshakeProof() {
+    proof.set(null);
+  }
+
+  @Override
   public String toString() {
     return "HandshakeProofSlot[redacted]";
   }

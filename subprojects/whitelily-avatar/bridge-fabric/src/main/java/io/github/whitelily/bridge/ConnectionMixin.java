@@ -7,6 +7,9 @@ import net.minecraft.network.Connection;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.Unique;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 @Mixin(Connection.class)
 abstract class ConnectionMixin
@@ -30,6 +33,11 @@ abstract class ConnectionMixin
   }
 
   @Override
+  public void whitelily$clearHandshakeProof() {
+    whitelily$handshakeProof.whitelily$clearHandshakeProof();
+  }
+
+  @Override
   public int whitelily$localPort() {
     if (channel == null || !(channel.localAddress() instanceof InetSocketAddress localAddress)) {
       return -1;
@@ -45,5 +53,18 @@ abstract class ConnectionMixin
   @Override
   public boolean whitelily$takePendingApproval(Object server, java.util.UUID profileId) {
     return whitelily$pendingApproval.whitelily$takePendingApproval(server, profileId);
+  }
+
+  @Override
+  public void whitelily$clearPendingApproval() {
+    whitelily$pendingApproval.whitelily$clearPendingApproval();
+  }
+
+  @Inject(
+      method = "disconnect(Lnet/minecraft/network/DisconnectionDetails;)V",
+      at = @At("HEAD"))
+  private void whitelily$clearBridgeConnectionState(
+      net.minecraft.network.DisconnectionDetails details, CallbackInfo callbackInfo) {
+    BridgeConnectionLifecycle.clear(this, this);
   }
 }

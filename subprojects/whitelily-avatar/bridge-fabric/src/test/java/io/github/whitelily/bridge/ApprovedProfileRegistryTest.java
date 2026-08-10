@@ -104,6 +104,22 @@ class ApprovedProfileRegistryTest {
     ApprovedProfileRegistry.clearServer(integratedServer);
   }
 
+  @Test
+  void approvalForAnOldStillPublishedServerNeverAuthorizesTheCurrentServerObject() {
+    Object oldPublishedServer = new Object();
+    Object currentPublishedServer = new Object();
+    approve(oldPublishedServer, () -> true);
+
+    assertTrue(
+        WhiteLilyBridge.isApprovedProfileForCurrentServer(
+            oldPublishedServer, WHITE_LILY_OFFLINE_UUID, "WhiteLily"));
+    assertFalse(
+        WhiteLilyBridge.isApprovedProfileForCurrentServer(
+            currentPublishedServer, WHITE_LILY_OFFLINE_UUID, "WhiteLily"));
+
+    ApprovedProfileRegistry.clearServer(oldPublishedServer);
+  }
+
   private static void approve(Object server, java.util.function.BooleanSupplier active) {
     PendingProfileApprovalSlot connection = new PendingProfileApprovalSlot();
     connection.mark(server, WHITE_LILY_OFFLINE_UUID);

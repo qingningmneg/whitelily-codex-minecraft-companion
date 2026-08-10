@@ -24,6 +24,11 @@ final class PendingProfileApprovalSlot implements BridgeConnectionApprovalAccess
   }
 
   @Override
+  public void whitelily$clearPendingApproval() {
+    candidate.set(null);
+  }
+
+  @Override
   public String toString() {
     return "PendingProfileApprovalSlot[redacted]";
   }

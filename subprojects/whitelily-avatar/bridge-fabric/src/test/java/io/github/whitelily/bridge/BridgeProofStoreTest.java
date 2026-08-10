@@ -10,7 +10,6 @@ import java.nio.file.FileSystemException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
-import java.lang.reflect.Method;
 import java.lang.reflect.Field;
 import java.security.MessageDigest;
 import java.util.HexFormat;
@@ -44,6 +43,65 @@ class BridgeProofStoreTest {
     assertFalse(Files.exists(request.resolveSibling(request.getFileName() + ".anchor")));
     assertEquals("keep", Files.readString(unrelated, UTF_8));
     assertEquals(Optional.empty(), store.consume(NONCE, CONTEXT));
+  }
+
+  @Test
+  void rejectsAPreexistingRetainedHardLinkWithoutConsumingTheProof() throws Exception {
+    Path request = writeRequest(temporaryDirectory, validJson());
+    Path retained = temporaryDirectory.resolve("retained-proof.json");
+    Files.createLink(retained, request);
+
+    assertEquals(Optional.empty(), new BridgeProofStore(temporaryDirectory).consume(NONCE, CONTEXT));
+    assertTrue(Files.exists(request));
+    assertTrue(Files.exists(retained));
+    assertEquals(validJson(), Files.readString(retained, UTF_8));
+  }
+
+  @Test
+  void rejectsANonCanonicalBase64UrlNonceBeforeOpeningItsProof() throws Exception {
+    String nonCanonical = NONCE.substring(0, NONCE.length() - 1) + "B";
+    Path request = temporaryDirectory.resolve(digest(nonCanonical) + ".json");
+    Files.writeString(request, validJson().replace(NONCE, nonCanonical), UTF_8, StandardOpenOption.CREATE_NEW);
+
+    assertEquals(Optional.empty(), new BridgeProofStore(temporaryDirectory).consume(nonCanonical, CONTEXT));
+    assertTrue(Files.exists(request));
+  }
+
+  @Test
+  void rejectsASameSizeThreePathReplacementWithoutDeletingIt() throws Exception {
+    Path request = writeRequest(temporaryDirectory, validJson());
+    Path claim = request.resolveSibling(request.getFileName() + ".claim");
+    Path anchor = request.resolveSibling(request.getFileName() + ".anchor");
+    Path replacement = temporaryDirectory.resolve("same-size-replacement.json");
+    String foreignDocument = validJson().replace("\"issuedAt\":1000", "\"issuedAt\":1001");
+    assertEquals(validJson().getBytes(UTF_8).length, foreignDocument.getBytes(UTF_8).length);
+    Files.writeString(replacement, foreignDocument, UTF_8, StandardOpenOption.CREATE_NEW);
+    Field hook = BridgeProofStore.class.getDeclaredField("beforeClaimHook");
+    hook.setAccessible(true);
+    hook.set(
+        null,
+        (Runnable)
+            () -> {
+              try {
+                Files.delete(request);
+                Files.delete(claim);
+                Files.delete(anchor);
+                Files.createLink(request, replacement);
+                Files.createLink(claim, replacement);
+                Files.createLink(anchor, replacement);
+              } catch (java.io.IOException failure) {
+                throw new RuntimeException(failure);
+              }
+            });
+    try {
+      assertEquals(Optional.empty(), new BridgeProofStore(temporaryDirectory).consume(NONCE, CONTEXT));
+      assertEquals(foreignDocument, Files.readString(request, UTF_8));
+      assertEquals(foreignDocument, Files.readString(claim, UTF_8));
+      assertEquals(foreignDocument, Files.readString(anchor, UTF_8));
+      assertEquals(foreignDocument, Files.readString(replacement, UTF_8));
+    } finally {
+      hook.set(null, null);
+    }
   }
 
   @Test
@@ -251,18 +309,6 @@ class BridgeProofStoreTest {
     assertTrue(new BridgeProofStore(temporaryDirectory).consume(NONCE, CONTEXT).isPresent());
     assertEquals("foreign-consumed", Files.readString(consumed, UTF_8));
     assertTrue(Files.exists(consumed));
-  }
-
-  @Test
-  void cleanupDoesNotDeleteAClaimReplacement() throws Exception {
-    Path request = writeRequest(temporaryDirectory, validJson());
-    Path claim = request.resolveSibling(request.getFileName() + ".claim");
-    Files.writeString(claim, "replacement", UTF_8, StandardOpenOption.CREATE_NEW);
-    Method cleanup = BridgeProofStore.class.getDeclaredMethod("deleteOwnedLink", Path.class, Path.class);
-    cleanup.setAccessible(true);
-    cleanup.invoke(null, claim, request);
-    assertEquals("replacement", Files.readString(claim, UTF_8));
-    assertTrue(Files.exists(claim));
   }
 
   @Test

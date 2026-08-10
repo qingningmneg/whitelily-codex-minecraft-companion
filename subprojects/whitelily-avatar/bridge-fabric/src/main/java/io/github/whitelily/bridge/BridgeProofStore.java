@@ -6,7 +6,6 @@ import com.google.gson.stream.JsonToken;
 import java.io.IOException;
 import java.io.StringReader;
 import java.nio.ByteBuffer;
-import java.nio.channels.FileChannel;
 import java.nio.charset.CharacterCodingException;
 import java.nio.charset.CharsetDecoder;
 import java.nio.charset.CodingErrorAction;
@@ -38,7 +37,7 @@ public final class BridgeProofStore {
   }
 
   public Optional<BridgeRequest> consume(String nonce, BridgeAuthorizationContext context) {
-    if (root == null || !validNonce(nonce)) {
+    if (root == null || !WindowsOwnedFile.isWindows() || !BridgeNonce.isCanonical(nonce)) {
       return Optional.empty();
     }
     try {
@@ -51,19 +50,14 @@ public final class BridgeProofStore {
       }
       Path claim = request.resolveSibling(request.getFileName() + ".claim");
       Path anchor = request.resolveSibling(request.getFileName() + ".anchor");
-      boolean claimCreated = false;
-      boolean anchorCreated = false;
-      boolean requestRemoved = false;
-      try {
-        Files.createLink(claim, request);
-        claimCreated = true;
-        Files.createLink(anchor, claim);
-        anchorCreated = true;
-        BasicFileAttributes captured = ordinaryFile(claim);
-        if (captured == null || !sameOwnedFile(request, claim, anchor)) {
+      try (WindowsProofHandle proof = WindowsProofHandle.open(request).orElse(null)) {
+        if (proof == null
+            || ordinaryFile(request) == null
+            || !proof.matches(request)
+            || !hasLinkCount(proof, 1)) {
           return Optional.empty();
         }
-        byte[] bytes = readStable(claim, captured);
+        byte[] bytes = proof.read(MAX_REQUEST_BYTES).orElse(null);
         if (bytes == null) {
           return Optional.empty();
         }
@@ -75,32 +69,36 @@ public final class BridgeProofStore {
         if (authorized.isEmpty()) {
           return Optional.empty();
         }
+        Files.createLink(claim, request);
+        if (!sameClaimedFile(proof, request, claim, 2)) {
+          return Optional.empty();
+        }
+        try {
+          Files.createLink(anchor, claim);
+        } catch (FileAlreadyExistsException collision) {
+          deleteOwnedLink(proof.identity(), claim, 2);
+          return Optional.empty();
+        }
+        if (!sameClaimedFile(proof, request, claim, anchor, 3)) {
+          return Optional.empty();
+        }
         runHook(beforeClaimHook);
-        if (!sameOwnedFile(request, claim, anchor)
-            || !sameAttributes(captured, ordinaryFile(claim))
-            || !ordinaryAncestorChain(root)
-            || !sameOwnedFile(request, claim, anchor)) {
+        if (!sameClaimedFile(proof, request, claim, anchor, 3) || !ordinaryAncestorChain(root)) {
           return Optional.empty();
         }
-        Files.delete(request);
-        requestRemoved = true;
-        if (!deleteSuccessfulPair(claim, anchor)) {
+        runHook(beforeSuccessCleanupHook);
+        if (!sameClaimedFile(proof, request, claim, anchor, 3) || !ordinaryAncestorChain(root)) {
           return Optional.empty();
         }
-        return authorized;
+        if (!deleteOwnedLink(proof.identity(), claim, 3)
+            || !deleteOwnedLink(proof.identity(), anchor, 2)) {
+          return Optional.empty();
+        }
+        return proof.deleteOwnedFile() ? authorized : Optional.empty();
       } catch (FileAlreadyExistsException ignored) {
         return Optional.empty();
-      } finally {
-        if (!requestRemoved) {
-          if (anchorCreated) {
-            deleteOwnedLink(anchor, claim);
-          }
-          if (claimCreated) {
-            deleteOwnedLink(claim, request);
-          }
-        }
       }
-    } catch (IOException | IllegalArgumentException | SecurityException ignored) {
+    } catch (IOException | RuntimeException ignored) {
       return Optional.empty();
     }
   }
@@ -128,61 +126,35 @@ public final class BridgeProofStore {
     return attributes;
   }
 
-  private static byte[] readStable(Path path, BasicFileAttributes before) throws IOException {
-    int size = Math.toIntExact(before.size());
-    ByteBuffer bytes = ByteBuffer.allocate(size);
-    try (FileChannel channel = FileChannel.open(path, StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS)) {
-      if (channel.size() != size) {
-        return null;
-      }
-      while (bytes.hasRemaining()) {
-        if (channel.read(bytes) < 0) {
-          return null;
-        }
-      }
-    }
-    return sameAttributes(before, ordinaryFile(path)) ? bytes.array() : null;
+  private static boolean hasLinkCount(WindowsProofHandle proof, int expected) {
+    return proof.linkCount().filter(count -> count == expected).isPresent();
   }
 
-  private static boolean sameAttributes(BasicFileAttributes expected, BasicFileAttributes actual) {
-    if (actual == null || expected.size() != actual.size()) {
-      return false;
-    }
-    return expected.fileKey() == null || actual.fileKey() == null || expected.fileKey().equals(actual.fileKey());
+  private static boolean sameClaimedFile(
+      WindowsProofHandle proof, Path request, Path claim, int expectedLinkCount) throws IOException {
+    return ordinaryFile(request) != null
+        && ordinaryFile(claim) != null
+        && proof.matches(request)
+        && proof.matches(claim)
+        && hasLinkCount(proof, expectedLinkCount);
   }
 
-  private static boolean sameOwnedFile(Path request, Path claim, Path anchor) {
-    try {
-      return Files.isSameFile(request, claim) && Files.isSameFile(claim, anchor);
-    } catch (IOException | SecurityException ignored) {
-      return false;
-    }
+  private static boolean sameClaimedFile(
+      WindowsProofHandle proof, Path request, Path claim, Path anchor, int expectedLinkCount)
+      throws IOException {
+    return sameClaimedFile(proof, request, claim, expectedLinkCount)
+        && ordinaryFile(anchor) != null
+        && proof.matches(anchor)
+        && hasLinkCount(proof, expectedLinkCount);
   }
 
-  private static void deleteOwnedLink(Path candidate, Path proof) {
-    try {
-      if (Files.exists(candidate, LinkOption.NOFOLLOW_LINKS)
-          && Files.exists(proof, LinkOption.NOFOLLOW_LINKS)
-          && Files.isSameFile(candidate, proof)) {
-        Files.delete(candidate);
-      }
-    } catch (IOException | SecurityException ignored) {
-      // A collision or replacement remains in place and blocks reuse.
-    }
-  }
-
-  private static boolean deleteSuccessfulPair(Path claim, Path anchor) {
-    try {
-      runHook(beforeSuccessCleanupHook);
-      if (!Files.exists(claim, LinkOption.NOFOLLOW_LINKS)
-          || !Files.exists(anchor, LinkOption.NOFOLLOW_LINKS)
-          || !Files.isSameFile(claim, anchor)) {
-        return false;
-      }
-      Files.delete(claim);
-      Files.delete(anchor);
-      return true;
-    } catch (IOException | SecurityException ignored) {
+  private static boolean deleteOwnedLink(
+      WindowsOwnedFile.Identity expectedIdentity, Path candidate, int expectedLinkCount) {
+    try (WindowsProofHandle candidateHandle = WindowsProofHandle.open(candidate).orElse(null)) {
+      return candidateHandle != null
+          && expectedIdentity.equals(candidateHandle.identity())
+          && candidateHandle.deleteIfExactLinkCount(expectedLinkCount);
+    } catch (RuntimeException ignored) {
       return false;
     }
   }
@@ -282,10 +254,6 @@ public final class BridgeProofStore {
     return (bytes.length >= 3 && bytes[0] == (byte) 0xef && bytes[1] == (byte) 0xbb && bytes[2] == (byte) 0xbf)
         || (bytes.length >= 2 && bytes[0] == (byte) 0xff && bytes[1] == (byte) 0xfe)
         || (bytes.length >= 2 && bytes[0] == (byte) 0xfe && bytes[1] == (byte) 0xff);
-  }
-
-  private static boolean validNonce(String nonce) {
-    return nonce != null && nonce.matches("[A-Za-z0-9_-]{43}");
   }
 
   private static String digest(String nonce) {

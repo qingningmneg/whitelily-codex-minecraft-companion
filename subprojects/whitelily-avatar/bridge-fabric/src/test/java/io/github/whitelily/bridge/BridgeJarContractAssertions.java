@@ -13,6 +13,8 @@ import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Set;
+import java.util.List;
+import java.util.HashSet;
 import java.util.jar.JarFile;
 import java.util.stream.Collectors;
 
@@ -37,9 +39,11 @@ final class BridgeJarContractAssertions {
           "io/github/whitelily/bridge/BridgeConnectionAccess.class",
           "io/github/whitelily/bridge/BridgeConnectionApprovalAccess.class",
           "io/github/whitelily/bridge/BridgeConnectionEndpointAccess.class",
+          "io/github/whitelily/bridge/BridgeConnectionLifecycle.class",
           "io/github/whitelily/bridge/BridgeLoginDecision.class",
           "io/github/whitelily/bridge/BridgeLoginSelector.class",
           "io/github/whitelily/bridge/BridgeNetworkAddresses.class",
+          "io/github/whitelily/bridge/BridgeNonce.class",
           "io/github/whitelily/bridge/BridgePresencePublisher.class",
           "io/github/whitelily/bridge/BridgeProofStore.class",
           "io/github/whitelily/bridge/BridgeRequest.class",
@@ -56,18 +60,23 @@ final class BridgeJarContractAssertions {
           "io/github/whitelily/bridge/WhiteLilyBridge.class",
           "io/github/whitelily/bridge/WhiteLilyBridgeClient.class",
           "io/github/whitelily/bridge/WindowsOwnedFile$Identity.class",
-          "io/github/whitelily/bridge/WindowsOwnedFile.class");
+          "io/github/whitelily/bridge/WindowsOwnedFile.class",
+          "io/github/whitelily/bridge/WindowsProofHandle.class");
 
   private BridgeJarContractAssertions() {}
 
   static void assertExact(Path jarPath, Path licensePath) throws Exception {
     assertEquals(EXPECTED_JAR, jarPath.getFileName().toString());
     try (JarFile jar = new JarFile(jarPath.toFile())) {
-      Set<String> entries =
-          jar.stream().map(entry -> entry.getName()).collect(Collectors.toSet());
+      List<java.util.jar.JarEntry> orderedEntries = jar.stream().toList();
+      Set<String> entries = orderedEntries.stream().map(entry -> entry.getName()).collect(Collectors.toSet());
       assertForbiddenPackagesAbsent(entries);
       assertEquals(EXACT_ENTRIES, entries);
       assertEquals(EXACT_ENTRIES.size(), jar.size());
+      assertNoDuplicateCentralDirectoryEntry(jarPath);
+      for (java.util.jar.JarEntry entry : orderedEntries) {
+        assertEquals(315504000000L, entry.getTime(), "non-reproducible entry timestamp: " + entry.getName());
+      }
 
       JsonObject metadata = json(jar, "fabric.mod.json");
       assertEquals(
@@ -125,13 +134,23 @@ final class BridgeJarContractAssertions {
       assertEquals(
           Set.of(
               "io/github/whitelily/bridge/MinecraftServerMixin",
+              "io/github/whitelily/bridge/ConnectionMixin",
               "io/github/whitelily/bridge/PlayerListMixin",
               "io/github/whitelily/bridge/ServerHandshakePacketListenerImplMixin",
               "io/github/whitelily/bridge/ServerLoginPacketListenerImplMixin"),
           mappings.keySet());
       assertEquals(
+          Set.of("disconnect(Lnet/minecraft/network/DisconnectionDetails;)V"),
+          mappings.getAsJsonObject("io/github/whitelily/bridge/ConnectionMixin").keySet());
+      assertEquals(
           Set.of("stopServer()V"),
           mappings.getAsJsonObject("io/github/whitelily/bridge/MinecraftServerMixin").keySet());
+      assertEquals(
+          "Lnet/minecraft/class_2535;method_60924(Lnet/minecraft/class_9812;)V",
+          mapping(
+              mappings,
+              "io/github/whitelily/bridge/ConnectionMixin",
+              "disconnect(Lnet/minecraft/network/DisconnectionDetails;)V"));
       assertEquals(
           Set.of(
               "placeNewPlayer(Lnet/minecraft/network/Connection;Lnet/minecraft/server/level/ServerPlayer;Lnet/minecraft/server/network/CommonListenerCookie;)V",
@@ -145,7 +164,9 @@ final class BridgeJarContractAssertions {
                   "io/github/whitelily/bridge/ServerHandshakePacketListenerImplMixin")
               .keySet());
       assertEquals(
-          Set.of("handleHello(Lnet/minecraft/network/protocol/login/ServerboundHelloPacket;)V"),
+          Set.of(
+              "handleHello(Lnet/minecraft/network/protocol/login/ServerboundHelloPacket;)V",
+              "Lnet/minecraft/server/network/ServerLoginPacketListenerImpl;requestedUsername:Ljava/lang/String;"),
           mappings
               .getAsJsonObject("io/github/whitelily/bridge/ServerLoginPacketListenerImplMixin")
               .keySet());
@@ -161,6 +182,12 @@ final class BridgeJarContractAssertions {
               mappings,
               "io/github/whitelily/bridge/ServerLoginPacketListenerImplMixin",
               "handleHello(Lnet/minecraft/network/protocol/login/ServerboundHelloPacket;)V"));
+      assertEquals(
+          "Lnet/minecraft/class_3248;field_45028:Ljava/lang/String;",
+          mapping(
+              mappings,
+              "io/github/whitelily/bridge/ServerLoginPacketListenerImplMixin",
+              "Lnet/minecraft/server/network/ServerLoginPacketListenerImpl;requestedUsername:Ljava/lang/String;"));
       assertEquals(
           "Lnet/minecraft/server/MinecraftServer;method_3782()V",
           mapping(mappings, "io/github/whitelily/bridge/MinecraftServerMixin", "stopServer()V"));
@@ -218,5 +245,37 @@ final class BridgeJarContractAssertions {
     JsonObject ownerMappings = mappings.getAsJsonObject(owner);
     assertNotNull(ownerMappings, owner);
     return ownerMappings.get(method).getAsString();
+  }
+
+  private static void assertNoDuplicateCentralDirectoryEntry(Path jarPath) throws Exception {
+    byte[] archive = Files.readAllBytes(jarPath);
+    int eocd = -1;
+    for (int index = archive.length - 22; index >= Math.max(0, archive.length - 65_557); index--) {
+      if (littleEndianInt(archive, index) == 0x06054b50) {
+        eocd = index;
+        break;
+      }
+    }
+    assertTrue(eocd >= 0, "end of central directory");
+    int count = littleEndianShort(archive, eocd + 10);
+    int offset = littleEndianInt(archive, eocd + 16);
+    Set<String> names = new HashSet<>();
+    for (int index = 0; index < count; index++) {
+      assertEquals(0x02014b50, littleEndianInt(archive, offset));
+      int nameLength = littleEndianShort(archive, offset + 28);
+      int extraLength = littleEndianShort(archive, offset + 30);
+      int commentLength = littleEndianShort(archive, offset + 32);
+      String name = new String(archive, offset + 46, nameLength, UTF_8);
+      assertTrue(names.add(name), "duplicate archive entry: " + name);
+      offset += 46 + nameLength + extraLength + commentLength;
+    }
+  }
+
+  private static int littleEndianShort(byte[] bytes, int offset) {
+    return (bytes[offset] & 0xff) | ((bytes[offset + 1] & 0xff) << 8);
+  }
+
+  private static int littleEndianInt(byte[] bytes, int offset) {
+    return littleEndianShort(bytes, offset) | (littleEndianShort(bytes, offset + 2) << 16);
   }
 }

@@ -26,7 +26,13 @@ abstract class ServerLoginPacketListenerImplMixin {
 
   @Inject(
       method = "handleHello(Lnet/minecraft/network/protocol/login/ServerboundHelloPacket;)V",
-      at = @At("HEAD"),
+      at =
+          @At(
+              value = "FIELD",
+              target =
+                  "Lnet/minecraft/server/network/ServerLoginPacketListenerImpl;requestedUsername:Ljava/lang/String;",
+              opcode = org.objectweb.asm.Opcodes.PUTFIELD,
+              shift = At.Shift.AFTER),
       cancellable = true)
   private void whitelily$authorizeBridgeProfile(
       ServerboundHelloPacket packet, CallbackInfo callbackInfo) {
