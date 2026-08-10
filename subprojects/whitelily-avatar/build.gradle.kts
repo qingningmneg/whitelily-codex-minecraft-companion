@@ -53,3 +53,28 @@ project(":mod-fabric") {
     }
   }
 }
+
+project(":bridge-fabric") {
+  apply(plugin = "java")
+
+  group = property("maven_group").toString()
+
+  extensions.configure<JavaPluginExtension> {
+    toolchain.languageVersion.set(JavaLanguageVersion.of(21))
+  }
+
+  repositories {
+    mavenCentral()
+  }
+
+  dependencies {
+    add("implementation", "com.google.code.gson:gson:2.13.1")
+    add("testImplementation", platform("org.junit:junit-bom:5.12.2"))
+    add("testImplementation", "org.junit.jupiter:junit-jupiter")
+    add("testRuntimeOnly", "org.junit.platform:junit-platform-launcher")
+  }
+
+  tasks.withType<Test>().configureEach {
+    useJUnitPlatform()
+  }
+}

@@ -7,3 +7,4 @@ pluginManagement {
 
 rootProject.name = "whitelily-avatar"
 include("mod-fabric")
+include("bridge-fabric")
