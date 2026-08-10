@@ -3,6 +3,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { OwnerIdentitySnapshot } from "../../../src/identity/ownerIdentity.js";
 import type { CompanionProfile } from "../../../src/profile/profileSchema.js";
+import type { MinecraftComponentStatus } from "../src-main/minecraftComponents.js";
 import {
   createWhiteLilyApi,
   WHITE_LILY_IPC_CHANNELS,
@@ -50,6 +51,99 @@ const ownerSnapshot: OwnerIdentitySnapshot = {
 const ownerAuthoritySnapshot = { ...ownerSnapshot, childGeneration: 7 };
 
 describe("Task 5 preload API", () => {
+  it("exposes only bounded opaque component operations and parses every result", async () => {
+    const status: MinecraftComponentStatus = {
+      state: "ready",
+      bridgeInstalled: true,
+      bridgeActive: true,
+      avatarInstalled: true,
+      restartRequired: false,
+    };
+    const invoke = vi.fn(async () => structuredClone(status));
+    const api = createWhiteLilyApi({ invoke, subscribe: vi.fn() });
+
+    await expect(api.getMinecraftComponentStatus("lan_candidate_1234")).resolves.toEqual(status);
+    await expect(
+      api.installMinecraftComponents("lan_candidate_1234", ["bridge", "avatar"]),
+    ).resolves.toEqual(status);
+    await expect(
+      api.removeMinecraftComponents("lan_candidate_1234", ["avatar", "bridge"]),
+    ).resolves.toEqual(status);
+    expect(invoke.mock.calls).toEqual([
+      [WHITE_LILY_IPC_CHANNELS.getMinecraftComponentStatus, "lan_candidate_1234"],
+      [
+        WHITE_LILY_IPC_CHANNELS.installMinecraftComponents,
+        "lan_candidate_1234",
+        ["bridge", "avatar"],
+      ],
+      [
+        WHITE_LILY_IPC_CHANNELS.removeMinecraftComponents,
+        "lan_candidate_1234",
+        ["avatar", "bridge"],
+      ],
+    ]);
+
+    for (const candidateId of ["", "short", "x".repeat(65), String.raw`C:\Private\mods`]) {
+      await expect(api.getMinecraftComponentStatus(candidateId)).rejects.toThrow("invalid");
+    }
+    let selectionGetterCalls = 0;
+    const accessorSelection: unknown[] = [];
+    Object.defineProperty(accessorSelection, "0", {
+      enumerable: true,
+      get: () => {
+        selectionGetterCalls += 1;
+        return "bridge";
+      },
+    });
+    for (const selection of [
+      ["bridge", "bridge"],
+      ["bridge", "avatar", "bridge"],
+      ["fabric-api"],
+      [{ path: String.raw`C:\Private\mods` }],
+      accessorSelection,
+      Object.setPrototypeOf(["bridge"], null),
+    ]) {
+      await expect(
+        api.installMinecraftComponents("lan_candidate_1234", selection as never),
+      ).rejects.toThrow("invalid");
+    }
+    await expect(
+      (
+        api.installMinecraftComponents as unknown as (
+          ...args: readonly unknown[]
+        ) => Promise<unknown>
+      )("lan_candidate_1234", ["bridge"], { manifest: "forged" }),
+    ).rejects.toThrow("invalid");
+    expect(selectionGetterCalls).toBe(0);
+    expect(invoke).toHaveBeenCalledTimes(3);
+  });
+
+  it("rejects malformed component results without exposing their extra authority", async () => {
+    const valid = {
+      state: "ready",
+      bridgeInstalled: true,
+      bridgeActive: true,
+      avatarInstalled: true,
+      restartRequired: false,
+    };
+    const invoke = vi
+      .fn()
+      .mockResolvedValueOnce({ ...valid, path: String.raw`C:\Private\mods` })
+      .mockResolvedValueOnce({ ...valid, state: "download_from_url" })
+      .mockResolvedValueOnce({ ...valid, restartRequired: true });
+    const api = createWhiteLilyApi({ invoke, subscribe: vi.fn() });
+
+    await expect(api.getMinecraftComponentStatus("lan_candidate_1234")).rejects.toThrow(
+      "invalid Minecraft component status",
+    );
+    await expect(api.installMinecraftComponents("lan_candidate_1234", ["bridge"])).rejects.toThrow(
+      "invalid Minecraft component status",
+    );
+    await expect(api.removeMinecraftComponents("lan_candidate_1234", ["avatar"])).rejects.toThrow(
+      "invalid Minecraft component status",
+    );
+  });
+
   it("stops only the current task over one fixed zero-argument channel", async () => {
     const stoppedTaskSnapshot = {
       revision: 9,

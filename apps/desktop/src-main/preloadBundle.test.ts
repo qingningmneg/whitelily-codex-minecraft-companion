@@ -60,6 +60,9 @@ it("runs the built preload with only sandbox-approved module access", async () =
     expect(exposedApi).toEqual(
       expect.objectContaining({
         detectLanCandidates: expect.any(Function),
+        getMinecraftComponentStatus: expect.any(Function),
+        installMinecraftComponents: expect.any(Function),
+        removeMinecraftComponents: expect.any(Function),
         readOwnerIdentity: expect.any(Function),
         updateOwnerIdentity: expect.any(Function),
         subscribeOwnerIdentity: expect.any(Function),

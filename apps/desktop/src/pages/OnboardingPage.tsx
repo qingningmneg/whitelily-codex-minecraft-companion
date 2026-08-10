@@ -5,6 +5,11 @@ import type { ModelCatalogSnapshot, ModelSelectionInput } from "../../../../src/
 import type { RuntimeSnapshot } from "../../../../src/runtime/runtimeEvents";
 import type { Pcl2Candidate } from "../../src-main/discovery/pcl2Discovery";
 import type { LanCandidate } from "../../src-main/discovery/lanDetector";
+import type {
+  MinecraftComponentId,
+  MinecraftComponentState,
+  MinecraftComponentStatus,
+} from "../../src-main/minecraftComponents";
 import { LanCandidateCard } from "../components/LanCandidateCard";
 import { ModelPicker } from "../components/ModelPicker";
 import { OnboardingProgress, type OnboardingStep } from "../components/OnboardingProgress";
@@ -72,6 +77,15 @@ interface LanDiscoveryIntent {
   readonly promise: Promise<readonly LanCandidate[]>;
 }
 
+interface CandidateComponentEntry {
+  readonly status: MinecraftComponentStatus | null;
+  readonly loading: boolean;
+  readonly pending: boolean;
+  readonly failed: boolean;
+  readonly bridgeSelected: boolean;
+  readonly avatarSelected: boolean;
+}
+
 const defaultPreferences: SafePreferences = {
   version: STORAGE_VERSION,
   locale: "zh-CN",
@@ -87,6 +101,9 @@ export function OnboardingPage({ api, locale, active, onReady }: OnboardingPageP
   const [lanCandidates, setLanCandidates] = useState<readonly LanCandidate[]>([]);
   const [lanLoading, setLanLoading] = useState(false);
   const [lanRefreshEpoch, setLanRefreshEpoch] = useState(0);
+  const [componentEntries, setComponentEntries] = useState<
+    ReadonlyMap<string, CandidateComponentEntry>
+  >(() => new Map());
   const [loginPending, setLoginPending] = useState(false);
   const [ownerDraft, setOwnerDraft] = useState("");
   const [ownerRevision, setOwnerRevision] = useState<number | null>(null);
@@ -111,6 +128,9 @@ export function OnboardingPage({ api, locale, active, onReady }: OnboardingPageP
   const lanDiscoveryInFlight = useRef<LanDiscoveryIntent | null>(null);
   const lanPollTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lanPreservedErrorKey = useRef<MessageKey | null>(null);
+  const componentGeneration = useRef(0);
+  const componentEntriesRef = useRef(componentEntries);
+  componentEntriesRef.current = componentEntries;
   const observedLocale = useRef(locale);
   const heading = useRef<HTMLHeadingElement>(null);
   const ownerAlert = useRef<HTMLParagraphElement>(null);
@@ -645,8 +665,158 @@ export function OnboardingPage({ api, locale, active, onReady }: OnboardingPageP
     setLanRefreshEpoch((current) => current + 1);
   };
 
+  useEffect(() => {
+    const generation = ++componentGeneration.current;
+    if (!active || step !== "lan" || lanCandidates.length === 0) {
+      setComponentEntries(new Map());
+      return;
+    }
+    const initial = new Map<string, CandidateComponentEntry>();
+    for (const candidate of lanCandidates) {
+      initial.set(candidate.id, {
+        status: null,
+        loading: true,
+        pending: false,
+        failed: false,
+        bridgeSelected: true,
+        avatarSelected: true,
+      });
+    }
+    setComponentEntries(initial);
+    for (const candidate of lanCandidates) {
+      void api.getMinecraftComponentStatus(candidate.id).then(
+        (status) => {
+          if (
+            !mounted.current ||
+            generation !== componentGeneration.current ||
+            Date.now() < candidate.observedAt ||
+            Date.now() >= candidate.expiresAt
+          ) {
+            return;
+          }
+          setComponentEntries((current) => {
+            if (generation !== componentGeneration.current || !current.has(candidate.id)) {
+              return current;
+            }
+            const next = new Map(current);
+            next.set(candidate.id, componentEntryFromStatus(status));
+            return next;
+          });
+        },
+        () => {
+          if (
+            !mounted.current ||
+            generation !== componentGeneration.current ||
+            Date.now() < candidate.observedAt ||
+            Date.now() >= candidate.expiresAt
+          ) {
+            return;
+          }
+          setComponentEntries((current) => {
+            if (!current.has(candidate.id)) return current;
+            const next = new Map(current);
+            next.set(candidate.id, {
+              status: null,
+              loading: false,
+              pending: false,
+              failed: true,
+              bridgeSelected: true,
+              avatarSelected: true,
+            });
+            return next;
+          });
+        },
+      );
+    }
+    return () => {
+      if (componentGeneration.current === generation) componentGeneration.current += 1;
+    };
+  }, [active, api, lanCandidates, step]);
+
+  const updateComponentSelection = (
+    candidateId: string,
+    component: MinecraftComponentId,
+    selected: boolean,
+  ): void => {
+    setComponentEntries((current) => {
+      const entry = current.get(candidateId);
+      if (!entry || entry.pending) return current;
+      const next = new Map(current);
+      next.set(
+        candidateId,
+        component === "bridge"
+          ? {
+              ...entry,
+              bridgeSelected: selected,
+              avatarSelected: selected ? entry.avatarSelected : false,
+            }
+          : {
+              ...entry,
+              avatarSelected: selected,
+              bridgeSelected: selected || entry.bridgeSelected,
+            },
+      );
+      return next;
+    });
+  };
+
+  const installComponents = async (candidate: LanCandidate): Promise<void> => {
+    const generation = componentGeneration.current;
+    const entry = componentEntriesRef.current.get(candidate.id);
+    if (!entry || entry.pending || !entry.status || isUnsupportedComponentStatus(entry.status)) {
+      return;
+    }
+    const selection: MinecraftComponentId[] = [];
+    if (entry.bridgeSelected) selection.push("bridge");
+    if (entry.avatarSelected) selection.push("avatar");
+    if (selection.length === 0) return;
+    setComponentEntries((current) => {
+      const currentEntry = current.get(candidate.id);
+      if (!currentEntry) return current;
+      const next = new Map(current);
+      next.set(candidate.id, { ...currentEntry, pending: true, failed: false });
+      return next;
+    });
+    try {
+      const status = await api.installMinecraftComponents(candidate.id, selection);
+      if (
+        !mounted.current ||
+        generation !== componentGeneration.current ||
+        Date.now() < candidate.observedAt ||
+        Date.now() >= candidate.expiresAt ||
+        !lanCandidates.some((current) => current.id === candidate.id)
+      ) {
+        return;
+      }
+      setComponentEntries((current) => {
+        if (!current.has(candidate.id)) return current;
+        const next = new Map(current);
+        next.set(candidate.id, componentEntryFromStatus(status));
+        return next;
+      });
+    } catch {
+      if (
+        !mounted.current ||
+        generation !== componentGeneration.current ||
+        Date.now() < candidate.observedAt ||
+        Date.now() >= candidate.expiresAt ||
+        !lanCandidates.some((current) => current.id === candidate.id)
+      ) {
+        return;
+      }
+      setComponentEntries((current) => {
+        const currentEntry = current.get(candidate.id);
+        if (!currentEntry) return current;
+        const next = new Map(current);
+        next.set(candidate.id, { ...currentEntry, pending: false, failed: true });
+        return next;
+      });
+    }
+  };
+
   const confirmAndConnect = async (candidateId: string): Promise<void> => {
     if (connectingCandidate) return;
+    if (!componentStatusAllowsConfirmation(componentEntriesRef.current.get(candidateId))) return;
     const generation = flowGeneration.current;
     let candidateConfirmed = false;
     setConnectingCandidate(candidateId);
@@ -931,16 +1101,28 @@ export function OnboardingPage({ api, locale, active, onReady }: OnboardingPageP
             {lanCandidates.length > 0 ? (
               <div className="lan-candidate-list">
                 {lanCandidates.map((candidate) => (
-                  <LanCandidateCard
-                    candidate={candidate}
-                    locale={locale}
-                    pending={connectingCandidate === candidate.id}
-                    disabled={
-                      connectingCandidate !== null || actionRecoveryAvailable || actionRetryPending
-                    }
-                    onConfirm={(id) => void confirmAndConnect(id)}
-                    key={candidate.id}
-                  />
+                  <div className="minecraft-component-candidate" key={candidate.id}>
+                    <LanCandidateCard
+                      candidate={candidate}
+                      locale={locale}
+                      pending={connectingCandidate === candidate.id}
+                      disabled={
+                        connectingCandidate !== null ||
+                        actionRecoveryAvailable ||
+                        actionRetryPending ||
+                        !componentStatusAllowsConfirmation(componentEntries.get(candidate.id))
+                      }
+                      onConfirm={(id) => void confirmAndConnect(id)}
+                    />
+                    <CandidateComponentControls
+                      entry={componentEntries.get(candidate.id)}
+                      locale={locale}
+                      onSelectionChange={(component, selected) =>
+                        updateComponentSelection(candidate.id, component, selected)
+                      }
+                      onInstall={() => void installComponents(candidate)}
+                    />
+                  </div>
                 ))}
               </div>
             ) : null}
@@ -987,6 +1169,134 @@ export function OnboardingPage({ api, locale, active, onReady }: OnboardingPageP
       </section>
     </main>
   );
+}
+
+function CandidateComponentControls({
+  entry,
+  locale,
+  onSelectionChange,
+  onInstall,
+}: {
+  readonly entry: CandidateComponentEntry | undefined;
+  readonly locale: Locale;
+  readonly onSelectionChange: (component: MinecraftComponentId, selected: boolean) => void;
+  readonly onInstall: () => void;
+}) {
+  if (!entry || entry.loading) {
+    return <p role="status">{translate(locale, "minecraft.components.checking")}</p>;
+  }
+  const supported = entry.status ? !isUnsupportedComponentStatus(entry.status) : false;
+  const installable =
+    supported &&
+    (entry.status?.state === "bridge_not_installed" ||
+      (entry.status?.state === "bridge_version_unsupported" && entry.status.bridgeInstalled) ||
+      entry.status?.state === "avatar_not_installed");
+  return (
+    <section className="minecraft-component-controls">
+      <h3>{translate(locale, "minecraft.components.title")}</h3>
+      {supported ? (
+        <>
+          <p>{translate(locale, "minecraft.components.verifiedInstance")}</p>
+          <p>{translate(locale, "minecraft.components.scope")}</p>
+          <p>{translate(locale, "minecraft.components.worldsUnchanged")}</p>
+        </>
+      ) : null}
+      {entry.status ? (
+        <p role="status">{translate(locale, componentStatusMessageKey(entry.status))}</p>
+      ) : null}
+      {entry.failed ? (
+        <p role="alert">{translate(locale, "minecraft.components.operationFailed")}</p>
+      ) : null}
+      {installable ? (
+        <>
+          <label>
+            <input
+              type="checkbox"
+              checked={entry.bridgeSelected}
+              disabled={entry.pending}
+              onChange={(event) => onSelectionChange("bridge", event.target.checked)}
+            />
+            {translate(locale, "minecraft.components.bridge")}
+          </label>
+          <label>
+            <input
+              type="checkbox"
+              checked={entry.avatarSelected}
+              disabled={entry.pending}
+              onChange={(event) => onSelectionChange("avatar", event.target.checked)}
+            />
+            {translate(locale, "minecraft.components.avatar")}
+          </label>
+          <button
+            className="primary-button"
+            type="button"
+            disabled={entry.pending || (!entry.bridgeSelected && !entry.avatarSelected)}
+            onClick={onInstall}
+          >
+            {translate(
+              locale,
+              entry.pending ? "minecraft.components.installing" : "minecraft.components.install",
+            )}
+          </button>
+        </>
+      ) : null}
+    </section>
+  );
+}
+
+function componentEntryFromStatus(status: MinecraftComponentStatus): CandidateComponentEntry {
+  return {
+    status,
+    loading: false,
+    pending: false,
+    failed: false,
+    bridgeSelected:
+      !status.bridgeInstalled ||
+      !status.avatarInstalled ||
+      status.state === "bridge_version_unsupported",
+    avatarSelected: !status.avatarInstalled,
+  };
+}
+
+function componentStatusAllowsConfirmation(entry: CandidateComponentEntry | undefined): boolean {
+  return (
+    entry?.status !== null &&
+    entry?.status !== undefined &&
+    !entry.loading &&
+    !entry.pending &&
+    !entry.failed &&
+    !entry.status.restartRequired &&
+    entry.status.bridgeActive &&
+    (entry.status.state === "ready" || entry.status.state === "avatar_not_installed")
+  );
+}
+
+function componentStatusMessageKey(status: MinecraftComponentStatus): MessageKey {
+  if (isUnsupportedComponentStatus(status)) {
+    return "minecraft.components.state.instance_unsupported";
+  }
+  switch (status.state) {
+    case "bridge_not_installed":
+      return "minecraft.components.state.bridge_not_installed";
+    case "bridge_restart_required":
+      return "minecraft.components.state.bridge_restart_required";
+    case "bridge_not_active":
+      return "minecraft.components.state.bridge_not_active";
+    case "bridge_version_unsupported":
+      return "minecraft.components.state.bridge_version_unsupported";
+    case "bridge_file_conflict":
+      return "minecraft.components.state.bridge_file_conflict";
+    case "avatar_not_installed":
+      return "minecraft.components.state.avatar_not_installed";
+    case "avatar_restart_required":
+      return "minecraft.components.state.avatar_restart_required";
+    case "ready":
+      return "minecraft.components.state.ready";
+  }
+}
+
+function isUnsupportedComponentStatus(status: MinecraftComponentStatus): boolean {
+  return status.state === "bridge_version_unsupported" && !status.bridgeInstalled;
 }
 
 export function readOnboardingLocale(): Locale {

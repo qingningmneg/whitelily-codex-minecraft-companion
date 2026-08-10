@@ -1,3 +1,4 @@
+import { useId } from "react";
 import type { LanCandidate } from "../../src-main/discovery/lanDetector";
 import type { Locale } from "../i18n/messageKeys";
 import { translate } from "../i18n/translator";
@@ -17,12 +18,13 @@ export function LanCandidateCard({
   disabled,
   onConfirm,
 }: LanCandidateCardProps) {
+  const id = useId();
   const observedDate = new Date(candidate.observedAt);
   const observedDateTime = Number.isNaN(observedDate.valueOf())
     ? undefined
     : observedDate.toISOString();
-  const headingId = `lan-candidate-port-${candidate.port}`;
-  const descriptionId = `lan-candidate-version-${candidate.port}`;
+  const headingId = `${id}-candidate`;
+  const descriptionId = `${id}-version`;
   const publicVersion =
     candidate.version === "unknown"
       ? translate(locale, "onboarding.lan.versionUnknown")
@@ -33,7 +35,7 @@ export function LanCandidateCard({
       <div className="lan-candidate__body">
         <div>
           <h2 id={headingId} className="lan-candidate__port">
-            {translate(locale, "onboarding.lan.port", { port: candidate.port })}
+            {translate(locale, "onboarding.lan.candidate")}
           </h2>
           <p id={descriptionId} className="lan-candidate__version">
             {publicVersion}
@@ -53,7 +55,6 @@ export function LanCandidateCard({
         aria-label={translate(
           locale,
           pending ? "onboarding.lan.connectingCandidate" : "onboarding.lan.confirmCandidate",
-          { port: candidate.port, version: publicVersion },
         )}
         aria-describedby={descriptionId}
         onClick={() => onConfirm(candidate.id)}

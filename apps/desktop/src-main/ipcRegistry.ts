@@ -16,6 +16,7 @@ import { DocumentStoreError } from "../../../src/storage/documentStore.js";
 import type { ConfirmedWorldBinding } from "../../../src/world/worldProfileStore.js";
 import type { ExternalUrlPolicy } from "./externalUrlPolicy.js";
 import type { Pcl2Candidate } from "./discovery/pcl2Discovery.js";
+import { isOpaqueLanId } from "./discovery/lanCandidateStore.js";
 import type {
   ConfirmedConnectionProof,
   ConfirmedLanSession,
@@ -26,6 +27,7 @@ import {
   parseConfirmedLanSession,
   parseDesktopRendererEvent,
   parseLanCandidates,
+  parseMinecraftComponentStatus,
   parseOwnerIdentityAuthoritySnapshot,
   parseOwnerIdentitySnapshot,
   parsePcl2Candidates,
@@ -34,6 +36,7 @@ import {
   type DesktopRendererEvent,
   type OwnerIdentityAuthoritySnapshot,
 } from "../src/desktopApi.js";
+import type { MinecraftComponentId, MinecraftComponentManager } from "./minecraftComponents.js";
 
 type IpcHandler = (event: unknown, ...args: unknown[]) => unknown;
 
@@ -78,6 +81,7 @@ export interface IpcRegistryOptions {
   worldAuthority?: {
     redeem(proof: ConfirmedConnectionProof): Promise<ConfirmedWorldBinding>;
   };
+  minecraftComponentManager?: MinecraftComponentManager;
   startupSettings?: {
     read(): { enabled: boolean; available: boolean };
     set(enabled: boolean): { enabled: boolean; available: boolean };
@@ -389,6 +393,45 @@ export function registerIpcHandlers(options: IpcRegistryOptions): () => void {
       return parseLanCandidates(await options.lanDetector.detectLanCandidates());
     });
     registeredChannels.push(WHITE_LILY_IPC_CHANNELS.detectLanCandidates);
+    options.ipcMain.handle(
+      WHITE_LILY_IPC_CHANNELS.getMinecraftComponentStatus,
+      async (_event, ...args) => {
+        const candidateId = parseMinecraftComponentCandidateArgs(args);
+        if (!options.minecraftComponentManager) {
+          throw new Error("Minecraft component manager is unavailable");
+        }
+        return parseMinecraftComponentStatus(
+          await options.minecraftComponentManager.status(candidateId),
+        );
+      },
+    );
+    registeredChannels.push(WHITE_LILY_IPC_CHANNELS.getMinecraftComponentStatus);
+    options.ipcMain.handle(
+      WHITE_LILY_IPC_CHANNELS.installMinecraftComponents,
+      async (_event, ...args) => {
+        const { candidateId, selection } = parseMinecraftComponentOperationArgs(args);
+        if (!options.minecraftComponentManager) {
+          throw new Error("Minecraft component manager is unavailable");
+        }
+        return parseMinecraftComponentStatus(
+          await options.minecraftComponentManager.install(candidateId, selection),
+        );
+      },
+    );
+    registeredChannels.push(WHITE_LILY_IPC_CHANNELS.installMinecraftComponents);
+    options.ipcMain.handle(
+      WHITE_LILY_IPC_CHANNELS.removeMinecraftComponents,
+      async (_event, ...args) => {
+        const { candidateId, selection } = parseMinecraftComponentOperationArgs(args);
+        if (!options.minecraftComponentManager) {
+          throw new Error("Minecraft component manager is unavailable");
+        }
+        return parseMinecraftComponentStatus(
+          await options.minecraftComponentManager.remove(candidateId, selection),
+        );
+      },
+    );
+    registeredChannels.push(WHITE_LILY_IPC_CHANNELS.removeMinecraftComponents);
     options.ipcMain.handle(WHITE_LILY_IPC_CHANNELS.confirmLanCandidate, async (_event, ...args) => {
       if (
         args.length !== 1 ||
@@ -681,6 +724,63 @@ export function registerIpcHandlers(options: IpcRegistryOptions): () => void {
 
 function validateNoIpcInput(args: readonly unknown[]): void {
   if (args.length !== 0) throw new Error("invalid IPC input");
+}
+
+function parseMinecraftComponentCandidateArgs(args: readonly unknown[]): string {
+  if (args.length !== 1 || !isOpaqueLanId(args[0])) throw new Error("invalid IPC input");
+  return args[0];
+}
+
+function parseMinecraftComponentOperationArgs(args: readonly unknown[]): {
+  readonly candidateId: string;
+  readonly selection: readonly MinecraftComponentId[];
+} {
+  if (args.length !== 2 || !isOpaqueLanId(args[0])) throw new Error("invalid IPC input");
+  const selection = readMinecraftComponentSelection(args[1]);
+  return Object.freeze({ candidateId: args[0], selection });
+}
+
+function readMinecraftComponentSelection(value: unknown): readonly MinecraftComponentId[] {
+  if (!Array.isArray(value) || value.length > 2) throw new Error("invalid IPC input");
+  let prototype: object | null;
+  let descriptors: PropertyDescriptorMap;
+  try {
+    prototype = Object.getPrototypeOf(value) as object | null;
+    descriptors = Object.getOwnPropertyDescriptors(value) as unknown as PropertyDescriptorMap;
+  } catch {
+    throw new Error("invalid IPC input");
+  }
+  const expectedKeys = [
+    ...Array.from({ length: value.length }, (_unused, index) => String(index)),
+    "length",
+  ];
+  const keys = Reflect.ownKeys(descriptors);
+  if (
+    prototype !== Array.prototype ||
+    keys.length !== expectedKeys.length ||
+    keys.some((key) => typeof key !== "string" || !expectedKeys.includes(key)) ||
+    descriptors.length?.value !== value.length
+  ) {
+    throw new Error("invalid IPC input");
+  }
+  const result: MinecraftComponentId[] = [];
+  const selected = new Set<MinecraftComponentId>();
+  for (let index = 0; index < value.length; index += 1) {
+    const descriptor = descriptors[String(index)];
+    if (!descriptor || !Object.hasOwn(descriptor, "value") || descriptor.enumerable !== true) {
+      throw new Error("invalid IPC input");
+    }
+    const component = descriptor.value;
+    if (
+      (component !== "bridge" && component !== "avatar") ||
+      selected.has(component as MinecraftComponentId)
+    ) {
+      throw new Error("invalid IPC input");
+    }
+    selected.add(component);
+    result.push(component);
+  }
+  return Object.freeze(result);
 }
 
 function parseSingleObjectCommand<

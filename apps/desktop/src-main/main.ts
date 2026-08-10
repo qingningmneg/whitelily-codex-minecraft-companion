@@ -18,6 +18,11 @@ import { exportSerializedJson } from "./safeExportDestination.js";
 import { saveDiagnosticArchive } from "./diagnosticExport.js";
 import { createStartupSettings } from "./startupSettings.js";
 import { DesktopPreferences } from "./desktopPreferences.js";
+import { MinecraftComponentPreferences } from "./minecraftComponentPreferences.js";
+import {
+  createMinecraftComponentManager,
+  type MinecraftComponentResourceManifest,
+} from "./minecraftComponents.js";
 import {
   createWorkspaceVersionEnvironment,
   provisionCodexWorkspace,
@@ -54,6 +59,71 @@ export interface DesktopCodexResources {
   resourceRoot: string;
   manifestPath: string;
   layout: "development" | "packaged";
+}
+
+export interface DesktopMinecraftComponentResources {
+  readonly resourceDirectory: string;
+  readonly presenceDirectory: string;
+  readonly manifest: MinecraftComponentResourceManifest;
+}
+
+const DESKTOP_MINECRAFT_COMPONENT_MANIFEST: MinecraftComponentResourceManifest = Object.freeze({
+  schemaVersion: 1,
+  minecraftVersion: "1.21.5",
+  artifacts: Object.freeze([
+    Object.freeze({
+      component: "bridge" as const,
+      fileName: "whitelily-bridge-fabric-1.21.5-0.1.0.jar",
+      bytes: 51_837,
+      sha256: "380721d28236f5ad8206fd8d69af1e5629d741e9d38ec27c26c052c95266b6ce",
+      modId: "whitelily_bridge",
+      version: "0.1.0",
+      prior: Object.freeze([]),
+    }),
+    Object.freeze({
+      component: "avatar" as const,
+      fileName: "whitelily-avatar-fabric-1.21.5-0.1.0.jar",
+      bytes: 52_550,
+      sha256: "f27dce8e9f13a1058b59d97cbeff1d36d567bbabf59e4de16f6e2d7c33e5d7c3",
+      modId: "whitelily_avatar",
+      version: "0.1.0",
+      prior: Object.freeze([]),
+    }),
+    Object.freeze({
+      component: "avatar" as const,
+      fileName: "fabric-api-0.128.2+1.21.5.jar",
+      bytes: 2_243_253,
+      sha256: "4aed9b9da68307bb3fc69ef5ed54be6caa9a07ac1d07cb7fd374acb9914a01b5",
+      modId: "fabric-api",
+      version: "0.128.2+1.21.5",
+      prior: Object.freeze([]),
+    }),
+    Object.freeze({
+      component: "avatar" as const,
+      fileName: "geckolib-fabric-1.21.5-5.1.0.jar",
+      bytes: 698_651,
+      sha256: "8d13e1c1f2317fc2d4c235cd8654fce6b7720252d5f310d65262cb72075b8eb4",
+      modId: "geckolib",
+      version: "5.1.0",
+      prior: Object.freeze([]),
+    }),
+  ]),
+});
+
+export function resolveDesktopMinecraftComponentResources(options: {
+  appPath: string;
+  resourcesPath: string;
+  dataRoot: string;
+  development: boolean;
+}): DesktopMinecraftComponentResources {
+  const repositoryRoot = resolve(options.appPath, "..", "..");
+  return Object.freeze({
+    resourceDirectory: options.development
+      ? resolve(repositoryRoot, "build", "minecraft-components")
+      : resolve(options.resourcesPath, "minecraft-components"),
+    presenceDirectory: resolve(options.dataRoot, "bridge", "presence"),
+    manifest: DESKTOP_MINECRAFT_COMPONENT_MANIFEST,
+  });
 }
 
 const APPLICATION_VERSION_PATTERN =
@@ -510,6 +580,17 @@ export async function runElectronMain(): Promise<void> {
               configPath: prepared.paths.configPath,
               lanDetector,
             });
+            const minecraftComponentResources = resolveDesktopMinecraftComponentResources({
+              appPath: app.getAppPath(),
+              resourcesPath: process.resourcesPath,
+              dataRoot: prepared.paths.dataRoot,
+              development: !app.isPackaged,
+            });
+            const minecraftComponentManager = createMinecraftComponentManager({
+              lanDetector,
+              worldBindingAuthority: worldAuthority,
+              ...minecraftComponentResources,
+            });
             const startupSettings = createStartupSettings({
               isPackaged: app.isPackaged,
               executablePath: process.execPath,
@@ -519,6 +600,9 @@ export async function runElectronMain(): Promise<void> {
             const desktopPreferences = new DesktopPreferences({
               rootDirectory: prepared.paths.dataRoot,
             });
+            await new MinecraftComponentPreferences({
+              dataRoot: prepared.paths.dataRoot,
+            }).initializeDefaults();
             let closeToTray = await desktopPreferences.read();
             const closeToTraySettings = {
               read: async () => ({
@@ -560,6 +644,7 @@ export async function runElectronMain(): Promise<void> {
                   pcl2Discovery,
                   lanDetector,
                   worldAuthority,
+                  minecraftComponentManager,
                   startupSettings,
                   closeToTraySettings,
                   exportSerialized: (serialized) =>

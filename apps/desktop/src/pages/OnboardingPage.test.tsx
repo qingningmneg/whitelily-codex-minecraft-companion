@@ -6,6 +6,7 @@ import type { ModelCatalogSnapshot, ModelSelection } from "../../../../src/codex
 import type { RuntimeSnapshot } from "../../../../src/runtime/runtimeEvents";
 import type { Pcl2Candidate } from "../../src-main/discovery/pcl2Discovery";
 import type { ConfirmedLanSession, LanCandidate } from "../../src-main/discovery/lanDetector";
+import type { MinecraftComponentStatus } from "../../src-main/minecraftComponents";
 import App from "../App";
 import { LanCandidateCard } from "../components/LanCandidateCard";
 import { ModelPicker } from "../components/ModelPicker";
@@ -92,6 +93,12 @@ interface ApiHarness {
   start: ReturnType<typeof vi.fn<WhiteLilyDesktopApi["start"]>>;
   readOwnerIdentity: ReturnType<typeof vi.fn<WhiteLilyDesktopApi["readOwnerIdentity"]>>;
   updateOwnerIdentity: ReturnType<typeof vi.fn<WhiteLilyDesktopApi["updateOwnerIdentity"]>>;
+  getMinecraftComponentStatus: ReturnType<
+    typeof vi.fn<WhiteLilyDesktopApi["getMinecraftComponentStatus"]>
+  >;
+  installMinecraftComponents: ReturnType<
+    typeof vi.fn<WhiteLilyDesktopApi["installMinecraftComponents"]>
+  >;
 }
 
 function deferred<T>(): {
@@ -106,6 +113,14 @@ function deferred<T>(): {
     reject = rejectPromise;
   });
   return { promise, resolve, reject };
+}
+
+async function flushComponentUi(): Promise<void> {
+  await act(async () => {
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      await Promise.resolve();
+    }
+  });
 }
 
 function privateWindowsPath(...segments: string[]): string {
@@ -123,6 +138,8 @@ function createApiHarness(
     start?: RuntimeSnapshot | Error | readonly (RuntimeSnapshot | Error)[];
     owner?: Awaited<ReturnType<WhiteLilyDesktopApi["readOwnerIdentity"]>> | Error;
     ownerUpdate?: Error;
+    componentStatus?: MinecraftComponentStatus;
+    componentInstall?: MinecraftComponentStatus;
   } = {},
 ): ApiHarness {
   const statuses = Array.isArray(options.status)
@@ -226,6 +243,30 @@ function createApiHarness(
       };
     },
   );
+  const getMinecraftComponentStatus = vi.fn<WhiteLilyDesktopApi["getMinecraftComponentStatus"]>(
+    async () =>
+      structuredClone(
+        options.componentStatus ?? {
+          state: "ready",
+          bridgeInstalled: true,
+          bridgeActive: true,
+          avatarInstalled: true,
+          restartRequired: false,
+        },
+      ),
+  );
+  const installMinecraftComponents = vi.fn<WhiteLilyDesktopApi["installMinecraftComponents"]>(
+    async () =>
+      structuredClone(
+        options.componentInstall ?? {
+          state: "bridge_restart_required",
+          bridgeInstalled: true,
+          bridgeActive: false,
+          avatarInstalled: true,
+          restartRequired: true,
+        },
+      ),
+  );
 
   return {
     api: {
@@ -246,6 +287,9 @@ function createApiHarness(
       discoverPcl2,
       detectLanCandidates,
       confirmLanCandidate,
+      getMinecraftComponentStatus,
+      installMinecraftComponents,
+      removeMinecraftComponents: vi.fn(),
       subscribeRuntime: () => vi.fn(),
     },
     getAccount,
@@ -260,6 +304,8 @@ function createApiHarness(
     start,
     readOwnerIdentity,
     updateOwnerIdentity,
+    getMinecraftComponentStatus,
+    installMinecraftComponents,
   };
 }
 
@@ -1302,7 +1348,7 @@ describe("first-run onboarding", () => {
     expect(harness.migrateModelPreference.mock.invocationCallOrder[0]).toBeLessThan(
       harness.readOwnerIdentity.mock.invocationCallOrder[0]!,
     );
-    expect(harness.discoverPcl2).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(harness.discoverPcl2).toHaveBeenCalledTimes(1));
   });
 
   it.each([
@@ -1584,14 +1630,12 @@ describe("first-run onboarding", () => {
     expect(screen.getByText(/请先用 PCL2 启动 Minecraft Java 1\.21\.5/u)).toBeTruthy();
     expect(screen.getByText(/白百合会自动检测/u)).toBeTruthy();
     expect(screen.getByText(/白百合会自动检测/u).textContent).not.toContain("然后刷新");
-    expect(await screen.findByText("端口 51321")).toBeTruthy();
+    expect(await screen.findAllByText("检测到本机 Minecraft 实例")).toHaveLength(2);
     expect(screen.getByText("Minecraft 1.21.5")).toBeTruthy();
-    expect(screen.getByText("端口 51322")).toBeTruthy();
     expect(screen.getByText(/无法确认 Minecraft 版本/u)).toBeTruthy();
-    expect(screen.getByRole("heading", { name: /51321/u })).toBeTruthy();
-    expect(screen.getByRole("heading", { name: /51322/u })).toBeTruthy();
-    const verifiedAction = screen.getByRole("button", { name: /51321.*1\.21\.5/u });
-    const unknownAction = screen.getByRole("button", { name: /51322.*unknown|51322.*未知/iu });
+    const [verifiedAction, unknownAction] = screen.getAllByRole("button", {
+      name: "确认并连接这个候选项",
+    });
     expect(verifiedAction.getAttribute("aria-describedby")).toBeTruthy();
     expect(unknownAction.getAttribute("aria-describedby")).toBeTruthy();
     expect(verifiedAction.getAttribute("aria-describedby")).not.toBe(
@@ -1600,6 +1644,303 @@ describe("first-run onboarding", () => {
     expect(document.body.textContent).not.toContain("lan_candidate_0001");
     expect(harness.confirmLanCandidate).not.toHaveBeenCalled();
     expect(harness.start).not.toHaveBeenCalled();
+    expect(translate("zh-CN", "minecraft.components.state.instance_unsupported")).toBe(
+      "这个候选项不是已验证的 PCL2 Fabric 1.21.5 实例，无法安装组件。",
+    );
+  });
+
+  it("keeps an installed outdated Bridge actionable only on a verified instance", async () => {
+    const harness = createApiHarness({
+      pcl2: [pcl2Candidate],
+      lan: [lanCandidate],
+      owner: {
+        revision: 1,
+        ownerUsername: "CurrentOwner",
+        configured: true,
+        presence: "unknown",
+      },
+      componentStatus: {
+        state: "bridge_version_unsupported",
+        bridgeInstalled: true,
+        bridgeActive: false,
+        avatarInstalled: false,
+        restartRequired: false,
+      },
+    });
+    await resumeLanWithFakeTimers(harness);
+    await flushComponentUi();
+
+    expect(screen.getByText("Current verified PCL2 Fabric 1.21.5 instance")).toBeTruthy();
+    expect(
+      screen.getByText(
+        "The installed WhiteLily Bridge version must be updated for Minecraft 1.21.5.",
+      ),
+    ).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Install in this PCL2 instance" })).toBeTruthy();
+    expect(
+      (
+        screen.getByRole("button", {
+          name: "Confirm and connect to this candidate",
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(true);
+    expect(harness.confirmLanCandidate).not.toHaveBeenCalled();
+    expect(harness.start).not.toHaveBeenCalled();
+  });
+
+  it("loads component status automatically but keeps ready behind a separate explicit confirmation", async () => {
+    const harness = createApiHarness({
+      pcl2: [pcl2Candidate],
+      lan: [lanCandidate],
+      owner: {
+        revision: 1,
+        ownerUsername: "CurrentOwner",
+        configured: true,
+        presence: "unknown",
+      },
+    });
+    await resumeLanWithFakeTimers(harness);
+    await flushComponentUi();
+
+    const confirm = screen.getByRole("button", {
+      name: "Confirm and connect to this candidate",
+    });
+    expect(harness.getMinecraftComponentStatus).toHaveBeenCalledWith("lan_candidate_0001");
+    expect(harness.confirmLanCandidate).not.toHaveBeenCalled();
+    expect(harness.start).not.toHaveBeenCalled();
+    expect(document.body.textContent).not.toContain("51321");
+    expect(document.body.textContent).not.toContain("lan_candidate_0001");
+    expect(document.body.textContent).not.toMatch(/[a-f0-9]{64}/u);
+    expect(document.body.textContent).not.toContain(String.raw`C:\Private`);
+
+    fireEvent.click(confirm);
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(harness.confirmLanCandidate).toHaveBeenCalledWith("lan_candidate_0001");
+    expect(harness.start).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps an unsupported or unknown candidate non-actionable without calling it verified", async () => {
+    const harness = createApiHarness({
+      pcl2: [pcl2Candidate],
+      lan: [unknownLanCandidate],
+      owner: {
+        revision: 1,
+        ownerUsername: "CurrentOwner",
+        configured: true,
+        presence: "unknown",
+      },
+      componentStatus: {
+        state: "bridge_version_unsupported",
+        bridgeInstalled: false,
+        bridgeActive: false,
+        avatarInstalled: false,
+        restartRequired: false,
+      },
+    });
+    await resumeLanWithFakeTimers(harness);
+    await flushComponentUi();
+
+    expect(
+      screen.getByText(
+        "This candidate is not a verified PCL2 Fabric 1.21.5 instance. Component installation is unavailable.",
+      ),
+    ).toBeTruthy();
+    expect(screen.queryByText("Current verified PCL2 Fabric 1.21.5 instance")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Install in this PCL2 instance" })).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: "Confirm and connect to this verified instance" }),
+    ).toBeNull();
+    expect(
+      (
+        screen.getByRole("button", {
+          name: "Confirm and connect to this candidate",
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(true);
+    expect(harness.confirmLanCandidate).not.toHaveBeenCalled();
+    expect(harness.start).not.toHaveBeenCalled();
+  });
+
+  it("defaults missing Bridge to checked Bridge and Avatar installation without confirming or starting", async () => {
+    const harness = createApiHarness({
+      pcl2: [pcl2Candidate],
+      lan: [lanCandidate],
+      owner: {
+        revision: 1,
+        ownerUsername: "CurrentOwner",
+        configured: true,
+        presence: "unknown",
+      },
+      componentStatus: {
+        state: "bridge_not_installed",
+        bridgeInstalled: false,
+        bridgeActive: false,
+        avatarInstalled: false,
+        restartRequired: false,
+      },
+    });
+    await resumeLanWithFakeTimers(harness);
+    await flushComponentUi();
+
+    const bridge = screen.getByRole("checkbox", { name: "WhiteLily Bridge" });
+    const avatar = screen.getByRole("checkbox", { name: "WhiteLily Avatar" });
+    expect((bridge as HTMLInputElement).checked).toBe(true);
+    expect((avatar as HTMLInputElement).checked).toBe(true);
+    fireEvent.click(avatar);
+    fireEvent.click(screen.getByRole("button", { name: "Install in this PCL2 instance" }));
+    await flushComponentUi();
+
+    expect(harness.installMinecraftComponents).toHaveBeenCalledWith("lan_candidate_0001", [
+      "bridge",
+    ]);
+    expect(screen.getByText("Restart Minecraft before confirming this LAN world.")).toBeTruthy();
+    expect(
+      (
+        screen.getByRole("button", {
+          name: "Confirm and connect to this candidate",
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(true);
+    expect(harness.confirmLanCandidate).not.toHaveBeenCalled();
+    expect(harness.start).not.toHaveBeenCalled();
+  });
+
+  it("lets a refreshed candidate generation own status when the prior request completes late", async () => {
+    const staleStatus = deferred<MinecraftComponentStatus>();
+    const harness = createApiHarness({
+      pcl2: [pcl2Candidate],
+      lan: [[lanCandidate], [lanCandidate]],
+      owner: {
+        revision: 1,
+        ownerUsername: "CurrentOwner",
+        configured: true,
+        presence: "unknown",
+      },
+      componentStatus: {
+        state: "avatar_not_installed",
+        bridgeInstalled: true,
+        bridgeActive: true,
+        avatarInstalled: false,
+        restartRequired: false,
+      },
+    });
+    harness.getMinecraftComponentStatus.mockImplementationOnce(() => staleStatus.promise);
+    await resumeLanWithFakeTimers(harness);
+    await flushComponentUi();
+
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    for (
+      let attempt = 0;
+      attempt < 20 && harness.getMinecraftComponentStatus.mock.calls.length < 2;
+      attempt += 1
+    ) {
+      await flushComponentUi();
+    }
+    expect(harness.getMinecraftComponentStatus).toHaveBeenCalledTimes(2);
+    expect(screen.getByText(/WhiteLily Avatar is optional/u)).toBeTruthy();
+
+    staleStatus.resolve({
+      state: "ready",
+      bridgeInstalled: true,
+      bridgeActive: true,
+      avatarInstalled: true,
+      restartRequired: false,
+    });
+    await act(async () => {
+      await staleStatus.promise;
+    });
+    expect(screen.getByText(/WhiteLily Avatar is optional/u)).toBeTruthy();
+  });
+
+  it("fences late component status and install completions after candidate expiry", async () => {
+    const lateStatus = deferred<MinecraftComponentStatus>();
+    const lateInstall = deferred<MinecraftComponentStatus>();
+    const harness = createApiHarness({
+      pcl2: [pcl2Candidate],
+      lan: [[lanCandidate], []],
+      owner: {
+        revision: 1,
+        ownerUsername: "CurrentOwner",
+        configured: true,
+        presence: "unknown",
+      },
+      componentStatus: {
+        state: "bridge_not_installed",
+        bridgeInstalled: false,
+        bridgeActive: false,
+        avatarInstalled: false,
+        restartRequired: false,
+      },
+    });
+    harness.getMinecraftComponentStatus.mockImplementationOnce(() => lateStatus.promise);
+    const view = await resumeLanWithFakeTimers(harness);
+    await flushComponentUi();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60_001);
+    });
+    lateStatus.resolve({
+      state: "ready",
+      bridgeInstalled: true,
+      bridgeActive: true,
+      avatarInstalled: true,
+      restartRequired: false,
+    });
+    await act(async () => {
+      await lateStatus.promise;
+    });
+    expect(
+      screen.queryByRole("button", { name: "Confirm and connect to this candidate" }),
+    ).toBeNull();
+
+    view.unmount();
+    window.localStorage.setItem(
+      ONBOARDING_STORAGE_KEY,
+      JSON.stringify({ version: 3, locale: "en", progressHint: "lan" }),
+    );
+    const second = createApiHarness({
+      pcl2: [pcl2Candidate],
+      lan: [[lanCandidate], []],
+      owner: {
+        revision: 1,
+        ownerUsername: "CurrentOwner",
+        configured: true,
+        presence: "unknown",
+      },
+      componentStatus: {
+        state: "bridge_not_installed",
+        bridgeInstalled: false,
+        bridgeActive: false,
+        avatarInstalled: false,
+        restartRequired: false,
+      },
+    });
+    second.installMinecraftComponents.mockImplementationOnce(() => lateInstall.promise);
+    render(<OnboardingPage api={second.api} locale="en" active onReady={vi.fn()} />);
+    await flushComponentUi();
+    const install = screen.getByRole("button", { name: "Install in this PCL2 instance" });
+    fireEvent.click(install);
+    await flushComponentUi();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60_001);
+    });
+    lateInstall.resolve({
+      state: "ready",
+      bridgeInstalled: true,
+      bridgeActive: true,
+      avatarInstalled: true,
+      restartRequired: false,
+    });
+    await act(async () => {
+      await lateInstall.promise;
+    });
+    expect(
+      screen.queryByRole("button", { name: "Confirm and connect to this candidate" }),
+    ).toBeNull();
+    expect(second.confirmLanCandidate).not.toHaveBeenCalled();
+    expect(second.start).not.toHaveBeenCalled();
   });
 
   it("polls after an empty LAN scan, reveals a later candidate, then waits for explicit confirmation", async () => {
@@ -1619,13 +1960,13 @@ describe("first-run onboarding", () => {
     });
 
     expect(harness.detectLanCandidates).toHaveBeenCalledTimes(1);
-    expect(screen.queryByText("Port 51321")).toBeNull();
+    expect(screen.queryByText("Detected local Minecraft instance")).toBeNull();
     await act(async () => {
       await vi.advanceTimersByTimeAsync(1_000);
     });
 
     expect(harness.detectLanCandidates).toHaveBeenCalledTimes(2);
-    expect(screen.getByText("Port 51321")).toBeTruthy();
+    expect(screen.getByText("Detected local Minecraft instance")).toBeTruthy();
     expect(harness.confirmLanCandidate).not.toHaveBeenCalled();
     expect(harness.start).not.toHaveBeenCalled();
     await act(async () => {
@@ -1668,7 +2009,7 @@ describe("first-run onboarding", () => {
     expect(harness.detectLanCandidates).toHaveBeenCalledTimes(2);
     expect(harness.confirmLanCandidate).not.toHaveBeenCalled();
     expect(harness.start).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole("button", { name: /Confirm and connect.*51321/u }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm and connect to this candidate" }));
     await act(async () => {
       await Promise.resolve();
     });
@@ -1696,7 +2037,7 @@ describe("first-run onboarding", () => {
     await resumeLanWithFakeTimers(harness);
 
     expect(harness.detectLanCandidates).toHaveBeenCalledTimes(1);
-    expect(screen.queryByText("Port 51321")).toBeNull();
+    expect(screen.queryByText("Detected local Minecraft instance")).toBeNull();
     await act(async () => {
       await vi.advanceTimersByTimeAsync(999);
     });
@@ -1750,7 +2091,7 @@ describe("first-run onboarding", () => {
       await vi.advanceTimersByTimeAsync(1_000);
     });
     expect(harness.detectLanCandidates).toHaveBeenCalledTimes(3);
-    expect(screen.getByText("Port 51321")).toBeTruthy();
+    expect(screen.getByText("Detected local Minecraft instance")).toBeTruthy();
   });
 
   it("cancels LAN polling and fences a late result when onboarding becomes inactive", async () => {
@@ -1776,7 +2117,7 @@ describe("first-run onboarding", () => {
       await vi.advanceTimersByTimeAsync(5_000);
     });
 
-    expect(screen.queryByText("Port 51321")).toBeNull();
+    expect(screen.queryByText("Detected local Minecraft instance")).toBeNull();
     expect(harness.detectLanCandidates).toHaveBeenCalledTimes(1);
   });
 
@@ -1821,7 +2162,7 @@ describe("first-run onboarding", () => {
       await vi.advanceTimersByTimeAsync(59_000);
     });
     expect(harness.detectLanCandidates).toHaveBeenCalledTimes(60);
-    expect(screen.queryByText("Port 51321")).toBeNull();
+    expect(screen.queryByText("Detected local Minecraft instance")).toBeNull();
     expect(vi.getTimerCount()).toBeGreaterThan(0);
 
     await act(async () => {
@@ -1833,7 +2174,7 @@ describe("first-run onboarding", () => {
       await vi.advanceTimersByTimeAsync(1);
     });
     expect(harness.detectLanCandidates).toHaveBeenCalledTimes(61);
-    expect(screen.getByText("Port 51321")).toBeTruthy();
+    expect(screen.getByText("Detected local Minecraft instance")).toBeTruthy();
     expect(harness.confirmLanCandidate).not.toHaveBeenCalled();
     expect(harness.start).not.toHaveBeenCalled();
     expect(vi.getTimerCount()).toBeGreaterThan(0);
@@ -1849,7 +2190,7 @@ describe("first-run onboarding", () => {
     const user = userEvent.setup();
     await reachLan(harness);
 
-    await user.click(await screen.findByRole("button", { name: /确认并连接.*51321/u }));
+    await user.click(await screen.findByRole("button", { name: "确认并连接这个候选项" }));
 
     expect(harness.confirmLanCandidate).toHaveBeenCalledWith("lan_candidate_0001");
     expect(harness.start).toHaveBeenCalledTimes(1);
@@ -1867,7 +2208,7 @@ describe("first-run onboarding", () => {
     const user = userEvent.setup();
     await reachLan(harness);
 
-    await user.click(await screen.findByRole("button", { name: /确认并连接.*51321/u }));
+    await user.click(await screen.findByRole("button", { name: "确认并连接这个候选项" }));
 
     expect(
       await screen.findByText("候选已过期。请重新开放 LAN，白百合会继续自动检测；也可手动刷新。"),
@@ -1887,7 +2228,7 @@ describe("first-run onboarding", () => {
     const user = userEvent.setup();
     await reachLan(harness);
 
-    await user.click(await screen.findByRole("button", { name: /确认并连接.*51321/u }));
+    await user.click(await screen.findByRole("button", { name: "确认并连接这个候选项" }));
 
     expect(
       await screen.findByText("无法连接 Minecraft，请确认世界仍开放 LAN 后重试。"),
@@ -1908,10 +2249,10 @@ describe("first-run onboarding", () => {
     const user = userEvent.setup();
     await reachLan(harness);
 
-    await user.click(await screen.findByRole("button", { name: /确认并连接.*51321/u }));
+    await user.click(await screen.findByRole("button", { name: "确认并连接这个候选项" }));
 
     expect(await screen.findByText("Minecraft 动作组件响应超时。")).toBeTruthy();
-    expect(screen.getByText("端口 51321")).toBeTruthy();
+    expect(screen.getByText("检测到本机 Minecraft 实例")).toBeTruthy();
     expect(harness.confirmLanCandidate).toHaveBeenCalledTimes(1);
     expect(harness.detectLanCandidates).toHaveBeenCalledTimes(1);
     expect(document.body.textContent).not.toContain(secret);
@@ -2127,6 +2468,23 @@ describe("safe onboarding error mapping", () => {
 });
 
 describe("LAN candidate presentation", () => {
+  it("does not call an unknown pending candidate a verified instance", () => {
+    render(
+      <LanCandidateCard
+        candidate={unknownLanCandidate}
+        locale="en"
+        pending
+        disabled
+        onConfirm={() => undefined}
+      />,
+    );
+
+    expect(
+      screen.queryByRole("button", { name: "Connecting to this verified instance" }),
+    ).toBeNull();
+    expect(screen.getByRole("button", { name: "Connecting to this candidate" })).toBeTruthy();
+  });
+
   it("does not crash when a validated safe-integer timestamp is outside the JavaScript Date range", () => {
     const extremeTimestampCandidate: LanCandidate = {
       ...lanCandidate,

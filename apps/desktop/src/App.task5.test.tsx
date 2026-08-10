@@ -62,6 +62,15 @@ function createAppApi(
     discoverPcl2: vi.fn(async () => []),
     detectLanCandidates: vi.fn(async () => []),
     confirmLanCandidate: vi.fn(),
+    getMinecraftComponentStatus: vi.fn(async () => ({
+      state: "ready" as const,
+      bridgeInstalled: true,
+      bridgeActive: true,
+      avatarInstalled: true,
+      restartRequired: false,
+    })),
+    installMinecraftComponents: vi.fn(),
+    removeMinecraftComponents: vi.fn(),
     subscribeRuntime: vi.fn((listener) => {
       runtimeListeners.add(listener);
       return () => runtimeListeners.delete(listener);
@@ -187,6 +196,15 @@ describe("Task 5 application routing", () => {
       discoverPcl2: vi.fn(async () => []),
       detectLanCandidates: vi.fn(async () => []),
       confirmLanCandidate: vi.fn(),
+      getMinecraftComponentStatus: vi.fn(async () => ({
+        state: "ready" as const,
+        bridgeInstalled: true,
+        bridgeActive: true,
+        avatarInstalled: true,
+        restartRequired: false,
+      })),
+      installMinecraftComponents: vi.fn(),
+      removeMinecraftComponents: vi.fn(),
       readOwnerIdentity: vi.fn(async () => owner("OldOwner")),
       updateOwnerIdentity: vi.fn(),
       subscribeOwnerIdentity: vi.fn(() => vi.fn()),
@@ -636,7 +654,7 @@ describe("Task 5 application routing", () => {
 
     await userEvent.click(
       await screen.findByRole("button", {
-        name: "Confirm and connect: port 51321, Minecraft 1.21.5",
+        name: "Confirm and connect to this candidate",
       }),
     );
     await screen.findByRole("heading", { name: "Runtime overview" });

@@ -78,14 +78,51 @@ export const en = {
   "onboarding.lan.instructionsTitle": "Open the world to LAN first",
   "onboarding.lan.instructionsBody":
     "Use PCL2 to launch Minecraft Java 1.21.5, enter the intended world, and open it to LAN manually. WhiteLily scans every second at first, then continues automatically at a lower frequency; manual refresh remains available.",
+  "onboarding.lan.candidate": "Detected local Minecraft instance",
   "onboarding.lan.port": "Port {port}",
   "onboarding.lan.version": "Minecraft {version}",
   "onboarding.lan.versionUnknown": "Minecraft version unknown",
   "onboarding.lan.observed": "Just discovered",
   "onboarding.lan.confirm": "Confirm and connect",
   "onboarding.lan.connecting": "Connecting",
-  "onboarding.lan.confirmCandidate": "Confirm and connect: port {port}, {version}",
-  "onboarding.lan.connectingCandidate": "Connecting: port {port}, {version}",
+  "onboarding.lan.confirmCandidate": "Confirm and connect to this candidate",
+  "onboarding.lan.connectingCandidate": "Connecting to this candidate",
+  "minecraft.components.title": "Minecraft components",
+  "minecraft.components.verifiedInstance": "Current verified PCL2 Fabric 1.21.5 instance",
+  "minecraft.components.scope":
+    "Changes apply only to this current verified instance and require a Minecraft restart.",
+  "minecraft.components.worldsUnchanged":
+    "Existing worlds are unchanged. Installation never confirms a LAN world or starts PCL2 or Minecraft.",
+  "minecraft.components.checking": "Checking Minecraft components",
+  "minecraft.components.notDetected":
+    "No current verified PCL2 Fabric 1.21.5 instance is available. Open a 1.21.5 Fabric world to LAN and refresh.",
+  "minecraft.components.operationFailed":
+    "The component operation could not be completed. Detect the current instance again.",
+  "minecraft.components.bridge": "WhiteLily Bridge",
+  "minecraft.components.avatar": "WhiteLily Avatar",
+  "minecraft.components.install": "Install in this PCL2 instance",
+  "minecraft.components.installing": "Installing components",
+  "minecraft.components.installBridge": "Install or update Bridge only",
+  "minecraft.components.installBridgeAvatar": "Install or update Bridge and Avatar",
+  "minecraft.components.removeAvatar": "Remove Avatar",
+  "minecraft.components.removeBridge": "Remove Bridge and Avatar",
+  "minecraft.components.refresh": "Detect current instance",
+  "minecraft.components.state.bridge_not_installed": "WhiteLily Bridge is not installed.",
+  "minecraft.components.state.bridge_restart_required":
+    "Restart Minecraft before confirming this LAN world.",
+  "minecraft.components.state.bridge_not_active":
+    "WhiteLily Bridge is installed but is not active in the current game session.",
+  "minecraft.components.state.bridge_version_unsupported":
+    "The installed WhiteLily Bridge version must be updated for Minecraft 1.21.5.",
+  "minecraft.components.state.instance_unsupported":
+    "This candidate is not a verified PCL2 Fabric 1.21.5 instance. Component installation is unavailable.",
+  "minecraft.components.state.bridge_file_conflict":
+    "A component file conflict prevents safe changes.",
+  "minecraft.components.state.avatar_not_installed":
+    "Bridge is ready. WhiteLily Avatar is optional and is not installed.",
+  "minecraft.components.state.avatar_restart_required":
+    "Restart Minecraft before using the updated WhiteLily Avatar.",
+  "minecraft.components.state.ready": "Ready",
   "onboarding.ready.title": "WhiteLily is ready",
   "onboarding.ready.body": "Opening the runtime overview.",
   "onboarding.refresh": "Refresh",

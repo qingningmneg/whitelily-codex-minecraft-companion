@@ -32,6 +32,11 @@ import type { DocumentEnvelope } from "../../../src/storage/documentStore.js";
 import type { SafetyPreset, WorldProfile } from "../../../src/world/worldProfileSchema.js";
 import type { Pcl2Candidate } from "../src-main/discovery/pcl2Discovery.js";
 import type { ConfirmedLanSession, LanCandidate } from "../src-main/discovery/lanDetector.js";
+import type {
+  MinecraftComponentId,
+  MinecraftComponentState,
+  MinecraftComponentStatus,
+} from "../src-main/minecraftComponents.js";
 
 export const WHITE_LILY_IPC_CHANNELS = {
   status: "whitelily:status",
@@ -50,6 +55,9 @@ export const WHITE_LILY_IPC_CHANNELS = {
   discoverPcl2: "whitelily:discover-pcl2",
   detectLanCandidates: "whitelily:detect-lan-candidates",
   confirmLanCandidate: "whitelily:confirm-lan-candidate",
+  getMinecraftComponentStatus: "whitelily:get-minecraft-component-status",
+  installMinecraftComponents: "whitelily:install-minecraft-components",
+  removeMinecraftComponents: "whitelily:remove-minecraft-components",
   bindConfirmedWorld: "whitelily:bind-confirmed-world",
   readProfile: "whitelily:read-profile",
   updateProfile: "whitelily:update-profile",
@@ -120,6 +128,15 @@ export interface WhiteLilyDesktopApi {
   discoverPcl2(): Promise<readonly Pcl2Candidate[]>;
   detectLanCandidates(): Promise<readonly LanCandidate[]>;
   confirmLanCandidate(candidateId: string): Promise<ConfirmedLanSession>;
+  getMinecraftComponentStatus(candidateId: string): Promise<MinecraftComponentStatus>;
+  installMinecraftComponents(
+    candidateId: string,
+    selection: readonly MinecraftComponentId[],
+  ): Promise<MinecraftComponentStatus>;
+  removeMinecraftComponents(
+    candidateId: string,
+    selection: readonly MinecraftComponentId[],
+  ): Promise<MinecraftComponentStatus>;
   bindConfirmedWorld?(input: {
     expectedRevision: number;
     label: string;
@@ -348,6 +365,32 @@ export function createWhiteLilyApi(transport: PreloadTransport): WhiteLilyAppApi
       if (!isLanCandidateId(candidateId)) throw new Error("invalid LAN candidate");
       return parseConfirmedLanSession(
         await transport.invoke(WHITE_LILY_IPC_CHANNELS.confirmLanCandidate, candidateId),
+      );
+    },
+    getMinecraftComponentStatus: async (...args: readonly unknown[]) => {
+      const candidateId = parseMinecraftComponentCandidateInput(args);
+      return parseMinecraftComponentStatus(
+        await transport.invoke(WHITE_LILY_IPC_CHANNELS.getMinecraftComponentStatus, candidateId),
+      );
+    },
+    installMinecraftComponents: async (...args: readonly unknown[]) => {
+      const { candidateId, selection } = parseMinecraftComponentOperationInput(args);
+      return parseMinecraftComponentStatus(
+        await transport.invoke(
+          WHITE_LILY_IPC_CHANNELS.installMinecraftComponents,
+          candidateId,
+          selection,
+        ),
+      );
+    },
+    removeMinecraftComponents: async (...args: readonly unknown[]) => {
+      const { candidateId, selection } = parseMinecraftComponentOperationInput(args);
+      return parseMinecraftComponentStatus(
+        await transport.invoke(
+          WHITE_LILY_IPC_CHANNELS.removeMinecraftComponents,
+          candidateId,
+          selection,
+        ),
       );
     },
     bindConfirmedWorld: async (input: { expectedRevision: number; label: string }) =>
@@ -836,7 +879,7 @@ function readExactPlainDataObject(
   let descriptors: PropertyDescriptorMap;
   try {
     prototype = Object.getPrototypeOf(value);
-    descriptors = Object.getOwnPropertyDescriptors(value);
+    descriptors = Object.getOwnPropertyDescriptors(value) as unknown as PropertyDescriptorMap;
   } catch {
     throw new Error("invalid owner identity input");
   }
@@ -963,6 +1006,173 @@ export function parseConfirmedLanSession(value: unknown): ConfirmedLanSession {
     version: session.version,
     confirmedAt: session.confirmedAt,
   });
+}
+
+export function parseMinecraftComponentStatus(value: unknown): MinecraftComponentStatus {
+  const fields = [
+    "state",
+    "bridgeInstalled",
+    "bridgeActive",
+    "avatarInstalled",
+    "restartRequired",
+  ] as const;
+  const record = readExactDataRecord(value, fields, "invalid Minecraft component status");
+  const state = record.state;
+  if (
+    !isMinecraftComponentState(state) ||
+    typeof record.bridgeInstalled !== "boolean" ||
+    typeof record.bridgeActive !== "boolean" ||
+    typeof record.avatarInstalled !== "boolean" ||
+    typeof record.restartRequired !== "boolean"
+  ) {
+    throw new Error("invalid Minecraft component status");
+  }
+  const status = {
+    state,
+    bridgeInstalled: record.bridgeInstalled,
+    bridgeActive: record.bridgeActive,
+    avatarInstalled: record.avatarInstalled,
+    restartRequired: record.restartRequired,
+  } satisfies MinecraftComponentStatus;
+  if (!isConsistentMinecraftComponentStatus(status)) {
+    throw new Error("invalid Minecraft component status");
+  }
+  return Object.freeze(status);
+}
+
+function parseMinecraftComponentCandidateInput(args: readonly unknown[]): string {
+  if (args.length !== 1 || !isLanCandidateId(args[0])) {
+    throw new Error("invalid Minecraft component input");
+  }
+  return args[0];
+}
+
+function parseMinecraftComponentOperationInput(args: readonly unknown[]): {
+  candidateId: string;
+  selection: readonly MinecraftComponentId[];
+} {
+  if (args.length !== 2 || !isLanCandidateId(args[0])) {
+    throw new Error("invalid Minecraft component input");
+  }
+  const selection = parseMinecraftComponentSelection(args[1]);
+  return Object.freeze({ candidateId: args[0], selection });
+}
+
+function parseMinecraftComponentSelection(value: unknown): readonly MinecraftComponentId[] {
+  if (!Array.isArray(value) || value.length > 2) {
+    throw new Error("invalid Minecraft component input");
+  }
+  let prototype: object | null;
+  let descriptors: PropertyDescriptorMap;
+  try {
+    prototype = Object.getPrototypeOf(value) as object | null;
+    descriptors = Object.getOwnPropertyDescriptors(value) as unknown as PropertyDescriptorMap;
+  } catch {
+    throw new Error("invalid Minecraft component input");
+  }
+  const expectedKeys = [
+    ...Array.from({ length: value.length }, (_unused, index) => String(index)),
+    "length",
+  ];
+  const keys = Reflect.ownKeys(descriptors);
+  if (
+    prototype !== Array.prototype ||
+    keys.length !== expectedKeys.length ||
+    keys.some((key) => typeof key !== "string" || !expectedKeys.includes(key)) ||
+    descriptors.length?.value !== value.length
+  ) {
+    throw new Error("invalid Minecraft component input");
+  }
+  const selected = new Set<MinecraftComponentId>();
+  const result: MinecraftComponentId[] = [];
+  for (let index = 0; index < value.length; index += 1) {
+    const descriptor = descriptors[String(index)];
+    if (!descriptor || !Object.hasOwn(descriptor, "value") || descriptor.enumerable !== true) {
+      throw new Error("invalid Minecraft component input");
+    }
+    const component = descriptor.value;
+    if (
+      (component !== "bridge" && component !== "avatar") ||
+      selected.has(component as MinecraftComponentId)
+    ) {
+      throw new Error("invalid Minecraft component input");
+    }
+    selected.add(component);
+    result.push(component);
+  }
+  return Object.freeze(result);
+}
+
+function readExactDataRecord<const K extends readonly string[]>(
+  value: unknown,
+  fields: K,
+  message: string,
+): { [P in K[number]]: unknown } {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error(message);
+  }
+  let prototype: object | null;
+  let descriptors: PropertyDescriptorMap;
+  try {
+    prototype = Object.getPrototypeOf(value) as object | null;
+    descriptors = Object.getOwnPropertyDescriptors(value);
+  } catch {
+    throw new Error(message);
+  }
+  const keys = Reflect.ownKeys(descriptors);
+  if (
+    prototype !== Object.prototype ||
+    keys.length !== fields.length ||
+    fields.some((field) => !Object.hasOwn(descriptors, field)) ||
+    keys.some((key) => typeof key !== "string" || !fields.includes(key))
+  ) {
+    throw new Error(message);
+  }
+  const result: Record<string, unknown> = {};
+  for (const field of fields) {
+    const descriptor = descriptors[field]!;
+    if (!Object.hasOwn(descriptor, "value") || descriptor.enumerable !== true) {
+      throw new Error(message);
+    }
+    result[field] = descriptor.value;
+  }
+  return result as { [P in K[number]]: unknown };
+}
+
+function isMinecraftComponentState(value: unknown): value is MinecraftComponentState {
+  return (
+    value === "bridge_not_installed" ||
+    value === "bridge_restart_required" ||
+    value === "bridge_not_active" ||
+    value === "bridge_version_unsupported" ||
+    value === "bridge_file_conflict" ||
+    value === "avatar_not_installed" ||
+    value === "avatar_restart_required" ||
+    value === "ready"
+  );
+}
+
+function isConsistentMinecraftComponentStatus(value: MinecraftComponentStatus): boolean {
+  const flags = `${Number(value.bridgeInstalled)}${Number(value.bridgeActive)}${Number(
+    value.avatarInstalled,
+  )}${Number(value.restartRequired)}`;
+  switch (value.state) {
+    case "bridge_not_installed":
+    case "bridge_file_conflict":
+      return flags === "0000";
+    case "bridge_version_unsupported":
+      return flags === "0000" || flags === "1000";
+    case "bridge_restart_required":
+      return flags === "1001";
+    case "bridge_not_active":
+      return flags === "1000";
+    case "avatar_not_installed":
+      return flags === "1100";
+    case "avatar_restart_required":
+      return flags === "1111";
+    case "ready":
+      return flags === "1110";
+  }
 }
 
 function isLanCandidateId(value: unknown): value is string {

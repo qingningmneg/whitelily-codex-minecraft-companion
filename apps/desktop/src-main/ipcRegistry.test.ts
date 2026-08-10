@@ -24,6 +24,7 @@ import { createMainWindowOptions } from "./main.js";
 import { ChildSupervisor, type ChildProcessPort, type SpawnChild } from "./childSupervisor.js";
 import { ExternalUrlPolicy } from "./externalUrlPolicy.js";
 import { registerIpcHandlers, type IpcMainPort, type IpcSupervisor } from "./ipcRegistry.js";
+import type { MinecraftComponentManager, MinecraftComponentStatus } from "./minecraftComponents.js";
 
 const idleSnapshot: RuntimeSnapshot = {
   revision: 0,
@@ -61,6 +62,14 @@ const lanCandidates = [
     expiresAt: 61_000,
   },
 ];
+
+const readyComponentStatus: MinecraftComponentStatus = {
+  state: "ready",
+  bridgeInstalled: true,
+  bridgeActive: true,
+  avatarInstalled: true,
+  restartRequired: false,
+};
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -232,6 +241,15 @@ function createRegistryHarness(snapshot: unknown = idleSnapshot) {
     },
   );
   const validateConfirmedSession = vi.fn(async () => true);
+  const getMinecraftComponentStatus = vi.fn<MinecraftComponentManager["status"]>(async () =>
+    structuredClone(readyComponentStatus),
+  );
+  const installMinecraftComponents = vi.fn<MinecraftComponentManager["install"]>(async () =>
+    structuredClone(readyComponentStatus),
+  );
+  const removeMinecraftComponents = vi.fn<MinecraftComponentManager["remove"]>(async () =>
+    structuredClone(readyComponentStatus),
+  );
   const cleanup = registerIpcHandlers({
     ipcMain,
     supervisor,
@@ -245,6 +263,11 @@ function createRegistryHarness(snapshot: unknown = idleSnapshot) {
       confirmLanCandidate,
       validateConfirmedSession,
       stop: vi.fn(),
+    },
+    minecraftComponentManager: {
+      status: getMinecraftComponentStatus,
+      install: installMinecraftComponents,
+      remove: removeMinecraftComponents,
     },
   });
   const invoke = (channel: string, ...args: unknown[]) => {
@@ -270,6 +293,9 @@ function createRegistryHarness(snapshot: unknown = idleSnapshot) {
     detectLanCandidates,
     confirmLanCandidate,
     validateConfirmedSession,
+    getMinecraftComponentStatus,
+    installMinecraftComponents,
+    removeMinecraftComponents,
     unsubscribeSupervisor,
   };
 }
@@ -297,6 +323,9 @@ describe("IPC registry", () => {
         WHITE_LILY_IPC_CHANNELS.discoverPcl2,
         WHITE_LILY_IPC_CHANNELS.detectLanCandidates,
         WHITE_LILY_IPC_CHANNELS.confirmLanCandidate,
+        WHITE_LILY_IPC_CHANNELS.getMinecraftComponentStatus,
+        WHITE_LILY_IPC_CHANNELS.installMinecraftComponents,
+        WHITE_LILY_IPC_CHANNELS.removeMinecraftComponents,
         WHITE_LILY_IPC_CHANNELS.bindConfirmedWorld,
         WHITE_LILY_IPC_CHANNELS.readProfile,
         WHITE_LILY_IPC_CHANNELS.updateProfile,
@@ -323,6 +352,119 @@ describe("IPC registry", () => {
     );
     expect(handlers.has("whitelily:execute")).toBe(false);
     expect(handlers.has("whitelily:open-external")).toBe(false);
+  });
+
+  it("accepts only opaque candidate IDs and duplicate-free bounded component selections", async () => {
+    const harness = createRegistryHarness();
+
+    await expect(
+      harness.invoke(WHITE_LILY_IPC_CHANNELS.getMinecraftComponentStatus, "lan_candidate_1234"),
+    ).resolves.toEqual(readyComponentStatus);
+    await expect(
+      harness.invoke(WHITE_LILY_IPC_CHANNELS.installMinecraftComponents, "lan_candidate_1234", [
+        "bridge",
+        "avatar",
+      ]),
+    ).resolves.toEqual(readyComponentStatus);
+    await expect(
+      harness.invoke(WHITE_LILY_IPC_CHANNELS.removeMinecraftComponents, "lan_candidate_1234", [
+        "avatar",
+        "bridge",
+      ]),
+    ).resolves.toEqual(readyComponentStatus);
+
+    expect(harness.getMinecraftComponentStatus).toHaveBeenCalledWith("lan_candidate_1234");
+    expect(harness.installMinecraftComponents).toHaveBeenCalledWith("lan_candidate_1234", [
+      "bridge",
+      "avatar",
+    ]);
+    expect(harness.removeMinecraftComponents).toHaveBeenCalledWith("lan_candidate_1234", [
+      "avatar",
+      "bridge",
+    ]);
+
+    const selectionWithExtraKey = ["bridge"] as string[] & { path?: string };
+    selectionWithExtraKey.path = String.raw`C:\Private\mods`;
+    let selectionGetterCalls = 0;
+    const accessorSelection: unknown[] = [];
+    Object.defineProperty(accessorSelection, "0", {
+      enumerable: true,
+      get: () => {
+        selectionGetterCalls += 1;
+        return "bridge";
+      },
+    });
+    const invalidStatusInputs: readonly (readonly unknown[])[] = [
+      [],
+      [""],
+      ["short"],
+      ["x".repeat(65)],
+      [String.raw`C:\Private\mods`],
+      ["../mods/lan_candidate_1234"],
+      ["lan_candidate_1234", { path: String.raw`C:\Private\mods` }],
+    ];
+    for (const input of invalidStatusInputs) {
+      await expect(
+        harness.invoke(WHITE_LILY_IPC_CHANNELS.getMinecraftComponentStatus, ...input),
+      ).rejects.toThrow("invalid IPC input");
+    }
+    const invalidSelections: readonly unknown[] = [
+      "bridge",
+      ["bridge", "bridge"],
+      ["avatar", "avatar"],
+      ["bridge", "avatar", "bridge"],
+      ["fabric-api"],
+      [{ path: String.raw`C:\Private\mods` }],
+      selectionWithExtraKey,
+      accessorSelection,
+      Object.setPrototypeOf(["bridge"], null),
+    ];
+    for (const selection of invalidSelections) {
+      await expect(
+        harness.invoke(
+          WHITE_LILY_IPC_CHANNELS.installMinecraftComponents,
+          "lan_candidate_1234",
+          selection,
+        ),
+      ).rejects.toThrow("invalid IPC input");
+    }
+    await expect(
+      harness.invoke(
+        WHITE_LILY_IPC_CHANNELS.installMinecraftComponents,
+        "lan_candidate_1234",
+        ["bridge"],
+        { resourceDirectory: String.raw`C:\Private\resources` },
+      ),
+    ).rejects.toThrow("invalid IPC input");
+    await expect(
+      harness.invoke(
+        WHITE_LILY_IPC_CHANNELS.removeMinecraftComponents,
+        "lan_candidate_1234",
+        ["avatar"],
+        { presenceDirectory: String.raw`C:\Private\presence` },
+      ),
+    ).rejects.toThrow("invalid IPC input");
+    expect(selectionGetterCalls).toBe(0);
+    expect(harness.installMinecraftComponents).toHaveBeenCalledTimes(1);
+    expect(harness.removeMinecraftComponents).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects malformed manager results before they cross the main boundary", async () => {
+    const harness = createRegistryHarness();
+    const malformed: readonly unknown[] = [
+      null,
+      { ...readyComponentStatus, path: String.raw`C:\Private\mods` },
+      { ...readyComponentStatus, state: "arbitrary" },
+      { ...readyComponentStatus, bridgeInstalled: "yes" },
+      { ...readyComponentStatus, restartRequired: true },
+    ];
+
+    for (const value of malformed) {
+      harness.getMinecraftComponentStatus.mockResolvedValueOnce(value as MinecraftComponentStatus);
+      await expect(
+        harness.invoke(WHITE_LILY_IPC_CHANNELS.getMinecraftComponentStatus, "lan_candidate_1234"),
+      ).rejects.toThrow("invalid Minecraft component status");
+    }
   });
 
   it("keeps startup, close-to-tray, and safe export as narrow main-process controls", async () => {
@@ -1256,6 +1398,9 @@ describe("IPC registry", () => {
         WHITE_LILY_IPC_CHANNELS.discoverPcl2,
         WHITE_LILY_IPC_CHANNELS.detectLanCandidates,
         WHITE_LILY_IPC_CHANNELS.confirmLanCandidate,
+        WHITE_LILY_IPC_CHANNELS.getMinecraftComponentStatus,
+        WHITE_LILY_IPC_CHANNELS.installMinecraftComponents,
+        WHITE_LILY_IPC_CHANNELS.removeMinecraftComponents,
         WHITE_LILY_IPC_CHANNELS.bindConfirmedWorld,
         WHITE_LILY_IPC_CHANNELS.readProfile,
         WHITE_LILY_IPC_CHANNELS.updateProfile,
@@ -1411,6 +1556,19 @@ describe("typed preload API", () => {
             confirmedAt: 1_000,
           };
         }
+        if (
+          channel === WHITE_LILY_IPC_CHANNELS.getMinecraftComponentStatus ||
+          channel === WHITE_LILY_IPC_CHANNELS.installMinecraftComponents ||
+          channel === WHITE_LILY_IPC_CHANNELS.removeMinecraftComponents
+        ) {
+          return {
+            state: "ready",
+            bridgeInstalled: true,
+            bridgeActive: true,
+            avatarInstalled: true,
+            restartRequired: false,
+          };
+        }
         if (channel === WHITE_LILY_IPC_CHANNELS.readOwnerIdentity) {
           return ownerAuthoritySnapshot;
         }
@@ -1445,6 +1603,9 @@ describe("typed preload API", () => {
         "discoverPcl2",
         "detectLanCandidates",
         "confirmLanCandidate",
+        "getMinecraftComponentStatus",
+        "installMinecraftComponents",
+        "removeMinecraftComponents",
         "bindConfirmedWorld",
         "readProfile",
         "updateProfile",
@@ -1488,6 +1649,15 @@ describe("typed preload API", () => {
       status: "confirmed",
       port: 51321,
     });
+    await expect(api.getMinecraftComponentStatus("lan_candidate_1234")).resolves.toMatchObject({
+      state: "ready",
+    });
+    await expect(
+      api.installMinecraftComponents("lan_candidate_1234", ["bridge", "avatar"]),
+    ).resolves.toMatchObject({ state: "ready" });
+    await expect(
+      api.removeMinecraftComponents("lan_candidate_1234", ["avatar"]),
+    ).resolves.toMatchObject({ state: "ready" });
     expect(invoked).toEqual([
       WHITE_LILY_IPC_CHANNELS.status,
       WHITE_LILY_IPC_CHANNELS.start,
@@ -1505,6 +1675,9 @@ describe("typed preload API", () => {
       WHITE_LILY_IPC_CHANNELS.discoverPcl2,
       WHITE_LILY_IPC_CHANNELS.detectLanCandidates,
       WHITE_LILY_IPC_CHANNELS.confirmLanCandidate,
+      WHITE_LILY_IPC_CHANNELS.getMinecraftComponentStatus,
+      WHITE_LILY_IPC_CHANNELS.installMinecraftComponents,
+      WHITE_LILY_IPC_CHANNELS.removeMinecraftComponents,
     ]);
     expect(api).not.toHaveProperty("invoke");
     expect(api).not.toHaveProperty("send");

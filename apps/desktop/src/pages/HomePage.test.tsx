@@ -150,6 +150,15 @@ function createApiHarness(
         version: "unknown",
         confirmedAt: 1_000,
       })),
+      getMinecraftComponentStatus: vi.fn(async () => ({
+        state: "ready" as const,
+        bridgeInstalled: true,
+        bridgeActive: true,
+        avatarInstalled: true,
+        restartRequired: false,
+      })),
+      installMinecraftComponents: vi.fn(),
+      removeMinecraftComponents: vi.fn(),
       subscribeRuntime: (nextListener) => {
         listener = nextListener;
         return unsubscribe;
@@ -990,6 +999,15 @@ describe("bilingual control-center home", () => {
           version: "unknown",
           confirmedAt: 1_000,
         })),
+        getMinecraftComponentStatus: vi.fn(async () => ({
+          state: "ready" as const,
+          bridgeInstalled: true,
+          bridgeActive: true,
+          avatarInstalled: true,
+          restartRequired: false,
+        })),
+        installMinecraftComponents: vi.fn(),
+        removeMinecraftComponents: vi.fn(),
         subscribeRuntime: () => {
           const unsubscribe = vi.fn();
           cleanups.push(unsubscribe);
