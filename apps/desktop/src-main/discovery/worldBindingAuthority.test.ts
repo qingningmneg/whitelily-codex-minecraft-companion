@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 import {
+  assertWindowsPathsAreOrdinary,
   parseJavaProcessSnapshotOutput,
   WorldBindingAuthority,
   type JavaProcessSnapshot,
@@ -52,6 +53,25 @@ async function configPath(): Promise<string> {
 }
 
 describe("WorldBindingAuthority", () => {
+  it.skipIf(process.platform !== "win32")(
+    "rejects a real junction through the handle-bound Windows reparse attribute check",
+    async () => {
+      const root = await mkdtemp(join(tmpdir(), "whitelily-reparse-attributes-"));
+      const ordinary = join(root, "ordinary");
+      const junction = join(root, "junction");
+      try {
+        await mkdir(ordinary);
+        await symlink(ordinary, junction, "junction");
+        await expect(assertWindowsPathsAreOrdinary([ordinary])).resolves.toBeUndefined();
+        await expect(assertWindowsPathsAreOrdinary([junction])).rejects.toThrow(
+          "Windows reparse boundary",
+        );
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
   it("fails closed when the PowerShell snapshot is not valid UTF-8", () => {
     expect(() => parseJavaProcessSnapshotOutput(Buffer.from([0xc3, 0x28]))).toThrow(
       "invalid Java process snapshot encoding",
@@ -136,7 +156,7 @@ describe("WorldBindingAuthority", () => {
       } finally {
         javaProcess.kill();
         await once(javaProcess, "exit");
-        await rm(root, { recursive: true, force: true });
+        await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
       }
     },
   );

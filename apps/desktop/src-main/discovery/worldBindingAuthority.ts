@@ -6,6 +6,9 @@ import { loadConfig } from "../../../../src/config/loadConfig.js";
 import type { ConfirmedWorldBinding } from "../../../../src/world/worldProfileStore.js";
 import type { ConfirmedConnectionProof, LanDetector } from "./lanDetector.js";
 import type { LanObservation } from "./lanCandidateStore.js";
+import { assertWindowsPathsAreOrdinary } from "./windowsReparseProbe.js";
+
+export { assertWindowsPathsAreOrdinary } from "./windowsReparseProbe.js";
 
 const execFile = promisify(nodeExecFile);
 const MAX_JAVA_PROCESS_SNAPSHOT_BYTES = 65_536;
@@ -188,10 +191,12 @@ async function resolveJavaGameDirectory(snapshot: JavaProcessSnapshot): Promise<
   if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
     throw new Error("Minecraft instance path is invalid");
   }
+  await assertWindowsPathsAreOrdinary([resolved]);
   const canonical = await realpath(requested);
   if (!samePath(resolve(canonical), resolved)) {
     throw new Error("Minecraft instance path is invalid");
   }
+  await assertWindowsPathsAreOrdinary([resolved]);
   return resolve(canonical);
 }
 

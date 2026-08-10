@@ -1,16 +1,34 @@
 import { createHash } from "node:crypto";
 import { type BigIntStats } from "node:fs";
-import { lstat, open, readFile, realpath, rename, unlink } from "node:fs/promises";
+import { link, lstat, open, readFile, realpath, unlink } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
-import { inflateRawSync } from "node:zlib";
 import type { LanDetector } from "./discovery/lanDetector.js";
 import type { LanObservation } from "./discovery/lanCandidateStore.js";
 import type {
   ResolvedJavaInstance,
   WorldBindingAuthority,
 } from "./discovery/worldBindingAuthority.js";
+import { assertWindowsPathsAreOrdinary } from "./discovery/worldBindingAuthority.js";
+import {
+  readFabricMetadata,
+  validateMinecraftComponentManifest,
+  type MinecraftComponentArtifact,
+  type MinecraftComponentArtifactVersion,
+  type MinecraftComponentId,
+  type MinecraftComponentResourceManifest,
+} from "./minecraftComponentManifest.js";
+import {
+  assertFabricLoaderIdentity,
+  verifyFabricLoader,
+  type FabricLoaderIdentity,
+} from "./minecraftFabricLoaderAuthority.js";
 
-export type MinecraftComponentId = "bridge" | "avatar";
+export type {
+  MinecraftComponentArtifact,
+  MinecraftComponentArtifactVersion,
+  MinecraftComponentId,
+  MinecraftComponentResourceManifest,
+} from "./minecraftComponentManifest.js";
 export type MinecraftComponentState =
   | "bridge_not_installed"
   | "bridge_restart_required"
@@ -41,25 +59,6 @@ export interface MinecraftComponentManager {
   ): Promise<MinecraftComponentStatus>;
 }
 
-export interface MinecraftComponentArtifactVersion {
-  readonly fileName: string;
-  readonly bytes: number;
-  readonly sha256: string;
-  readonly modId: string;
-  readonly version: string;
-}
-
-export interface MinecraftComponentArtifact extends MinecraftComponentArtifactVersion {
-  readonly component: MinecraftComponentId;
-  readonly prior: readonly MinecraftComponentArtifactVersion[];
-}
-
-export interface MinecraftComponentResourceManifest {
-  readonly schemaVersion: 1;
-  readonly minecraftVersion: "1.21.5";
-  readonly artifacts: readonly MinecraftComponentArtifact[];
-}
-
 export interface MinecraftComponentManagerOptions {
   readonly lanDetector: Pick<LanDetector, "inspectCandidate">;
   readonly worldBindingAuthority: Pick<WorldBindingAuthority, "resolveJavaInstance">;
@@ -68,19 +67,8 @@ export interface MinecraftComponentManagerOptions {
   readonly manifest: MinecraftComponentResourceManifest;
 }
 
-const MAX_ARTIFACT_BYTES = 64 * 1024 * 1024;
-const MAX_ARTIFACTS = 8;
-const MAX_PRIOR_VERSIONS = 4;
-const MAX_ZIP_ENTRIES = 4_096;
-const MAX_FABRIC_METADATA_BYTES = 64 * 1024;
 const MAX_PRESENCE_BYTES = 4_096;
-const HASH_PATTERN = /^[a-f0-9]{64}$/u;
-const VERSION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9.+_-]{0,63}$/u;
 const FILE_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9.+_-]{0,127}\.jar$/u;
-const FABRIC_CLIENT_PATTERN =
-  /(?:^|\s)"?net\.fabricmc\.loader\.impl\.launch\.knot\.KnotClient"?(?=\s|$)/u;
-const FABRIC_CLASSPATH_PATTERN =
-  /(?:^|\s)(?:-cp|-classpath)\s+(?:"[^"]*fabric-loader[^"]*"|[^\s"]*fabric-loader[^\s"]*)(?=\s|$)/iu;
 const strictUtf8Decoder = new TextDecoder("utf-8", { fatal: true });
 
 type ComponentFailureCode =
@@ -145,9 +133,12 @@ interface AuthorizedInstance {
 export function createMinecraftComponentManager(
   options: MinecraftComponentManagerOptions,
 ): MinecraftComponentManager {
+  if (process.platform !== "win32" || process.arch !== "x64") {
+    throw new ComponentFailure("MINECRAFT_COMPONENT_AUTHORITY_INVALID");
+  }
   let manifest: MinecraftComponentResourceManifest;
   try {
-    manifest = validateManifest(options.manifest);
+    manifest = validateMinecraftComponentManifest(options.manifest);
   } catch {
     throw new ComponentFailure("MINECRAFT_COMPONENT_MANIFEST_INVALID");
   }
@@ -180,6 +171,7 @@ class MainMinecraftComponentManager implements MinecraftComponentManager {
   ): Promise<MinecraftComponentStatus> {
     return this.#serialize(async () => {
       const selected = validateSelection(selection);
+      if (selected.has("avatar")) selected.add("bridge");
       const authorized = await this.#authorize(candidateId);
       if (!authorized.supported || authorized.inventory.drifted) {
         return this.#toStatus(authorized);
@@ -188,7 +180,10 @@ class MainMinecraftComponentManager implements MinecraftComponentManager {
         return this.#toStatus(authorized);
       }
       try {
-        for (const item of authorized.inventory.artifacts) {
+        const dependencySafeOrder = [...authorized.inventory.artifacts].sort(
+          (left, right) => installRank(left.artifact) - installRank(right.artifact),
+        );
+        for (const item of dependencySafeOrder) {
           if (!selected.has(item.artifact.component) || item.state === "current") continue;
           await this.#publishArtifact(authorized, item);
         }
@@ -206,6 +201,7 @@ class MainMinecraftComponentManager implements MinecraftComponentManager {
   ): Promise<MinecraftComponentStatus> {
     return this.#serialize(async () => {
       const selected = validateSelection(selection);
+      if (selected.has("bridge")) selected.add("avatar");
       const authorized = await this.#authorize(candidateId);
       if (!authorized.supported || authorized.inventory.drifted) {
         return this.#toStatus(authorized);
@@ -214,15 +210,11 @@ class MainMinecraftComponentManager implements MinecraftComponentManager {
         return this.#toStatus(authorized);
       }
       try {
-        for (const item of authorized.inventory.artifacts) {
-          if (
-            !selected.has(item.artifact.component) ||
-            !(
-              item.artifact.modId === "whitelily_bridge" ||
-              item.artifact.modId === "whitelily_avatar"
-            ) ||
-            item.selected === undefined
-          ) {
+        const dependencyFirst = [...authorized.inventory.artifacts].sort(
+          (left, right) => removeRank(left.artifact) - removeRank(right.artifact),
+        );
+        for (const item of dependencyFirst) {
+          if (!selected.has(item.artifact.component) || item.selected === undefined) {
             continue;
           }
           await this.#removeExactArtifact(authorized, item);
@@ -242,15 +234,11 @@ class MainMinecraftComponentManager implements MinecraftComponentManager {
   async #authorize(candidateId: string): Promise<AuthorizedInstance> {
     let before: Readonly<LanObservation>;
     let instance: ResolvedJavaInstance;
+    let loader: FabricLoaderIdentity;
     try {
       before = await this.#lanDetector.inspectCandidate(candidateId);
       instance = await this.#worldBindingAuthority.resolveJavaInstance(before);
-      if (
-        !FABRIC_CLIENT_PATTERN.test(instance.snapshot.commandLine) ||
-        !FABRIC_CLASSPATH_PATTERN.test(instance.snapshot.commandLine)
-      ) {
-        throw new Error("invalid");
-      }
+      loader = await verifyFabricLoader(instance.snapshot.commandLine);
     } catch {
       throw new ComponentFailure("MINECRAFT_COMPONENT_AUTHORITY_INVALID");
     }
@@ -258,6 +246,7 @@ class MainMinecraftComponentManager implements MinecraftComponentManager {
     if (!supported) {
       let after: Readonly<LanObservation>;
       try {
+        await assertWindowsPathsAreOrdinary([loader.path]);
         after = await this.#lanDetector.inspectCandidate(candidateId);
       } catch {
         throw new ComponentFailure("MINECRAFT_COMPONENT_AUTHORITY_INVALID");
@@ -265,6 +254,7 @@ class MainMinecraftComponentManager implements MinecraftComponentManager {
       if (!sameObservation(before, after)) {
         throw new ComponentFailure("MINECRAFT_COMPONENT_AUTHORITY_INVALID");
       }
+      await assertFabricLoaderIdentity(loader);
       const unavailable = await unavailableAuthorizedInstance(instance);
       return unavailable;
     }
@@ -274,8 +264,19 @@ class MainMinecraftComponentManager implements MinecraftComponentManager {
     let resourceDirectory: DirectoryIdentity;
     let firstInventory: Inventory;
     try {
+      const modsPath = join(instance.canonicalInstancePath, "mods");
+      const resourcePaths = this.#manifest.artifacts.map((artifact) =>
+        containedFile(this.#resourceDirectory, artifact.fileName),
+      );
+      await assertWindowsPathsAreOrdinary([
+        instance.canonicalInstancePath,
+        modsPath,
+        this.#resourceDirectory,
+        loader.path,
+        ...resourcePaths,
+        ...(await existingArtifactPaths(modsPath, this.#manifest)),
+      ]);
       gameDirectory = await captureDirectory(instance.canonicalInstancePath);
-      const modsPath = join(gameDirectory.path, "mods");
       if (relative(gameDirectory.path, modsPath) !== "mods") throw new Error("invalid");
       modsDirectory = await captureDirectory(modsPath);
       resourceDirectory = await this.#verifyResources();
@@ -289,9 +290,20 @@ class MainMinecraftComponentManager implements MinecraftComponentManager {
     try {
       after = await this.#lanDetector.inspectCandidate(candidateId);
       if (!sameObservation(before, after)) throw new Error("invalid");
+      await assertFabricLoaderIdentity(loader);
       await assertDirectoryIdentity(gameDirectory);
       await assertDirectoryIdentity(modsDirectory);
       await assertDirectoryIdentity(resourceDirectory);
+      await assertWindowsPathsAreOrdinary([
+        gameDirectory.path,
+        modsDirectory.path,
+        resourceDirectory.path,
+        loader.path,
+        ...this.#manifest.artifacts.map((artifact) =>
+          containedFile(resourceDirectory.path, artifact.fileName),
+        ),
+        ...(await existingArtifactPaths(modsDirectory.path, this.#manifest)),
+      ]);
       const secondInventory = await scanInventory(modsDirectory.path, this.#manifest);
       return {
         instance,
@@ -342,6 +354,13 @@ class MainMinecraftComponentManager implements MinecraftComponentManager {
     let published = false;
     let handle: Awaited<ReturnType<typeof open>> | undefined;
     try {
+      await assertWindowsPathsAreOrdinary([
+        authorized.gameDirectory.path,
+        mods.path,
+        authorized.resourceDirectory.path,
+        containedFile(this.#resourceDirectory, artifact.fileName),
+        ...(prior === undefined ? [] : [prior.path]),
+      ]);
       await assertDirectoryIdentity(authorized.gameDirectory);
       await assertDirectoryIdentity(mods);
       await requireMissing(temporaryPath);
@@ -355,19 +374,29 @@ class MainMinecraftComponentManager implements MinecraftComponentManager {
       );
       await assertDirectoryIdentity(authorized.resourceDirectory);
       handle = await open(temporaryPath, "wx", 0o600);
+      const openedTemporary = await handle.stat({ bigint: true });
+      if (
+        !openedTemporary.isFile() ||
+        openedTemporary.nlink !== 1n ||
+        openedTemporary.size !== 0n
+      ) {
+        throw new Error("invalid");
+      }
+      temporaryIdentity = fileIdentity(openedTemporary);
       await handle.writeFile(source);
       await handle.sync();
       await handle.close();
       handle = undefined;
       const temporary = await inspectArtifactPath(temporaryPath, artifact);
-      if (temporary.kind !== "exact") throw new Error("invalid");
-      temporaryIdentity = temporary.identity;
+      if (temporary.kind !== "exact" || !sameIdentity(temporary.identity, temporaryIdentity)) {
+        throw new Error("invalid");
+      }
       await assertDirectoryIdentity(mods);
 
       if (prior !== undefined && backupPath !== undefined) {
         await requireMissing(backupPath);
         await assertExactInspection(prior, artifact.prior);
-        await rename(prior.path, backupPath);
+        await moveFileNoReplace(prior.path, backupPath, prior.identity);
         priorMoved = true;
         await assertIdentityAtPath(backupPath, prior.identity);
         await requireMissing(prior.path);
@@ -375,9 +404,15 @@ class MainMinecraftComponentManager implements MinecraftComponentManager {
 
       await assertDirectoryIdentity(authorized.gameDirectory);
       await assertDirectoryIdentity(mods);
+      await assertWindowsPathsAreOrdinary([
+        authorized.gameDirectory.path,
+        mods.path,
+        temporaryPath,
+        ...(priorMoved && backupPath !== undefined ? [backupPath] : []),
+      ]);
       await requireMissing(targetPath);
       await assertIdentityAtPath(temporaryPath, temporaryIdentity);
-      await rename(temporaryPath, targetPath);
+      await moveFileNoReplace(temporaryPath, targetPath, temporaryIdentity);
       published = true;
       await assertIdentityAtPath(targetPath, temporaryIdentity);
       const installed = await inspectArtifactPath(targetPath, artifact);
@@ -473,9 +508,11 @@ class MainMinecraftComponentManager implements MinecraftComponentManager {
     bridge: MinecraftComponentArtifact,
   ): Promise<boolean> {
     try {
+      await assertWindowsPathsAreOrdinary([this.#presenceDirectory]);
       const directory = await captureDirectory(this.#presenceDirectory);
       const path = containedPresenceFile(directory.path, instance.javaSession.pid);
       const before = await ordinaryFile(path, MAX_PRESENCE_BYTES);
+      await assertWindowsPathsAreOrdinary([directory.path, path]);
       const bytes = await readFile(path);
       const after = await ordinaryFile(path, MAX_PRESENCE_BYTES);
       await assertDirectoryIdentity(directory);
@@ -570,106 +607,14 @@ function validateSelection(selection: readonly MinecraftComponentId[]): Set<Mine
   return selected;
 }
 
-function validateManifest(value: unknown): MinecraftComponentResourceManifest {
-  if (
-    !isRecord(value) ||
-    !hasExactKeys(value, ["schemaVersion", "minecraftVersion", "artifacts"]) ||
-    value.schemaVersion !== 1 ||
-    value.minecraftVersion !== "1.21.5" ||
-    !Array.isArray(value.artifacts) ||
-    value.artifacts.length < 2 ||
-    value.artifacts.length > MAX_ARTIFACTS
-  ) {
-    throw new Error("invalid");
-  }
-  const names = new Set<string>();
-  const artifacts = value.artifacts.map((entry) => {
-    if (
-      !isRecord(entry) ||
-      !hasExactKeys(entry, [
-        "component",
-        "fileName",
-        "bytes",
-        "sha256",
-        "modId",
-        "version",
-        "prior",
-      ]) ||
-      (entry.component !== "bridge" && entry.component !== "avatar") ||
-      !Array.isArray(entry.prior) ||
-      entry.prior.length > MAX_PRIOR_VERSIONS
-    ) {
-      throw new Error("invalid");
-    }
-    const current = validateArtifactVersion(entry);
-    const prior = entry.prior.map((item) => {
-      if (
-        !isRecord(item) ||
-        !hasExactKeys(item, ["fileName", "bytes", "sha256", "modId", "version"])
-      ) {
-        throw new Error("invalid");
-      }
-      return validateArtifactVersion(item);
-    });
-    if (prior.some((item) => item.modId !== current.modId)) throw new Error("invalid");
-    for (const item of [current, ...prior]) {
-      if (names.has(item.fileName)) throw new Error("invalid");
-      names.add(item.fileName);
-    }
-    return Object.freeze({ component: entry.component, ...current, prior: Object.freeze(prior) });
-  });
-  const bridgeArtifacts = artifacts.filter(({ component }) => component === "bridge");
-  const avatarArtifacts = artifacts.filter(({ component }) => component === "avatar");
-  if (
-    bridgeArtifacts.length !== 1 ||
-    bridgeArtifacts[0]?.modId !== "whitelily_bridge" ||
-    !/^whitelily-bridge-fabric-1\.21\.5-[A-Za-z0-9.+_-]+\.jar$/u.test(
-      bridgeArtifacts[0].fileName,
-    ) ||
-    avatarArtifacts.length < 1 ||
-    avatarArtifacts.filter(({ modId }) => modId === "whitelily_avatar").length !== 1 ||
-    !avatarArtifacts
-      .filter(({ modId }) => modId === "whitelily_avatar")
-      .every(({ fileName }) =>
-        /^whitelily-avatar-fabric-1\.21\.5-[A-Za-z0-9.+_-]+\.jar$/u.test(fileName),
-      ) ||
-    new Set(artifacts.map(({ modId }) => modId)).size !== artifacts.length
-  ) {
-    throw new Error("invalid");
-  }
-  return Object.freeze({
-    schemaVersion: 1,
-    minecraftVersion: "1.21.5",
-    artifacts: Object.freeze(artifacts),
-  });
+function installRank(artifact: MinecraftComponentArtifact): number {
+  if (artifact.component === "bridge") return 0;
+  return artifact.modId === "whitelily_avatar" ? 2 : 1;
 }
 
-function validateArtifactVersion(
-  value: Record<string, unknown>,
-): MinecraftComponentArtifactVersion {
-  if (
-    typeof value.fileName !== "string" ||
-    !FILE_NAME_PATTERN.test(value.fileName) ||
-    typeof value.bytes !== "number" ||
-    !Number.isSafeInteger(value.bytes) ||
-    value.bytes < 1 ||
-    value.bytes > MAX_ARTIFACT_BYTES ||
-    typeof value.sha256 !== "string" ||
-    !HASH_PATTERN.test(value.sha256) ||
-    typeof value.modId !== "string" ||
-    !/^[a-z][a-z0-9_-]{1,63}$/u.test(value.modId) ||
-    typeof value.version !== "string" ||
-    !VERSION_PATTERN.test(value.version)
-  ) {
-    throw new Error("invalid");
-  }
-  return Object.freeze({
-    fileName: value.fileName,
-    bytes: value.bytes,
-    sha256: value.sha256,
-    modId: value.modId,
-    version: value.version,
-  });
+function removeRank(artifact: MinecraftComponentArtifact): number {
+  if (artifact.modId === "whitelily_avatar") return 0;
+  return artifact.component === "avatar" ? 1 : 2;
 }
 
 async function scanInventory(
@@ -713,6 +658,25 @@ async function scanInventory(
     fingerprint: fingerprints.join("|"),
     drifted: false,
   };
+}
+
+async function existingArtifactPaths(
+  modsDirectory: string,
+  manifest: MinecraftComponentResourceManifest,
+): Promise<readonly string[]> {
+  const paths: string[] = [];
+  for (const artifact of manifest.artifacts) {
+    for (const version of [artifact, ...artifact.prior]) {
+      const path = containedFile(modsDirectory, version.fileName);
+      try {
+        await lstat(path);
+        paths.push(path);
+      } catch (error) {
+        if (!isNodeError(error) || error.code !== "ENOENT") throw error;
+      }
+    }
+  }
+  return paths;
 }
 
 async function inspectArtifactPath(
@@ -813,7 +777,7 @@ async function rollbackArtifact(options: {
     try {
       await requireMissing(options.prior.path);
       await assertIdentityAtPath(options.backupPath, options.prior.identity);
-      await rename(options.backupPath, options.prior.path);
+      await moveFileNoReplace(options.backupPath, options.prior.path, options.prior.identity);
       await assertIdentityAtPath(options.prior.path, options.prior.identity);
     } catch {
       succeeded = false;
@@ -834,6 +798,84 @@ async function unlinkIfIdentity(path: string, identity: FileIdentity): Promise<b
     return true;
   } catch (error) {
     return isNodeError(error) && error.code === "ENOENT";
+  }
+}
+
+async function moveFileNoReplace(
+  sourcePath: string,
+  destinationPath: string,
+  identity: FileIdentity,
+): Promise<void> {
+  await assertIdentityAtPath(sourcePath, identity);
+  await link(sourcePath, destinationPath);
+  try {
+    await assertLinkedIdentityAtPath(sourcePath, identity);
+    await assertLinkedIdentityAtPath(destinationPath, identity);
+    await unlink(sourcePath);
+  } catch (error) {
+    if (
+      (await hasLinkedIdentityAtPath(sourcePath, identity)) &&
+      (await hasLinkedIdentityAtPath(destinationPath, identity))
+    ) {
+      await unlinkIfIdentity(destinationPath, identity);
+    }
+    if (
+      (await isMissingPath(sourcePath)) &&
+      (await hasSingleIdentityAtPath(destinationPath, identity))
+    ) {
+      return;
+    }
+    throw error;
+  }
+}
+
+async function hasLinkedIdentityAtPath(path: string, expected: FileIdentity): Promise<boolean> {
+  try {
+    const metadata = await lstat(path, { bigint: true });
+    return (
+      metadata.isFile() &&
+      !metadata.isSymbolicLink() &&
+      metadata.nlink === 2n &&
+      sameIdentity(fileIdentity(metadata), expected)
+    );
+  } catch {
+    return false;
+  }
+}
+
+async function hasSingleIdentityAtPath(path: string, expected: FileIdentity): Promise<boolean> {
+  try {
+    const metadata = await lstat(path, { bigint: true });
+    return (
+      metadata.isFile() &&
+      !metadata.isSymbolicLink() &&
+      metadata.nlink === 1n &&
+      sameIdentity(fileIdentity(metadata), expected)
+    );
+  } catch {
+    return false;
+  }
+}
+
+async function isMissingPath(path: string): Promise<boolean> {
+  try {
+    await lstat(path);
+    return false;
+  } catch (error) {
+    return isNodeError(error) && error.code === "ENOENT";
+  }
+}
+
+async function assertLinkedIdentityAtPath(path: string, expected: FileIdentity): Promise<void> {
+  const metadata = await lstat(path, { bigint: true });
+  if (
+    !metadata.isFile() ||
+    metadata.isSymbolicLink() ||
+    metadata.nlink !== 2n ||
+    !sameIdentity(fileIdentity(metadata), expected) ||
+    !samePath(resolve(await realpath(path)), resolve(path))
+  ) {
+    throw new Error("invalid");
   }
 }
 
@@ -935,126 +977,6 @@ function sameObservation(left: LanObservation, right: LanObservation): boolean {
 function inspectionFingerprint(value: PathInspection): string {
   if (value.kind === "missing") return "missing";
   return `${value.kind}:${value.identity.dev}:${value.identity.ino}:${value.identity.birthtimeNs}:${value.sha256 ?? "-"}`;
-}
-
-function readFabricMetadata(bytes: Buffer): Readonly<{ id: string; version: string }> {
-  const endOffset = findEndOfCentralDirectory(bytes);
-  const entries = bytes.readUInt16LE(endOffset + 10);
-  const centralSize = bytes.readUInt32LE(endOffset + 12);
-  const centralOffset = bytes.readUInt32LE(endOffset + 16);
-  if (
-    entries < 1 ||
-    entries > MAX_ZIP_ENTRIES ||
-    centralOffset + centralSize !== endOffset ||
-    centralOffset > bytes.byteLength
-  ) {
-    throw new Error("invalid");
-  }
-  let offset = centralOffset;
-  let metadata: Buffer | undefined;
-  for (let index = 0; index < entries; index += 1) {
-    assertBufferRange(bytes, offset, 46);
-    if (bytes.readUInt32LE(offset) !== 0x02014b50) throw new Error("invalid");
-    const flags = bytes.readUInt16LE(offset + 8);
-    const method = bytes.readUInt16LE(offset + 10);
-    const crc = bytes.readUInt32LE(offset + 16);
-    const compressedSize = bytes.readUInt32LE(offset + 20);
-    const uncompressedSize = bytes.readUInt32LE(offset + 24);
-    const nameLength = bytes.readUInt16LE(offset + 28);
-    const extraLength = bytes.readUInt16LE(offset + 30);
-    const commentLength = bytes.readUInt16LE(offset + 32);
-    const localOffset = bytes.readUInt32LE(offset + 42);
-    assertBufferRange(bytes, offset + 46, nameLength + extraLength + commentLength);
-    const name = strictUtf8(bytes.subarray(offset + 46, offset + 46 + nameLength));
-    offset += 46 + nameLength + extraLength + commentLength;
-    if (name !== "fabric.mod.json") continue;
-    if (
-      metadata !== undefined ||
-      (flags & 1) !== 0 ||
-      (method !== 0 && method !== 8) ||
-      compressedSize > MAX_FABRIC_METADATA_BYTES ||
-      uncompressedSize > MAX_FABRIC_METADATA_BYTES
-    ) {
-      throw new Error("invalid");
-    }
-    assertBufferRange(bytes, localOffset, 30);
-    if (bytes.readUInt32LE(localOffset) !== 0x04034b50) throw new Error("invalid");
-    const localFlags = bytes.readUInt16LE(localOffset + 6);
-    const localMethod = bytes.readUInt16LE(localOffset + 8);
-    const localNameLength = bytes.readUInt16LE(localOffset + 26);
-    const localExtraLength = bytes.readUInt16LE(localOffset + 28);
-    assertBufferRange(bytes, localOffset + 30, localNameLength + localExtraLength);
-    const localName = strictUtf8(
-      bytes.subarray(localOffset + 30, localOffset + 30 + localNameLength),
-    );
-    if (localName !== name || localFlags !== flags || localMethod !== method) {
-      throw new Error("invalid");
-    }
-    const dataOffset = localOffset + 30 + localNameLength + localExtraLength;
-    assertBufferRange(bytes, dataOffset, compressedSize);
-    const compressed = bytes.subarray(dataOffset, dataOffset + compressedSize);
-    metadata =
-      method === 0
-        ? Buffer.from(compressed)
-        : inflateRawSync(compressed, { maxOutputLength: MAX_FABRIC_METADATA_BYTES });
-    if (metadata.byteLength !== uncompressedSize || crc32(metadata) !== crc) {
-      throw new Error("invalid");
-    }
-  }
-  if (offset !== centralOffset + centralSize || metadata === undefined) throw new Error("invalid");
-  const value: unknown = JSON.parse(strictUtf8(metadata));
-  if (!isRecord(value) || typeof value.id !== "string" || typeof value.version !== "string") {
-    throw new Error("invalid");
-  }
-  return Object.freeze({ id: value.id, version: value.version });
-}
-
-function findEndOfCentralDirectory(bytes: Buffer): number {
-  const minimum = Math.max(0, bytes.byteLength - 65_557);
-  for (let offset = bytes.byteLength - 22; offset >= minimum; offset -= 1) {
-    if (bytes.readUInt32LE(offset) !== 0x06054b50) continue;
-    assertBufferRange(bytes, offset, 22);
-    const commentLength = bytes.readUInt16LE(offset + 20);
-    if (
-      offset + 22 + commentLength === bytes.byteLength &&
-      bytes.readUInt16LE(offset + 4) === 0 &&
-      bytes.readUInt16LE(offset + 6) === 0 &&
-      bytes.readUInt16LE(offset + 8) === bytes.readUInt16LE(offset + 10)
-    ) {
-      return offset;
-    }
-  }
-  throw new Error("invalid");
-}
-
-function assertBufferRange(bytes: Buffer, offset: number, length: number): void {
-  if (
-    !Number.isSafeInteger(offset) ||
-    !Number.isSafeInteger(length) ||
-    offset < 0 ||
-    length < 0 ||
-    offset + length > bytes.byteLength
-  ) {
-    throw new Error("invalid");
-  }
-}
-
-function strictUtf8(bytes: Uint8Array): string {
-  if (bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) {
-    throw new Error("invalid");
-  }
-  return strictUtf8Decoder.decode(bytes);
-}
-
-function crc32(bytes: Uint8Array): number {
-  let value = 0xffffffff;
-  for (const byte of bytes) {
-    value ^= byte;
-    for (let bit = 0; bit < 8; bit += 1) {
-      value = (value >>> 1) ^ (value & 1 ? 0xedb88320 : 0);
-    }
-  }
-  return (value ^ 0xffffffff) >>> 0;
 }
 
 function sha256(bytes: Uint8Array): string {

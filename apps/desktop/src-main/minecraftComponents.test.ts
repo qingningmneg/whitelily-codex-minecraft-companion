@@ -7,6 +7,7 @@ import {
   lstat,
   mkdir,
   mkdtemp,
+  open,
   readFile,
   rename,
   rm,
@@ -16,8 +17,10 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { deflateRawSync } from "node:zlib";
+import { describe, expect, it, vi } from "vitest";
 import { LanDetector } from "./discovery/lanDetector.js";
+import type { LanObservation } from "./discovery/lanCandidateStore.js";
 import type { JavaListenerProbeRecord } from "./discovery/fixedWindowsProbe.js";
 import { WorldBindingAuthority } from "./discovery/worldBindingAuthority.js";
 import {
@@ -31,6 +34,9 @@ const AFTER_PROCESS_START = new Date(PROCESS_STARTED_AT + 10_000);
 const BRIDGE_FILE = "whitelily-bridge-fabric-1.21.5-0.1.0.jar";
 const PRIOR_BRIDGE_FILE = "whitelily-bridge-fabric-1.21.5-0.0.9.jar";
 const AVATAR_FILE = "whitelily-avatar-fabric-1.21.5-0.1.0.jar";
+const FABRIC_API_FILE = "fabric-api-0.128.2+1.21.5.jar";
+const GECKOLIB_FILE = "geckolib-fabric-1.21.5-5.1.0.jar";
+const FABRIC_LOADER_FILE = "fabric-loader-0.16.14.jar";
 
 interface Fixture {
   readonly root: string;
@@ -42,6 +48,10 @@ interface Fixture {
   readonly bridge: Buffer;
   readonly priorBridge: Buffer;
   readonly avatar: Buffer;
+  readonly fabricApi: Buffer;
+  readonly geckoLib: Buffer;
+  readonly loader: Buffer;
+  readonly loaderPath: string;
   readonly manifest: MinecraftComponentResourceManifest;
   readonly manager: ReturnType<typeof createMinecraftComponentManager>;
   cleanup(): Promise<void>;
@@ -57,9 +67,14 @@ interface FixtureOptions {
   ) => Promise<void>;
   readonly probeRecordPatch?: (call: number) => Partial<JavaListenerProbeRecord>;
   readonly gameDirOverride?: (fixture: Omit<Fixture, "manager" | "candidateId">) => string;
+  readonly loaderId?: string;
+  readonly loaderVersion?: string;
   readonly manifestPatch?: (
     manifest: MinecraftComponentResourceManifest,
   ) => MinecraftComponentResourceManifest;
+  readonly managerFactory?: typeof createMinecraftComponentManager;
+  readonly bridgeBytes?: Buffer;
+  readonly stubWorldBindingAuthority?: boolean;
 }
 
 async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
@@ -71,11 +86,24 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
   await mkdir(mods, { recursive: true });
   await mkdir(resources);
   await mkdir(presence);
-  const bridge = jar("whitelily_bridge", "0.1.0");
+  const bridge = options.bridgeBytes ?? jar("whitelily_bridge", "0.1.0");
   const priorBridge = jar("whitelily_bridge", "0.0.9");
   const avatar = jar("whitelily_avatar", "0.1.0");
+  const fabricApi = jar("fabric-api", "0.128.2+1.21.5");
+  const geckoLib = jar("geckolib", "5.1.0");
+  const loaderVersion = options.loaderVersion ?? "0.16.14";
+  const loader = jar(options.loaderId ?? "fabricloader", loaderVersion);
+  const loaderDirectory = join(root, "libraries");
+  const loaderPath = join(
+    loaderDirectory,
+    loaderVersion === "0.16.14" ? FABRIC_LOADER_FILE : `fabric-loader-${loaderVersion}.jar`,
+  );
+  await mkdir(loaderDirectory);
+  await writeFile(loaderPath, loader);
   await writeFile(join(resources, BRIDGE_FILE), bridge);
   await writeFile(join(resources, AVATAR_FILE), avatar);
+  await writeFile(join(resources, FABRIC_API_FILE), fabricApi);
+  await writeFile(join(resources, GECKOLIB_FILE), geckoLib);
   const baseManifest: MinecraftComponentResourceManifest = {
     schemaVersion: 1,
     minecraftVersion: "1.21.5",
@@ -106,6 +134,24 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
         version: "0.1.0",
         prior: [],
       },
+      {
+        component: "avatar",
+        fileName: FABRIC_API_FILE,
+        bytes: fabricApi.byteLength,
+        sha256: sha256(fabricApi),
+        modId: "fabric-api",
+        version: "0.128.2+1.21.5",
+        prior: [],
+      },
+      {
+        component: "avatar",
+        fileName: GECKOLIB_FILE,
+        bytes: geckoLib.byteLength,
+        sha256: sha256(geckoLib),
+        modId: "geckolib",
+        version: "5.1.0",
+        prior: [],
+      },
     ],
   };
   const manifest = options.manifestPatch?.(baseManifest) ?? baseManifest;
@@ -118,6 +164,10 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
     bridge,
     priorBridge,
     avatar,
+    fabricApi,
+    geckoLib,
+    loader,
+    loaderPath,
     manifest,
     cleanup: async () => rm(root, { recursive: true, force: true }),
   };
@@ -157,16 +207,24 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
     executablePath: "C:/Java/bin/javaw.exe",
     commandLine:
       options.commandLineOverride?.(selectedGameDir) ??
-      `javaw.exe -cp fabric-loader.jar ${mainClass} --version Fabric --gameDir "${selectedGameDir}"`,
+      `javaw.exe -cp "${loaderPath};minecraft.jar" ${mainClass} --version Fabric --gameDir "${selectedGameDir}"`,
   };
-  const authority = new WorldBindingAuthority({
-    configPath: join(root, "unused.toml"),
-    lanDetector: detector,
-    readJavaProcessSnapshot: async () => snapshot,
-  });
+  const authority = options.stubWorldBindingAuthority
+    ? {
+        resolveJavaInstance: async (javaSession: Readonly<LanObservation>) => ({
+          canonicalInstancePath: selectedGameDir,
+          javaSession,
+          snapshot,
+        }),
+      }
+    : new WorldBindingAuthority({
+        configPath: join(root, "unused.toml"),
+        lanDetector: detector,
+        readJavaProcessSnapshot: async () => snapshot,
+      });
   let manager: ReturnType<typeof createMinecraftComponentManager>;
   try {
-    manager = createMinecraftComponentManager({
+    manager = (options.managerFactory ?? createMinecraftComponentManager)({
       lanDetector: detector,
       worldBindingAuthority: authority,
       resourceDirectory: resources,
@@ -305,11 +363,13 @@ describe("Minecraft component manager", () => {
     }
   });
 
-  it("removes only reviewed WhiteLily current artifacts and treats a missing target as idempotent", async () => {
+  it("removes only the exact reviewed Avatar set and treats missing targets as idempotent", async () => {
     const fixture = await createFixture();
     try {
       await installFixtureFile(fixture, BRIDGE_FILE, fixture.bridge);
       await installFixtureFile(fixture, AVATAR_FILE, fixture.avatar);
+      await installFixtureFile(fixture, FABRIC_API_FILE, fixture.fabricApi);
+      await installFixtureFile(fixture, GECKOLIB_FILE, fixture.geckoLib);
 
       await expect(fixture.manager.remove(fixture.candidateId, ["avatar"])).resolves.toMatchObject({
         state: "bridge_not_active",
@@ -318,6 +378,12 @@ describe("Minecraft component manager", () => {
       });
       expect(await readFile(join(fixture.mods, BRIDGE_FILE))).toEqual(fixture.bridge);
       await expect(lstat(join(fixture.mods, AVATAR_FILE))).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+      await expect(lstat(join(fixture.mods, FABRIC_API_FILE))).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+      await expect(lstat(join(fixture.mods, GECKOLIB_FILE))).rejects.toMatchObject({
         code: "ENOENT",
       });
       await expect(fixture.manager.remove(fixture.candidateId, ["avatar"])).resolves.toMatchObject({
@@ -375,6 +441,8 @@ describe("Minecraft component manager", () => {
         fixture.avatar,
         AFTER_PROCESS_START,
       );
+      await installFixtureFile(fixture, FABRIC_API_FILE, fixture.fabricApi);
+      await installFixtureFile(fixture, GECKOLIB_FILE, fixture.geckoLib);
       await writePresence(fixture);
 
       await expect(fixture.manager.status(fixture.candidateId)).resolves.toMatchObject({
@@ -392,6 +460,173 @@ describe("Minecraft component manager", () => {
         avatarInstalled: true,
         restartRequired: false,
       });
+    } finally {
+      await fixture.cleanup();
+    }
+  });
+
+  it("makes Avatar imply Bridge while Bridge-only stays dependency-free", async () => {
+    const bridgeOnly = await createFixture({ stubWorldBindingAuthority: true });
+    const avatarOnly = await createFixture({ stubWorldBindingAuthority: true });
+    try {
+      await bridgeOnly.manager.install(bridgeOnly.candidateId, ["bridge"]);
+      await expect(readFile(join(bridgeOnly.mods, BRIDGE_FILE))).resolves.toEqual(
+        bridgeOnly.bridge,
+      );
+      for (const fileName of [AVATAR_FILE, FABRIC_API_FILE, GECKOLIB_FILE]) {
+        await expect(lstat(join(bridgeOnly.mods, fileName))).rejects.toMatchObject({
+          code: "ENOENT",
+        });
+      }
+
+      await avatarOnly.manager.install(avatarOnly.candidateId, ["avatar"]);
+      await expect(readFile(join(avatarOnly.mods, AVATAR_FILE))).resolves.toEqual(
+        avatarOnly.avatar,
+      );
+      await expect(readFile(join(avatarOnly.mods, FABRIC_API_FILE))).resolves.toEqual(
+        avatarOnly.fabricApi,
+      );
+      await expect(readFile(join(avatarOnly.mods, GECKOLIB_FILE))).resolves.toEqual(
+        avatarOnly.geckoLib,
+      );
+      await expect(readFile(join(avatarOnly.mods, BRIDGE_FILE))).resolves.toEqual(
+        avatarOnly.bridge,
+      );
+    } finally {
+      await bridgeOnly.cleanup();
+      await avatarOnly.cleanup();
+    }
+  });
+
+  it("makes Bridge removal remove the exact reviewed Avatar dependency set", async () => {
+    const fixture = await createFixture({ stubWorldBindingAuthority: true });
+    try {
+      await fixture.manager.install(fixture.candidateId, ["avatar"]);
+      await fixture.manager.remove(fixture.candidateId, ["bridge"]);
+      for (const fileName of [BRIDGE_FILE, AVATAR_FILE, FABRIC_API_FILE, GECKOLIB_FILE]) {
+        await expect(lstat(join(fixture.mods, fileName))).rejects.toMatchObject({
+          code: "ENOENT",
+        });
+      }
+    } finally {
+      await fixture.cleanup();
+    }
+  });
+
+  it("preserves the complete stack when Bridge removal preflight finds a dependency conflict", async () => {
+    const fixture = await createFixture({ stubWorldBindingAuthority: true });
+    const foreign = Buffer.from("foreign geckolib collision");
+    try {
+      await installFixtureFile(fixture, BRIDGE_FILE, fixture.bridge);
+      await installFixtureFile(fixture, AVATAR_FILE, fixture.avatar);
+      await installFixtureFile(fixture, FABRIC_API_FILE, fixture.fabricApi);
+      await writeFile(join(fixture.mods, GECKOLIB_FILE), foreign);
+
+      await expect(fixture.manager.remove(fixture.candidateId, ["bridge"])).resolves.toMatchObject({
+        state: "bridge_file_conflict",
+      });
+      expect(await readFile(join(fixture.mods, BRIDGE_FILE))).toEqual(fixture.bridge);
+      expect(await readFile(join(fixture.mods, AVATAR_FILE))).toEqual(fixture.avatar);
+      expect(await readFile(join(fixture.mods, FABRIC_API_FILE))).toEqual(fixture.fabricApi);
+      expect(await readFile(join(fixture.mods, GECKOLIB_FILE))).toEqual(foreign);
+    } finally {
+      await fixture.cleanup();
+    }
+  });
+
+  it("removes Avatar before dependencies for a valid permuted manifest", async () => {
+    vi.resetModules();
+    vi.doMock("node:fs/promises", async (importOriginal) => {
+      const actual = await importOriginal<typeof import("node:fs/promises")>();
+      return {
+        ...actual,
+        unlink: async (path: string) => {
+          if (path.endsWith(AVATAR_FILE)) throw new Error("forced Avatar removal failure");
+          return actual.unlink(path);
+        },
+      };
+    });
+    const { createMinecraftComponentManager: createFailingManager } =
+      await import("./minecraftComponents.js");
+    const fixture = await createFixture({
+      managerFactory: createFailingManager,
+      stubWorldBindingAuthority: true,
+      manifestPatch: (manifest) => ({
+        ...manifest,
+        artifacts: [
+          manifest.artifacts[0]!,
+          manifest.artifacts[2]!,
+          manifest.artifacts[3]!,
+          manifest.artifacts[1]!,
+        ],
+      }),
+    });
+    try {
+      await installFixtureFile(fixture, BRIDGE_FILE, fixture.bridge);
+      await installFixtureFile(fixture, AVATAR_FILE, fixture.avatar);
+      await installFixtureFile(fixture, FABRIC_API_FILE, fixture.fabricApi);
+      await installFixtureFile(fixture, GECKOLIB_FILE, fixture.geckoLib);
+
+      await expect(fixture.manager.remove(fixture.candidateId, ["bridge"])).rejects.toThrow(
+        "MINECRAFT_COMPONENT_OPERATION_FAILED",
+      );
+      expect(await readFile(join(fixture.mods, BRIDGE_FILE))).toEqual(fixture.bridge);
+      expect(await readFile(join(fixture.mods, AVATAR_FILE))).toEqual(fixture.avatar);
+      expect(await readFile(join(fixture.mods, FABRIC_API_FILE))).toEqual(fixture.fabricApi);
+      expect(await readFile(join(fixture.mods, GECKOLIB_FILE))).toEqual(fixture.geckoLib);
+    } finally {
+      await fixture.cleanup();
+      vi.doUnmock("node:fs/promises");
+      vi.resetModules();
+    }
+  });
+
+  it("publishes Avatar last so a dependency failure cannot leave a broken Avatar stack", async () => {
+    vi.resetModules();
+    vi.doMock("node:fs/promises", async (importOriginal) => {
+      const actual = await importOriginal<typeof import("node:fs/promises")>();
+      return {
+        ...actual,
+        link: async (source: string, destination: string) => {
+          if (destination.endsWith(GECKOLIB_FILE)) throw new Error("forced dependency failure");
+          return actual.link(source, destination);
+        },
+      };
+    });
+    const { createMinecraftComponentManager: createFailingManager } =
+      await import("./minecraftComponents.js");
+    const fixture = await createFixture({
+      managerFactory: createFailingManager,
+      stubWorldBindingAuthority: true,
+    });
+    try {
+      await expect(fixture.manager.install(fixture.candidateId, ["avatar"])).rejects.toThrow(
+        "MINECRAFT_COMPONENT_OPERATION_FAILED",
+      );
+      expect(await readFile(join(fixture.mods, BRIDGE_FILE))).toEqual(fixture.bridge);
+      expect(await readFile(join(fixture.mods, FABRIC_API_FILE))).toEqual(fixture.fabricApi);
+      await expect(lstat(join(fixture.mods, GECKOLIB_FILE))).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+      await expect(lstat(join(fixture.mods, AVATAR_FILE))).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+    } finally {
+      await fixture.cleanup();
+      vi.doUnmock("node:fs/promises");
+      vi.resetModules();
+    }
+  });
+
+  it("reports a stable conflict for a foreign exact-name Avatar dependency", async () => {
+    const fixture = await createFixture({ stubWorldBindingAuthority: true });
+    const foreign = Buffer.from("foreign fabric api");
+    try {
+      await writeFile(join(fixture.mods, FABRIC_API_FILE), foreign);
+      await expect(fixture.manager.status(fixture.candidateId)).resolves.toMatchObject({
+        state: "bridge_file_conflict",
+      });
+      expect(await readFile(join(fixture.mods, FABRIC_API_FILE))).toEqual(foreign);
     } finally {
       await fixture.cleanup();
     }
@@ -418,6 +653,45 @@ describe("Minecraft component manager", () => {
       await nonFabric.cleanup();
       await fabricClassDecoy.cleanup();
       await unknownVersion.cleanup();
+    }
+  });
+
+  it("rejects an authentic Fabric Loader below the reviewed minimum and fake loader metadata", async () => {
+    const oldLoader = await createFixture({ loaderVersion: "0.16.13" });
+    const fakeLoader = await createFixture({ loaderId: "foreign_loader" });
+    try {
+      await expect(oldLoader.manager.status(oldLoader.candidateId)).rejects.toThrow(
+        "MINECRAFT_COMPONENT_AUTHORITY_INVALID",
+      );
+      await expect(fakeLoader.manager.status(fakeLoader.candidateId)).rejects.toThrow(
+        "MINECRAFT_COMPONENT_AUTHORITY_INVALID",
+      );
+    } finally {
+      await oldLoader.cleanup();
+      await fakeLoader.cleanup();
+    }
+  });
+
+  it("rejects an Avatar manifest missing exact Fabric API or GeckoLib versions", async () => {
+    const fixture = await createFixture();
+    const complete = fixture.manifest.artifacts;
+    const create = (artifacts: MinecraftComponentResourceManifest["artifacts"]) =>
+      createMinecraftComponentManager({
+        lanDetector: { inspectCandidate: async () => Promise.reject(new Error("unused")) },
+        worldBindingAuthority: {
+          resolveJavaInstance: async () => Promise.reject(new Error("unused")),
+        },
+        resourceDirectory: fixture.resources,
+        presenceDirectory: fixture.presence,
+        manifest: { ...fixture.manifest, artifacts },
+      });
+    try {
+      expect(() => create(complete.slice(0, -1))).toThrow("MINECRAFT_COMPONENT_MANIFEST_INVALID");
+      expect(() =>
+        create([...complete.slice(0, -1), { ...complete.at(-1)!, version: "5.0.0" }]),
+      ).toThrow("MINECRAFT_COMPONENT_MANIFEST_INVALID");
+    } finally {
+      await fixture.cleanup();
     }
   });
 
@@ -540,6 +814,8 @@ describe("Minecraft component manager", () => {
           await mkdir(current.resources);
           await writeFile(join(current.resources, BRIDGE_FILE), current.bridge);
           await writeFile(join(current.resources, AVATAR_FILE), current.avatar);
+          await writeFile(join(current.resources, FABRIC_API_FILE), current.fabricApi);
+          await writeFile(join(current.resources, GECKOLIB_FILE), current.geckoLib);
         }
       },
     });
@@ -572,6 +848,147 @@ describe("Minecraft component manager", () => {
     }
   });
 
+  it("atomically rejects a foreign target introduced at the publication syscall", async () => {
+    const foreign = Buffer.from("publication syscall collision");
+    let raced = 0;
+    vi.resetModules();
+    vi.doMock("node:fs/promises", async (importOriginal) => {
+      const actual = await importOriginal<typeof import("node:fs/promises")>();
+      const racePublication = async (source: string, destination: string): Promise<void> => {
+        if (
+          raced === 0 &&
+          source.endsWith(".whitelily-installing") &&
+          destination.endsWith(BRIDGE_FILE)
+        ) {
+          writeFileSync(destination, foreign, { flag: "wx" });
+          raced += 1;
+        }
+      };
+      return {
+        ...actual,
+        link: async (source: string, destination: string) => {
+          await racePublication(source, destination);
+          return actual.link(source, destination);
+        },
+        rename: async (source: string, destination: string) => {
+          await racePublication(source, destination);
+          return actual.rename(source, destination);
+        },
+      };
+    });
+    const { createMinecraftComponentManager: createRacingManager } =
+      await import("./minecraftComponents.js");
+    const fixture = await createFixture({ managerFactory: createRacingManager });
+    const target = join(fixture.mods, BRIDGE_FILE);
+    try {
+      await expect(fixture.manager.install(fixture.candidateId, ["bridge"])).rejects.toThrow(
+        "MINECRAFT_COMPONENT_OPERATION_FAILED",
+      );
+      expect(raced).toBe(1);
+      expect(await readFile(target)).toEqual(foreign);
+      await expect(
+        lstat(join(fixture.mods, `${BRIDGE_FILE}.whitelily-installing`)),
+      ).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await fixture.cleanup();
+      vi.doUnmock("node:fs/promises");
+      vi.resetModules();
+    }
+  });
+
+  it("atomically rejects a foreign backup introduced at its publication syscall", async () => {
+    const foreign = Buffer.from("backup syscall collision");
+    let collisions = 0;
+    vi.resetModules();
+    vi.doMock("node:fs/promises", async (importOriginal) => {
+      const actual = await importOriginal<typeof import("node:fs/promises")>();
+      return {
+        ...actual,
+        link: async (source: string, destination: string) => {
+          if (
+            collisions === 0 &&
+            source.endsWith(PRIOR_BRIDGE_FILE) &&
+            destination.endsWith(".whitelily-disabled")
+          ) {
+            writeFileSync(destination, foreign, { flag: "wx" });
+            collisions += 1;
+          }
+          return actual.link(source, destination);
+        },
+      };
+    });
+    const { createMinecraftComponentManager: createRacingManager } =
+      await import("./minecraftComponents.js");
+    const fixture = await createFixture({ managerFactory: createRacingManager });
+    const priorPath = await installFixtureFile(fixture, PRIOR_BRIDGE_FILE, fixture.priorBridge);
+    const backupPath = join(fixture.mods, `${PRIOR_BRIDGE_FILE}.whitelily-disabled`);
+    try {
+      await expect(fixture.manager.install(fixture.candidateId, ["bridge"])).rejects.toThrow(
+        "MINECRAFT_COMPONENT_OPERATION_FAILED",
+      );
+      expect(collisions).toBe(1);
+      expect(await readFile(priorPath)).toEqual(fixture.priorBridge);
+      expect(await readFile(backupPath)).toEqual(foreign);
+    } finally {
+      await fixture.cleanup();
+      vi.doUnmock("node:fs/promises");
+      vi.resetModules();
+    }
+  });
+
+  it("atomically rejects rollback-restore syscall collisions", async () => {
+    const targetForeign = Buffer.from("publication collision");
+    const priorForeign = Buffer.from("restore collision");
+    let publicationCollisions = 0;
+    let restoreCollisions = 0;
+    vi.resetModules();
+    vi.doMock("node:fs/promises", async (importOriginal) => {
+      const actual = await importOriginal<typeof import("node:fs/promises")>();
+      return {
+        ...actual,
+        link: async (source: string, destination: string) => {
+          if (
+            publicationCollisions === 0 &&
+            source.endsWith(".whitelily-installing") &&
+            destination.endsWith(BRIDGE_FILE)
+          ) {
+            writeFileSync(destination, targetForeign, { flag: "wx" });
+            publicationCollisions += 1;
+          } else if (
+            restoreCollisions === 0 &&
+            source.endsWith(".whitelily-disabled") &&
+            destination.endsWith(PRIOR_BRIDGE_FILE)
+          ) {
+            writeFileSync(destination, priorForeign, { flag: "wx" });
+            restoreCollisions += 1;
+          }
+          return actual.link(source, destination);
+        },
+      };
+    });
+    const { createMinecraftComponentManager: createRacingManager } =
+      await import("./minecraftComponents.js");
+    const fixture = await createFixture({ managerFactory: createRacingManager });
+    const priorPath = await installFixtureFile(fixture, PRIOR_BRIDGE_FILE, fixture.priorBridge);
+    const backupPath = join(fixture.mods, `${PRIOR_BRIDGE_FILE}.whitelily-disabled`);
+    try {
+      await expect(fixture.manager.install(fixture.candidateId, ["bridge"])).rejects.toThrow(
+        "MINECRAFT_COMPONENT_OPERATION_FAILED",
+      );
+      expect({ publicationCollisions, restoreCollisions }).toEqual({
+        publicationCollisions: 1,
+        restoreCollisions: 1,
+      });
+      expect(await readFile(join(fixture.mods, BRIDGE_FILE))).toEqual(targetForeign);
+      expect(await readFile(priorPath)).toEqual(priorForeign);
+      expect(await readFile(backupPath)).toEqual(fixture.priorBridge);
+    } finally {
+      await fixture.cleanup();
+      vi.doUnmock("node:fs/promises");
+      vi.resetModules();
+    }
+  });
+
   it("rejects fixed temp and update-backup collisions without deleting either collision", async () => {
     const tempFixture = await createFixture();
     const updateFixture = await createFixture();
@@ -598,6 +1015,116 @@ describe("Minecraft component manager", () => {
     } finally {
       await tempFixture.cleanup();
       await updateFixture.cleanup();
+    }
+  });
+
+  it.each(["writeFile", "sync"] as const)(
+    "cleans its exact partial staging file when FileHandle.%s fails",
+    async (method) => {
+      const fixture = await createFixture();
+      const temporaryPath = join(fixture.mods, `${BRIDGE_FILE}.whitelily-installing`);
+      const probePath = join(fixture.root, `file-handle-${method}`);
+      const probe = await open(probePath, "wx");
+      let prototype = Object.getPrototypeOf(probe) as Record<
+        string,
+        (...args: never[]) => unknown
+      > | null;
+      while (prototype && !Object.prototype.hasOwnProperty.call(prototype, method)) {
+        prototype = Object.getPrototypeOf(prototype) as typeof prototype;
+      }
+      if (!prototype) throw new Error(`FileHandle.${method} is unavailable`);
+      await probe.close();
+      const original = prototype[method]!;
+      const failure = vi.spyOn(prototype, method).mockImplementationOnce(async function (
+        this: unknown,
+        ...args: never[]
+      ) {
+        throw new Error(`forced ${method} failure`);
+      });
+      try {
+        await expect(fixture.manager.install(fixture.candidateId, ["bridge"])).rejects.toThrow(
+          "MINECRAFT_COMPONENT_OPERATION_FAILED",
+        );
+        await expect(lstat(temporaryPath)).rejects.toMatchObject({ code: "ENOENT" });
+      } finally {
+        failure.mockRestore();
+        await fixture.cleanup();
+      }
+    },
+  );
+
+  it("preserves a foreign replacement when staging write cleanup detects identity drift", async () => {
+    const foreign = Buffer.from("foreign staging replacement");
+    vi.resetModules();
+    vi.doMock("node:fs/promises", async (importOriginal) => {
+      const actual = await importOriginal<typeof import("node:fs/promises")>();
+      return {
+        ...actual,
+        open: async (...args: Parameters<typeof actual.open>) => {
+          const handle = await actual.open(...args);
+          const path = String(args[0]);
+          if (path.endsWith(".whitelily-installing")) {
+            handle.writeFile = async () => {
+              await actual.rename(path, `${path}.moved-owned`);
+              await actual.writeFile(path, foreign, { flag: "wx" });
+              throw new Error("forced write replacement");
+            };
+          }
+          return handle;
+        },
+      };
+    });
+    const { createMinecraftComponentManager: createReplacingManager } =
+      await import("./minecraftComponents.js");
+    const fixture = await createFixture({ managerFactory: createReplacingManager });
+    const temporaryPath = join(fixture.mods, `${BRIDGE_FILE}.whitelily-installing`);
+    try {
+      await expect(fixture.manager.install(fixture.candidateId, ["bridge"])).rejects.toThrow(
+        "MINECRAFT_COMPONENT_OPERATION_FAILED",
+      );
+      expect(await readFile(temporaryPath)).toEqual(foreign);
+      expect((await lstat(`${temporaryPath}.moved-owned`)).size).toBe(0);
+    } finally {
+      await fixture.cleanup();
+      vi.doUnmock("node:fs/promises");
+      vi.resetModules();
+    }
+  });
+
+  it("cleans its exact partial staging file when FileHandle.close fails", async () => {
+    vi.resetModules();
+    vi.doMock("node:fs/promises", async (importOriginal) => {
+      const actual = await importOriginal<typeof import("node:fs/promises")>();
+      return {
+        ...actual,
+        open: async (...args: Parameters<typeof actual.open>) => {
+          const handle = await actual.open(...args);
+          const close = handle.close.bind(handle);
+          let failed = false;
+          handle.close = async () => {
+            await close();
+            if (!failed) {
+              failed = true;
+              throw new Error("forced close failure");
+            }
+          };
+          return handle;
+        },
+      };
+    });
+    const { createMinecraftComponentManager: createCloseFailingManager } =
+      await import("./minecraftComponents.js");
+    const fixture = await createFixture({ managerFactory: createCloseFailingManager });
+    const temporaryPath = join(fixture.mods, `${BRIDGE_FILE}.whitelily-installing`);
+    try {
+      await expect(fixture.manager.install(fixture.candidateId, ["bridge"])).rejects.toThrow(
+        "MINECRAFT_COMPONENT_OPERATION_FAILED",
+      );
+      await expect(lstat(temporaryPath)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await fixture.cleanup();
+      vi.doUnmock("node:fs/promises");
+      vi.resetModules();
     }
   });
 
@@ -685,11 +1212,28 @@ describe("Minecraft component manager", () => {
     }
   });
 
+  it.each(malformedJarCases())(
+    "rejects malformed packaged ZIP metadata: %s",
+    async (_label, bridgeBytes) => {
+      const fixture = await createFixture({ bridgeBytes, stubWorldBindingAuthority: true });
+      try {
+        await expect(fixture.manager.status(fixture.candidateId)).rejects.toThrow(
+          "MINECRAFT_COMPONENT_MANIFEST_INVALID",
+        );
+      } finally {
+        await fixture.cleanup();
+      }
+    },
+  );
+
   it("rejects main-supplied manifest hash and embedded mod-ID mismatches", async () => {
     const badHash = await createFixture({
       manifestPatch: (manifest) => ({
         ...manifest,
-        artifacts: [{ ...manifest.artifacts[0]!, sha256: "0".repeat(64) }, manifest.artifacts[1]!],
+        artifacts: [
+          { ...manifest.artifacts[0]!, sha256: "0".repeat(64) },
+          ...manifest.artifacts.slice(1),
+        ],
       }),
     });
     const foreignBridge = jar("foreign_bridge", "0.1.0");
@@ -702,7 +1246,7 @@ describe("Minecraft component manager", () => {
             bytes: foreignBridge.byteLength,
             sha256: sha256(foreignBridge),
           },
-          manifest.artifacts[1]!,
+          ...manifest.artifacts.slice(1),
         ],
       }),
     });
@@ -717,7 +1261,7 @@ describe("Minecraft component manager", () => {
             ...manifest,
             artifacts: [
               { ...manifest.artifacts[0]!, modId: "foreign_bridge" },
-              manifest.artifacts[1]!,
+              ...manifest.artifacts.slice(1),
             ],
           }),
         }),
@@ -749,6 +1293,107 @@ function jar(modId: string, version: string): Buffer {
     ],
     ["fixture.txt", Buffer.from(`${modId}:${version}`, "utf8")],
   ]);
+}
+
+function malformedJarCases(): readonly (readonly [string, Buffer])[] {
+  const valid = jar("whitelily_bridge", "0.1.0");
+  const endOffset = valid.byteLength - 22;
+  const centralOffset = valid.readUInt32LE(endOffset + 16);
+  const mutate = (change: (bytes: Buffer) => void): Buffer => {
+    const bytes = Buffer.from(valid);
+    change(bytes);
+    return bytes;
+  };
+  const metadata = Buffer.from(
+    JSON.stringify({ id: "whitelily_bridge", version: "0.1.0" }),
+    "utf8",
+  );
+  return [
+    [
+      "central directory offset outside the archive",
+      mutate((bytes) => bytes.writeUInt32LE(0xffffffff, endOffset + 16)),
+    ],
+    [
+      "local header offset outside the archive",
+      mutate((bytes) => bytes.writeUInt32LE(0xffffffff, centralOffset + 42)),
+    ],
+    [
+      "central/local entry-name mismatch",
+      mutate((bytes) => bytes.writeUInt8("x".charCodeAt(0), 30)),
+    ],
+    [
+      "duplicate fabric.mod.json",
+      zip([
+        ["fabric.mod.json", metadata],
+        ["fabric.mod.json", metadata],
+      ]),
+    ],
+    [
+      "duplicate decoded JSON object keys",
+      zip([
+        [
+          "fabric.mod.json",
+          Buffer.from('{"id":"foreign","\\u0069d":"whitelily_bridge","version":"0.1.0"}', "utf8"),
+        ],
+      ]),
+    ],
+    ["central CRC mismatch", mutate((bytes) => bytes.writeUInt32LE(0, centralOffset + 16))],
+    [
+      "entry count beyond the bound",
+      mutate((bytes) => {
+        bytes.writeUInt16LE(4_097, endOffset + 8);
+        bytes.writeUInt16LE(4_097, endOffset + 10);
+      }),
+    ],
+    ["invalid UTF-8 entry name", mutate((bytes) => bytes.writeUInt8(0xff, centralOffset + 46))],
+    [
+      "encrypted entry flag",
+      mutate((bytes) => {
+        bytes.writeUInt16LE(1, 6);
+        bytes.writeUInt16LE(1, centralOffset + 8);
+      }),
+    ],
+    [
+      "data-descriptor entry flag",
+      mutate((bytes) => {
+        bytes.writeUInt16LE(8, 6);
+        bytes.writeUInt16LE(8, centralOffset + 8);
+      }),
+    ],
+    ["central/local size mismatch", mutate((bytes) => bytes.writeUInt32LE(1, 18))],
+    ["deflate expansion beyond the metadata bound", overExpandingMetadataJar()],
+  ];
+}
+
+function overExpandingMetadataJar(): Buffer {
+  const name = Buffer.from("fabric.mod.json", "utf8");
+  const expanded = Buffer.alloc(64 * 1024 + 1, 0x61);
+  const compressed = deflateRawSync(expanded);
+  const local = Buffer.alloc(30);
+  local.writeUInt32LE(0x04034b50, 0);
+  local.writeUInt16LE(20, 4);
+  local.writeUInt16LE(8, 8);
+  local.writeUInt32LE(crc32(expanded), 14);
+  local.writeUInt32LE(compressed.byteLength, 18);
+  local.writeUInt32LE(64 * 1024, 22);
+  local.writeUInt16LE(name.byteLength, 26);
+  const centralOffset = local.byteLength + name.byteLength + compressed.byteLength;
+  const central = Buffer.alloc(46);
+  central.writeUInt32LE(0x02014b50, 0);
+  central.writeUInt16LE(20, 4);
+  central.writeUInt16LE(20, 6);
+  central.writeUInt16LE(8, 10);
+  central.writeUInt32LE(crc32(expanded), 16);
+  central.writeUInt32LE(compressed.byteLength, 20);
+  central.writeUInt32LE(64 * 1024, 24);
+  central.writeUInt16LE(name.byteLength, 28);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(1, 8);
+  end.writeUInt16LE(1, 10);
+  end.writeUInt32LE(central.byteLength + name.byteLength, 12);
+  end.writeUInt32LE(centralOffset, 16);
+  return Buffer.concat([local, name, compressed, central, name, end]);
 }
 
 function zip(entries: readonly (readonly [string, Buffer])[]): Buffer {
