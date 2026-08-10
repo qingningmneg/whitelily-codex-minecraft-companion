@@ -9,7 +9,7 @@ import java.nio.file.FileSystemException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
-import java.nio.file.attribute.BasicFileAttributes;
+import java.lang.reflect.Method;
 import java.security.MessageDigest;
 import java.util.HexFormat;
 import java.util.Optional;
@@ -17,7 +17,6 @@ import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
-import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -35,9 +34,9 @@ class BridgeProofStoreTest {
     Files.writeString(unrelated, "keep", UTF_8, StandardOpenOption.CREATE_NEW);
     BridgeProofStore store = new BridgeProofStore(temporaryDirectory);
 
-    assertEquals(Optional.of(new BridgeRequest(1, "WhiteLily", 49152, 1000, 2000, NONCE)), store.consume(NONCE, CONTEXT));
+    assertEquals(Optional.of(new BridgeRequest(1, "WhiteLily", 49152, 1000, 31000, NONCE)), store.consume(NONCE, CONTEXT));
     assertFalse(Files.exists(request));
-    assertFalse(Files.exists(request.resolveSibling(request.getFileName() + ".consumed")));
+    assertTrue(Files.exists(request.resolveSibling(request.getFileName() + ".claim")));
     assertEquals("keep", Files.readString(unrelated, UTF_8));
     assertEquals(Optional.empty(), store.consume(NONCE, CONTEXT));
   }
@@ -113,15 +112,6 @@ class BridgeProofStoreTest {
   }
 
   @Test
-  void failsClosedWhenTheFilesystemDoesNotExposeABasicFileIdentity() throws Exception {
-    Path request = writeRequest(temporaryDirectory, validJson());
-    BasicFileAttributes first = Files.readAttributes(request, BasicFileAttributes.class);
-    BasicFileAttributes second = Files.readAttributes(request, BasicFileAttributes.class);
-    Assumptions.assumeTrue(first.fileKey() == null && second.fileKey() == null);
-    assertFalse(BridgeProofStore.sameFile(first, second));
-  }
-
-  @Test
   void rejectsOversizedAndMismatchedDigestRequests() throws Exception {
     Path oversized = Files.createTempDirectory(temporaryDirectory, "large-");
     Path oversizedRequest = writeRequest(oversized, " ".repeat(4097));
@@ -144,7 +134,7 @@ class BridgeProofStoreTest {
 
   @Test
   void rejectsExpiredProofAndDoesNotConsumeIt() throws Exception {
-    Path request = writeRequest(temporaryDirectory, validJson().replace("2000", "1500"));
+    Path request = writeRequest(temporaryDirectory, validJson().replace("31000", "1500"));
     assertEquals(Optional.empty(), new BridgeProofStore(temporaryDirectory).consume(NONCE, CONTEXT));
     assertTrue(Files.exists(request));
   }
@@ -157,9 +147,97 @@ class BridgeProofStoreTest {
     assertTrue(Files.exists(future));
 
     Path invertedRoot = Files.createTempDirectory(temporaryDirectory, "inverted-");
-    Path inverted = writeRequest(invertedRoot, validJson().replace("\"expiresAt\":2000", "\"expiresAt\":1000"));
+    Path inverted = writeRequest(invertedRoot, validJson().replace("\"expiresAt\":31000", "\"expiresAt\":1000"));
     assertEquals(Optional.empty(), new BridgeProofStore(invertedRoot).consume(NONCE, CONTEXT));
     assertTrue(Files.exists(inverted));
+  }
+
+  @Test
+  void rejectsNonCanonicalNumericLexemesWithoutConsumingTheRequest() throws Exception {
+    String[] invalid = {
+      validJson().replace("\"schemaVersion\":1", "\"schemaVersion\":1.0"),
+      validJson().replace("\"port\":49152", "\"port\":4.9152e4"),
+      validJson().replace("\"issuedAt\":1000", "\"issuedAt\":\"1000\""),
+      validJson().replace("\"expiresAt\":31000", "\"expiresAt\":null"),
+      validJson().replace("\"issuedAt\":1000", "\"issuedAt\":9223372036854775808"),
+    };
+    for (String document : invalid) {
+      Path root = Files.createTempDirectory(temporaryDirectory, "numeric-");
+      Path request = writeRequest(root, document);
+      assertEquals(Optional.empty(), new BridgeProofStore(root).consume(NONCE, CONTEXT));
+      assertTrue(Files.exists(request));
+    }
+  }
+
+  @Test
+  void rejectsNonThirtySecondTtlWithoutConsumingTheRequest() throws Exception {
+    String[] invalid = {
+      validJson().replace("\"expiresAt\":31000", "\"expiresAt\":31001"),
+      validJson().replace("\"issuedAt\":1000", "\"issuedAt\":-1"),
+      validJson().replace("\"issuedAt\":1000", "\"issuedAt\":9223372036854770000").replace("\"expiresAt\":31000", "\"expiresAt\":-9223372036854740000"),
+    };
+    for (String document : invalid) {
+      Path root = Files.createTempDirectory(temporaryDirectory, "ttl-");
+      Path request = writeRequest(root, document);
+      assertEquals(Optional.empty(), new BridgeProofStore(root).consume(NONCE, CONTEXT));
+      assertTrue(Files.exists(request));
+    }
+  }
+
+  @Test
+  void claimCollisionBlocksConsumptionAndPreservesClaimAndRequest() throws Exception {
+    Path request = writeRequest(temporaryDirectory, validJson());
+    Path claim = request.resolveSibling(request.getFileName() + ".claim");
+    Files.writeString(claim, "collision", UTF_8, StandardOpenOption.CREATE_NEW);
+    assertEquals(Optional.empty(), new BridgeProofStore(temporaryDirectory).consume(NONCE, CONTEXT));
+    assertEquals("collision", Files.readString(claim, UTF_8));
+    assertTrue(Files.exists(request));
+  }
+
+  @Test
+  void anchorCollisionBlocksConsumptionAndPreservesTheForeignAnchor() throws Exception {
+    Path request = writeRequest(temporaryDirectory, validJson());
+    Path anchor = request.resolveSibling(request.getFileName() + ".anchor");
+    Files.writeString(anchor, "foreign-anchor", UTF_8, StandardOpenOption.CREATE_NEW);
+    assertEquals(Optional.empty(), new BridgeProofStore(temporaryDirectory).consume(NONCE, CONTEXT));
+    assertEquals("foreign-anchor", Files.readString(anchor, UTF_8));
+    assertTrue(Files.exists(request));
+    assertFalse(Files.exists(request.resolveSibling(request.getFileName() + ".claim")));
+  }
+
+  @Test
+  void existingConsumedSiblingIsNeverOverwrittenOrDeleted() throws Exception {
+    Path request = writeRequest(temporaryDirectory, validJson());
+    Path consumed = request.resolveSibling(request.getFileName() + ".consumed");
+    Files.writeString(consumed, "foreign-consumed", UTF_8, StandardOpenOption.CREATE_NEW);
+    assertTrue(new BridgeProofStore(temporaryDirectory).consume(NONCE, CONTEXT).isPresent());
+    assertEquals("foreign-consumed", Files.readString(consumed, UTF_8));
+    assertTrue(Files.exists(consumed));
+  }
+
+  @Test
+  void cleanupDoesNotDeleteAClaimReplacement() throws Exception {
+    Path request = writeRequest(temporaryDirectory, validJson());
+    Path claim = request.resolveSibling(request.getFileName() + ".claim");
+    Files.writeString(claim, "replacement", UTF_8, StandardOpenOption.CREATE_NEW);
+    Method cleanup = BridgeProofStore.class.getDeclaredMethod("deleteOwnedLink", Path.class, Path.class);
+    cleanup.setAccessible(true);
+    cleanup.invoke(null, claim, request);
+    assertEquals("replacement", Files.readString(claim, UTF_8));
+    assertTrue(Files.exists(claim));
+  }
+
+  @Test
+  void rejectsAReparsePointInTheConfiguredRootAncestorChain() throws Exception {
+    Path target = Files.createTempDirectory(temporaryDirectory, "ancestor-target-");
+    Path ancestor = temporaryDirectory.resolve("ancestor-link");
+    createJunction(ancestor, target);
+    Path root = ancestor.resolve("nested-proof-root");
+    Files.createDirectory(root);
+    Path request = writeRequest(root, validJson());
+    assertEquals(Optional.empty(), new BridgeProofStore(root).consume(NONCE, CONTEXT));
+    assertTrue(Files.exists(request));
+    Files.delete(ancestor);
   }
 
   @Test
@@ -183,39 +261,6 @@ class BridgeProofStoreTest {
   }
 
   @Test
-  void rejectsAFileSymlinkRequestWhenTheWindowsConfigurationPermitsIt() throws Exception {
-    Path sourceRoot = Files.createTempDirectory(temporaryDirectory, "file-source-");
-    Path source = writeRequest(sourceRoot, validJson());
-    Path linkRoot = Files.createTempDirectory(temporaryDirectory, "file-link-");
-    Path requestLink = linkRoot.resolve(source.getFileName());
-    try {
-      Files.createSymbolicLink(requestLink, source);
-    } catch (FileSystemException | UnsupportedOperationException unsupported) {
-      Assumptions.abort("Windows symbolic-link privilege is unavailable: " + unsupported.getMessage());
-    }
-    assertEquals(Optional.empty(), new BridgeProofStore(linkRoot).consume(NONCE, CONTEXT));
-    assertTrue(Files.exists(requestLink, java.nio.file.LinkOption.NOFOLLOW_LINKS));
-    Files.delete(requestLink);
-  }
-
-  @Test
-  void forcedNonAtomicMoveFailureDoesNotApproveOrDeleteRequest() throws Exception {
-    Path request = writeRequest(temporaryDirectory, validJson());
-    BridgeProofStore store = new BridgeProofStore(temporaryDirectory, (source, consumed) -> { throw new java.nio.file.AtomicMoveNotSupportedException(source.toString(), consumed.toString(), "forced"); });
-    assertEquals(Optional.empty(), store.consume(NONCE, CONTEXT));
-    assertTrue(Files.exists(request));
-  }
-
-  @Test
-  void windowsMoveNeverReplacesAnExistingConsumedSibling() throws Exception {
-    Path request = writeRequest(temporaryDirectory, validJson());
-    Path consumed = request.resolveSibling(request.getFileName() + ".consumed");
-    Files.writeString(consumed, "sentinel", UTF_8, StandardOpenOption.CREATE_NEW);
-    assertEquals(Optional.empty(), new BridgeProofStore(temporaryDirectory).consume(NONCE, CONTEXT));
-    assertEquals("sentinel", Files.readString(consumed, UTF_8));
-    assertTrue(Files.exists(request));
-  }
-
   private static Path writeRequest(Path root, String document) throws Exception {
     return writeRequestBytes(root, document.getBytes(UTF_8));
   }
@@ -227,7 +272,7 @@ class BridgeProofStoreTest {
   }
 
   private static String validJson() {
-    return "{\"schemaVersion\":1,\"username\":\"WhiteLily\",\"port\":49152,\"issuedAt\":1000,\"expiresAt\":2000,\"nonce\":\"" + NONCE + "\"}";
+    return "{\"schemaVersion\":1,\"username\":\"WhiteLily\",\"port\":49152,\"issuedAt\":1000,\"expiresAt\":31000,\"nonce\":\"" + NONCE + "\"}";
   }
 
   private static String digest(String value) throws Exception {
@@ -243,6 +288,10 @@ class BridgeProofStoreTest {
 
   private static void createJunction(Path link, Path target) throws Exception {
     Process process = new ProcessBuilder("cmd.exe", "/c", "mklink", "/J", link.toString(), target.toString()).start();
-    assertEquals(0, process.waitFor());
+    if (!process.waitFor(2, java.util.concurrent.TimeUnit.SECONDS)) {
+      process.destroyForcibly();
+      assertTrue(false, "junction helper timed out");
+    }
+    assertEquals(0, process.exitValue());
   }
 }

@@ -3,74 +3,55 @@ package io.github.whitelily.bridge;
 import com.google.gson.Strictness;
 import com.google.gson.stream.JsonReader;
 import com.google.gson.stream.JsonToken;
-import java.io.InputStream;
 import java.io.IOException;
 import java.io.StringReader;
 import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.nio.charset.CharacterCodingException;
 import java.nio.charset.CharsetDecoder;
 import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
-import java.nio.channels.FileChannel;
-import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.HashSet;
 import java.util.HexFormat;
-import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
-import java.util.concurrent.TimeUnit;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 public final class BridgeProofStore {
   private static final int MAX_REQUEST_BYTES = 4096;
   private static final Set<String> REQUIRED_KEYS =
       Set.of("schemaVersion", "username", "port", "issuedAt", "expiresAt", "nonce");
-  private static final Pattern WINDOWS_FILE_ID = Pattern.compile("0x([0-9A-Fa-f]+)");
 
   private final Path root;
-  private final AtomicMover mover;
 
   public BridgeProofStore(Path root) {
-    this(root, (source, consumed) -> Files.move(source, consumed, StandardCopyOption.ATOMIC_MOVE));
-  }
-
-  // Test-only seam: production composition always uses the atomic Files.move constructor above.
-  BridgeProofStore(Path root, AtomicMover mover) {
     this.root = root == null ? null : root.toAbsolutePath().normalize();
-    this.mover = mover;
   }
 
   public Optional<BridgeRequest> consume(String nonce, BridgeAuthorizationContext context) {
-    if (root == null || mover == null || !validNonce(nonce)) {
+    if (root == null || !validNonce(nonce)) {
       return Optional.empty();
     }
     try {
-      if (!isOrdinaryDirectory(root) || root.getParent() == null || !isOrdinaryDirectory(root.getParent())) {
+      if (!ordinaryAncestorChain(root)) {
         return Optional.empty();
       }
       Path request = root.resolve(digest(nonce) + ".json").normalize();
       if (!request.getParent().equals(root)) {
         return Optional.empty();
       }
-
       BasicFileAttributes original = ordinaryFile(request);
       if (original == null) {
         return Optional.empty();
       }
-      String identity = stableIdentity(request, original);
-      if (identity == null) {
-        return Optional.empty();
-      }
-      byte[] bytes = readStable(request, original, identity);
+      byte[] bytes = readStable(request, original);
       if (bytes == null) {
         return Optional.empty();
       }
@@ -79,47 +60,37 @@ public final class BridgeProofStore {
         return Optional.empty();
       }
       Optional<BridgeRequest> authorized = BridgeAuthorizationPolicy.authorize(parsed, context);
-      if (authorized.isEmpty() || !sameStableFile(original, identity, request)) {
+      if (authorized.isEmpty()) {
         return Optional.empty();
       }
 
-      Path consumed = request.resolveSibling(request.getFileName() + ".consumed");
-      Path reservation = consumed.resolveSibling(consumed.getFileName() + ".lock");
-      boolean reserved = false;
-      boolean moved = false;
+      Path claim = request.resolveSibling(request.getFileName() + ".claim");
+      Path anchor = request.resolveSibling(request.getFileName() + ".anchor");
+      boolean claimCreated = false;
+      boolean anchorCreated = false;
+      boolean requestRemoved = false;
       try {
-        try (FileChannel ignored = FileChannel.open(
-            reservation,
-            StandardOpenOption.CREATE_NEW,
-            StandardOpenOption.WRITE,
-            LinkOption.NOFOLLOW_LINKS)) {
-          reserved = true;
-        }
-        if (Files.exists(consumed, LinkOption.NOFOLLOW_LINKS)) {
+        Files.createLink(claim, request);
+        claimCreated = true;
+        Files.createLink(anchor, claim);
+        anchorCreated = true;
+        if (!sameOwnedFile(request, claim, anchor)
+            || !sameAttributes(original, ordinaryFile(request))
+            || !ordinaryAncestorChain(root)
+            || !sameOwnedFile(request, claim, anchor)) {
           return Optional.empty();
         }
-        if (!sameStableFile(original, identity, request)) {
-          return Optional.empty();
-        }
-        mover.move(request, consumed);
-        moved = true;
+        Files.delete(request);
+        requestRemoved = true;
         return authorized;
-      } catch (AtomicMoveNotSupportedException | java.nio.file.FileAlreadyExistsException ignored) {
+      } catch (FileAlreadyExistsException ignored) {
         return Optional.empty();
       } finally {
-        if (moved) {
-          try {
-            Files.deleteIfExists(consumed);
-          } catch (IOException ignored) {
-            // A consumed proof is never approved a second time, even if cleanup is delayed.
-          }
+        if (anchorCreated) {
+          deleteOwnedLink(anchor, claim);
         }
-        if (reserved) {
-          try {
-            Files.deleteIfExists(reservation);
-          } catch (IOException ignored) {
-            // A stale reservation can only deny this one proof, never approve it.
-          }
+        if (claimCreated && !requestRemoved) {
+          deleteOwnedLink(claim, request);
         }
       }
     } catch (IOException | IllegalArgumentException | SecurityException ignored) {
@@ -127,9 +98,15 @@ public final class BridgeProofStore {
     }
   }
 
-  private static boolean isOrdinaryDirectory(Path path) throws IOException {
-    BasicFileAttributes attributes = Files.readAttributes(path, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
-    return attributes.isDirectory() && !attributes.isSymbolicLink() && !attributes.isOther();
+  private static boolean ordinaryAncestorChain(Path path) throws IOException {
+    for (Path current = path; current != null; current = current.getParent()) {
+      BasicFileAttributes attributes = Files.readAttributes(
+          current, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+      if (!attributes.isDirectory() || attributes.isSymbolicLink() || attributes.isOther()) {
+        return false;
+      }
+    }
+    return true;
   }
 
   private static BasicFileAttributes ordinaryFile(Path path) throws IOException {
@@ -144,7 +121,7 @@ public final class BridgeProofStore {
     return attributes;
   }
 
-  private static byte[] readStable(Path path, BasicFileAttributes before, String identity) throws IOException {
+  private static byte[] readStable(Path path, BasicFileAttributes before) throws IOException {
     int size = Math.toIntExact(before.size());
     ByteBuffer bytes = ByteBuffer.allocate(size);
     try (FileChannel channel = FileChannel.open(path, StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS)) {
@@ -157,68 +134,33 @@ public final class BridgeProofStore {
         }
       }
     }
-    if (!sameStableFile(before, identity, path)) {
-      return null;
-    }
-    return bytes.array();
+    return sameAttributes(before, ordinaryFile(path)) ? bytes.array() : null;
   }
 
-  static boolean sameFile(BasicFileAttributes expected, BasicFileAttributes actual) {
-    return actual != null
-        && expected.fileKey() != null
-        && actual.fileKey() != null
-        && expected.size() == actual.size()
-        && Objects.equals(expected.fileKey(), actual.fileKey());
-  }
-
-  private static boolean sameStableFile(BasicFileAttributes expected, String identity, Path path)
-      throws IOException {
-    BasicFileAttributes actual = ordinaryFile(path);
+  private static boolean sameAttributes(BasicFileAttributes expected, BasicFileAttributes actual) {
     if (actual == null || expected.size() != actual.size()) {
       return false;
     }
-    if (expected.fileKey() != null || actual.fileKey() != null) {
-      return sameFile(expected, actual);
-    }
-    String actualIdentity = stableIdentity(path, actual);
-    return actualIdentity != null && identity.equals(actualIdentity);
+    return expected.fileKey() == null || actual.fileKey() == null || expected.fileKey().equals(actual.fileKey());
   }
 
-  private static String stableIdentity(Path path, BasicFileAttributes attributes) {
-    Object basicKey = attributes.fileKey();
-    if (basicKey != null) {
-      return "basic:" + basicKey;
-    }
-    if (!System.getProperty("os.name", "").startsWith("Windows")) {
-      return null;
-    }
-    String systemRoot = System.getenv("SystemRoot");
-    if (systemRoot == null || systemRoot.isBlank()) {
-      return null;
-    }
-    Path fsutil = Path.of(systemRoot, "System32", "fsutil.exe");
+  private static boolean sameOwnedFile(Path request, Path claim, Path anchor) {
     try {
-      Process process = new ProcessBuilder(fsutil.toString(), "file", "queryFileID", path.toString())
-          .redirectErrorStream(true)
-          .start();
-      if (!process.waitFor(2, TimeUnit.SECONDS)) {
-        process.destroyForcibly();
-        return null;
+      return Files.isSameFile(request, claim) && Files.isSameFile(claim, anchor);
+    } catch (IOException | SecurityException ignored) {
+      return false;
+    }
+  }
+
+  private static void deleteOwnedLink(Path candidate, Path proof) {
+    try {
+      if (Files.exists(candidate, LinkOption.NOFOLLOW_LINKS)
+          && Files.exists(proof, LinkOption.NOFOLLOW_LINKS)
+          && Files.isSameFile(candidate, proof)) {
+        Files.delete(candidate);
       }
-      byte[] output;
-      try (InputStream stream = process.getInputStream()) {
-        output = stream.readNBytes(256);
-      }
-      if (process.exitValue() != 0) {
-        return null;
-      }
-      Matcher match = WINDOWS_FILE_ID.matcher(new String(output, StandardCharsets.US_ASCII));
-      return match.find() ? "windows:" + match.group(1).toLowerCase(java.util.Locale.ROOT) : null;
-    } catch (IOException ignored) {
-      return null;
-    } catch (InterruptedException interrupted) {
-      Thread.currentThread().interrupt();
-      return null;
+    } catch (IOException | SecurityException ignored) {
+      // A collision or replacement remains in place and blocks reuse.
     }
   }
 
@@ -235,9 +177,9 @@ public final class BridgeProofStore {
       if (reader.peek() != JsonToken.BEGIN_OBJECT) {
         return null;
       }
-      Integer schemaVersion = null;
+      Long schemaVersion = null;
       String username = null;
-      Integer port = null;
+      Long port = null;
       Long issuedAt = null;
       Long expiresAt = null;
       String nonce = null;
@@ -249,34 +191,47 @@ public final class BridgeProofStore {
           return null;
         }
         switch (name) {
-          case "schemaVersion" -> schemaVersion = nextInt(reader);
+          case "schemaVersion" -> schemaVersion = nextCanonicalLong(reader);
           case "username" -> username = nextString(reader);
-          case "port" -> port = nextInt(reader);
-          case "issuedAt" -> issuedAt = nextLong(reader);
-          case "expiresAt" -> expiresAt = nextLong(reader);
+          case "port" -> port = nextCanonicalLong(reader);
+          case "issuedAt" -> issuedAt = nextCanonicalLong(reader);
+          case "expiresAt" -> expiresAt = nextCanonicalLong(reader);
           case "nonce" -> nonce = nextString(reader);
           default -> throw new IllegalStateException("validated key");
         }
       }
       reader.endObject();
-      if (!seen.equals(REQUIRED_KEYS) || reader.peek() != JsonToken.END_DOCUMENT) {
+      if (!seen.equals(REQUIRED_KEYS)
+          || reader.peek() != JsonToken.END_DOCUMENT
+          || schemaVersion == null
+          || username == null
+          || port == null
+          || issuedAt == null
+          || expiresAt == null
+          || nonce == null
+          || schemaVersion > Integer.MAX_VALUE
+          || port > Integer.MAX_VALUE) {
         return null;
       }
-      if (schemaVersion == null || username == null || port == null || issuedAt == null || expiresAt == null || nonce == null) {
-        return null;
-      }
-      return new BridgeRequest(schemaVersion, username, port, issuedAt, expiresAt, nonce);
+      return new BridgeRequest(schemaVersion.intValue(), username, port.intValue(), issuedAt, expiresAt, nonce);
     } catch (IOException | IllegalStateException ignored) {
       return null;
     }
   }
 
-  private static Integer nextInt(JsonReader reader) throws IOException {
-    return reader.peek() == JsonToken.NUMBER ? reader.nextInt() : null;
-  }
-
-  private static Long nextLong(JsonReader reader) throws IOException {
-    return reader.peek() == JsonToken.NUMBER ? reader.nextLong() : null;
+  private static Long nextCanonicalLong(JsonReader reader) throws IOException {
+    if (reader.peek() != JsonToken.NUMBER) {
+      return null;
+    }
+    String literal = reader.nextString();
+    if (!literal.matches("0|[1-9][0-9]*")) {
+      return null;
+    }
+    try {
+      return Long.parseLong(literal);
+    } catch (NumberFormatException ignored) {
+      return null;
+    }
   }
 
   private static String nextString(JsonReader reader) throws IOException {
@@ -310,10 +265,5 @@ public final class BridgeProofStore {
     } catch (NoSuchAlgorithmException impossible) {
       throw new IllegalStateException(impossible);
     }
-  }
-
-  @FunctionalInterface
-  interface AtomicMover {
-    void move(Path source, Path consumed) throws IOException;
   }
 }

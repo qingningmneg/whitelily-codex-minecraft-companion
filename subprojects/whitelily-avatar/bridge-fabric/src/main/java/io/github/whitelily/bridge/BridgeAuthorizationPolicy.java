@@ -19,6 +19,9 @@ public final class BridgeAuthorizationPolicy {
         || !context.loopbackRemote()
         || request.port() != context.handshakePort()
         || request.port() != context.publishedPort()
+        || request.issuedAt() < 0
+        || request.expiresAt() < request.issuedAt()
+        || request.expiresAt() - request.issuedAt() != 30_000
         || request.issuedAt() > context.now()
         || context.now() >= request.expiresAt()
         || !isNonce(request.nonce())) {

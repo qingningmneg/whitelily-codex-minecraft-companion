@@ -32,7 +32,7 @@ class BridgeAuthorizationPolicyTest {
       new PolicyCase(validRequest(), new BridgeAuthorizationContext(true, true, 49152, 49153, "WhiteLily", 1500)),
       new PolicyCase(validRequest(), new BridgeAuthorizationContext(true, true, 49152, 49152, "whiteLily", 1500)),
       new PolicyCase(validRequest(), new BridgeAuthorizationContext(true, true, 49152, 49152, "WhiteLily", 999)),
-      new PolicyCase(validRequest(), new BridgeAuthorizationContext(true, true, 49152, 49152, "WhiteLily", 2000)),
+      new PolicyCase(validRequest(), new BridgeAuthorizationContext(true, true, 49152, 49152, "WhiteLily", 31000)),
     };
 
     for (PolicyCase rejectedCase : rejected) {
@@ -42,7 +42,7 @@ class BridgeAuthorizationPolicyTest {
   }
 
   private static BridgeRequest validRequest() {
-    return new BridgeRequest(1, "WhiteLily", 49152, 1000, 2000, NONCE);
+    return new BridgeRequest(1, "WhiteLily", 49152, 1000, 31000, NONCE);
   }
 
   private static BridgeAuthorizationContext validContext() {
