@@ -36,20 +36,23 @@ abstract class ServerLoginPacketListenerImplMixin {
       cancellable = true)
   private void whitelily$authorizeBridgeProfile(
       ServerboundHelloPacket packet, CallbackInfo callbackInfo) {
-    boolean integrated = server instanceof IntegratedServer integratedServer && integratedServer.isPublished();
-    int publishedPort = integrated ? ((IntegratedServer) server).getPort() : -1;
+    if (!WhiteLilyBridge.isCurrentPublishedIntegratedServer(server)) {
+      return;
+    }
+    int publishedPort = ((IntegratedServer) server).getPort();
     int localPort = ((BridgeConnectionEndpointAccess) connection).whitelily$localPort();
     BridgeLoginDecision decision =
         BridgeRuntime.loginSelector()
             .select(
                 (BridgeConnectionAccess) connection,
-                integrated,
+                true,
                 BridgeNetworkAddresses.isLoopback(connection.getRemoteAddress()),
                 localPort,
                 publishedPort,
                 packet.name(),
                 System.currentTimeMillis());
-    if (decision != BridgeLoginDecision.BRIDGE_OFFLINE_PROFILE) {
+    if (decision != BridgeLoginDecision.BRIDGE_OFFLINE_PROFILE
+        || !WhiteLilyBridge.isCurrentPublishedIntegratedServer(server)) {
       return;
     }
 

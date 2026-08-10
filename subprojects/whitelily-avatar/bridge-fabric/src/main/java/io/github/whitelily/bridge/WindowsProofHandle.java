@@ -19,6 +19,8 @@ final class WindowsProofHandle implements AutoCloseable {
       WinNT.FILE_SHARE_READ | WinNT.FILE_SHARE_WRITE | WinNT.FILE_SHARE_DELETE;
   private static volatile Function<HANDLE, Optional<WindowsOwnedFile.Identity>> identityReader =
       WindowsOwnedFile::identity;
+  private static volatile Function<HANDLE, Boolean> dispositionSetter =
+      WindowsProofHandle::setDeleteDisposition;
 
   private final HANDLE handle;
   private final WindowsOwnedFile.Identity identity;
@@ -103,25 +105,25 @@ final class WindowsProofHandle implements AutoCloseable {
         : Optional.empty();
   }
 
-  boolean deleteOwnedFile() {
-    return deleteIfExactLinkCount(1);
-  }
-
   private boolean disposeAndClose() {
     if (!closed.compareAndSet(false, true)) {
       return false;
     }
-    FILE_DISPOSITION_INFO disposition = new FILE_DISPOSITION_INFO(true);
-    disposition.write();
     try {
-      return Kernel32.INSTANCE.SetFileInformationByHandle(
-          handle,
-          FILE_DISPOSITION_INFO_CLASS,
-          disposition.getPointer(),
-          new DWORD(disposition.size()));
+      return Boolean.TRUE.equals(dispositionSetter.apply(handle));
     } finally {
       Kernel32.INSTANCE.CloseHandle(handle);
     }
+  }
+
+  private static boolean setDeleteDisposition(HANDLE handle) {
+    FILE_DISPOSITION_INFO disposition = new FILE_DISPOSITION_INFO(true);
+    disposition.write();
+    return Kernel32.INSTANCE.SetFileInformationByHandle(
+        handle,
+        FILE_DISPOSITION_INFO_CLASS,
+        disposition.getPointer(),
+        new DWORD(disposition.size()));
   }
 
   @Override

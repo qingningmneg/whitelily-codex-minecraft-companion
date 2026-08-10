@@ -311,6 +311,27 @@ final class BridgeJarContractAssertions {
       String name = new String(archive, offset + 46, nameLength, UTF_8);
       assertEquals(0, littleEndianShort(archive, offset + 12), "entry timestamp: " + name);
       assertEquals(0x21, littleEndianShort(archive, offset + 14), "entry date: " + name);
+      int localOffset = littleEndianInt(archive, offset + 42);
+      assertTrue(
+          localOffset >= 0 && localOffset + 30 <= archive.length,
+          "local entry offset: " + name);
+      assertEquals(0x04034b50, littleEndianInt(archive, localOffset));
+      int localNameLength = littleEndianShort(archive, localOffset + 26);
+      assertTrue(
+          localOffset + 30 + localNameLength <= archive.length,
+          "local entry name bounds: " + name);
+      assertEquals(
+          name,
+          new String(archive, localOffset + 30, localNameLength, UTF_8),
+          "local entry name: " + name);
+      assertEquals(
+          0,
+          littleEndianShort(archive, localOffset + 10),
+          "local entry timestamp: " + name);
+      assertEquals(
+          0x21,
+          littleEndianShort(archive, localOffset + 12),
+          "local entry date: " + name);
       offset += 46 + nameLength + extraLength + commentLength;
     }
   }

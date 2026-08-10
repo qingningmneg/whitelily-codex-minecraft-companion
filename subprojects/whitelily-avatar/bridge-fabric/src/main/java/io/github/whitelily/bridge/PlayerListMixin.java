@@ -26,13 +26,14 @@ abstract class PlayerListMixin {
       ServerPlayer player,
       CommonListenerCookie cookie,
       CallbackInfo callbackInfo) {
-    if (server instanceof IntegratedServer integratedServer) {
+    if (server instanceof IntegratedServer integratedServer
+        && WhiteLilyBridge.isCurrentPublishedIntegratedServer(integratedServer)) {
       ApprovedProfileRegistry.complete(
           (BridgeConnectionApprovalAccess) connection,
           server,
           player.getUUID(),
           player.getGameProfile().getName(),
-          integratedServer::isPublished);
+          () -> WhiteLilyBridge.isCurrentPublishedIntegratedServer(integratedServer));
     }
   }
 

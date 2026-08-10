@@ -91,6 +91,10 @@ project(":bridge-fabric") {
   tasks.withType<Test>().configureEach {
     useJUnitPlatform()
     dependsOn(tasks.named("remapJar"))
+    environment(
+      "LOCALAPPDATA",
+      layout.buildDirectory.dir("test-local-app-data").get().asFile.absolutePath,
+    )
     systemProperty(
       "whitelily.bridge.jar",
       layout.buildDirectory.file("libs/whitelily-bridge-fabric-$minecraftVersion-$bridgeVersion.jar").get().asFile.absolutePath,

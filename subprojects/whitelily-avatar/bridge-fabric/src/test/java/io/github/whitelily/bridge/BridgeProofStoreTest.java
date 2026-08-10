@@ -19,6 +19,7 @@ import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.function.Function;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.io.TempDir;
@@ -359,6 +360,83 @@ class BridgeProofStoreTest {
       assertTrue(Files.exists(request.resolveSibling(request.getFileName() + ".claim")));
     } finally {
       hook.set(null, null);
+    }
+  }
+
+  @Test
+  void interruptionAfterRequestRemovalLeavesTwoBlockersAndPreventsReplay() throws Exception {
+    Path request = writeRequest(temporaryDirectory, validJson());
+    Path claim = request.resolveSibling(request.getFileName() + ".claim");
+    Path anchor = request.resolveSibling(request.getFileName() + ".anchor");
+    Field hook = BridgeProofStore.class.getDeclaredField("afterRequestRemovalHook");
+    hook.setAccessible(true);
+    hook.set(null, (Runnable) () -> { throw new RuntimeException("simulated interruption"); });
+    try {
+      BridgeProofStore store = new BridgeProofStore(temporaryDirectory);
+
+      assertEquals(Optional.empty(), store.consume(NONCE, CONTEXT));
+      assertFalse(Files.exists(request));
+      assertTrue(Files.exists(claim));
+      assertTrue(Files.exists(anchor));
+
+      writeRequest(temporaryDirectory, validJson());
+      assertEquals(Optional.empty(), store.consume(NONCE, CONTEXT));
+      assertTrue(Files.exists(request));
+      assertTrue(Files.exists(claim));
+      assertTrue(Files.exists(anchor));
+    } finally {
+      hook.set(null, null);
+    }
+  }
+
+  @Test
+  void interruptionAfterClaimRemovalLeavesAnAnchorBlockerAndPreventsReplay() throws Exception {
+    Path request = writeRequest(temporaryDirectory, validJson());
+    Path claim = request.resolveSibling(request.getFileName() + ".claim");
+    Path anchor = request.resolveSibling(request.getFileName() + ".anchor");
+    Field hook = BridgeProofStore.class.getDeclaredField("afterClaimRemovalHook");
+    hook.setAccessible(true);
+    hook.set(null, (Runnable) () -> { throw new RuntimeException("simulated interruption"); });
+    try {
+      BridgeProofStore store = new BridgeProofStore(temporaryDirectory);
+
+      assertEquals(Optional.empty(), store.consume(NONCE, CONTEXT));
+      assertFalse(Files.exists(request));
+      assertFalse(Files.exists(claim));
+      assertTrue(Files.exists(anchor));
+
+      writeRequest(temporaryDirectory, validJson());
+      assertEquals(Optional.empty(), store.consume(NONCE, CONTEXT));
+      assertTrue(Files.exists(request));
+      assertFalse(Files.exists(claim));
+      assertTrue(Files.exists(anchor));
+    } finally {
+      hook.set(null, null);
+    }
+  }
+
+  @Test
+  void failedRequestDispositionLeavesEveryBlockerAndPreventsReplay() throws Exception {
+    Path request = writeRequest(temporaryDirectory, validJson());
+    Path claim = request.resolveSibling(request.getFileName() + ".claim");
+    Path anchor = request.resolveSibling(request.getFileName() + ".anchor");
+    Field setter = WindowsProofHandle.class.getDeclaredField("dispositionSetter");
+    setter.setAccessible(true);
+    Object original = setter.get(null);
+    setter.set(null, (Function<Object, Boolean>) ignored -> false);
+    try {
+      BridgeProofStore store = new BridgeProofStore(temporaryDirectory);
+
+      assertEquals(Optional.empty(), store.consume(NONCE, CONTEXT));
+      assertTrue(Files.exists(request));
+      assertTrue(Files.exists(claim));
+      assertTrue(Files.exists(anchor));
+      assertEquals(Optional.empty(), store.consume(NONCE, CONTEXT));
+      assertTrue(Files.exists(request));
+      assertTrue(Files.exists(claim));
+      assertTrue(Files.exists(anchor));
+    } finally {
+      setter.set(null, original);
     }
   }
 

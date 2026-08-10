@@ -29,6 +29,8 @@ public final class BridgeProofStore {
       Set.of("schemaVersion", "username", "port", "issuedAt", "expiresAt", "nonce");
   private static volatile Runnable beforeClaimHook;
   private static volatile Runnable beforeSuccessCleanupHook;
+  private static volatile Runnable afterRequestRemovalHook;
+  private static volatile Runnable afterClaimRemovalHook;
 
   private final Path root;
 
@@ -90,11 +92,16 @@ public final class BridgeProofStore {
         if (!sameClaimedFile(proof, request, claim, anchor, 3) || !ordinaryAncestorChain(root)) {
           return Optional.empty();
         }
-        if (!deleteOwnedLink(proof.identity(), claim, 3)
-            || !deleteOwnedLink(proof.identity(), anchor, 2)) {
+        WindowsOwnedFile.Identity identity = proof.identity();
+        if (!proof.deleteIfExactLinkCount(3)) {
           return Optional.empty();
         }
-        return proof.deleteOwnedFile() ? authorized : Optional.empty();
+        runHook(afterRequestRemovalHook);
+        if (!deleteOwnedLink(identity, claim, 2)) {
+          return Optional.empty();
+        }
+        runHook(afterClaimRemovalHook);
+        return deleteOwnedLink(identity, anchor, 1) ? authorized : Optional.empty();
       } catch (FileAlreadyExistsException ignored) {
         return Optional.empty();
       }
