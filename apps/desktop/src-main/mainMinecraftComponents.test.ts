@@ -6,10 +6,10 @@ import { resolveDesktopMinecraftComponentResources } from "./main.js";
 
 describe("desktop Minecraft component composition", () => {
   it("supplies only reviewed fixed resource, presence, and manifest authority from main", () => {
-    const dataRoot = String.raw`C:\Users\Current\AppData\Local\WhiteLily`;
-    const resourcesPath = String.raw`C:\Program Files\WhiteLily\resources`;
+    const dataRoot = String.raw`X:\WhiteLilyTestData`;
+    const resourcesPath = String.raw`X:\WhiteLilyTestApp\resources`;
     const authority = resolveDesktopMinecraftComponentResources({
-      appPath: String.raw`C:\Program Files\WhiteLily\resources\app.asar`,
+      appPath: String.raw`X:\WhiteLilyTestApp\resources\app.asar`,
       resourcesPath,
       dataRoot,
       development: false,
