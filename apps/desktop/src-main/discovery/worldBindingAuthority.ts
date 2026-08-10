@@ -1,10 +1,11 @@
 import { execFile as nodeExecFile } from "node:child_process";
-import { realpath, stat } from "node:fs/promises";
-import { basename } from "node:path";
+import { lstat, realpath } from "node:fs/promises";
+import { basename, isAbsolute, resolve } from "node:path";
 import { promisify } from "node:util";
 import { loadConfig } from "../../../../src/config/loadConfig.js";
 import type { ConfirmedWorldBinding } from "../../../../src/world/worldProfileStore.js";
 import type { ConfirmedConnectionProof, LanDetector } from "./lanDetector.js";
+import type { LanObservation } from "./lanCandidateStore.js";
 
 const execFile = promisify(nodeExecFile);
 const MAX_JAVA_PROCESS_SNAPSHOT_BYTES = 65_536;
@@ -24,6 +25,12 @@ export interface WorldBindingAuthorityOptions {
   resolveInstancePath?: (snapshot: JavaProcessSnapshot) => Promise<string>;
 }
 
+export interface ResolvedJavaInstance {
+  readonly canonicalInstancePath: string;
+  readonly javaSession: Readonly<LanObservation>;
+  readonly snapshot: Readonly<JavaProcessSnapshot>;
+}
+
 /** Main-process-only authority derivation. Neither path nor owner enters IPC input. */
 export class WorldBindingAuthority {
   readonly #configPath: string;
@@ -40,29 +47,34 @@ export class WorldBindingAuthority {
 
   async redeem(proof: ConfirmedConnectionProof): Promise<ConfirmedWorldBinding> {
     const session = await this.#lanDetector.redeemConfirmedProof(proof);
-    const snapshot = await this.#readJavaProcessSnapshot(session.pid);
-    assertExactJavaSession(snapshot, session);
-    const [config, canonicalInstancePath] = await Promise.all([
+    const [config, instance] = await Promise.all([
       loadConfig(this.#configPath),
-      this.#resolveInstancePath(snapshot),
+      this.resolveJavaInstance(session),
     ]);
+    return Object.freeze({
+      canonicalInstancePath: instance.canonicalInstancePath,
+      javaSession: instance.javaSession,
+      ownerUsername: config.minecraft.ownerUsername,
+      proof: { ...proof },
+    });
+  }
+
+  /** Main-process-only Java identity and canonical game-directory derivation. */
+  async resolveJavaInstance(observation: LanObservation): Promise<ResolvedJavaInstance> {
+    const snapshot = await this.#readJavaProcessSnapshot(observation.pid);
+    assertExactJavaSession(snapshot, observation);
+    const canonicalInstancePath = await this.#resolveInstancePath(snapshot);
     // A process can exit and its PID be reused while resolving a filesystem path.
-    // Re-read the process identity before the derived authority leaves main.
-    const revalidated = await this.#readJavaProcessSnapshot(session.pid);
-    assertExactJavaSession(revalidated, session);
+    // Re-read the complete process identity before derived authority leaves main.
+    const revalidated = await this.#readJavaProcessSnapshot(observation.pid);
+    assertExactJavaSession(revalidated, observation);
     if (!sameJavaSnapshot(snapshot, revalidated)) {
       throw new Error("Java process identity changed while resolving the Minecraft instance path");
     }
     return Object.freeze({
       canonicalInstancePath,
-      javaSession: {
-        pid: session.pid,
-        processStartedAt: session.processStartedAt,
-        port: session.port,
-        version: session.version,
-      },
-      ownerUsername: config.minecraft.ownerUsername,
-      proof: { ...proof },
+      javaSession: Object.freeze({ ...observation }),
+      snapshot: Object.freeze({ ...snapshot }),
     });
   }
 }
@@ -159,12 +171,30 @@ export function parseJavaProcessSnapshotOutput(output: Uint8Array): JavaProcessS
 }
 
 async function resolveJavaGameDirectory(snapshot: JavaProcessSnapshot): Promise<string> {
-  const match = /(?:^|\s)--gameDir(?:=|\s+)(?:"([^"]+)"|([^\s]+))/u.exec(snapshot.commandLine);
-  const requested = match?.[1] ?? match?.[2];
-  if (!requested || requested.includes("\u0000")) {
+  const matches = [
+    ...snapshot.commandLine.matchAll(/(?:^|\s)--gameDir(?:=|\s+)(?:"([^"]+)"|([^\s]+))(?=\s|$)/gu),
+  ];
+  const requested = matches[0]?.[1] ?? matches[0]?.[2];
+  if (
+    matches.length !== 1 ||
+    !requested ||
+    requested.includes("\u0000") ||
+    !isAbsolute(requested)
+  ) {
     throw new Error("Minecraft instance path is unavailable");
   }
+  const resolved = resolve(requested);
+  const metadata = await lstat(resolved);
+  if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+    throw new Error("Minecraft instance path is invalid");
+  }
   const canonical = await realpath(requested);
-  if (!(await stat(canonical)).isDirectory()) throw new Error("Minecraft instance path is invalid");
-  return canonical;
+  if (!samePath(resolve(canonical), resolved)) {
+    throw new Error("Minecraft instance path is invalid");
+  }
+  return resolve(canonical);
+}
+
+function samePath(left: string, right: string): boolean {
+  return process.platform === "win32" ? left.toLowerCase() === right.toLowerCase() : left === right;
 }

@@ -924,6 +924,112 @@ describe("local Minecraft LAN detector", () => {
     );
   });
 
+  it("inspects an immutable candidate repeatedly without consuming confirmation authority", async () => {
+    let nonceIndex = 0;
+    const record: JavaListenerProbeRecord = {
+      localAddress: "127.0.0.1",
+      localPort: 51321,
+      pid: 4200,
+      processName: "javaw.exe",
+      processStartedAt: 1785196800123,
+      version: "1.21.5",
+    };
+    const detector = new LanDetector({
+      probe: async () => ({ records: [record], diagnostic: null }),
+      now: () => 1_000,
+      idFactory: () => "lan_candidate_inspect01",
+      nonceFactory: () => `proof_nonce_inspect${String(++nonceIndex).padStart(2, "0")}`,
+    });
+    const candidate = (await detector.detectLanCandidates())[0]!;
+
+    const first = await detector.inspectCandidate(candidate.id);
+    const second = await detector.inspectCandidate(candidate.id);
+
+    expect(first).toEqual({
+      port: 51321,
+      pid: 4200,
+      processStartedAt: 1785196800123,
+      version: "1.21.5",
+    });
+    expect(Object.isFrozen(first)).toBe(true);
+    expect(second).toEqual(first);
+    await expect(
+      detector.confirmLanCandidate(candidate.id, async (candidateProof) => ({
+        status: "configured",
+        port: candidateProof.port,
+        confirmedAt: candidateProof.issuedAt,
+      })),
+    ).resolves.toMatchObject({ status: "confirmed", port: 51321 });
+  });
+
+  it("fails candidate inspection on expiry or any PID, start, listener, Java, or version drift", async () => {
+    let now = 1_000;
+    let record: JavaListenerProbeRecord = {
+      localAddress: "127.0.0.1",
+      localPort: 51321,
+      pid: 4200,
+      processName: "javaw.exe",
+      processStartedAt: 1785196800123,
+      version: "1.21.5",
+    };
+    let nextId = 0;
+    const detector = new LanDetector({
+      probe: async () => ({ records: [record], diagnostic: null }),
+      now: () => now,
+      idFactory: () => `lan_candidate_drift_${String(++nextId).padStart(2, "0")}`,
+    });
+
+    for (const replacement of [
+      { ...record, pid: record.pid + 1 },
+      { ...record, processStartedAt: record.processStartedAt + 1 },
+      { ...record, localPort: record.localPort + 1 },
+      { ...record, localAddress: "192.168.1.10" },
+      { ...record, processName: "node.exe" } as unknown as JavaListenerProbeRecord,
+      { ...record, version: null },
+    ] satisfies readonly JavaListenerProbeRecord[]) {
+      record = {
+        localAddress: "127.0.0.1",
+        localPort: 51321,
+        pid: 4200,
+        processName: "javaw.exe",
+        processStartedAt: 1785196800123,
+        version: "1.21.5",
+      };
+      const candidate = (await detector.detectLanCandidates())[0]!;
+      record = replacement;
+      await expect(detector.inspectCandidate(candidate.id)).rejects.toThrow(
+        "LAN_CANDIDATE_CHANGED",
+      );
+    }
+
+    record = {
+      localAddress: "127.0.0.1",
+      localPort: 51321,
+      pid: 4200,
+      processName: "javaw.exe",
+      processStartedAt: 1785196800123,
+      version: "1.21.5",
+    };
+    const expired = (await detector.detectLanCandidates())[0]!;
+    now = expired.expiresAt;
+    await expect(detector.inspectCandidate(expired.id)).rejects.toThrow("LAN_CANDIDATE_EXPIRED");
+  });
+
+  it("rejects renderer-shaped paths without probing or exposing stored process metadata", async () => {
+    let probes = 0;
+    const detector = new LanDetector({
+      probe: async () => {
+        probes += 1;
+        return { records: [], diagnostic: null };
+      },
+    });
+
+    await expect(detector.inspectCandidate("C:\\Minecraft\\mods")).rejects.toThrow(
+      "LAN_CANDIDATE_EXPIRED",
+    );
+    expect(probes).toBe(0);
+  });
+
   it("invalidates an in-flight probe when discovery stops", async () => {
     let releaseProbe!: () => void;
     const gate = new Promise<void>((resolve) => {

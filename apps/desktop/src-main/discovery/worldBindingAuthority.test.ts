@@ -1,6 +1,6 @@
 import { execFile as nodeExecFile, spawn } from "node:child_process";
 import { once } from "node:events";
-import { copyFile, mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -154,6 +154,64 @@ describe("WorldBindingAuthority", () => {
     });
 
     await expect(authority.redeem(proof)).rejects.toThrow("identity changed");
+  });
+
+  it("resolves one immutable Java instance through the same double-snapshot authority path", async () => {
+    const received: JavaProcessSnapshot[] = [];
+    const authority = new WorldBindingAuthority({
+      configPath: await configPath(),
+      lanDetector: { redeemConfirmedProof: async () => session },
+      readJavaProcessSnapshot: async () => snapshot,
+      resolveInstancePath: async (value) => {
+        received.push(value);
+        return "C:/Minecraft/Instance";
+      },
+    });
+
+    const resolved = await authority.resolveJavaInstance(session);
+
+    expect(resolved).toEqual({
+      canonicalInstancePath: "C:/Minecraft/Instance",
+      javaSession: session,
+      snapshot,
+    });
+    expect(received).toEqual([snapshot]);
+    expect(Object.isFrozen(resolved)).toBe(true);
+    expect(Object.isFrozen(resolved.javaSession)).toBe(true);
+    expect(Object.isFrozen(resolved.snapshot)).toBe(true);
+  });
+
+  it("rejects a linked --gameDir instead of silently canonicalizing through it", async () => {
+    const root = await mkdtemp(join(tmpdir(), "whitelily-linked-game-dir-"));
+    const target = join(root, "target");
+    const linked = join(root, "linked");
+    try {
+      await mkdir(target);
+      await symlink(target, linked, "junction");
+      const linkedSnapshot = { ...snapshot, commandLine: `javaw.exe --gameDir "${linked}"` };
+      const authority = new WorldBindingAuthority({
+        configPath: await configPath(),
+        lanDetector: { redeemConfirmedProof: async () => session },
+        readJavaProcessSnapshot: async () => linkedSnapshot,
+      });
+
+      await expect(authority.resolveJavaInstance(session)).rejects.toThrow(
+        "Minecraft instance path",
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects non-Java snapshots through direct component inspection authority", async () => {
+    const authority = new WorldBindingAuthority({
+      configPath: await configPath(),
+      lanDetector: { redeemConfirmedProof: async () => session },
+      readJavaProcessSnapshot: async () => ({ ...snapshot, executablePath: "C:/node.exe" }),
+      resolveInstancePath: async () => "C:/Minecraft/Instance",
+    });
+
+    await expect(authority.resolveJavaInstance(session)).rejects.toThrow("same Java process");
   });
 
   it("derives a binding only from a revalidated Java snapshot", async () => {
