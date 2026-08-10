@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "id": "whitelily_bridge",
+  "version": "${version}",
+  "name": "WhiteLily Bridge",
+  "environment": "client",
+  "entrypoints": {
+    "client": ["io.github.whitelily.bridge.WhiteLilyBridgeClient"]
+  },
+  "mixins": ["whitelily_bridge.mixins.json"],
+  "depends": {
+    "minecraft": "=1.21.5",
+    "fabricloader": ">=0.16.14"
+  }
+}

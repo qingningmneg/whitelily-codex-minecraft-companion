@@ -1,0 +1,16 @@
+{
+  "required": true,
+  "package": "io.github.whitelily.bridge",
+  "compatibilityLevel": "JAVA_21",
+  "refmap": "whitelily-bridge-fabric-refmap.json",
+  "client": [
+    "ConnectionMixin",
+    "ServerHandshakePacketListenerImplMixin",
+    "ServerLoginPacketListenerImplMixin",
+    "MinecraftServerMixin",
+    "PlayerListMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}
