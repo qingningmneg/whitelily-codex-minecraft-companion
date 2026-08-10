@@ -14,6 +14,7 @@ final class ModuleMetadataTest {
     assertTrue(json.contains("\"environment\": \"client\""));
     assertTrue(json.contains("\"minecraft\": \"=1.21.5\""));
     assertTrue(json.contains("\"fabricloader\": \">=0.16.14\""));
+    assertTrue(json.contains("\"whitelily_bridge\": \">=0.1.0\""));
     assertTrue(json.contains("\"geckolib\": \"=5.1.0\""));
   }
 

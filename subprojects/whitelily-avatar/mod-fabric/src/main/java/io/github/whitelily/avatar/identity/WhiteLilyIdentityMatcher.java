@@ -4,11 +4,10 @@ package io.github.whitelily.avatar.identity;
  * Makes fail-closed visual identity decisions from a bounded, immutable player snapshot.
  *
  * <p>This matcher intentionally accepts only the supplied snapshot fields. Minecraft chat,
- * display text, scoreboard text, NBT, and skin URLs are not inputs to this decision.
+ * display text, scoreboard/team text, NBT, and skin URLs are not inputs to this decision.
  */
 public final class WhiteLilyIdentityMatcher {
   private static final String TARGET_PROFILE_NAME = "WhiteLily";
-  private static final String TARGET_TEAM_NAME = "whitelily_avatar";
   private static final int MAX_PROFILE_NAME_LENGTH = 16;
   private static final int MAX_WORLD_SESSION_LENGTH = 128;
 
@@ -27,21 +26,13 @@ public final class WhiteLilyIdentityMatcher {
         || snapshot.playerId() == null
         || snapshot.localPlayer()
         || !isTargetProfileName(snapshot.profileName())
+        || !snapshot.bridgeApproved()
         || !isValidWorldSession(snapshot.worldSession())
         || !snapshot.worldSession().equals(currentWorldSession)
         || !isValidWorldSession(currentWorldSession)) {
       return IdentityDecision.NONE;
     }
-
-    if (TARGET_TEAM_NAME.equals(snapshot.teamName())) {
-      return IdentityDecision.FULL;
-    }
-
-    if (isMissingTeam(snapshot.teamName()) && snapshot.explicitWeakNameMode()) {
-      return IdentityDecision.BASIC_NAME_ONLY;
-    }
-
-    return IdentityDecision.NONE;
+    return IdentityDecision.FULL;
   }
 
   @Override
@@ -70,10 +61,6 @@ public final class WhiteLilyIdentityMatcher {
       }
     }
     return true;
-  }
-
-  private static boolean isMissingTeam(String teamName) {
-    return teamName == null || teamName.isEmpty();
   }
 
   private static boolean isValidWorldSession(String worldSession) {

@@ -1,6 +1,5 @@
 package io.github.whitelily.avatar;
 
-import io.github.whitelily.avatar.render.WeakNameModeControl;
 import io.github.whitelily.avatar.render.WhiteLilyRenderRuntime;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientWorldEvents;
@@ -32,7 +31,4 @@ public final class WhiteLilyAvatarClient implements ClientModInitializer {
     return RENDER_RUNTIME;
   }
 
-  public static WeakNameModeControl weakNameModeControl() {
-    return RENDER_RUNTIME.weakNameModeControl();
-  }
 }

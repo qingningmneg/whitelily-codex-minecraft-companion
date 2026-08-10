@@ -32,7 +32,7 @@ public final class WhiteLilyRenderDecision {
       RenderSessionId capturedSession,
       RenderSessionId currentSession) {
     if (identity == null
-        || identity == IdentityDecision.NONE
+        || identity != IdentityDecision.FULL
         || armorTheme == null
         || capturedSession == null
         || !capturedSession.equals(currentSession)) {

@@ -7,23 +7,20 @@ public final class PlayerIdentitySnapshot {
   private final UUID playerId;
   private final String profileName;
   private final boolean localPlayer;
-  private final String teamName;
   private final String worldSession;
-  private final boolean explicitWeakNameMode;
+  private final boolean bridgeApproved;
 
   public PlayerIdentitySnapshot(
       UUID playerId,
       String profileName,
       boolean localPlayer,
-      String teamName,
       String worldSession,
-      boolean explicitWeakNameMode) {
+      boolean bridgeApproved) {
     this.playerId = playerId;
     this.profileName = profileName;
     this.localPlayer = localPlayer;
-    this.teamName = teamName;
     this.worldSession = worldSession;
-    this.explicitWeakNameMode = explicitWeakNameMode;
+    this.bridgeApproved = bridgeApproved;
   }
 
   public UUID playerId() {
@@ -38,16 +35,12 @@ public final class PlayerIdentitySnapshot {
     return localPlayer;
   }
 
-  public String teamName() {
-    return teamName;
-  }
-
   public String worldSession() {
     return worldSession;
   }
 
-  public boolean explicitWeakNameMode() {
-    return explicitWeakNameMode;
+  public boolean bridgeApproved() {
+    return bridgeApproved;
   }
 
   @Override

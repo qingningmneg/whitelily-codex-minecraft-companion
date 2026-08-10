@@ -8,18 +8,6 @@ import org.junit.jupiter.api.Test;
 
 final class WhiteLilyRenderSessionsTest {
   @Test
-  void weakNameModeDefaultsOffAndCanOnlyBeChangedThroughTheNarrowControl() {
-    WhiteLilyRenderSessions sessions = new WhiteLilyRenderSessions();
-
-    assertFalse(sessions.weakNameModeEnabled());
-
-    WeakNameModeControl control = sessions;
-    control.setWeakNameModeEnabled(true);
-
-    assertTrue(sessions.weakNameModeEnabled());
-  }
-
-  @Test
   void eachConnectionOrWorldSessionGetsANewOpaqueSafeRandomIdentityAndEpoch() {
     WhiteLilyRenderSessions sessions = new WhiteLilyRenderSessions();
 

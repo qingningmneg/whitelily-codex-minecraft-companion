@@ -6,12 +6,12 @@ import io.github.whitelily.avatar.identity.WhiteLilyIdentityMatcher;
 import io.github.whitelily.avatar.theme.ArmorTheme;
 import io.github.whitelily.avatar.theme.ArmorThemeResolver;
 import io.github.whitelily.avatar.theme.EquipmentThemeInput;
+import io.github.whitelily.bridge.WhiteLilyBridge;
 import java.util.Optional;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.player.AbstractClientPlayer;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.world.entity.EquipmentSlot;
-import net.minecraft.world.scores.PlayerTeam;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -35,10 +35,6 @@ public final class WhiteLilyRenderRuntime {
     sessions.endSession();
   }
 
-  public WeakNameModeControl weakNameModeControl() {
-    return sessions;
-  }
-
   public WhiteLilyRenderDecision captureDecision(AbstractClientPlayer player) {
     Optional<RenderSessionId> current = sessions.currentSession();
     if (player == null || current.isEmpty()) {
@@ -46,15 +42,14 @@ public final class WhiteLilyRenderRuntime {
     }
 
     RenderSessionId session = current.orElseThrow();
-    PlayerTeam team = player.getTeam();
+    String profileName = player.getGameProfile().getName();
     PlayerIdentitySnapshot identitySnapshot =
         new PlayerIdentitySnapshot(
             player.getUUID(),
-            player.getGameProfile().getName(),
+            profileName,
             player == Minecraft.getInstance().player,
-            team == null ? null : team.getName(),
             session.matcherToken(),
-            sessions.weakNameModeEnabled());
+            WhiteLilyBridge.isApprovedProfile(player.getUUID(), profileName));
     IdentityDecision identity =
         new WhiteLilyIdentityMatcher(session.matcherToken()).decide(identitySnapshot);
     EquipmentThemeInput equipment =

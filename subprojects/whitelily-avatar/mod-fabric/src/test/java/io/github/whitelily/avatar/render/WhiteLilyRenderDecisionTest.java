@@ -25,7 +25,7 @@ final class WhiteLilyRenderDecisionTest {
   }
 
   @Test
-  void fullAndBasicNameOnlyUseTheCustomRenderer() {
+  void onlyFullIdentityUsesTheCustomRenderer() {
     WhiteLilyRenderSessions sessions = new WhiteLilyRenderSessions();
     RenderSessionId session = sessions.beginSession();
 
@@ -35,22 +35,7 @@ final class WhiteLilyRenderDecisionTest {
             .usesCustomRenderer());
     assertTrue(
         WhiteLilyRenderDecision.capture(
-                IdentityDecision.BASIC_NAME_ONLY, ArmorTheme.IRON, session, session)
-            .usesCustomRenderer());
-  }
-
-  @Test
-  void onlyFullIdentityCanReceiveLaterPrivateExpressions() {
-    WhiteLilyRenderSessions sessions = new WhiteLilyRenderSessions();
-    RenderSessionId session = sessions.beginSession();
-
-    assertTrue(
-        WhiteLilyRenderDecision.capture(
                 IdentityDecision.FULL, ArmorTheme.BASE, session, session)
-            .expressionCapable());
-    assertFalse(
-        WhiteLilyRenderDecision.capture(
-                IdentityDecision.BASIC_NAME_ONLY, ArmorTheme.BASE, session, session)
             .expressionCapable());
   }
 
