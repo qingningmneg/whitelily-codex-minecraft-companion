@@ -1,14 +1,10 @@
 package io.github.whitelily.bridge;
 
 import java.io.IOException;
-import java.nio.ByteBuffer;
-import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
-import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -19,14 +15,13 @@ public final class BridgePresencePublisher implements AutoCloseable {
 
   private static volatile Runnable beforePresenceIdentityHook;
   private static volatile Runnable beforeLinkIdentityHook;
+  private static volatile Runnable beforeOwnedHandleCloseHook;
 
-  private final Path presence;
-  private final BasicFileAttributes identity;
+  private final WindowsOwnedFile ownership;
   private final AtomicBoolean closed = new AtomicBoolean();
 
-  private BridgePresencePublisher(Path presence, BasicFileAttributes identity) {
-    this.presence = presence;
-    this.identity = identity;
+  private BridgePresencePublisher(WindowsOwnedFile ownership) {
+    this.ownership = ownership;
   }
 
   public static Optional<BridgePresencePublisher> publish(
@@ -41,68 +36,57 @@ public final class BridgePresencePublisher implements AutoCloseable {
       return Optional.empty();
     }
 
-    BasicFileAttributes temporaryIdentity = null;
+    WindowsOwnedFile ownership = null;
     try {
-      BasicFileAttributes rootIdentity = ordinaryDirectory(root);
-      if (rootIdentity == null || !ordinaryAncestorChain(root)) {
+      WindowsOwnedFile.Identity rootIdentity =
+          WindowsOwnedFile.identity(root, true).orElse(null);
+      if (ordinaryDirectory(root) == null
+          || rootIdentity == null
+          || !ordinaryAncestorChain(root)) {
         return Optional.empty();
       }
       byte[] document = document(pid, processStartEpochMs, writtenAt).getBytes(StandardCharsets.UTF_8);
-      try (FileChannel channel =
-          FileChannel.open(
-              temporary,
-              StandardOpenOption.CREATE_NEW,
-              StandardOpenOption.WRITE,
-              LinkOption.NOFOLLOW_LINKS)) {
-        ByteBuffer bytes = ByteBuffer.wrap(document);
-        while (bytes.hasRemaining()) {
-          channel.write(bytes);
-        }
-        channel.force(true);
-      }
-      temporaryIdentity = ordinaryFile(temporary);
-      if (temporaryIdentity == null
-          || !sameDirectoryIdentity(rootIdentity, ordinaryDirectory(root))
+      ownership = WindowsOwnedFile.create(temporary, document).orElse(null);
+      if (ownership == null
+          || ordinaryFile(temporary) == null
+          || !ownership.identity().equals(WindowsOwnedFile.identity(temporary, false).orElse(null))
+          || !rootIdentity.equals(WindowsOwnedFile.identity(root, true).orElse(null))
           || !ordinaryAncestorChain(root)) {
         return Optional.empty();
       }
-      Files.createLink(presence, temporary);
+      Files.move(temporary, presence);
       runHook(beforeLinkIdentityHook);
-      if (!sameDirectoryIdentity(rootIdentity, ordinaryDirectory(root))
+      if (ordinaryFile(presence) == null
+          || !rootIdentity.equals(WindowsOwnedFile.identity(root, true).orElse(null))
           || !ordinaryAncestorChain(root)
-          || !sameIdentity(temporaryIdentity, ordinaryFile(temporary))
-          || !sameIdentity(temporaryIdentity, ordinaryFile(presence))
-          || !Files.isSameFile(presence, temporary)) {
-        return Optional.empty();
-      }
-      deleteIfOwned(temporary, temporaryIdentity);
-      if (Files.exists(temporary, LinkOption.NOFOLLOW_LINKS)) {
+          || !ownership.identity().equals(WindowsOwnedFile.identity(presence, false).orElse(null))) {
         return Optional.empty();
       }
       runHook(beforePresenceIdentityHook);
-      BasicFileAttributes presenceIdentity = ordinaryFile(presence);
-      if (!sameIdentity(temporaryIdentity, presenceIdentity)
-          || !sameDirectoryIdentity(rootIdentity, ordinaryDirectory(root))
+      if (ordinaryFile(presence) == null
+          || !ownership.identity().equals(WindowsOwnedFile.identity(presence, false).orElse(null))
+          || !rootIdentity.equals(WindowsOwnedFile.identity(root, true).orElse(null))
           || !ordinaryAncestorChain(root)) {
-        deleteIfOwned(presence, temporaryIdentity);
         return Optional.empty();
       }
-      return Optional.of(new BridgePresencePublisher(presence, temporaryIdentity));
-    } catch (FileAlreadyExistsException ignored) {
-      return Optional.empty();
-    } catch (IOException | SecurityException ignored) {
+      WindowsOwnedFile publishedOwnership = ownership;
+      ownership = null;
+      return Optional.of(new BridgePresencePublisher(publishedOwnership));
+    } catch (IOException | RuntimeException ignored) {
       return Optional.empty();
     } finally {
-      if (temporaryIdentity != null) {
-        deleteIfOwned(temporary, temporaryIdentity);
-      }
+      closeOwnedFile(ownership);
     }
   }
 
   @Override
   public void close() {
     if (closed.compareAndSet(false, true)) {
-      deleteIfOwned(presence, identity);
+      try {
+        runHook(beforeOwnedHandleCloseHook);
+      } finally {
+        closeOwnedFile(ownership);
+      }
     }
   }
 
@@ -145,44 +129,16 @@ public final class BridgePresencePublisher implements AutoCloseable {
         : null;
   }
 
-  private static boolean sameIdentity(
-      BasicFileAttributes expected, BasicFileAttributes actual) {
-    if (expected == null || actual == null) {
-      return false;
-    }
-    if (expected.fileKey() != null && actual.fileKey() != null) {
-      return expected.fileKey().equals(actual.fileKey());
-    }
-    return expected.creationTime().equals(actual.creationTime())
-        && expected.lastModifiedTime().equals(actual.lastModifiedTime())
-        && expected.size() == actual.size();
-  }
-
-  private static boolean sameDirectoryIdentity(
-      BasicFileAttributes expected, BasicFileAttributes actual) {
-    if (expected == null || actual == null) {
-      return false;
-    }
-    if (expected.fileKey() != null && actual.fileKey() != null) {
-      return expected.fileKey().equals(actual.fileKey());
-    }
-    return expected.creationTime().equals(actual.creationTime());
-  }
-
   private static void runHook(Runnable hook) {
     if (hook != null) {
       hook.run();
     }
   }
 
-  private static void deleteIfOwned(Path path, BasicFileAttributes expected) {
-    try {
-      BasicFileAttributes actual = ordinaryFile(path);
-      if (sameIdentity(expected, actual) && expected.size() == actual.size()) {
-        Files.delete(path);
-      }
-    } catch (IOException | SecurityException ignored) {
-      // Best-effort cleanup never deletes an ambiguous replacement.
+  private static void closeOwnedFile(WindowsOwnedFile ownership) {
+    if (ownership == null) {
+      return;
     }
+    ownership.close();
   }
 }

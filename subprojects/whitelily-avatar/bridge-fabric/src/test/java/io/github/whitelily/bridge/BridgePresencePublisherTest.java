@@ -18,6 +18,7 @@ import java.lang.reflect.Field;
 import java.time.Duration;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -151,6 +152,39 @@ class BridgePresencePublisherTest {
   }
 
   @Test
+  void handleCoupledClosePreservesAReplacementInstalledAtTheDeleteBoundary() throws Exception {
+    BridgePresencePublisher publisher =
+        BridgePresencePublisher.publish(
+                temporaryDirectory, 42_001, 1_725_000_000_123L, 1_725_000_005_678L)
+            .orElseThrow();
+    Path presence = temporaryDirectory.resolve("42001.json");
+    Path movedOwnedFile = temporaryDirectory.resolve("owned-moved.json");
+    Field hook = BridgePresencePublisher.class.getDeclaredField("beforeOwnedHandleCloseHook");
+    hook.setAccessible(true);
+    hook.set(
+        null,
+        (Runnable)
+            () -> {
+              try {
+                Files.move(presence, movedOwnedFile, StandardCopyOption.ATOMIC_MOVE);
+                Files.writeString(
+                    presence, "replacement", UTF_8, StandardOpenOption.CREATE_NEW);
+              } catch (java.io.IOException failure) {
+                throw new RuntimeException(failure);
+              }
+            });
+    try {
+      publisher.close();
+
+      assertEquals("replacement", Files.readString(presence, UTF_8));
+      assertFalse(Files.exists(movedOwnedFile, LinkOption.NOFOLLOW_LINKS));
+    } finally {
+      hook.set(null, null);
+      publisher.close();
+    }
+  }
+
+  @Test
   void publicationPreservesAReplacementAtTheFinalIdentityBoundary() throws Exception {
     Path presence = temporaryDirectory.resolve("42001.json");
     Path replacement = temporaryDirectory.resolve("replacement.json");
@@ -180,12 +214,13 @@ class BridgePresencePublisherTest {
   }
 
   @Test
-  void publicationNeverDeletesFilesFromAReplacementDirectory() throws Exception {
+  void publicationCleansItsOwnedFileWhenDirectoryReplacementIsBlocked() throws Exception {
     Path presenceRoot = Files.createDirectory(temporaryDirectory.resolve("presence-root"));
     Path originalRoot = temporaryDirectory.resolve("original-root");
     Path foreignSource = presenceRoot.resolve("foreign-source.json");
     Path foreignPresence = presenceRoot.resolve("42001.json");
     Path foreignTemporary = presenceRoot.resolve(".42001.json.tmp");
+    AtomicBoolean hookRan = new AtomicBoolean();
     Field hook = BridgePresencePublisher.class.getDeclaredField("beforeLinkIdentityHook");
     hook.setAccessible(true);
     hook.set(
@@ -193,6 +228,7 @@ class BridgePresencePublisherTest {
         (Runnable)
             () -> {
               try {
+                hookRan.set(true);
                 Files.move(presenceRoot, originalRoot, StandardCopyOption.ATOMIC_MOVE);
                 Files.createDirectory(presenceRoot);
                 Files.writeString(
@@ -208,8 +244,9 @@ class BridgePresencePublisherTest {
           BridgePresencePublisher.publish(
                   presenceRoot, 42_001, 1_725_000_000_123L, 1_725_000_005_678L)
               .isEmpty());
-      assertEquals("foreign", Files.readString(foreignPresence, UTF_8));
-      assertEquals("foreign", Files.readString(foreignTemporary, UTF_8));
+      assertTrue(hookRan.get());
+      assertEquals(Set.of(), fileNames(presenceRoot));
+      assertFalse(Files.exists(originalRoot, LinkOption.NOFOLLOW_LINKS));
     } finally {
       hook.set(null, null);
     }
