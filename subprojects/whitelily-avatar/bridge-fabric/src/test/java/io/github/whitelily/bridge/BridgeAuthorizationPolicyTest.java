@@ -23,6 +23,7 @@ class BridgeAuthorizationPolicyTest {
       new PolicyCase(new BridgeRequest(2, "WhiteLily", 49152, 1000, 31000, NONCE), validContext()),
       new PolicyCase(new BridgeRequest(1, "whiteLily", 49152, 1000, 31000, NONCE), validContext()),
       new PolicyCase(new BridgeRequest(1, "WhiteLily", 49153, 1000, 31000, NONCE), validContext()),
+      new PolicyCase(new BridgeRequest(1, "WhiteLily", 49152, 1001, 31000, NONCE), validContext()),
       new PolicyCase(new BridgeRequest(1, "WhiteLily", 49152, 1501, 31501, NONCE), validContext()),
       new PolicyCase(new BridgeRequest(1, "WhiteLily", 49152, 1000, 1000, NONCE), validContext()),
       new PolicyCase(new BridgeRequest(1, "WhiteLily", 49152, 1000, 31000, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"), validContext()),

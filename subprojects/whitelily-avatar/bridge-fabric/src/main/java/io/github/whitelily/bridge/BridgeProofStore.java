@@ -54,7 +54,6 @@ public final class BridgeProofStore {
       boolean claimCreated = false;
       boolean anchorCreated = false;
       boolean requestRemoved = false;
-      boolean successCleaned = false;
       try {
         Files.createLink(claim, request);
         claimCreated = true;
@@ -88,14 +87,11 @@ public final class BridgeProofStore {
         if (!deleteSuccessfulPair(claim, anchor)) {
           return Optional.empty();
         }
-        successCleaned = true;
         return authorized;
       } catch (FileAlreadyExistsException ignored) {
         return Optional.empty();
       } finally {
-        if (claimCreated && anchorCreated && requestRemoved && !successCleaned) {
-          deleteSuccessfulPair(claim, anchor);
-        } else {
+        if (!requestRemoved) {
           if (anchorCreated) {
             deleteOwnedLink(anchor, claim);
           }

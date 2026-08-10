@@ -14,6 +14,7 @@ import java.lang.reflect.Field;
 import java.security.MessageDigest;
 import java.util.HexFormat;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -290,19 +291,25 @@ class BridgeProofStoreTest {
   void successCleanupPreservesAnAnchorReplacementAtItsBoundary() throws Exception {
     Path request = writeRequest(temporaryDirectory, validJson());
     Path anchor = request.resolveSibling(request.getFileName() + ".anchor");
+    Path foreign = temporaryDirectory.resolve("foreign-anchor");
+    Files.writeString(foreign, "foreign-anchor-content", UTF_8, StandardOpenOption.CREATE_NEW);
+    AtomicInteger hookCalls = new AtomicInteger();
     Field hook = BridgeProofStore.class.getDeclaredField("beforeSuccessCleanupHook");
     hook.setAccessible(true);
     hook.set(null, (Runnable) () -> {
       try {
+        hookCalls.incrementAndGet();
         Files.delete(anchor);
-        Files.writeString(anchor, "anchor-replacement", UTF_8, StandardOpenOption.CREATE_NEW);
+        Files.move(foreign, anchor, java.nio.file.StandardCopyOption.ATOMIC_MOVE);
       } catch (java.io.IOException failure) {
         throw new RuntimeException(failure);
       }
     });
     try {
       assertEquals(Optional.empty(), new BridgeProofStore(temporaryDirectory).consume(NONCE, CONTEXT));
-      assertEquals("anchor-replacement", Files.readString(anchor, UTF_8));
+      assertEquals(1, hookCalls.get());
+      assertEquals("foreign-anchor-content", Files.readString(anchor, UTF_8));
+      assertTrue(Files.exists(request.resolveSibling(request.getFileName() + ".claim")));
     } finally {
       hook.set(null, null);
     }
