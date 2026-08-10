@@ -4,6 +4,7 @@ import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import java.nio.file.FileSystemException;
 import java.nio.file.Files;
@@ -363,6 +364,18 @@ class BridgeProofStoreTest {
     assertTrue(Files.exists(link, java.nio.file.LinkOption.NOFOLLOW_LINKS));
   }
 
+  @Test
+  void failedJunctionHelperCleansOnlyTheCreatedLink() throws Exception {
+    Path target = Files.createTempDirectory(temporaryDirectory, "junction-target-");
+    Path sentinel = target.resolve("sentinel.txt");
+    Files.writeString(sentinel, "target-survives", UTF_8, StandardOpenOption.CREATE_NEW);
+    Path link = temporaryDirectory.resolve("failed-junction-link");
+    assertThrows(AssertionError.class, () -> createJunction(link, target, () -> new ProcessBuilder(
+        "cmd.exe", "/c", "mklink", "/J", link.toString(), target.toString(), "&", "exit", "/b", "1").start()));
+    assertFalse(Files.exists(link, java.nio.file.LinkOption.NOFOLLOW_LINKS));
+    assertEquals("target-survives", Files.readString(sentinel, UTF_8));
+  }
+
   private static Path writeRequest(Path root, String document) throws Exception {
     return writeRequestBytes(root, document.getBytes(UTF_8));
   }
@@ -389,11 +402,37 @@ class BridgeProofStoreTest {
   }
 
   private static void createJunction(Path link, Path target) throws Exception {
-    Process process = new ProcessBuilder("cmd.exe", "/c", "mklink", "/J", link.toString(), target.toString()).start();
-    if (!process.waitFor(2, java.util.concurrent.TimeUnit.SECONDS)) {
-      process.destroyForcibly();
-      assertTrue(false, "junction helper timed out");
+    createJunction(link, target, () -> new ProcessBuilder(
+        "cmd.exe", "/c", "mklink", "/J", link.toString(), target.toString()).start());
+  }
+
+  private static void createJunction(Path link, Path target, JunctionCommand command) throws Exception {
+    Process process = null;
+    boolean succeeded = false;
+    try {
+      process = command.start();
+      if (!process.waitFor(2, java.util.concurrent.TimeUnit.SECONDS)) {
+        process.destroyForcibly();
+        assertTrue(process.waitFor(2, java.util.concurrent.TimeUnit.SECONDS), "junction helper child did not terminate");
+        throw new AssertionError("junction helper timed out");
+      }
+      assertEquals(0, process.exitValue());
+      succeeded = true;
+    } finally {
+      if (!succeeded) {
+        if (process != null && process.isAlive()) {
+          process.destroyForcibly();
+          assertTrue(process.waitFor(2, java.util.concurrent.TimeUnit.SECONDS), "junction helper child did not terminate");
+        }
+        if (Files.exists(link, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
+          Files.delete(link);
+        }
+      }
     }
-    assertEquals(0, process.exitValue());
+  }
+
+  @FunctionalInterface
+  private interface JunctionCommand {
+    Process start() throws java.io.IOException;
   }
 }
