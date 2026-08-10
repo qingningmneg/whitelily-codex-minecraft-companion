@@ -376,6 +376,16 @@ class BridgeProofStoreTest {
     assertEquals("target-survives", Files.readString(sentinel, UTF_8));
   }
 
+  @Test
+  void failedJunctionCleanupDoesNotExposeTheLiteralLinkPath() throws Exception {
+    Path target = Files.createTempDirectory(temporaryDirectory, "cleanup-target-");
+    Path link = temporaryDirectory.resolve("cleanup-link");
+    AssertionError failure = assertThrows(AssertionError.class, () -> createJunction(link, target,
+        () -> new ProcessBuilder("cmd.exe", "/c", "mklink", "/J", link.toString(), target.toString(), "&", "exit", "/b", "1").start(),
+        ignored -> { throw new java.nio.file.FileSystemException(link.toString()); }));
+    assertFalse(failure.getMessage().contains(link.toString()));
+  }
+
   private static Path writeRequest(Path root, String document) throws Exception {
     return writeRequestBytes(root, document.getBytes(UTF_8));
   }
@@ -407,6 +417,10 @@ class BridgeProofStoreTest {
   }
 
   private static void createJunction(Path link, Path target, JunctionCommand command) throws Exception {
+    createJunction(link, target, command, BridgeProofStoreTest::deleteLinkNoFollow);
+  }
+
+  private static void createJunction(Path link, Path target, JunctionCommand command, JunctionLinkCleanup cleanup) throws Exception {
     Process process = null;
     boolean succeeded = false;
     try {
@@ -424,8 +438,10 @@ class BridgeProofStoreTest {
           process.destroyForcibly();
           assertTrue(process.waitFor(2, java.util.concurrent.TimeUnit.SECONDS), "junction helper child did not terminate");
         }
-        if (Files.exists(link, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
-          Files.delete(link);
+        try {
+          cleanup.delete(link);
+        } catch (java.io.IOException cleanupFailure) {
+          throw new AssertionError("junction helper cleanup failed");
         }
       }
     }
@@ -434,5 +450,16 @@ class BridgeProofStoreTest {
   @FunctionalInterface
   private interface JunctionCommand {
     Process start() throws java.io.IOException;
+  }
+
+  @FunctionalInterface
+  private interface JunctionLinkCleanup {
+    void delete(Path link) throws java.io.IOException;
+  }
+
+  private static void deleteLinkNoFollow(Path link) throws java.io.IOException {
+    if (Files.exists(link, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
+      Files.delete(link);
+    }
   }
 }
