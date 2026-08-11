@@ -16,7 +16,8 @@
     "codexPackage": "codex/package",
     "codexNativePackage": "codex/native",
     "codexExecutable": "codex/native/vendor/x86_64-pc-windows-msvc/bin/codex.exe",
-    "licenses": "licenses"
+    "licenses": "licenses",
+    "minecraftComponents": "minecraft-components"
   },
   "managedWorkspace": {
     "root": "codex-workspace",
@@ -148,8 +149,62 @@
       {
         "source": "NOTICE",
         "target": "licenses/WhiteLily-NOTICE.txt",
-        "bytes": 459,
-        "sha256": "d14e84981ee7c7c43cb8ae0e3b22eea184c1f23cc05d68d73659dd8bf616a05c"
+        "bytes": 697,
+        "sha256": "6323cb4b742d322d61ee47279d71d0f0de496568cf1f2f793fea104a58ab0dde"
+      },
+      {
+        "source": "build/minecraft-components/fabric-api-0.128.2+1.21.5.jar",
+        "target": "minecraft-components/fabric-api-0.128.2+1.21.5.jar",
+        "bytes": 2248994,
+        "sha256": "a82fd00827206e911936ed1e0ceaec6eb55d061ca5d3c5d63c7f0031426d29ae"
+      },
+      {
+        "source": "build/minecraft-components/Fabric-API-LICENSE.txt",
+        "target": "minecraft-components/Fabric-API-LICENSE.txt",
+        "bytes": 11357,
+        "sha256": "b40930bbcf80744c86c46a12bc9da056641d722716c378f5659b9e555ef833e1"
+      },
+      {
+        "source": "build/minecraft-components/geckolib-fabric-1.21.5-5.1.0.jar",
+        "target": "minecraft-components/geckolib-fabric-1.21.5-5.1.0.jar",
+        "bytes": 670425,
+        "sha256": "885ef4b03cd438c7d2ec9f59bb492f3af6ba2b73aa0493afc4f80801b5a9126c"
+      },
+      {
+        "source": "build/minecraft-components/GeckoLib-LICENSE.txt",
+        "target": "minecraft-components/GeckoLib-LICENSE.txt",
+        "bytes": 1065,
+        "sha256": "5f2943625776c6126cd252652f4c57d2fb187d339a20fa065a2b7c619165a52f"
+      },
+      {
+        "source": "build/minecraft-components/minecraft-components-manifest.json",
+        "target": "minecraft-components/minecraft-components-manifest.json",
+        "bytes": 1585,
+        "sha256": "91a09da35550b81e0722829e559a50e69deada5e55035608cdb667f6b5fd7985"
+      },
+      {
+        "source": "build/minecraft-components/whitelily-avatar-fabric-1.21.5-0.1.0.jar",
+        "target": "minecraft-components/whitelily-avatar-fabric-1.21.5-0.1.0.jar",
+        "bytes": 55627,
+        "sha256": "fff00f66e4beab2eff1e51f253608b198f43aa0a12443fbe07f7f3fd48278872"
+      },
+      {
+        "source": "build/minecraft-components/whitelily-bridge-fabric-1.21.5-0.1.0.jar",
+        "target": "minecraft-components/whitelily-bridge-fabric-1.21.5-0.1.0.jar",
+        "bytes": 51837,
+        "sha256": "380721d28236f5ad8206fd8d69af1e5629d741e9d38ec27c26c052c95266b6ce"
+      },
+      {
+        "source": "build/minecraft-components/WhiteLily-LICENSE.txt",
+        "target": "minecraft-components/WhiteLily-LICENSE.txt",
+        "bytes": 11123,
+        "sha256": "226d0e41f61309952c27fcc11a5140c4e735115f702ff0484ff0c25cfbbeee16"
+      },
+      {
+        "source": "build/minecraft-components/WhiteLily-NOTICE.txt",
+        "target": "minecraft-components/WhiteLily-NOTICE.txt",
+        "bytes": 697,
+        "sha256": "6323cb4b742d322d61ee47279d71d0f0de496568cf1f2f793fea104a58ab0dde"
       }
     ],
     "generatedFiles": [
@@ -172,7 +227,16 @@
       "codex/native/vendor/x86_64-pc-windows-msvc/codex-resources/codex-windows-sandbox-setup.exe",
       "licenses/WhiteLily-LICENSE.txt",
       "licenses/WhiteLily-NOTICE.txt",
-      "licenses/OpenAI-Codex-NOTICE.txt"
+      "licenses/OpenAI-Codex-NOTICE.txt",
+      "minecraft-components/fabric-api-0.128.2+1.21.5.jar",
+      "minecraft-components/Fabric-API-LICENSE.txt",
+      "minecraft-components/geckolib-fabric-1.21.5-5.1.0.jar",
+      "minecraft-components/GeckoLib-LICENSE.txt",
+      "minecraft-components/minecraft-components-manifest.json",
+      "minecraft-components/whitelily-avatar-fabric-1.21.5-0.1.0.jar",
+      "minecraft-components/whitelily-bridge-fabric-1.21.5-0.1.0.jar",
+      "minecraft-components/WhiteLily-LICENSE.txt",
+      "minecraft-components/WhiteLily-NOTICE.txt"
     ],
     "executableFiles": [
       "codex/native/vendor/x86_64-pc-windows-msvc/bin/codex.exe",

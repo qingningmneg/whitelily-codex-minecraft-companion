@@ -5,6 +5,7 @@ const {
   copyFile,
   lstat,
   mkdir,
+  open,
   readFile,
   readdir,
   realpath,
@@ -26,6 +27,51 @@ async function sha256(path) {
   return createHash("sha256")
     .update(await readFile(path))
     .digest("hex");
+}
+
+function sameFileIdentity(left, right) {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+async function readVerifiedSingleLinkFile(path, exactBytes, label) {
+  const before = await lstat(path, { bigint: true });
+  if (
+    !before.isFile() ||
+    before.isSymbolicLink() ||
+    before.nlink !== 1n ||
+    before.size !== BigInt(exactBytes)
+  ) {
+    throw new Error(`WhiteLily ${label} must be one ordinary single-link file`);
+  }
+  const handle = await open(path, "r");
+  try {
+    const opened = await handle.stat({ bigint: true });
+    if (
+      !opened.isFile() ||
+      opened.nlink !== 1n ||
+      opened.size !== BigInt(exactBytes) ||
+      !sameFileIdentity(before, opened)
+    ) {
+      throw new Error(`WhiteLily ${label} identity changed before read`);
+    }
+    const bytes = await handle.readFile();
+    const afterHandle = await handle.stat({ bigint: true });
+    const afterPath = await lstat(path, { bigint: true });
+    if (
+      bytes.length !== exactBytes ||
+      !afterPath.isFile() ||
+      afterPath.isSymbolicLink() ||
+      afterPath.nlink !== 1n ||
+      !sameFileIdentity(opened, afterHandle) ||
+      !sameFileIdentity(afterHandle, afterPath) ||
+      afterHandle.size !== BigInt(bytes.length)
+    ) {
+      throw new Error(`WhiteLily ${label} identity changed during read`);
+    }
+    return bytes;
+  } finally {
+    await handle.close();
+  }
 }
 
 function sha256Bytes(bytes) {
@@ -232,6 +278,152 @@ function hasExactKeys(value, expectedKeys) {
     actualKeys.length === reviewedKeys.length &&
     actualKeys.every((key, index) => key === reviewedKeys[index])
   );
+}
+
+async function verifyReviewedMinecraftComponents(
+  resourcesDirectory,
+  sourceManifest,
+  resources,
+  sourceManifestPath,
+) {
+  if (sourceManifest.paths?.minecraftComponents === undefined) return;
+  const root = sourceManifest.paths.minecraftComponents;
+  if (root !== "minecraft-components") {
+    throw new Error("WhiteLily reviewed Minecraft component root is invalid");
+  }
+  const prefix = `${root}/`;
+  let policy;
+  try {
+    policy = JSON.parse(
+      await readFile(resolve(dirname(sourceManifestPath), "minecraft-component-pack.json"), "utf8"),
+    );
+  } catch {
+    throw new Error("WhiteLily reviewed Minecraft component policy is invalid");
+  }
+  if (
+    !hasExactKeys(policy, ["schemaVersion", "files"]) ||
+    policy.schemaVersion !== 1 ||
+    !Array.isArray(policy.files) ||
+    policy.files.length !== 9
+  ) {
+    throw new Error("WhiteLily reviewed Minecraft component policy is invalid");
+  }
+  const policyByKey = new Map();
+  for (const entry of policy.files) {
+    if (
+      !hasExactKeys(entry, ["name", "bytes", "sha256"]) ||
+      typeof entry.name !== "string" ||
+      entry.name.length === 0 ||
+      entry.name.includes("/") ||
+      entry.name.includes("\\") ||
+      !Number.isSafeInteger(entry.bytes) ||
+      entry.bytes <= 0 ||
+      typeof entry.sha256 !== "string" ||
+      !/^[a-f0-9]{64}$/u.test(entry.sha256)
+    ) {
+      throw new Error("WhiteLily reviewed Minecraft component policy is invalid");
+    }
+    const key = entry.name.toLowerCase();
+    if (policyByKey.has(key)) {
+      throw new Error("WhiteLily reviewed Minecraft component policy is ambiguous");
+    }
+    policyByKey.set(key, entry);
+  }
+
+  const exactFiles = sourceManifest.allowlist?.exactFiles;
+  const requiredFiles = sourceManifest.allowlist?.requiredFiles;
+  if (!Array.isArray(exactFiles) || !Array.isArray(requiredFiles)) {
+    throw new Error("WhiteLily reviewed Minecraft component allowlist is invalid");
+  }
+  const sourceEntries = exactFiles.filter(
+    (entry) => typeof entry?.target === "string" && entry.target.startsWith(prefix),
+  );
+  const resourceEntries = resources.filter(
+    (entry) => typeof entry?.path === "string" && entry.path.startsWith(prefix),
+  );
+  const requiredEntries = requiredFiles.filter(
+    (entry) => typeof entry === "string" && entry.startsWith(prefix),
+  );
+  const executableEntries = (sourceManifest.allowlist.executableFiles ?? []).filter(
+    (entry) => typeof entry === "string" && entry.startsWith(prefix),
+  );
+  const scriptEntries = (sourceManifest.allowlist.scriptFiles ?? []).filter(
+    (entry) => typeof entry === "string" && entry.startsWith(prefix),
+  );
+  if (
+    sourceEntries.length !== 9 ||
+    resourceEntries.length !== 9 ||
+    requiredEntries.length !== 9 ||
+    executableEntries.length !== 0 ||
+    scriptEntries.length !== 0
+  ) {
+    throw new Error("WhiteLily reviewed Minecraft component resource set is invalid");
+  }
+
+  const sourceByKey = new Map();
+  for (const entry of sourceEntries) {
+    if (!hasExactKeys(entry, ["source", "target", "bytes", "sha256"])) {
+      throw new Error("WhiteLily reviewed Minecraft component descriptor is invalid");
+    }
+    const name = entry.target.slice(prefix.length);
+    const expected = policyByKey.get(name.toLowerCase());
+    if (
+      expected === undefined ||
+      expected.name !== name ||
+      entry.source !== `build/${entry.target}` ||
+      entry.bytes !== expected.bytes ||
+      entry.sha256 !== expected.sha256 ||
+      sourceByKey.has(name.toLowerCase())
+    ) {
+      throw new Error("WhiteLily reviewed Minecraft component pin mismatch");
+    }
+    sourceByKey.set(name.toLowerCase(), entry);
+  }
+
+  const resourcesByKey = new Map();
+  for (const entry of resourceEntries) {
+    if (!hasExactKeys(entry, ["path", "bytes", "sha256"])) {
+      throw new Error("WhiteLily packaged Minecraft component descriptor is invalid");
+    }
+    const name = entry.path.slice(prefix.length);
+    const expected = policyByKey.get(name.toLowerCase());
+    if (
+      expected === undefined ||
+      expected.name !== name ||
+      entry.bytes !== expected.bytes ||
+      entry.sha256 !== expected.sha256 ||
+      resourcesByKey.has(name.toLowerCase())
+    ) {
+      throw new Error("WhiteLily packaged Minecraft component pin mismatch");
+    }
+    resourcesByKey.set(name.toLowerCase(), entry);
+  }
+  const requiredByKey = indexPortablePaths(requiredEntries, "reviewed Minecraft component files");
+  if (requiredByKey.size !== policyByKey.size) {
+    throw new Error("WhiteLily required Minecraft component set is invalid");
+  }
+  for (const [key, expected] of policyByKey) {
+    if (
+      sourceByKey.get(key)?.target !== `${prefix}${expected.name}` ||
+      resourcesByKey.get(key)?.path !== `${prefix}${expected.name}` ||
+      requiredByKey.get(`${prefix}${expected.name}`.toLowerCase()) !== `${prefix}${expected.name}`
+    ) {
+      throw new Error("WhiteLily Minecraft component authorities disagree");
+    }
+  }
+
+  const componentRoot = resolveContained(resourcesDirectory, root);
+  const actual = (await readdir(componentRoot, { withFileTypes: true })).sort((left, right) =>
+    compareOrdinal(left.name, right.name),
+  );
+  if (
+    actual.length !== 9 ||
+    actual.some(
+      (entry) => !entry.isFile() || policyByKey.get(entry.name.toLowerCase())?.name !== entry.name,
+    )
+  ) {
+    throw new Error("WhiteLily packaged Minecraft component directory is not exact");
+  }
 }
 
 function assertManagedPortablePath(portablePath) {
@@ -478,10 +670,27 @@ async function verifyResourceDirectory(resourcesDirectory, sourceManifestPath) {
     }
   }
 
+  await verifyReviewedMinecraftComponents(
+    resourcesDirectory,
+    sourceManifest,
+    resources,
+    sourceManifestPath,
+  );
   await verifyManagedWorkspace(resourcesDirectory, sourceManifest.managedWorkspace, resources);
 
   for (const [resourcePath, resource] of looseDeclared) {
     const path = resolveContained(resourcesDirectory, resourcePath);
+    if (resourcePath.startsWith("minecraft-components/")) {
+      const bytes = await readVerifiedSingleLinkFile(
+        path,
+        resource.bytes,
+        "Minecraft component resource",
+      );
+      if (sha256Bytes(bytes) !== resource.sha256) {
+        throw new Error(`WhiteLily runtime resource hash mismatch: ${resourcePath}`);
+      }
+      continue;
+    }
     const metadata = await stat(path);
     if (!metadata.isFile() || metadata.size !== resource.bytes) {
       throw new Error(`WhiteLily runtime resource size mismatch: ${resourcePath}`);

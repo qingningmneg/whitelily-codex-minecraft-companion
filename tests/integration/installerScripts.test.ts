@@ -1,16 +1,39 @@
 import { createHash } from "node:crypto";
 import { spawn, spawnSync, type SpawnSyncReturns } from "node:child_process";
-import { copyFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import {
+  copyFile,
+  link,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rename,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
 const repositoryRoot = resolve(import.meta.dirname, "..", "..");
 const packageScript = join(repositoryRoot, "scripts", "package-installer.ps1");
 const releaseScript = join(repositoryRoot, "scripts", "package-release.ps1");
 const inspectScript = join(repositoryRoot, "scripts", "inspect-installer.ps1");
 const lifecycleScript = join(repositoryRoot, "scripts", "test-installer.ps1");
+const installedComponentVerifier = join(
+  repositoryRoot,
+  "scripts",
+  "minecraft-component-resource-verifier.ps1",
+);
+const componentPreferenceValidator = join(
+  repositoryRoot,
+  "packaging",
+  "nsis",
+  "validate-minecraft-component-preferences.ps1",
+);
 const version = "0.2.0-beta.2";
 const baselineVersion = "0.2.0-beta.1";
 const installerName = `WhiteLily-${version}-windows-x64-setup.exe`;
@@ -32,6 +55,8 @@ interface CommandResult {
 
 interface FixtureOptions {
   omitRequiredResource?: boolean;
+  coordinatedComponentRewrite?: boolean;
+  sourceComponentPinMismatch?: boolean;
 }
 
 function run(
@@ -230,13 +255,13 @@ public static class FakeWindowsSandbox {
                     "\",\"baselineInstallerSha256\":\"" + baselineHash +
                     "\",\"controllerObservedBaselineInstallerSha256\":\"" + baselineHash +
                     "\",\"installedVersion\":\"" + expectedVersion +
-                    "\",\"managedWorkspaceResources\":3,\"success\":true,\"stages\":" + stages + ",\"error\":null}\n"
+                    "\",\"managedWorkspaceResources\":3,\"minecraftComponentResources\":9,\"componentPreferencesFresh\":true,\"componentPreferencesUpgradePreserved\":true,\"componentPreferencesKeepPreserved\":true,\"success\":true,\"stages\":" + stages + ",\"error\":null}\n"
                 : "{\"schemaVersion\":2,\"controllerSid\":\"S-1-5-18\",\"candidateSid\":\"S-1-5-21-1-2-3-1001\",\"candidateReportWriteDenied\":true,\"installerSha256\":\"" + hash +
                     "\",\"controllerObservedInstallerSha256\":\"" + hash +
                     "\",\"expectedVersion\":\"" + expectedVersion +
                     "\",\"baselineInstallerSha256\":\"" + baselineHash +
                     "\",\"controllerObservedBaselineInstallerSha256\":\"" + baselineHash +
-                    "\",\"installedVersion\":null,\"managedWorkspaceResources\":0,\"success\":false,\"stages\":[],\"error\":\"" + requestedError + "\"}";
+                    "\",\"installedVersion\":null,\"managedWorkspaceResources\":0,\"minecraftComponentResources\":0,\"componentPreferencesFresh\":false,\"componentPreferencesUpgradePreserved\":false,\"componentPreferencesKeepPreserved\":false,\"success\":false,\"stages\":[],\"error\":\"" + requestedError + "\"}";
             report = report.TrimEnd('\r', '\n');
             var keyHex = File.ReadAllText(Path.Combine(reportRoot, "bootstrap-secret.txt")).Trim();
             var envelope = "{\"transportSchemaVersion\":1,\"payload\":\"" + JsonEscape(report) +
@@ -377,6 +402,100 @@ async function writeFixtureFile(root: string, portablePath: string, value: strin
   await writeFile(path, value, "utf8");
 }
 
+async function createInstalledComponentFixture(): Promise<{
+  root: string;
+  programRoot: string;
+  componentRoot: string;
+  runtimePath: string;
+  policyPath: string;
+  harnessPath: string;
+  paths: string[];
+}> {
+  const root = await createTemporaryRoot("whitelily-installed-components-");
+  const programRoot = join(root, "WhiteLily");
+  const resources = join(programRoot, "resources");
+  const componentRoot = join(resources, "minecraft-components");
+  const policyPath = join(root, "policy.json");
+  const harnessPath = join(root, "verify.ps1");
+  const paths = [
+    "fabric-api-0.128.2+1.21.5.jar",
+    "Fabric-API-LICENSE.txt",
+    "geckolib-fabric-1.21.5-5.1.0.jar",
+    "GeckoLib-LICENSE.txt",
+    "minecraft-components-manifest.json",
+    "whitelily-avatar-fabric-1.21.5-0.1.0.jar",
+    "whitelily-bridge-fabric-1.21.5-0.1.0.jar",
+    "WhiteLily-LICENSE.txt",
+    "WhiteLily-NOTICE.txt",
+  ];
+  await mkdir(componentRoot, { recursive: true });
+  const files = [];
+  for (const name of paths) {
+    const bytes = Buffer.from(`reviewed:${name}`, "utf8");
+    await writeFile(join(componentRoot, name), bytes);
+    files.push({
+      name,
+      bytes: bytes.length,
+      sha256: createHash("sha256").update(bytes).digest("hex"),
+    });
+  }
+  const resourcesManifest = files.map(({ name, bytes, sha256 }) => ({
+    path: `minecraft-components/${name}`,
+    bytes,
+    sha256,
+  }));
+  const runtimePath = join(resources, "runtime-manifest.json");
+  await writeFile(
+    runtimePath,
+    JSON.stringify({
+      paths: { minecraftComponents: "minecraft-components" },
+      allowlist: {
+        exactFiles: resourcesManifest.map(({ path, bytes, sha256 }) => ({
+          source: `build/${path}`,
+          target: path,
+          bytes,
+          sha256,
+        })),
+        requiredFiles: resourcesManifest.map(({ path }) => path),
+        executableFiles: [],
+        scriptFiles: [],
+      },
+      resources: resourcesManifest,
+    }),
+  );
+  await writeFile(policyPath, JSON.stringify({ schemaVersion: 1, files }));
+  await writeFile(
+    harnessPath,
+    [
+      "param([string]$Verifier,[string]$ProgramRoot,[string]$PolicyPath)",
+      "$ErrorActionPreference='Stop'",
+      ". $Verifier",
+      "$policy=Get-Content -LiteralPath $PolicyPath -Raw -Encoding UTF8 | ConvertFrom-Json",
+      "$count=Assert-ReviewedMinecraftComponentResources -ProgramRoot $ProgramRoot -ReviewedFiles @($policy.files)",
+      "[Console]::Out.Write([string]$count)",
+      "",
+    ].join("\r\n"),
+  );
+  return { root, programRoot, componentRoot, runtimePath, policyPath, harnessPath, paths };
+}
+
+function runInstalledComponentVerifier(
+  fixture: Awaited<ReturnType<typeof createInstalledComponentFixture>>,
+): CommandResult {
+  return runPowerShell(
+    fixture.harnessPath,
+    [
+      "-Verifier",
+      installedComponentVerifier,
+      "-ProgramRoot",
+      fixture.programRoot,
+      "-PolicyPath",
+      fixture.policyPath,
+    ],
+    { timeout: 15_000 },
+  );
+}
+
 async function createInstallerFixture(
   repository: string,
   options: FixtureOptions = {},
@@ -395,6 +514,18 @@ async function createInstallerFixture(
     "codex/native/vendor/x86_64-pc-windows-msvc/bin/codex.exe",
     "licenses/WhiteLily-LICENSE.txt",
   ];
+  const componentPaths = [
+    "minecraft-components/fabric-api-0.128.2+1.21.5.jar",
+    "minecraft-components/Fabric-API-LICENSE.txt",
+    "minecraft-components/geckolib-fabric-1.21.5-5.1.0.jar",
+    "minecraft-components/GeckoLib-LICENSE.txt",
+    "minecraft-components/minecraft-components-manifest.json",
+    "minecraft-components/whitelily-avatar-fabric-1.21.5-0.1.0.jar",
+    "minecraft-components/whitelily-bridge-fabric-1.21.5-0.1.0.jar",
+    "minecraft-components/WhiteLily-LICENSE.txt",
+    "minecraft-components/WhiteLily-NOTICE.txt",
+  ];
+  requiredFiles.push(...componentPaths);
   const workspacePayloads = new Map<string, string>([
     [".codex/config.toml", '[mcp_servers.minecraft]\nurl = "http://127.0.0.1:32123/mcp"\n'],
     ["AGENTS.md", "# 白百合测试动作工作区\n"],
@@ -412,6 +543,9 @@ async function createInstallerFixture(
     null,
     2,
   )}\n`;
+  const reviewedComponentValues = new Map(
+    componentPaths.map((path) => [path, `fixture:${path}`] as const),
+  );
   const looseFiles = new Map<string, string>([
     ["codex-workspace/.codex/config.toml", workspacePayloads.get(".codex/config.toml") ?? ""],
     ["codex-workspace/AGENTS.md", workspacePayloads.get("AGENTS.md") ?? ""],
@@ -419,7 +553,11 @@ async function createInstallerFixture(
     ["core/childMain.js", "fixture child"],
     ["codex/native/vendor/x86_64-pc-windows-msvc/bin/codex.exe", "fixture bundled codex"],
     ["licenses/WhiteLily-LICENSE.txt", "fixture license"],
+    ...reviewedComponentValues,
   ]);
+  if (options.coordinatedComponentRewrite) {
+    looseFiles.set(componentPaths[0]!, "coordinated packaged component replacement");
+  }
   const desktopFiles = new Map<string, string>([
     ["desktop/main/main.js", "fixture main"],
     ["desktop/preload/preload.cjs", "fixture preload"],
@@ -468,6 +606,7 @@ async function createInstallerFixture(
       codexNativePackage: "codex/native",
       codexExecutable: "codex/native/vendor/x86_64-pc-windows-msvc/bin/codex.exe",
       licenses: "licenses",
+      minecraftComponents: "minecraft-components",
     },
     managedWorkspace: {
       root: "codex-workspace",
@@ -484,7 +623,18 @@ async function createInstallerFixture(
         excludedPackages: [],
         forbiddenExtensions: [],
       },
-      exactFiles: [],
+      exactFiles: componentPaths.map((target, index) => {
+        const value = looseFiles.get(target) ?? "";
+        return {
+          source: `build/${target}`,
+          target,
+          bytes: Buffer.byteLength(value),
+          sha256:
+            options.sourceComponentPinMismatch && index === 0
+              ? "0".repeat(64)
+              : createHash("sha256").update(value).digest("hex"),
+        };
+      }),
       generatedFiles: [],
       requiredFiles,
       executableFiles: ["codex/native/vendor/x86_64-pc-windows-msvc/bin/codex.exe"],
@@ -496,6 +646,25 @@ async function createInstallerFixture(
   await mkdir(dirname(sourceManifestPath), { recursive: true });
   const sourceBytes = `${JSON.stringify(sourceManifest, null, 2)}\n`;
   await writeFile(sourceManifestPath, sourceBytes, "utf8");
+  await writeFile(
+    join(repository, "packaging", "electron", "minecraft-component-pack.json"),
+    `${JSON.stringify(
+      {
+        schemaVersion: 1,
+        files: componentPaths.map((target) => {
+          const value = reviewedComponentValues.get(target) ?? "";
+          return {
+            name: target.slice("minecraft-components/".length),
+            bytes: Buffer.byteLength(value),
+            sha256: createHash("sha256").update(value).digest("hex"),
+          };
+        }),
+      },
+      null,
+      2,
+    )}\n`,
+    "utf8",
+  );
 
   const resources = [...looseFiles.entries(), ...desktopFiles.entries()].map(([path, value]) => ({
     path,
@@ -550,6 +719,10 @@ async function createRepositoryFixture(options: FixtureOptions = {}): Promise<{
   await copyFile(packageScript, join(root, "scripts", "package-installer.ps1"));
   await copyFile(inspectScript, join(root, "scripts", "inspect-installer.ps1"));
   await copyFile(lifecycleScript, join(root, "scripts", "test-installer.ps1"));
+  await copyFile(
+    installedComponentVerifier,
+    join(root, "scripts", "minecraft-component-resource-verifier.ps1"),
+  );
   await mkdir(join(root, "packaging", "electron"), { recursive: true });
   await copyFile(
     join(repositoryRoot, "packaging", "electron", "after-pack.cjs"),
@@ -686,6 +859,152 @@ async function stageLifecycleInstallers(fixture: {
   return releaseInstaller;
 }
 
+async function createNsisComponentPreferenceFixture(): Promise<{
+  root: string;
+  installer: string;
+  dataRoot: string;
+  preferences: string;
+  modePath: string;
+  hookPath: string;
+  lastErrorPath: string;
+  aclSddlPath: string;
+  attackResultPath: string;
+  tempPathRecord: string;
+  hardlinkPeerPath: string;
+  relocatedTempPath: string;
+}> {
+  const root = await createTemporaryRoot("whitelily-nsis-components-");
+  const installer = join(root, "component-preferences.exe");
+  const dataRoot = join(root, "data");
+  const preferences = join(dataRoot, "config", "minecraft-components.json");
+  const modePath = join(root, "mode.txt");
+  const lastErrorPath = join(root, "last-error.txt");
+  const aclSddlPath = join(root, "config-acl.sddl");
+  const attackResultPath = join(root, "attack-result.txt");
+  const tempPathRecord = join(root, "temp-path.txt");
+  const hardlinkPeerPath = join(root, "hardlink-peer.json");
+  const relocatedTempPath = join(root, "relocated-temp.json");
+  const hookPath = join(root, "hook.ps1");
+  const validatorPath = join(root, "validate-minecraft-component-preferences.ps1");
+  await writeFile(
+    hookPath,
+    [
+      "param([string]$Phase,[string]$ModePath,[string]$TargetPath,[string]$TempPath,[string]$Root)",
+      "$ErrorActionPreference='Stop'",
+      "$mode=if(Test-Path -LiteralPath $ModePath){(Get-Content -LiteralPath $ModePath -Raw).Trim()}else{'fresh'}",
+      '$valid=\'{"schemaVersion":1,"bridgeEnabled":false,"avatarEnabled":false}\'',
+      '$pretty="{`r`n  `"avatarEnabled`": true,`r`n  `"schemaVersion`": 1,`r`n  `"bridgeEnabled`": false`r`n}`r`n"',
+      "if($Phase -eq 'restore-acl') {$config=Split-Path -Parent $TargetPath; $sddlPath=Join-Path $Root 'config-acl.sddl'; $acl=Get-Acl -LiteralPath $config; $acl.SetSecurityDescriptorSddlForm([IO.File]::ReadAllText($sddlPath)); Set-Acl -LiteralPath $config -AclObject $acl; exit}",
+      "if($Phase -eq 'before-publish') {",
+      "  [IO.File]::WriteAllText((Join-Path $Root 'temp-path.txt'),$TempPath)",
+      "  if($mode -in @('collision-valid','race-replacement','temp-replacement-before-cleanup')) {[IO.File]::WriteAllText($TargetPath,$valid,[Text.UTF8Encoding]::new($false))}",
+      "  elseif($mode -eq 'collision-valid-pretty') {[IO.File]::WriteAllText($TargetPath,$pretty,[Text.UTF8Encoding]::new($false))}",
+      "  elseif($mode -eq 'collision-malformed') {[IO.File]::WriteAllText($TargetPath,'malformed',[Text.UTF8Encoding]::new($false))}",
+      "  elseif($mode -eq 'collision-reparse') {$outside=Join-Path $Root 'outside'; New-Item -ItemType Directory -Path $outside -Force|Out-Null; New-Item -ItemType Junction -Path $TargetPath -Target $outside|Out-Null}",
+      "  elseif($mode -eq 'collision-hardlink') {$peer=Join-Path $Root 'hardlink-peer.json'; [IO.File]::WriteAllText($peer,$valid,[Text.UTF8Encoding]::new($false)); New-Item -ItemType HardLink -Path $TargetPath -Target $peer|Out-Null}",
+      "  elseif($mode -eq 'missing-temp-noncollision') {Remove-Item -LiteralPath $TempPath -Force}",
+      "  elseif($mode -eq 'access-denied') {$config=Split-Path -Parent $TargetPath; $sddlPath=Join-Path $Root 'config-acl.sddl'; $acl=Get-Acl -LiteralPath $config; [IO.File]::WriteAllText($sddlPath,$acl.GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::All)); $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User; $rule=[Security.AccessControl.FileSystemAccessRule]::new($sid,[Security.AccessControl.FileSystemRights]::CreateFiles,[Security.AccessControl.AccessControlType]::Deny); [void]$acl.AddAccessRule($rule); Set-Acl -LiteralPath $config -AclObject $acl}",
+      "  elseif($mode -eq 'temp-replacement-before-publish') {try {Move-Item -LiteralPath $TempPath -Destination (Join-Path $Root 'relocated-temp.json'); [IO.File]::WriteAllText($TempPath,$valid,[Text.UTF8Encoding]::new($false)); [IO.File]::WriteAllText((Join-Path $Root 'attack-result.txt'),'replaced')} catch {[IO.File]::WriteAllText((Join-Path $Root 'attack-result.txt'),'blocked')}}",
+      "  elseif($mode -eq 'temp-hardlink-before-publish') {New-Item -ItemType HardLink -Path (Join-Path $Root 'hardlink-peer.json') -Target $TempPath|Out-Null}",
+      "}",
+      "if($Phase -eq 'before-winner-validation' -and $mode -eq 'race-replacement') {[IO.File]::WriteAllText($TargetPath,'replaced',[Text.UTF8Encoding]::new($false))}",
+      "if($Phase -eq 'before-temp-cleanup' -and $mode -eq 'temp-replacement-before-cleanup') {try {Move-Item -LiteralPath $TempPath -Destination (Join-Path $Root 'relocated-temp.json'); [IO.File]::WriteAllText($TempPath,$pretty,[Text.UTF8Encoding]::new($false)); [IO.File]::WriteAllText((Join-Path $Root 'attack-result.txt'),'replaced')} catch {[IO.File]::WriteAllText((Join-Path $Root 'attack-result.txt'),'blocked')}}",
+      "if($Phase -eq 'before-temp-cleanup' -and $mode -eq 'cleanup-lock') {",
+      "  throw 'forced owned-cleanup transition failure'",
+      "}",
+      "",
+    ].join("\r\n"),
+  );
+  const invokeHook = (phase: string) =>
+    [
+      "$testRoot=[Environment]::GetEnvironmentVariable('WHITELILY_COMPONENT_TEST_ROOT')",
+      "$testModePath=[Environment]::GetEnvironmentVariable('WHITELILY_COMPONENT_TEST_MODE_PATH')",
+      `& (Join-Path $testRoot 'hook.ps1') -Phase '${phase}' -ModePath $testModePath -TargetPath $target -TempPath $owned.Path -Root $testRoot`,
+      "if(-not $?) {throw 'component preference test hook failed'}",
+    ].join("\r\n        ");
+  let validatorSource = await readFile(componentPreferenceValidator, "utf8");
+  validatorSource = validatorSource
+    .replace("# WHITELILY_TEST_BEFORE_PUBLISH", invokeHook("before-publish"))
+    .replace(
+      "# WHITELILY_TEST_AFTER_PUBLISH",
+      [
+        "if(-not $publication.Published){",
+        "    $testRoot=[Environment]::GetEnvironmentVariable('WHITELILY_COMPONENT_TEST_ROOT')",
+        "    [IO.File]::WriteAllText((Join-Path $testRoot 'last-error.txt'),[string]$publication.ErrorCode)",
+        "}",
+      ].join("\r\n        "),
+    )
+    .replace("# WHITELILY_TEST_BEFORE_WINNER_CLEANUP", invokeHook("before-winner-validation"))
+    .replace("# WHITELILY_TEST_BEFORE_OWNED_CLEANUP", invokeHook("before-temp-cleanup"));
+  expect(validatorSource).not.toContain("# WHITELILY_TEST_");
+  await writeFile(validatorPath, validatorSource, "utf8");
+  const projectDir = join(repositoryRoot, "apps", "desktop");
+  const nsisPath = join(root, "fixture.nsi");
+  await writeFile(
+    nsisPath,
+    [
+      "Unicode true",
+      `!define PROJECT_DIR "${projectDir}"`,
+      '!define WHITELILY_COMPONENT_DATA_ROOT "$EXEDIR\\data"',
+      "!define WHITELILY_COMPONENT_TEST_HOOKS",
+      `!define WHITELILY_COMPONENT_VALIDATOR_SOURCE "${validatorPath}"`,
+      `!include "${join(repositoryRoot, "packaging", "nsis", "installer.nsh")}"`,
+      'Name "WhiteLily component preference fixture"',
+      `OutFile "${installer}"`,
+      "RequestExecutionLevel user",
+      "SilentInstall silent",
+      "Section",
+      "  !insertmacro customInit",
+      "  !insertmacro customInstall",
+      "SectionEnd",
+      "",
+    ].join("\r\n"),
+  );
+  const compilation = run(makeNsisPath, ["/V2", nsisPath], {
+    cwd: root,
+    env: makeNsisEnvironment,
+    timeout: 60_000,
+  });
+  expect(compilation.status, `${compilation.stdout}\n${compilation.stderr}`).toBe(0);
+  return {
+    root,
+    installer,
+    dataRoot,
+    preferences,
+    modePath,
+    hookPath,
+    lastErrorPath,
+    aclSddlPath,
+    attackResultPath,
+    tempPathRecord,
+    hardlinkPeerPath,
+    relocatedTempPath,
+  };
+}
+
+async function runNsisComponentPreferenceFixture(
+  fixture: Awaited<ReturnType<typeof createNsisComponentPreferenceFixture>>,
+  mode: string,
+): Promise<CommandResult> {
+  await Promise.all([
+    rm(fixture.attackResultPath, { force: true }),
+    rm(fixture.tempPathRecord, { force: true }),
+    rm(fixture.hardlinkPeerPath, { force: true }),
+    rm(fixture.relocatedTempPath, { force: true }),
+  ]);
+  await writeFile(fixture.modePath, mode, "utf8");
+  await rm(fixture.lastErrorPath, { force: true });
+  return run(fixture.installer, ["/S"], {
+    cwd: fixture.root,
+    timeout: 15_000,
+    env: {
+      ...process.env,
+      WHITELILY_COMPONENT_TEST_ROOT: fixture.root,
+      WHITELILY_COMPONENT_TEST_MODE_PATH: fixture.modePath,
+    },
+  });
+}
+
 beforeAll(() => {
   const result = run(process.execPath, [
     "-e",
@@ -734,6 +1053,281 @@ afterAll(async () => {
 });
 
 describe("WhiteLily installer packaging scripts", () => {
+  it("rejects a valid hard-linked component preference without changing its external peer", async () => {
+    const root = await createTemporaryRoot("whitelily-preference-hardlink-");
+    const peer = join(root, "external-peer.json");
+    const target = join(root, "minecraft-components.json");
+    const bytes = '{"schemaVersion":1,"bridgeEnabled":false,"avatarEnabled":true}';
+    await writeFile(peer, bytes, "utf8");
+    await link(peer, target);
+    const before = await lstat(peer, { bigint: true });
+
+    const result = runPowerShell(componentPreferenceValidator, [], {
+      env: { ...process.env, WHITELILY_COMPONENT_PREFERENCES_PATH: target },
+    });
+
+    expect(result.status, `${result.stdout}\n${result.stderr}`).not.toBe(0);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toBe("");
+    await expect(readFile(peer, "utf8")).resolves.toBe(bytes);
+    await expect(readFile(target, "utf8")).resolves.toBe(bytes);
+    const after = await lstat(peer, { bigint: true });
+    expect({ dev: after.dev, ino: after.ino, nlink: after.nlink }).toEqual({
+      dev: before.dev,
+      ino: before.ino,
+      nlink: 2n,
+    });
+  });
+
+  it("fails closed when an opened component preference path changes identity", async () => {
+    const root = await createTemporaryRoot("whitelily-preference-identity-");
+    const target = join(root, "minecraft-components.json");
+    const original = join(root, "opened-original.json");
+    const marker = join(root, "opened.marker");
+    const first = '{"schemaVersion":1,"bridgeEnabled":true,"avatarEnabled":false}';
+    const replacement = '{"schemaVersion":1,"bridgeEnabled":false,"avatarEnabled":true}';
+    await writeFile(target, first, "utf8");
+    const validatorPath = join(root, "identity-validator.ps1");
+    const source = (await readFile(componentPreferenceValidator, "utf8"))
+      .replace("FILE_SHARE_READ, // WHITELILY_TEST_EXISTING_SHARE", "0x00000007,")
+      .replace(
+        "// WHITELILY_TEST_AFTER_EXISTING_OPEN",
+        [
+          'string marker = Environment.GetEnvironmentVariable("WHITELILY_COMPONENT_TEST_OPEN_MARKER");',
+          'File.WriteAllText(marker, "opened");',
+          "System.Threading.Thread.Sleep(1000);",
+        ].join("\n                "),
+      );
+    expect(source).not.toContain("WHITELILY_TEST_EXISTING_SHARE");
+    expect(source).not.toContain("WHITELILY_TEST_AFTER_EXISTING_OPEN");
+    await writeFile(validatorPath, source, "utf8");
+    const child = spawn(
+      "powershell.exe",
+      ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", validatorPath],
+      {
+        env: {
+          ...process.env,
+          WHITELILY_COMPONENT_PREFERENCES_PATH: target,
+          WHITELILY_COMPONENT_TEST_OPEN_MARKER: marker,
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+        windowsHide: true,
+      },
+    );
+    let stdout = "";
+    let stderr = "";
+    child.stdout?.setEncoding("utf8").on("data", (chunk: string) => (stdout += chunk));
+    child.stderr?.setEncoding("utf8").on("data", (chunk: string) => (stderr += chunk));
+    const exit = new Promise<number | null>((resolveExit, rejectExit) => {
+      child.once("error", rejectExit);
+      child.once("exit", resolveExit);
+    });
+    try {
+      await vi.waitFor(async () => expect(readFile(marker, "utf8")).resolves.toBe("opened"), {
+        timeout: 10_000,
+        interval: 25,
+      });
+      await rename(target, original);
+      await writeFile(target, replacement, "utf8");
+      const status = await exit;
+      expect(status).not.toBe(0);
+      expect(stdout).toBe("");
+      expect(stderr).toBe("");
+      await expect(readFile(original, "utf8")).resolves.toBe(first);
+      await expect(readFile(target, "utf8")).resolves.toBe(replacement);
+    } finally {
+      if (child.exitCode === null) child.kill();
+    }
+  });
+
+  it("executes no-clobber component preference publication across collision and cleanup boundaries", async () => {
+    const fixture = await createNsisComponentPreferenceFixture();
+    const enabled = '{"schemaVersion":1,"bridgeEnabled":true,"avatarEnabled":true}';
+    const disabled = '{"schemaVersion":1,"bridgeEnabled":false,"avatarEnabled":false}';
+
+    let result = await runNsisComponentPreferenceFixture(fixture, "fresh");
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    await expect(readFile(fixture.preferences, "utf8")).resolves.toBe(enabled);
+    expect(await readdir(dirname(fixture.preferences))).toEqual(["minecraft-components.json"]);
+
+    await rm(fixture.dataRoot, { recursive: true, force: true });
+    await mkdir(dirname(fixture.preferences), { recursive: true });
+    await writeFile(fixture.preferences, disabled);
+    result = await runNsisComponentPreferenceFixture(fixture, "upgrade");
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    await expect(readFile(fixture.preferences, "utf8")).resolves.toBe(disabled);
+
+    const validExistingPreferences = [
+      '{"schemaVersion":1,"bridgeEnabled":false,"avatarEnabled":true}',
+      '{\n  "avatarEnabled": false,\n  "bridgeEnabled": true,\n  "schemaVersion": 1\n}\n',
+    ];
+    for (const existing of validExistingPreferences) {
+      await rm(fixture.dataRoot, { recursive: true, force: true });
+      await mkdir(dirname(fixture.preferences), { recursive: true });
+      await writeFile(fixture.preferences, existing);
+      result = await runNsisComponentPreferenceFixture(fixture, "upgrade");
+      expect(result.status, `${existing}\n${result.stdout}\n${result.stderr}`).toBe(0);
+      await expect(readFile(fixture.preferences, "utf8")).resolves.toBe(existing);
+    }
+
+    const invalidExistingPreferences = [
+      Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(enabled)]),
+      Buffer.from(
+        '{"schemaVersion":1,"schemaVersion":1,"bridgeEnabled":true,"avatarEnabled":true}',
+      ),
+      Buffer.from(
+        '{"SchemaVersion":1,"schemaVersion":1,"bridgeEnabled":true,"avatarEnabled":true}',
+      ),
+      Buffer.from('{"schemaVersion":1,"bridgeEnabled":true,"avatarEnabled":true,"extra":false}'),
+      Buffer.from('{"schemaVersion":1,"bridgeEnabled":true}'),
+      Buffer.from('{"schemaVersion":1,"bridgeEnabled":"true","avatarEnabled":true}'),
+      Buffer.from('{"schemaVersion":1,"bridgeEnabled":true,"avatarEnabled":true,}'),
+      Buffer.from("malformed"),
+      Buffer.alloc(4097, 0x20),
+    ];
+    for (const existing of invalidExistingPreferences) {
+      await rm(fixture.dataRoot, { recursive: true, force: true });
+      await mkdir(dirname(fixture.preferences), { recursive: true });
+      await writeFile(fixture.preferences, existing);
+      result = await runNsisComponentPreferenceFixture(fixture, "upgrade");
+      expect(result.status, "invalid preference timed out").not.toBeNull();
+      expect(result.status, `${result.stdout}\n${result.stderr}`).not.toBe(0);
+      await expect(readFile(fixture.preferences)).resolves.toEqual(existing);
+    }
+
+    await rm(fixture.dataRoot, { recursive: true, force: true });
+    result = await runNsisComponentPreferenceFixture(fixture, "collision-valid");
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    await expect(readFile(fixture.preferences, "utf8")).resolves.toBe(disabled);
+    expect(await readdir(dirname(fixture.preferences))).toEqual(["minecraft-components.json"]);
+
+    await rm(fixture.dataRoot, { recursive: true, force: true });
+    result = await runNsisComponentPreferenceFixture(fixture, "collision-valid-pretty");
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    await expect(readFile(fixture.preferences, "utf8")).resolves.toContain('"avatarEnabled": true');
+
+    await rm(fixture.dataRoot, { recursive: true, force: true });
+    const existingHardlinkPeer = join(fixture.root, "existing-hardlink-peer.json");
+    await rm(existingHardlinkPeer, { force: true });
+    await mkdir(dirname(fixture.preferences), { recursive: true });
+    await writeFile(existingHardlinkPeer, disabled, "utf8");
+    await link(existingHardlinkPeer, fixture.preferences);
+    const existingPeerBefore = await lstat(existingHardlinkPeer, { bigint: true });
+    result = await runNsisComponentPreferenceFixture(fixture, "upgrade-hardlink");
+    expect(result.status, "existing hardlink timed out").not.toBeNull();
+    expect(result.status, `${result.stdout}\n${result.stderr}`).not.toBe(0);
+    await expect(readFile(existingHardlinkPeer, "utf8")).resolves.toBe(disabled);
+    await expect(readFile(fixture.preferences, "utf8")).resolves.toBe(disabled);
+    const existingPeerAfter = await lstat(existingHardlinkPeer, { bigint: true });
+    expect({ dev: existingPeerAfter.dev, ino: existingPeerAfter.ino }).toEqual({
+      dev: existingPeerBefore.dev,
+      ino: existingPeerBefore.ino,
+    });
+
+    await rm(fixture.dataRoot, { recursive: true, force: true });
+    result = await runNsisComponentPreferenceFixture(fixture, "collision-hardlink");
+    expect(result.status, "collision hardlink timed out").not.toBeNull();
+    expect(result.status, `${result.stdout}\n${result.stderr}`).not.toBe(0);
+    await expect(readFile(fixture.hardlinkPeerPath, "utf8")).resolves.toBe(disabled);
+    await expect(readFile(fixture.preferences, "utf8")).resolves.toBe(disabled);
+    const [collisionPeer, collisionTarget] = await Promise.all([
+      lstat(fixture.hardlinkPeerPath, { bigint: true }),
+      lstat(fixture.preferences, { bigint: true }),
+    ]);
+    expect({
+      dev: collisionTarget.dev,
+      ino: collisionTarget.ino,
+      nlink: collisionTarget.nlink,
+    }).toEqual({ dev: collisionPeer.dev, ino: collisionPeer.ino, nlink: 2n });
+
+    await rm(fixture.dataRoot, { recursive: true, force: true });
+    result = await runNsisComponentPreferenceFixture(fixture, "temp-replacement-before-publish");
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    await expect(readFile(fixture.attackResultPath, "utf8")).resolves.toBe("blocked");
+    await expect(readFile(fixture.preferences, "utf8")).resolves.toBe(enabled);
+    const publicationTemp = await readFile(fixture.tempPathRecord, "utf8");
+    await expect(readFile(publicationTemp)).rejects.toThrow();
+    await expect(readFile(fixture.relocatedTempPath)).rejects.toThrow();
+
+    await rm(fixture.dataRoot, { recursive: true, force: true });
+    result = await runNsisComponentPreferenceFixture(fixture, "temp-hardlink-before-publish");
+    expect(result.status, "temp hardlink attack timed out").not.toBeNull();
+    expect(result.status, `${result.stdout}\n${result.stderr}`).not.toBe(0);
+    await expect(readFile(fixture.preferences)).rejects.toThrow();
+    await expect(readFile(fixture.hardlinkPeerPath, "utf8")).resolves.toBe(enabled);
+    await expect(lstat(fixture.hardlinkPeerPath, { bigint: true })).resolves.toMatchObject({
+      nlink: 1n,
+    });
+    const hardlinkedTemp = await readFile(fixture.tempPathRecord, "utf8");
+    await expect(readFile(hardlinkedTemp)).rejects.toThrow();
+
+    await rm(fixture.dataRoot, { recursive: true, force: true });
+    result = await runNsisComponentPreferenceFixture(fixture, "temp-replacement-before-cleanup");
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    await expect(readFile(fixture.attackResultPath, "utf8")).resolves.toBe("blocked");
+    await expect(readFile(fixture.preferences, "utf8")).resolves.toBe(disabled);
+    const collisionTemp = await readFile(fixture.tempPathRecord, "utf8");
+    await expect(readFile(collisionTemp)).rejects.toThrow();
+    await expect(readFile(fixture.relocatedTempPath)).rejects.toThrow();
+
+    for (const mode of [
+      "collision-malformed",
+      "collision-reparse",
+      "missing-temp-noncollision",
+      "race-replacement",
+    ]) {
+      await rm(fixture.dataRoot, { recursive: true, force: true });
+      result = await runNsisComponentPreferenceFixture(fixture, mode);
+      expect(result.status, `${mode} timed out`).not.toBeNull();
+      expect(result.status, `${mode}\n${result.stdout}\n${result.stderr}`).not.toBe(0);
+    }
+
+    await rm(fixture.dataRoot, { recursive: true, force: true });
+    try {
+      result = await runNsisComponentPreferenceFixture(fixture, "access-denied");
+      expect(result.status, "access-denied timed out").not.toBeNull();
+      expect(result.status, `${result.stdout}\n${result.stderr}`).not.toBe(0);
+      const lastError = Number((await readFile(fixture.lastErrorPath, "utf8")).trim());
+      expect(lastError).toBe(5);
+      await expect(readFile(fixture.preferences)).rejects.toThrow();
+    } finally {
+      const restore = runPowerShell(fixture.hookPath, [
+        "-Phase",
+        "restore-acl",
+        "-ModePath",
+        fixture.modePath,
+        "-TargetPath",
+        fixture.preferences,
+        "-TempPath",
+        "unused",
+        "-Root",
+        fixture.root,
+      ]);
+      expect(restore.status, `${restore.stdout}\n${restore.stderr}`).toBe(0);
+    }
+    expect(await readdir(dirname(fixture.preferences))).toEqual([]);
+
+    await rm(fixture.dataRoot, { recursive: true, force: true });
+    const outsideConfig = join(fixture.root, "outside-config");
+    const outsidePreferences = join(outsideConfig, "minecraft-components.json");
+    await mkdir(outsideConfig, { recursive: true });
+    await writeFile(outsidePreferences, disabled);
+    await mkdir(fixture.dataRoot, { recursive: true });
+    await symlink(outsideConfig, dirname(fixture.preferences), "junction");
+    result = await runNsisComponentPreferenceFixture(fixture, "upgrade");
+    expect(result.status, "reparse config parent timed out").not.toBeNull();
+    expect(result.status, `${result.stdout}\n${result.stderr}`).not.toBe(0);
+    await expect(readFile(outsidePreferences, "utf8")).resolves.toBe(disabled);
+    await rm(dirname(fixture.preferences), { force: true });
+
+    await rm(fixture.dataRoot, { recursive: true, force: true });
+    result = await runNsisComponentPreferenceFixture(fixture, "cleanup-lock");
+    expect(result.status, "cleanup-lock timed out").not.toBeNull();
+    expect(result.status, `${result.stdout}\n${result.stderr}`).not.toBe(0);
+    await expect(readFile(fixture.preferences, "utf8")).resolves.toBe(enabled);
+    expect(await readdir(dirname(fixture.preferences))).toEqual(["minecraft-components.json"]);
+  }, 120_000);
+
   it("computes release hashes without depending on the optional Get-FileHash cmdlet", async () => {
     for (const scriptPath of [releaseScript, inspectScript, lifecycleScript]) {
       const script = await readFile(scriptPath, "utf8");
@@ -836,6 +1430,17 @@ describe("WhiteLily installer packaging scripts", () => {
 });
 
 describe("WhiteLily installer inspection", () => {
+  it("verifies the exact reviewed Minecraft component directory separately", async () => {
+    const source = await readFile(inspectScript, "utf8");
+
+    expect(source).toContain("$sourceManifest.paths.minecraftComponents");
+    expect(source).toContain("INSTALLER_MINECRAFT_COMPONENT_RESOURCES_INVALID");
+    expect(source).toMatch(/\$minecraftComponentResources\.Count\s+-ne\s+9/u);
+    expect(source).toContain("minecraftComponentResourcesVerified");
+    expect(source).toMatch(/executableFiles[\s\S]*?minecraftComponentPrefix/iu);
+    expect(source).toMatch(/scriptFiles[\s\S]*?minecraftComponentPrefix/iu);
+  });
+
   it("rejects an archive that omits a reviewed required bundled resource", async () => {
     const fixture = await createRepositoryFixture({ omitRequiredResource: true });
     const result = runPowerShell(
@@ -847,9 +1452,99 @@ describe("WhiteLily installer inspection", () => {
     expect(result.status).not.toBe(0);
     expect(`${result.stdout}\n${result.stderr}`).toContain("INSTALLER_RESOURCE_MISSING");
   });
+
+  it("binds packaged component descriptors and bytes to the independent reviewed policy", async () => {
+    const baseline = await createRepositoryFixture();
+    const baselineResult = runPowerShell(
+      join(baseline.root, "scripts", "inspect-installer.ps1"),
+      ["-InstallerPath", baseline.installer, "-ExpectedVersion", version],
+      { cwd: baseline.root, env: baseline.environment, timeout: 120_000 },
+    );
+    expect(baselineResult.status, `${baselineResult.stdout}\n${baselineResult.stderr}`).toBe(0);
+
+    for (const options of [
+      { coordinatedComponentRewrite: true },
+      { sourceComponentPinMismatch: true },
+    ]) {
+      const fixture = await createRepositoryFixture(options);
+      const result = runPowerShell(
+        join(fixture.root, "scripts", "inspect-installer.ps1"),
+        ["-InstallerPath", fixture.installer, "-ExpectedVersion", version],
+        { cwd: fixture.root, env: fixture.environment, timeout: 120_000 },
+      );
+      expect(result.status).not.toBe(0);
+      expect(`${result.stdout}\n${result.stderr}`).toMatch(/MINECRAFT_COMPONENT|component|pin/iu);
+    }
+  }, 180_000);
 });
 
 describe("WhiteLily isolated installer lifecycle", () => {
+  it("binds installed component descriptors and bytes to reviewed pins and rejects set/link drift", async () => {
+    const baseline = await createInstalledComponentFixture();
+    const baselineResult = runInstalledComponentVerifier(baseline);
+    expect(baselineResult.status, `${baselineResult.stdout}\n${baselineResult.stderr}`).toBe(0);
+    expect(baselineResult.stdout).toBe("9");
+
+    const coordinated = await createInstalledComponentFixture();
+    const replacement = Buffer.from("coordinated installed replacement", "utf8");
+    await writeFile(join(coordinated.componentRoot, coordinated.paths[0]!), replacement);
+    const coordinatedRuntime = JSON.parse(await readFile(coordinated.runtimePath, "utf8")) as {
+      resources: Array<{ path: string; bytes: number; sha256: string }>;
+    };
+    coordinatedRuntime.resources[0]!.bytes = replacement.length;
+    coordinatedRuntime.resources[0]!.sha256 = createHash("sha256")
+      .update(replacement)
+      .digest("hex");
+    await writeFile(coordinated.runtimePath, JSON.stringify(coordinatedRuntime));
+
+    const missing = await createInstalledComponentFixture();
+    await rm(join(missing.componentRoot, missing.paths[0]!));
+
+    const hardLinked = await createInstalledComponentFixture();
+    const hardLinkedComponent = join(hardLinked.componentRoot, hardLinked.paths[0]!);
+    const hardLinkPeer = join(hardLinked.root, "foreign-component-peer.jar");
+    await link(hardLinkedComponent, hardLinkPeer);
+
+    const embeddedPinDrift = await createInstalledComponentFixture();
+    const driftedRuntime = JSON.parse(await readFile(embeddedPinDrift.runtimePath, "utf8")) as {
+      allowlist: { exactFiles: Array<{ sha256: string }> };
+    };
+    driftedRuntime.allowlist.exactFiles[0]!.sha256 = "0".repeat(64);
+    await writeFile(embeddedPinDrift.runtimePath, JSON.stringify(driftedRuntime));
+
+    const extra = await createInstalledComponentFixture();
+    await writeFile(join(extra.componentRoot, "unreviewed.jar"), "unreviewed");
+
+    const linked = await createInstalledComponentFixture();
+    const outside = join(linked.root, "outside-components");
+    await rename(linked.componentRoot, outside);
+    await symlink(outside, linked.componentRoot, "junction");
+
+    for (const fixture of [coordinated, embeddedPinDrift, missing, hardLinked, extra, linked]) {
+      const result = runInstalledComponentVerifier(fixture);
+      expect(result.status).not.toBe(0);
+    }
+    await expect(readFile(hardLinkPeer)).resolves.toEqual(await readFile(hardLinkedComponent));
+  }, 60_000);
+
+  it("verifies packaged components and absent-only component preferences across the 15 stages", async () => {
+    const source = await readFile(lifecycleScript, "utf8");
+
+    expect(source).toContain("__WHITELILY_REVIEWED_COMPONENT_VERIFIER__");
+    expect(source).toContain("Assert-ReviewedMinecraftComponentResources");
+    expect(source).toContain("minecraftComponentResources");
+    expect(source).toContain("componentPreferencesFresh");
+    expect(source).toContain("componentPreferencesUpgradePreserved");
+    expect(source).toContain("componentPreferencesKeepPreserved");
+    expect(source).toContain('{"schemaVersion":1,"bridgeEnabled":true,"avatarEnabled":true}');
+    expect(source).toContain('{"schemaVersion":1,"bridgeEnabled":false,"avatarEnabled":false}');
+    expect(source.match(/Assert-ExactComponentPreferences/gu)).toHaveLength(5);
+    expect(source).toMatch(/\[int\]\$report\.minecraftComponentResources\s+-ne\s+9/u);
+    expect(source).toMatch(/\$report\.componentPreferencesFresh\s+-ne\s+\$true/u);
+    expect(source).toMatch(/\$report\.componentPreferencesUpgradePreserved\s+-ne\s+\$true/u);
+    expect(source).toMatch(/\$report\.componentPreferencesKeepPreserved\s+-ne\s+\$true/u);
+  });
+
   it("separates a SYSTEM-owned trusted controller from the standard candidate user", async () => {
     const source = await readFile(lifecycleScript, "utf8");
 

@@ -83,8 +83,8 @@ const DESKTOP_MINECRAFT_COMPONENT_MANIFEST: MinecraftComponentResourceManifest =
     Object.freeze({
       component: "avatar" as const,
       fileName: "whitelily-avatar-fabric-1.21.5-0.1.0.jar",
-      bytes: 52_550,
-      sha256: "f27dce8e9f13a1058b59d97cbeff1d36d567bbabf59e4de16f6e2d7c33e5d7c3",
+      bytes: 55_627,
+      sha256: "fff00f66e4beab2eff1e51f253608b198f43aa0a12443fbe07f7f3fd48278872",
       modId: "whitelily_avatar",
       version: "0.1.0",
       prior: Object.freeze([]),
@@ -92,8 +92,8 @@ const DESKTOP_MINECRAFT_COMPONENT_MANIFEST: MinecraftComponentResourceManifest =
     Object.freeze({
       component: "avatar" as const,
       fileName: "fabric-api-0.128.2+1.21.5.jar",
-      bytes: 2_243_253,
-      sha256: "4aed9b9da68307bb3fc69ef5ed54be6caa9a07ac1d07cb7fd374acb9914a01b5",
+      bytes: 2_248_994,
+      sha256: "a82fd00827206e911936ed1e0ceaec6eb55d061ca5d3c5d63c7f0031426d29ae",
       modId: "fabric-api",
       version: "0.128.2+1.21.5",
       prior: Object.freeze([]),
@@ -101,8 +101,8 @@ const DESKTOP_MINECRAFT_COMPONENT_MANIFEST: MinecraftComponentResourceManifest =
     Object.freeze({
       component: "avatar" as const,
       fileName: "geckolib-fabric-1.21.5-5.1.0.jar",
-      bytes: 698_651,
-      sha256: "8d13e1c1f2317fc2d4c235cd8654fce6b7720252d5f310d65262cb72075b8eb4",
+      bytes: 670_425,
+      sha256: "885ef4b03cd438c7d2ec9f59bb492f3af6ba2b73aa0493afc4f80801b5a9126c",
       modId: "geckolib",
       version: "5.1.0",
       prior: Object.freeze([]),

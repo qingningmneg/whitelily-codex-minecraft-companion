@@ -85,6 +85,20 @@ function Invoke-CheckedNpm {
     }
 }
 
+function Invoke-CheckedMinecraftComponentStage {
+    $avatarProject = Join-Path $repositoryRoot 'subprojects/whitelily-avatar'
+    $gradleWrapper = Join-Path $avatarProject 'gradlew.bat'
+    & $gradleWrapper `
+        '-p' $avatarProject `
+        ':stageMinecraftComponents' `
+        '--offline' `
+        '--no-daemon' `
+        '--max-workers=1'
+    if ($LASTEXITCODE -ne 0) {
+        throw "Minecraft component staging failed with exit code $LASTEXITCODE"
+    }
+}
+
 function Get-RelativePath {
     param(
         [Parameter(Mandatory = $true)][string]$BasePath,
@@ -104,10 +118,74 @@ function Assert-ReviewedFile {
         throw "reviewed source dependency is missing: $($Entry.source)"
     }
     $file = Get-Item -LiteralPath $path
+    if (($file.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "reviewed source dependency cannot be a link or reparse point: $($Entry.source)"
+    }
     $hash = Get-Sha256Hex $path
     if ($file.Length -ne [long]$Entry.bytes -or -not [StringComparer]::Ordinal.Equals($hash, [string]$Entry.sha256)) {
         throw "reviewed source dependency hash mismatch: $($Entry.source)"
     }
+}
+
+function Assert-ExactMinecraftComponentPack {
+    $componentTargetPrefix = 'minecraft-components/'
+    $componentEntries = @(
+        $sourceManifest.allowlist.exactFiles |
+            Where-Object { $null -ne $_.target -and ([string]$_.target).StartsWith($componentTargetPrefix, [StringComparison]::Ordinal) }
+    )
+    if ($componentEntries.Count -ne 9) {
+        throw 'reviewed Minecraft component pack must declare exactly nine files'
+    }
+
+    $componentRoot = Join-Path $repositoryRoot 'build/minecraft-components'
+    if (-not (Test-Path -LiteralPath $componentRoot -PathType Container)) {
+        throw 'reviewed Minecraft component pack is missing'
+    }
+    $componentRootItem = Get-Item -LiteralPath $componentRoot -Force
+    if (($componentRootItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw 'reviewed Minecraft component pack cannot be a link or reparse point'
+    }
+
+    [string[]]$expectedNames = @(
+        $componentEntries |
+            ForEach-Object { [System.IO.Path]::GetFileName(([string]$_.source).Replace('/', [System.IO.Path]::DirectorySeparatorChar)) }
+    )
+    [string[]]$actualNames = @(
+        Get-ChildItem -LiteralPath $componentRoot -Force |
+            ForEach-Object {
+                if (-not $_.PSIsContainer -and ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq 0) {
+                    return $_.Name
+                }
+                throw "reviewed Minecraft component pack contains a non-file entry: $($_.Name)"
+            }
+    )
+    [Array]::Sort($expectedNames, [StringComparer]::Ordinal)
+    [Array]::Sort($actualNames, [StringComparer]::Ordinal)
+    if (-not [System.Linq.Enumerable]::SequenceEqual([string[]]$actualNames, [string[]]$expectedNames)) {
+        throw 'reviewed Minecraft component pack contains a missing or unreviewed file'
+    }
+}
+
+Invoke-CheckedMinecraftComponentStage
+Assert-ExactMinecraftComponentPack
+$nodeExecutable = (Get-Command node -ErrorAction Stop).Source
+$componentVerificationOutput = @(
+    & (Join-Path $PSScriptRoot 'invoke-bounded-component-verifier.ps1') `
+        -NodeExecutable $nodeExecutable `
+        -VerifierPath (Join-Path $PSScriptRoot 'verify-minecraft-component-pack.mjs') `
+        -RepositoryRoot $repositoryRoot `
+        -ManifestPath $sourceManifestPath `
+        -TimeoutMilliseconds 15000 `
+        -MaximumOutputBytes 256
+)
+if (
+    $componentVerificationOutput.Count -ne 1 -or
+    -not [StringComparer]::Ordinal.Equals(
+        [string]$componentVerificationOutput[0],
+        '{"status":"ok","files":9}'
+    )
+) {
+    throw 'Minecraft component pack verification failed'
 }
 
 foreach ($entry in $sourceManifest.allowlist.exactFiles) {

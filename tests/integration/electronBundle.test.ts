@@ -1,9 +1,21 @@
 import { createHash } from "node:crypto";
 import { execFile, spawn } from "node:child_process";
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  link,
+  mkdtemp,
+  readFile,
+  readdir,
+  rename,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve, sep } from "node:path";
+import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 import { validConfig } from "../support/appHarness.js";
@@ -24,6 +36,7 @@ interface RuntimeManifest {
     codexNativePackage: string;
     codexExecutable: string;
     licenses: string;
+    minecraftComponents: string;
   };
   allowlist: {
     exactFiles: Array<{
@@ -50,6 +63,16 @@ const sourceManifestPath = join(repositoryRoot, "packaging", "electron", "runtim
 const bundleRoot = join(repositoryRoot, "build", "electron-bundle");
 const bundleManifestPath = join(bundleRoot, "runtime-manifest.json");
 const prepareScriptPath = join(repositoryRoot, "scripts", "prepare-electron-bundle.ps1");
+const componentPackVerifierPath = join(
+  repositoryRoot,
+  "scripts",
+  "verify-minecraft-component-pack.mjs",
+);
+const boundedComponentVerifierPath = join(
+  repositoryRoot,
+  "scripts",
+  "invoke-bounded-component-verifier.ps1",
+);
 const workspaceBuilderPath = join(repositoryRoot, "scripts", "build-codex-workspace.mjs");
 const productVersionVerifierPath = join(repositoryRoot, "scripts", "verify-product-versions.mjs");
 const workspaceBundleRoot = join(bundleRoot, "codex-workspace");
@@ -155,6 +178,62 @@ const workspaceLoosePaths = [
   "codex-workspace/AGENTS.md",
   "codex-workspace/workspace-manifest.json",
 ] as const;
+const minecraftComponentFiles = [
+  {
+    source: "build/minecraft-components/fabric-api-0.128.2+1.21.5.jar",
+    target: "minecraft-components/fabric-api-0.128.2+1.21.5.jar",
+    bytes: 2_248_994,
+    sha256: "a82fd00827206e911936ed1e0ceaec6eb55d061ca5d3c5d63c7f0031426d29ae",
+  },
+  {
+    source: "build/minecraft-components/Fabric-API-LICENSE.txt",
+    target: "minecraft-components/Fabric-API-LICENSE.txt",
+    bytes: 11_357,
+    sha256: "b40930bbcf80744c86c46a12bc9da056641d722716c378f5659b9e555ef833e1",
+  },
+  {
+    source: "build/minecraft-components/geckolib-fabric-1.21.5-5.1.0.jar",
+    target: "minecraft-components/geckolib-fabric-1.21.5-5.1.0.jar",
+    bytes: 670_425,
+    sha256: "885ef4b03cd438c7d2ec9f59bb492f3af6ba2b73aa0493afc4f80801b5a9126c",
+  },
+  {
+    source: "build/minecraft-components/GeckoLib-LICENSE.txt",
+    target: "minecraft-components/GeckoLib-LICENSE.txt",
+    bytes: 1_065,
+    sha256: "5f2943625776c6126cd252652f4c57d2fb187d339a20fa065a2b7c619165a52f",
+  },
+  {
+    source: "build/minecraft-components/minecraft-components-manifest.json",
+    target: "minecraft-components/minecraft-components-manifest.json",
+    bytes: 1_585,
+    sha256: "91a09da35550b81e0722829e559a50e69deada5e55035608cdb667f6b5fd7985",
+  },
+  {
+    source: "build/minecraft-components/whitelily-avatar-fabric-1.21.5-0.1.0.jar",
+    target: "minecraft-components/whitelily-avatar-fabric-1.21.5-0.1.0.jar",
+    bytes: 55_627,
+    sha256: "fff00f66e4beab2eff1e51f253608b198f43aa0a12443fbe07f7f3fd48278872",
+  },
+  {
+    source: "build/minecraft-components/whitelily-bridge-fabric-1.21.5-0.1.0.jar",
+    target: "minecraft-components/whitelily-bridge-fabric-1.21.5-0.1.0.jar",
+    bytes: 51_837,
+    sha256: "380721d28236f5ad8206fd8d69af1e5629d741e9d38ec27c26c052c95266b6ce",
+  },
+  {
+    source: "build/minecraft-components/WhiteLily-LICENSE.txt",
+    target: "minecraft-components/WhiteLily-LICENSE.txt",
+    bytes: 11_123,
+    sha256: "226d0e41f61309952c27fcc11a5140c4e735115f702ff0484ff0c25cfbbeee16",
+  },
+  {
+    source: "build/minecraft-components/WhiteLily-NOTICE.txt",
+    target: "minecraft-components/WhiteLily-NOTICE.txt",
+    bytes: 697,
+    sha256: "6323cb4b742d322d61ee47279d71d0f0de496568cf1f2f793fea104a58ab0dde",
+  },
+] as const;
 
 function workspaceInnerManifest(
   payloads: Record<(typeof workspacePayloadPaths)[number], Buffer | string> = {
@@ -178,6 +257,176 @@ async function runWorkspaceBuilder(sourceRoot: string, stagingRoot: string): Pro
     cwd: repositoryRoot,
     windowsHide: true,
   });
+}
+
+async function createComponentPackVerifierFixture(): Promise<{
+  root: string;
+  repository: string;
+  manifestPath: string;
+  policyPath: string;
+  componentRoot: string;
+}> {
+  const root = await mkdtemp(join(tmpdir(), "whitelily-component-pack-"));
+  const repository = join(root, "repository");
+  const componentRoot = join(repository, "build", "minecraft-components");
+  const manifestPath = join(repository, "packaging", "electron", "runtime-manifest.json");
+  const policyPath = join(repository, "packaging", "electron", "minecraft-component-pack.json");
+  const files = Object.fromEntries(
+    minecraftComponentFiles.map(({ target }) => [
+      target,
+      Buffer.from(`reviewed:${target}`, "utf8"),
+    ]),
+  );
+  await writeTree(
+    repository,
+    Object.fromEntries(Object.entries(files).map(([path, data]) => [`build/${path}`, data])),
+  );
+  const exactFiles = Object.entries(files).map(([target, data]) => ({
+    source: `build/${target}`,
+    target,
+    bytes: data.length,
+    sha256: createHash("sha256").update(data).digest("hex"),
+  }));
+  const productionManifest = JSON.parse(await readFile(sourceManifestPath, "utf8")) as {
+    allowlist: { exactFiles: Array<{ target: string | null }> };
+  };
+  productionManifest.allowlist.exactFiles = [
+    ...productionManifest.allowlist.exactFiles.filter(
+      ({ target }) => target === null || !target.startsWith("minecraft-components/"),
+    ),
+    ...exactFiles,
+  ];
+  await mkdir(dirname(manifestPath), { recursive: true });
+  await writeFile(manifestPath, JSON.stringify(productionManifest));
+  await writeFile(
+    policyPath,
+    JSON.stringify({
+      schemaVersion: 1,
+      files: exactFiles.map(({ target, bytes, sha256 }) => ({
+        name: target.slice("minecraft-components/".length),
+        bytes,
+        sha256,
+      })),
+    }),
+  );
+  return { root, repository, manifestPath, policyPath, componentRoot };
+}
+
+async function runComponentPackVerifier(repository: string, manifestPath: string): Promise<void> {
+  await execFileAsync(process.execPath, [componentPackVerifierPath, repository, manifestPath], {
+    cwd: repositoryRoot,
+    windowsHide: true,
+  });
+}
+
+async function createBoundedVerifierFixture(): Promise<{
+  root: string;
+  verifier: string;
+  marker: string;
+}> {
+  const root = await mkdtemp(join(tmpdir(), "whitelily-bounded-verifier-"));
+  const verifier = join(root, "fake-verifier.mjs");
+  const marker = join(root, "descendant.pid");
+  await writeFile(
+    verifier,
+    `import { spawn } from "node:child_process";
+import { writeFileSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
+const mode = basename(process.argv[3]);
+const marker = join(dirname(process.argv[3]), "descendant.pid");
+if (mode === "success") process.stdout.write('{"status":"ok","files":9}\\n');
+else if (mode === "nonzero") process.exitCode = 7;
+else if (mode === "stderr") process.stderr.write("unreviewed stderr");
+else if (mode === "oversize-stdout") process.stdout.write("x".repeat(10000));
+else if (mode === "oversize-stderr") process.stderr.write("x".repeat(10000));
+else if (mode === "extra-line") process.stdout.write('{"status":"ok","files":9}\\nextra\\n');
+else if (mode === "malformed") process.stdout.write('{"status":"ok"}\\n');
+else if (mode === "hang") {
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore", windowsHide: true });
+  writeFileSync(marker, String(child.pid));
+  setInterval(() => {}, 1000);
+}
+else if (mode === "parent-exits-first") {
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+    detached: true,
+    stdio: ["ignore", "inherit", "inherit"],
+    windowsHide: true,
+  });
+  writeFileSync(marker, String(child.pid));
+  child.unref();
+  process.stdout.write('{"status":"ok","files":9}\\n');
+}
+`,
+  );
+  return { root, verifier, marker };
+}
+
+async function runBoundedVerifier(
+  fixture: Awaited<ReturnType<typeof createBoundedVerifierFixture>>,
+  mode: string,
+): Promise<void> {
+  await execFileAsync(
+    "powershell.exe",
+    [
+      "-NoProfile",
+      "-NonInteractive",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-File",
+      boundedComponentVerifierPath,
+      "-NodeExecutable",
+      process.execPath,
+      "-VerifierPath",
+      fixture.verifier,
+      "-RepositoryRoot",
+      fixture.root,
+      "-ManifestPath",
+      join(fixture.root, mode),
+      "-TimeoutMilliseconds",
+      "1500",
+      "-MaximumOutputBytes",
+      "256",
+    ],
+    { cwd: repositoryRoot, windowsHide: true, timeout: 10_000, maxBuffer: 4_096 },
+  );
+}
+
+async function runCapturedBoundedVerifier(
+  fixture: Awaited<ReturnType<typeof createBoundedVerifierFixture>>,
+): Promise<void> {
+  const harness = join(fixture.root, "capture-verifier.ps1");
+  await writeFile(
+    harness,
+    `[CmdletBinding()]
+param([string]$Helper, [string]$Node, [string]$Verifier, [string]$Root)
+$output = @(
+    & $Helper -NodeExecutable $Node -VerifierPath $Verifier -RepositoryRoot $Root -ManifestPath (Join-Path $Root 'success') -TimeoutMilliseconds 1500 -MaximumOutputBytes 256
+)
+if ($output.Count -ne 1 -or $output[0] -cne '{"status":"ok","files":9}') {
+    exit 9
+}
+`,
+  );
+  await execFileAsync(
+    "powershell.exe",
+    [
+      "-NoProfile",
+      "-NonInteractive",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-File",
+      harness,
+      "-Helper",
+      boundedComponentVerifierPath,
+      "-Node",
+      process.execPath,
+      "-Verifier",
+      fixture.verifier,
+      "-Root",
+      fixture.root,
+    ],
+    { cwd: repositoryRoot, windowsHide: true, timeout: 5_000, maxBuffer: 4_096 },
+  );
 }
 
 async function createWorkspaceSource(root: string): Promise<string> {
@@ -253,6 +502,78 @@ async function createManagedWorkspaceVerifierFixture(options?: {
     }),
   );
   return { root, resources, sourcePath };
+}
+
+async function createComponentResourceVerifierFixture(): Promise<{
+  root: string;
+  resources: string;
+  sourcePath: string;
+  policyPath: string;
+  componentTarget: string;
+}> {
+  const root = await mkdtemp(join(tmpdir(), "whitelily-component-resources-"));
+  const resources = join(root, "resources");
+  const sourcePath = join(root, "runtime-manifest.json");
+  const policyPath = join(root, "minecraft-component-pack.json");
+  const asarSource = join(root, "asar-source");
+  await mkdir(resources);
+  await mkdir(asarSource);
+  await writeTree(asarSource, { "package.json": JSON.stringify(desktopAsarPolicy.packageJson) });
+  await asar.createPackage(asarSource, join(resources, "app.asar"));
+
+  const payloads = Object.fromEntries(
+    minecraftComponentFiles.map(({ target }) => [
+      target,
+      Buffer.from(`reviewed:${target}`, "utf8"),
+    ]),
+  );
+  await writeTree(resources, payloads);
+  const exactFiles = Object.entries(payloads).map(([target, bytes]) => ({
+    source: `build/${target}`,
+    target,
+    bytes: bytes.length,
+    sha256: createHash("sha256").update(bytes).digest("hex"),
+  }));
+  const sourceManifest = {
+    schemaVersion: 1,
+    productVersion: "0.2.0-beta.1",
+    paths: { minecraftComponents: "minecraft-components" },
+    desktopAsar: desktopAsarPolicy,
+    allowlist: {
+      exactFiles,
+      requiredFiles: exactFiles.map(({ target }) => target),
+      executableFiles: [],
+      scriptFiles: [],
+      afterPackFiles: ["app.asar"],
+    },
+  };
+  await writeFile(sourcePath, JSON.stringify(sourceManifest));
+  await writeFile(
+    policyPath,
+    JSON.stringify({
+      schemaVersion: 1,
+      files: exactFiles.map(({ target, bytes, sha256 }) => ({
+        name: target.slice("minecraft-components/".length),
+        bytes,
+        sha256,
+      })),
+    }),
+  );
+  await writeFile(
+    join(resources, "runtime-manifest.json"),
+    JSON.stringify({
+      ...sourceManifest,
+      policySha256: await sha256(sourcePath),
+      resources: Object.entries(payloads).map(([path, bytes]) => resource(path, bytes)),
+    }),
+  );
+  return {
+    root,
+    resources,
+    sourcePath,
+    policyPath,
+    componentTarget: exactFiles[0]!.target,
+  };
 }
 
 async function createVerifierFixture(options?: {
@@ -368,6 +689,292 @@ async function createMaterializationFixture(options?: {
 }
 
 describe("deterministic Electron resources", () => {
+  it("runs component staging and exact-pack verification before reviewed file validation", async () => {
+    const script = await readFile(prepareScriptPath, "utf8");
+    const stage = script.indexOf("Invoke-CheckedMinecraftComponentStage");
+    const verify = script.indexOf("verify-minecraft-component-pack.mjs");
+    const reviewedFiles = script.indexOf(
+      "foreach ($entry in $sourceManifest.allowlist.exactFiles)",
+    );
+
+    expect(stage).toBeGreaterThanOrEqual(0);
+    expect(verify).toBeGreaterThan(stage);
+    expect(reviewedFiles).toBeGreaterThan(verify);
+  });
+
+  it.each([
+    {
+      label: "tampered bytes",
+      mutate: async (fixture: Awaited<ReturnType<typeof createComponentPackVerifierFixture>>) => {
+        await writeFile(
+          join(fixture.componentRoot, "whitelily-bridge-fabric-1.21.5-0.1.0.jar"),
+          "tampered",
+        );
+      },
+    },
+    {
+      label: "missing reviewed file",
+      mutate: async (fixture: Awaited<ReturnType<typeof createComponentPackVerifierFixture>>) => {
+        await rm(join(fixture.componentRoot, "WhiteLily-NOTICE.txt"));
+      },
+    },
+    {
+      label: "unreviewed jar",
+      mutate: async (fixture: Awaited<ReturnType<typeof createComponentPackVerifierFixture>>) => {
+        await writeFile(join(fixture.componentRoot, "unreviewed.jar"), "foreign");
+      },
+    },
+    {
+      label: "changed Gradle output pin",
+      mutate: async (fixture: Awaited<ReturnType<typeof createComponentPackVerifierFixture>>) => {
+        const manifest = JSON.parse(await readFile(fixture.manifestPath, "utf8")) as {
+          allowlist: { exactFiles: Array<{ target: string | null; sha256: string }> };
+        };
+        manifest.allowlist.exactFiles.find((entry) =>
+          entry.target?.startsWith("minecraft-components/"),
+        )!.sha256 = "0".repeat(64);
+        await writeFile(fixture.manifestPath, JSON.stringify(manifest));
+      },
+    },
+    {
+      label: "junction component root",
+      mutate: async (fixture: Awaited<ReturnType<typeof createComponentPackVerifierFixture>>) => {
+        const outside = join(fixture.root, "outside-pack");
+        await rename(fixture.componentRoot, outside);
+        await symlink(outside, fixture.componentRoot, "junction");
+      },
+    },
+  ])("rejects a $label before Electron resource preparation", async ({ mutate }) => {
+    const fixture = await createComponentPackVerifierFixture();
+    try {
+      await expect(
+        runComponentPackVerifier(fixture.repository, fixture.manifestPath),
+      ).resolves.toBeUndefined();
+      await mutate(fixture);
+      await expect(
+        runComponentPackVerifier(fixture.repository, fixture.manifestPath),
+      ).rejects.toThrow(/Minecraft component pack/iu);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a coordinated payload and runtime descriptor rewrite against the independent pack policy", async () => {
+    const fixture = await createComponentPackVerifierFixture();
+    try {
+      await runComponentPackVerifier(fixture.repository, fixture.manifestPath);
+      const target = "minecraft-components/whitelily-bridge-fabric-1.21.5-0.1.0.jar";
+      const payload = Buffer.from("coordinated replacement", "utf8");
+      await writeFile(join(fixture.repository, "build", target), payload);
+      const manifest = JSON.parse(await readFile(fixture.manifestPath, "utf8")) as {
+        allowlist: {
+          exactFiles: Array<{ target: string | null; bytes: number; sha256: string }>;
+        };
+      };
+      const descriptor = manifest.allowlist.exactFiles.find((entry) => entry.target === target)!;
+      descriptor.bytes = payload.length;
+      descriptor.sha256 = createHash("sha256").update(payload).digest("hex");
+      await writeFile(fixture.manifestPath, JSON.stringify(manifest));
+      await expect(
+        runComponentPackVerifier(fixture.repository, fixture.manifestPath),
+      ).rejects.toThrow(/Minecraft component pack/iu);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    {
+      label: "UTF-8 BOM",
+      mutate: async (fixture: Awaited<ReturnType<typeof createComponentPackVerifierFixture>>) => {
+        const bytes = await readFile(fixture.manifestPath);
+        await writeFile(
+          fixture.manifestPath,
+          Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), bytes]),
+        );
+      },
+    },
+    {
+      label: "oversized runtime manifest",
+      mutate: async (fixture: Awaited<ReturnType<typeof createComponentPackVerifierFixture>>) => {
+        await writeFile(fixture.manifestPath, Buffer.alloc(131_073, 0x20));
+      },
+    },
+    {
+      label: "case-insensitive duplicate key",
+      mutate: async (fixture: Awaited<ReturnType<typeof createComponentPackVerifierFixture>>) => {
+        const text = await readFile(fixture.manifestPath, "utf8");
+        await writeFile(
+          fixture.manifestPath,
+          text.replace('{"schemaVersion":1,', '{"SchemaVersion":1,"schemaVersion":1,'),
+        );
+      },
+    },
+    {
+      label: "extra top-level key",
+      mutate: async (fixture: Awaited<ReturnType<typeof createComponentPackVerifierFixture>>) => {
+        const manifest = JSON.parse(await readFile(fixture.manifestPath, "utf8")) as Record<
+          string,
+          unknown
+        >;
+        manifest.unreviewed = true;
+        await writeFile(fixture.manifestPath, JSON.stringify(manifest));
+      },
+    },
+    {
+      label: "missing nested component descriptor key",
+      mutate: async (fixture: Awaited<ReturnType<typeof createComponentPackVerifierFixture>>) => {
+        const manifest = JSON.parse(await readFile(fixture.manifestPath, "utf8")) as {
+          allowlist: { exactFiles: Array<Record<string, unknown>> };
+        };
+        const descriptor = manifest.allowlist.exactFiles.find((entry) =>
+          String(entry.target).startsWith("minecraft-components/"),
+        )!;
+        delete descriptor.sha256;
+        await writeFile(fixture.manifestPath, JSON.stringify(manifest));
+      },
+    },
+    {
+      label: "extra nested component descriptor key",
+      mutate: async (fixture: Awaited<ReturnType<typeof createComponentPackVerifierFixture>>) => {
+        const manifest = JSON.parse(await readFile(fixture.manifestPath, "utf8")) as {
+          allowlist: { exactFiles: Array<Record<string, unknown>> };
+        };
+        const descriptor = manifest.allowlist.exactFiles.find((entry) =>
+          String(entry.target).startsWith("minecraft-components/"),
+        )!;
+        descriptor.unreviewed = true;
+        await writeFile(fixture.manifestPath, JSON.stringify(manifest));
+      },
+    },
+    {
+      label: "non-array nested allowlist value",
+      mutate: async (fixture: Awaited<ReturnType<typeof createComponentPackVerifierFixture>>) => {
+        const manifest = JSON.parse(await readFile(fixture.manifestPath, "utf8")) as {
+          allowlist: { requiredFiles: unknown };
+        };
+        manifest.allowlist.requiredFiles = { unreviewed: true };
+        await writeFile(fixture.manifestPath, JSON.stringify(manifest));
+      },
+    },
+  ])("rejects a $label in the runtime manifest", async ({ mutate }) => {
+    const fixture = await createComponentPackVerifierFixture();
+    try {
+      await runComponentPackVerifier(fixture.repository, fixture.manifestPath);
+      await mutate(fixture);
+      await expect(
+        runComponentPackVerifier(fixture.repository, fixture.manifestPath),
+      ).rejects.toThrow(/Minecraft component pack/iu);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["build", "packaging/electron", "build/minecraft-components"])(
+    "rejects a real junction at the %s ancestor boundary",
+    async (portableAncestor) => {
+      const fixture = await createComponentPackVerifierFixture();
+      try {
+        await runComponentPackVerifier(fixture.repository, fixture.manifestPath);
+        const ancestor = join(fixture.repository, ...portableAncestor.split("/"));
+        const outside = join(fixture.root, `outside-${portableAncestor.replaceAll("/", "-")}`);
+        await rename(ancestor, outside);
+        await symlink(outside, ancestor, "junction");
+        await expect(
+          runComponentPackVerifier(fixture.repository, fixture.manifestPath),
+        ).rejects.toThrow(/Minecraft component pack/iu);
+      } finally {
+        await rm(fixture.root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("rejects a hard-linked component leaf", async () => {
+    const fixture = await createComponentPackVerifierFixture();
+    try {
+      await runComponentPackVerifier(fixture.repository, fixture.manifestPath);
+      const target = join(fixture.componentRoot, "WhiteLily-NOTICE.txt");
+      const peer = join(fixture.root, "hard-link-peer.txt");
+      await link(target, peer);
+      await expect(
+        runComponentPackVerifier(fixture.repository, fixture.manifestPath),
+      ).rejects.toThrow(/Minecraft component pack/iu);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a same-bytes path replacement after a handle-bound read", async () => {
+    const fixture = await createComponentPackVerifierFixture();
+    try {
+      const module = (await import(`${pathToFileURL(componentPackVerifierPath).href}?race=1`)) as {
+        verifyMinecraftComponentPack: (
+          repository: string,
+          manifestPath: string,
+          options: { beforePathRecheck(path: string): Promise<void> },
+        ) => Promise<void>;
+      };
+      let replaced = false;
+      await expect(
+        module.verifyMinecraftComponentPack(fixture.repository, fixture.manifestPath, {
+          beforePathRecheck: async (path) => {
+            if (replaced || !path.endsWith("WhiteLily-NOTICE.txt")) return;
+            replaced = true;
+            const bytes = await readFile(path);
+            await rename(path, `${path}.old`);
+            await writeFile(path, bytes);
+          },
+        }),
+      ).rejects.toThrow(/Minecraft component pack/iu);
+      expect(replaced).toBe(true);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    "nonzero",
+    "stderr",
+    "oversize-stdout",
+    "oversize-stderr",
+    "extra-line",
+    "malformed",
+    "hang",
+    "parent-exits-first",
+  ])("bounds and rejects verifier child mode %s after proving the exact protocol", async (mode) => {
+    const fixture = await createBoundedVerifierFixture();
+    try {
+      await expect(runBoundedVerifier(fixture, "success")).resolves.toBeUndefined();
+      const startedAt = Date.now();
+      let failure: unknown;
+      try {
+        await runBoundedVerifier(fixture, mode);
+      } catch (error) {
+        failure = error;
+      }
+      expect(failure).toBeInstanceOf(Error);
+      expect((failure as { stderr?: string }).stderr).toMatch(
+        /^MINECRAFT_COMPONENT_VERIFIER_FAILED\r?\n$/u,
+      );
+      expect(Date.now() - startedAt).toBeLessThan(3_000);
+      if (mode === "hang" || mode === "parent-exits-first") {
+        const descendantPid = Number(await readFile(fixture.marker, "utf8"));
+        expect(() => process.kill(descendantPid, 0)).toThrow();
+      }
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it("returns one capturable protocol record to the prepare script", async () => {
+    const fixture = await createBoundedVerifierFixture();
+    try {
+      await expect(runCapturedBoundedVerifier(fixture)).resolves.toBeUndefined();
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
   it("stages exactly the two reviewed workspace payloads and a deterministic manifest", async () => {
     const root = await mkdtemp(join(tmpdir(), "whitelily-workspace-builder-"));
     try {
@@ -977,6 +1584,7 @@ describe("deterministic Electron resources", () => {
         codexNativePackage: "codex/native",
         codexExecutable: "codex/native/vendor/x86_64-pc-windows-msvc/bin/codex.exe",
         licenses: "licenses",
+        minecraftComponents: "minecraft-components",
       },
     });
     expect(manifest.allowlist.executableFiles).toEqual([
@@ -994,6 +1602,108 @@ describe("deterministic Electron resources", () => {
           /^[a-f0-9]{64}$/u.test(entry.sha256),
       ),
     ).toBe(true);
+    expect(
+      manifest.allowlist.exactFiles.filter((entry) =>
+        (entry.target ?? "").startsWith("minecraft-components/"),
+      ),
+    ).toEqual(minecraftComponentFiles);
+    expect(
+      manifest.allowlist.requiredFiles.filter((path) => path.startsWith("minecraft-components/")),
+    ).toEqual(minecraftComponentFiles.map(({ target }) => target));
+    expect(
+      manifest.allowlist.executableFiles.filter((path) => path.startsWith("minecraft-components/")),
+    ).toEqual([]);
+  });
+
+  it("prepares exactly the reviewed nine-file Minecraft component pack", async () => {
+    const manifest = await readManifest(bundleManifestPath);
+    expect(await filesUnder(join(bundleRoot, manifest.paths.minecraftComponents))).toEqual(
+      minecraftComponentFiles
+        .map(({ target }) => target.slice("minecraft-components/".length))
+        .sort(),
+    );
+    const resources = new Map(manifest.resources?.map((entry) => [entry.path, entry]));
+    for (const expected of minecraftComponentFiles) {
+      expect(resources.get(expected.target)).toEqual({
+        path: expected.target,
+        bytes: expected.bytes,
+        sha256: expected.sha256,
+      });
+    }
+  });
+
+  it("rejects a coordinated packaged component payload and runtime-resource descriptor rewrite", async () => {
+    const fixture = await createComponentResourceVerifierFixture();
+    try {
+      await expect(
+        verifier.verifyResourceDirectory?.(fixture.resources, fixture.sourcePath),
+      ).resolves.toBeUndefined();
+      const replacement = Buffer.from("coordinated packaged replacement", "utf8");
+      await writeFile(join(fixture.resources, ...fixture.componentTarget.split("/")), replacement);
+      const runtimePath = join(fixture.resources, "runtime-manifest.json");
+      const runtime = JSON.parse(await readFile(runtimePath, "utf8")) as {
+        resources: Array<{ path: string; bytes: number; sha256: string }>;
+      };
+      const descriptor = runtime.resources.find(({ path }) => path === fixture.componentTarget)!;
+      descriptor.bytes = replacement.length;
+      descriptor.sha256 = createHash("sha256").update(replacement).digest("hex");
+      await writeFile(runtimePath, JSON.stringify(runtime));
+      await expect(
+        verifier.verifyResourceDirectory?.(fixture.resources, fixture.sourcePath),
+      ).rejects.toThrow(/component|reviewed|policy|hash/iu);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a hard-linked packaged component without deleting its foreign peer", async () => {
+    const fixture = await createComponentResourceVerifierFixture();
+    try {
+      await expect(
+        verifier.verifyResourceDirectory?.(fixture.resources, fixture.sourcePath),
+      ).resolves.toBeUndefined();
+      const component = join(fixture.resources, ...fixture.componentTarget.split("/"));
+      const foreignPeer = join(fixture.root, "foreign-component-peer.jar");
+      await link(component, foreignPeer);
+      await expect(
+        verifier.verifyResourceDirectory?.(fixture.resources, fixture.sourcePath),
+      ).rejects.toThrow(/component|link|identity|resource/iu);
+      await expect(readFile(foreignPeer)).resolves.toEqual(await readFile(component));
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a reviewed source component pin that differs from the independent policy", async () => {
+    const fixture = await createComponentResourceVerifierFixture();
+    try {
+      await expect(
+        verifier.verifyResourceDirectory?.(fixture.resources, fixture.sourcePath),
+      ).resolves.toBeUndefined();
+      const source = JSON.parse(await readFile(fixture.sourcePath, "utf8")) as {
+        allowlist: {
+          exactFiles: Array<{ target: string | null; sha256: string }>;
+        };
+      };
+      source.allowlist.exactFiles.find(({ target }) => target === fixture.componentTarget)!.sha256 =
+        "0".repeat(64);
+      await writeFile(fixture.sourcePath, JSON.stringify(source));
+      const runtimePath = join(fixture.resources, "runtime-manifest.json");
+      const runtime = JSON.parse(await readFile(runtimePath, "utf8")) as Record<string, unknown>;
+      const resources = runtime.resources;
+      delete runtime.resources;
+      delete runtime.policySha256;
+      Object.assign(runtime, source, {
+        policySha256: await sha256(fixture.sourcePath),
+        resources,
+      });
+      await writeFile(runtimePath, JSON.stringify(runtime));
+      await expect(
+        verifier.verifyResourceDirectory?.(fixture.resources, fixture.sourcePath),
+      ).rejects.toThrow(/component|reviewed|policy|hash/iu);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
   });
 
   it("records a matching SHA-256 and byte length for every prepared resource", async () => {

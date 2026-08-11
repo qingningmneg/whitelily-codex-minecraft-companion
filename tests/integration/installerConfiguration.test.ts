@@ -65,6 +65,12 @@ interface IcoEntry {
 const repositoryRoot = resolve(import.meta.dirname, "..", "..");
 const desktopPackagePath = join(repositoryRoot, "apps", "desktop", "package.json");
 const installerIncludePath = join(repositoryRoot, "packaging", "nsis", "installer.nsh");
+const componentPreferenceValidatorPath = join(
+  repositoryRoot,
+  "packaging",
+  "nsis",
+  "validate-minecraft-component-preferences.ps1",
+);
 const uninstallerIncludePath = join(repositoryRoot, "packaging", "nsis", "uninstaller.nsh");
 const svgPath = join(repositoryRoot, "assets", "branding", "whitelily-icon.svg");
 const icoPath = join(repositoryRoot, "apps", "desktop", "build", "icon.ico");
@@ -188,6 +194,11 @@ describe("WhiteLily assisted Windows installer configuration", () => {
         },
         { from: "../../build/electron-bundle/licenses", to: "licenses", filter: ["**/*"] },
         {
+          from: "../../build/electron-bundle/minecraft-components",
+          to: "minecraft-components",
+          filter: ["**/*"],
+        },
+        {
           from: "../../build/electron-bundle/runtime-manifest.json",
           to: "runtime-manifest.json",
         },
@@ -212,6 +223,19 @@ describe("WhiteLily assisted Windows installer configuration", () => {
       to: "codex",
       filter: ["**/*"],
     });
+    expect(
+      build?.extraResources?.filter(
+        (entry) =>
+          entry.from === "../../build/electron-bundle/minecraft-components" ||
+          entry.to === "minecraft-components",
+      ),
+    ).toEqual([
+      {
+        from: "../../build/electron-bundle/minecraft-components",
+        to: "minecraft-components",
+        filter: ["**/*"],
+      },
+    ]);
     expect(
       build?.extraResources?.filter(
         (entry) =>
@@ -282,6 +306,49 @@ describe("WhiteLily assisted Windows installer configuration", () => {
     expect(assistedTemplate.indexOf("!insertmacro customPageAfterChangeDir")).toBeLessThan(
       assistedTemplate.indexOf("!insertmacro MUI_PAGE_INSTFILES"),
     );
+  });
+
+  it("defaults Bridge and Avatar on and publishes the exact schema only when preferences are absent", async () => {
+    const [installer, validator] = await Promise.all([
+      readFile(installerIncludePath, "utf8"),
+      readFile(componentPreferenceValidatorPath, "utf8"),
+    ]);
+
+    expect(installer).toMatch(/Function\s+WhiteLilyMinecraftComponentsPageCreate/u);
+    expect(installer).toContain("WhiteLily Bridge");
+    expect(installer).toContain("WhiteLily Avatar");
+    expect(installer.match(/\$\{NSD_Check\}/gu)).toHaveLength(2);
+    expect(installer).toMatch(
+      /!macro\s+customInit[\s\S]*?StrCpy\s+\$WhiteLilyBridgeEnabled\s+"true"[\s\S]*?StrCpy\s+\$WhiteLilyAvatarEnabled\s+"true"/u,
+    );
+    expect(installer).toContain('!define WHITELILY_COMPONENT_DATA_ROOT "$LOCALAPPDATA\\WhiteLily"');
+    expect(installer).toMatch(
+      /!macro\s+customInstall[\s\S]*?\$\{WHITELILY_COMPONENT_DATA_ROOT\}\\config[\s\S]*?minecraft-components\.json/u,
+    );
+    expect(installer).toContain("WHITELILY_COMPONENT_BRIDGE_ENABLED");
+    expect(installer).toContain("WHITELILY_COMPONENT_AVATAR_ENABLED");
+    expect(installer).toContain("WHITELILY_COMPONENT_VALIDATOR_SOURCE");
+    expect(installer).toMatch(/nsExec::ExecToStack\s+\/TIMEOUT=5000/u);
+    expect(installer).not.toMatch(/GetTempFileNameW|FileWrite|\bDelete\s+"\$WhiteLily/u);
+    expect(validator).toContain(
+      "'{\"schemaVersion\":1,\"bridgeEnabled\":' + $bridge + ',\"avatarEnabled\":' + $avatar + '}'",
+    );
+    expect(validator).toMatch(/CreateFile[\s\S]*?GENERIC_READ \| GENERIC_WRITE \| DELETE/u);
+    expect(validator).toMatch(/GENERIC_READ \| GENERIC_WRITE \| DELETE,\s+FILE_SHARE_READ,/u);
+    expect(validator).toMatch(/information\.NumberOfLinks != requiredLinks/u);
+    expect(validator).toMatch(/GetFinalPathNameByHandle/u);
+    expect(validator).toMatch(/CreateHardLink[\s\S]*?Marshal\.GetLastWin32Error\(\)/u);
+    expect(validator).toMatch(/SetFileInformationByHandle[\s\S]*?FileDispositionInfo/u);
+    expect(validator).not.toMatch(/Remove-Item|\[IO\.File\]::Delete|File\.Delete/u);
+    expect(installer).toMatch(
+      /Function\s+WhiteLilyMinecraftComponentsPageLeave[\s\S]*?\$WhiteLilyAvatarEnabled\s+"true"[\s\S]*?StrCpy\s+\$WhiteLilyBridgeEnabled\s+"true"/u,
+    );
+    expect(installer).toMatch(
+      /IfFileExists\s+"\$WhiteLilyComponentPreferencesPath"\s+validate_existing[\s\S]*?SetEnvironmentVariableW\(w\s+"WHITELILY_COMPONENT_PREFERENCES_OPERATION",\s+w\s+"publish"\)/u,
+    );
+    expect(installer).not.toMatch(/FileOpen\s+\$\d+\s+"\$WhiteLilyComponentPreferencesPath"/u);
+    expect(installer).toMatch(/GetFileAttributesW[\s\S]*?0x400/u);
+    expect(installer).not.toMatch(/(?:PCL2|\.minecraft|gameDir|\\mods(?:\\|"))/iu);
   });
 });
 

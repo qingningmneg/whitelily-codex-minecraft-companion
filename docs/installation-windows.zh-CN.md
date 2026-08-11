@@ -70,6 +70,10 @@ if ($actual -ne $expected) { throw "SHA-256 mismatch. Do not run the installer."
 
 安装包计划内置 Electron、编译后的 WhiteLily 后台运行时、固定版本的 Codex CLI、生产依赖和许可证材料。因此普通用户**不需要系统 Node.js、npm、Git 或 Codex CLI**，安装过程也不会联网下载可执行依赖。PCL2 和 Minecraft 不包含在 WhiteLily 安装包中，仍由用户从各自可信来源安装。
 
+beta.2 安装包还内置一套经过逐字节校验的 Minecraft 组件资源：WhiteLily Bridge、可选的 WhiteLily Avatar、Fabric API `0.128.2+1.21.5`、GeckoLib `5.1.0` 及其许可证。辅助安装默认勾选 Bridge 和 Avatar；静默安装也默认启用两者。安装器只在当前用户的 `%LOCALAPPDATA%\WhiteLily\config\minecraft-components.json` 不存在时写入一次偏好，不搜索 PCL2、不猜测游戏目录，也不向 Minecraft 写文件。升级、重装和“保留数据”卸载不会覆盖该偏好。
+
+WhiteLily 只会在桌面应用中把固定组件安装到**当前已验证的 PCL2 Fabric Loader `>=0.16.14`、Minecraft Java `1.21.5` 实例**。Bridge 是官方认证 LAN 连接所必需的；Avatar 是可选外观，并依赖 Bridge、上述 Fabric API 与 GeckoLib。写入组件后必须重新启动该 Minecraft 实例；已创建的世界不会被修改。WhiteLily 不读取或复用 PCL2、Microsoft 或 Minecraft 凭据，不更改全局在线认证、`online-mode`、白名单、计分板/队伍或持久世界数据。
+
 ## 6. 首次打开
 
 1. 打开 WhiteLily。
@@ -154,7 +158,7 @@ WhiteLily 只做只读发现，不替你安装或启动 PCL2。请从 PCL2 官�
 
 维护者验证安装包时，生命周期测试会在 Windows Sandbox 中建立真实的 Windows 主体边界：可信控制器以 `SYSTEM` 运行，交互式引导进程只充当受信任的启动代理，安装包、应用和卸载程序始终以一次性的标准本地候选用户运行。报告与控制状态位于 guest 本地的 SYSTEM/Administrators-only 目录；候选用户的恶意写入探针必须得到 AccessDenied。由于 Sandbox 映射目录不能作为 guest ACL 的安全边界，最终 schema 2 报告通过一次性 256-bit 主机密钥生成 HMAC-SHA256 信封传回。控制器在写入信封前以独占方式持有映射中的 shutdown guard，检查系统关机命令是否成功启动，并保持控制器与 guard 存活，直到 guest 关机终止它们；主机必须先验签、再等待 guard 的独占占用释放、重新验签，才能继续。guard 未释放或关机启动失败时必须失败关闭，保留映射目录并要求人工关闭 Sandbox。
 
-控制器直接核对候选用户的 per-user 安装目录、数据目录、注册表 hive、安装包哈希和全部 15 个阶段，并在候选用户被删除后才签出报告。主机只跟踪它启动的那个 `WindowsSandbox.exe` 进程，不会按进程名枚举或终止其他 Sandbox 会话。成功后的清理采用两层固定允许集合：先检查映射根和报告目录的全部顶层条目，拒绝任何意外目录、reparse point、额外名称或非普通文件；然后只按固定 `LiteralPath` 逐个删除已允许的普通文件，最后非递归删除已经确认为空的两个目录。发现污染时不得递归删除；应保留提示中的精确路径，先关闭 Sandbox，再人工核对并只删除已确认的普通文件。保留数据和删除数据两种卸载都必须在有限等待后证明程序目录、`WhiteLily.exe`、卸载器和注册表项已经消失。
+控制器直接核对候选用户的 per-user 安装目录、数据目录、注册表 hive、双重观察的安装包哈希和全部 15 个阶段，并在候选用户被删除后才签出报告。它还对安装后的 9 个 Minecraft 组件资源逐个重算字节数与 SHA-256，确认清洁安装生成精确的无 BOM/无换行 schema 1 偏好，并证明 beta.1 升级、“保留数据”卸载和重装都不覆盖用户偏好；“删除数据”最终删除该文件和整个固定数据根。主机只跟踪它启动的那个 `WindowsSandbox.exe` 进程，不会按进程名枚举或终止其他 Sandbox 会话。成功后的清理采用两层固定允许集合：先检查映射根和报告目录的全部顶层条目，拒绝任何意外目录、reparse point、额外名称或非普通文件；然后只按固定 `LiteralPath` 逐个删除已允许的普通文件，最后非递归删除已经确认为空的两个目录。发现污染时不得递归删除；应保留提示中的精确路径，先关闭 Sandbox，再人工核对并只删除已确认的普通文件。保留数据和删除数据两种卸载都必须在有限等待后证明程序目录、`WhiteLily.exe`、卸载器和注册表项已经消失。
 
 ## 13. 已知 Beta 限制
 

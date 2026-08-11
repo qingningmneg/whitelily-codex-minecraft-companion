@@ -80,6 +80,13 @@
         ]
       },
       {
+        "from": "../../build/electron-bundle/minecraft-components",
+        "to": "minecraft-components",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
         "from": "../../build/electron-bundle/runtime-manifest.json",
         "to": "runtime-manifest.json"
       }

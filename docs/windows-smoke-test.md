@@ -11,6 +11,14 @@
 - [ ] 将测试世界“对局域网开放”；核对并确认 WhiteLily 检测到的候选会话只使用本机回环地址 `127.0.0.1`。
 - [ ] 确认名为 `WhiteLily` 的机器人进入测试世界。
 
+## Bridge 与 Avatar 组件验收
+
+- [ ] 使用 PCL2 中当前已验证的 Fabric Loader `>=0.16.14`、Minecraft Java `1.21.5` 实例；不要使用正式存档。
+- [ ] 新安装时确认安装器中的 WhiteLily Bridge 与 WhiteLily Avatar 默认勾选；安装器本身没有启动 PCL2/Minecraft，也没有向实例或世界写文件。
+- [ ] 在 WhiteLily 中对该实例安装 Bridge，或安装 Bridge + Avatar（含固定 Fabric API `0.128.2+1.21.5` 与 GeckoLib `5.1.0`）；写入后确认界面要求重启 Minecraft，且旧世界数据未改变。
+- [ ] 仅安装 Bridge 时确认官方认证 LAN 可连接；安装 Avatar 时确认只有当前会话中经 Bridge 批准的远程 `WhiteLily` 显示基础外观与盔甲主题，本地玩家、错误 UUID、旧会话和计分板/队伍伪装均不触发。
+- [ ] 检查日志、诊断与截图，不得出现 nonce、请求路径、端口、PID、gameDir、哈希、原始踢出文本、真实用户目录或账户数据。
+
 ## 安装版动作链路验收
 
 以下证据只记录“通过/失败”、版本和构建提交，不复制用户名、PID、用户目录、原始日志、提示词、租约或凭据。

@@ -17,6 +17,8 @@
 
 安装包内置 Electron、WhiteLily 后台运行时和固定版本的 Codex CLI，因此普通用户不需要在系统中另装 Node.js、npm、Git 或 Codex CLI。首次打开后在 WhiteLily 中完成 ChatGPT 登录；不提供 Platform API 密钥回退。用户自行启动和操作 PCL2、用 PCL2 启动 Minecraft Java 1.21.5，并手动把可丢弃世界开放到 LAN。WhiteLily 不会启动、控制、点击或修改 PCL2，只连接同一台电脑上的 `127.0.0.1`。
 
+beta.2 同时内置固定哈希的 WhiteLily Bridge、可选 Avatar、Fabric API `0.128.2+1.21.5`、GeckoLib `5.1.0` 和许可证。安装器只保存当前用户的默认组件偏好，不搜索或修改 PCL2/Minecraft；组件只由桌面应用安装到当前已验证的 Fabric Loader `>=0.16.14`、Minecraft `1.21.5` 实例。Bridge 是官方认证 LAN 必需组件，Avatar 依赖 Bridge；写入后需要重启 Minecraft，旧世界不变。WhiteLily 不读取启动器/微软/游戏凭据，也不更改全局认证、`online-mode`、白名单、计分板/队伍或世界数据。
+
 ### 项目定位与状态
 
 WhiteLily（白百合）是一个面向 Minecraft Java 版的本地 AI 伙伴运行时。它通过 Mineflayer 以机器人身份加入 Minecraft 世界，让主人直接在游戏聊天框中与本机已登录的 Codex 交互。它不是 Minecraft 客户端模组，也不替代启动器。
@@ -151,6 +153,7 @@ npm run build
 | [Electron 02 引导与连接](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/blob/main/docs/superpowers/plans/2026-07-27-whitelily-electron-02-onboarding-connection.md)        | Beta 已实现 | ChatGPT 登录、实时模型选择、只读 PCL2 发现和 LAN 确认     |
 | [Electron 03 配置、记忆与安全](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/blob/main/docs/superpowers/plans/2026-07-27-whitelily-electron-03-profiles-memory-safety.md) | 开发中      | 可编辑伙伴配置、分层记忆、世界绑定、安全预设与本地诊断    |
 | [Electron 04 安装包与发布](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/blob/main/docs/superpowers/plans/2026-07-27-whitelily-electron-04-installer-release.md)          | Beta 已发布 | 内置运行时的 NSIS 安装器、升级/卸载保护、校验和与发布门禁 |
+| [本机 LAN Bridge](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/blob/main/docs/superpowers/specs/2026-08-10-local-lan-bridge-design.md)                                   | beta.2 候选 | 官方认证 LAN 证明、当前实例组件管理与 Bridge 约束 Avatar  |
 
 旧版 v0.1.1 CLI ZIP 没有桌面端、PCL2/LAN 检测或模型选择 UI；这些能力从 `v0.2.0-beta.1` Windows 桌面安装包开始提供。
 
@@ -186,6 +189,8 @@ After `v0.2.0-beta.2` is published, download both assets from the official [GitH
 Verify the SHA-256 using the [Windows installation guide](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/blob/main/docs/installation-windows.md), then read the [unsigned build and SmartScreen guide](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/blob/main/docs/smartscreen.md). The first Beta is unsigned, so Windows SmartScreen may report an unknown publisher. Do not disable system protection or run a file from another source or with a mismatched hash.
 
 The installer bundles Electron, the WhiteLily child runtime, and an exact Codex CLI, so ordinary users do not need system Node.js, npm, Git, or Codex CLI. Complete ChatGPT sign-in inside WhiteLily; there is no Platform API-key fallback. You start and operate PCL2 yourself, use it to start Minecraft Java 1.21.5, and manually open a disposable world to LAN. WhiteLily does not launch, control, click, or modify PCL2 and connects only to `127.0.0.1` on the same computer.
+
+Beta.2 also bundles fixed-hash WhiteLily Bridge, optional Avatar, Fabric API `0.128.2+1.21.5`, GeckoLib `5.1.0`, and licenses. Setup stores only a current-user component preference and never searches or modifies PCL2/Minecraft; only the desktop app installs components into the currently verified Fabric Loader `>=0.16.14`, Minecraft `1.21.5` instance. Bridge is required for official-auth LAN and Avatar depends on Bridge. Restart Minecraft after a component write; existing worlds remain unchanged. WhiteLily never reads launcher/Microsoft/game credentials or changes global authentication, `online-mode`, the whitelist, scoreboards/teams, or world data.
 
 ### Positioning and status
 
@@ -321,6 +326,7 @@ These four Electron implementation plans replace the earlier Tauri/Rust/sidecar 
 | [Electron 02 Onboarding and connection](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/blob/main/docs/superpowers/plans/2026-07-27-whitelily-electron-02-onboarding-connection.md)     | Implemented in Beta | ChatGPT sign-in, live model selection, read-only PCL2 discovery, and LAN confirmation            |
 | [Electron 03 Profiles, memory, and safety](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/blob/main/docs/superpowers/plans/2026-07-27-whitelily-electron-03-profiles-memory-safety.md) | In development      | Editable companion profiles, scoped memory, world binding, safety presets, and local diagnostics |
 | [Electron 04 Installer and release](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/blob/main/docs/superpowers/plans/2026-07-27-whitelily-electron-04-installer-release.md)             | Published in Beta   | Bundled-runtime NSIS installer, upgrade/uninstall protection, checksums, and release gates       |
+| [Local LAN Bridge](https://github.com/qingningmneg/whitelily-codex-minecraft-companion/blob/main/docs/superpowers/specs/2026-08-10-local-lan-bridge-design.md)                                              | beta.2 candidate    | Official-auth LAN proof, current-instance component management, and Bridge-bound Avatar identity |
 
 The older v0.1.1 CLI ZIP has no desktop app, PCL2/LAN detection, or model-selection UI. Those capabilities are available starting with the `v0.2.0-beta.1` Windows desktop installer.
 

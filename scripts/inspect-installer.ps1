@@ -410,6 +410,66 @@ try {
         throw 'INSTALLER_MANAGED_WORKSPACE_RESOURCES_INVALID'
     }
 
+    $minecraftComponents = [string]$sourceManifest.paths.minecraftComponents
+    if (-not [StringComparer]::Ordinal.Equals($minecraftComponents, 'minecraft-components')) {
+        throw 'INSTALLER_MINECRAFT_COMPONENT_RESOURCES_INVALID'
+    }
+    $minecraftComponentPrefix = $minecraftComponents + '/'
+    [string[]]$sourceMinecraftComponentFiles = @(
+        $sourceManifest.allowlist.exactFiles |
+            Where-Object {
+                $null -ne $_.target -and
+                ([string]$_.target).StartsWith($minecraftComponentPrefix, [StringComparison]::Ordinal)
+            } |
+            ForEach-Object { [string]$_.target }
+    )
+    [string[]]$requiredMinecraftComponentFiles = @(
+        $sourceRequired |
+            Where-Object { $_.StartsWith($minecraftComponentPrefix, [StringComparison]::Ordinal) }
+    )
+    $minecraftComponentResources = @(
+        $runtimeManifest.resources |
+            Where-Object {
+                ([string]$_.path).StartsWith($minecraftComponentPrefix, [StringComparison]::Ordinal)
+            }
+    )
+    [string[]]$runtimeMinecraftComponentFiles = @(
+        $minecraftComponentResources |
+            ForEach-Object { [string]$_.path }
+    )
+    $componentExecutableFiles = @(
+        $sourceManifest.allowlist.executableFiles |
+            Where-Object {
+                ([string]$_).StartsWith($minecraftComponentPrefix, [StringComparison]::Ordinal)
+            }
+    )
+    $componentScriptFiles = @(
+        $sourceManifest.allowlist.scriptFiles |
+            Where-Object {
+                ([string]$_).StartsWith($minecraftComponentPrefix, [StringComparison]::Ordinal)
+            }
+    )
+    [Array]::Sort($sourceMinecraftComponentFiles, [StringComparer]::Ordinal)
+    [Array]::Sort($requiredMinecraftComponentFiles, [StringComparer]::Ordinal)
+    [Array]::Sort($runtimeMinecraftComponentFiles, [StringComparer]::Ordinal)
+    if (
+        $minecraftComponentResources.Count -ne 9 -or
+        $sourceMinecraftComponentFiles.Count -ne 9 -or
+        $requiredMinecraftComponentFiles.Count -ne 9 -or
+        $componentExecutableFiles.Count -ne 0 -or
+        $componentScriptFiles.Count -ne 0 -or
+        -not [System.Linq.Enumerable]::SequenceEqual(
+            [string[]]$sourceMinecraftComponentFiles,
+            [string[]]$requiredMinecraftComponentFiles
+        ) -or
+        -not [System.Linq.Enumerable]::SequenceEqual(
+            [string[]]$sourceMinecraftComponentFiles,
+            [string[]]$runtimeMinecraftComponentFiles
+        )
+    ) {
+        throw 'INSTALLER_MINECRAFT_COMPONENT_RESOURCES_INVALID'
+    }
+
     $workspaceRoot = Resolve-ContainedResource $resourceRoot 'codex-workspace'
     $workspaceManifestPath = Resolve-ContainedResource `
         $resourceRoot `
@@ -494,6 +554,7 @@ try {
         resourcesVerified = $declared.Count
         managedWorkspaceResourcesVerified = $managedWorkspaceResources.Count
         managedWorkspacePayloadsVerified = $managedPayloads.Count
+        minecraftComponentResourcesVerified = $minecraftComponentResources.Count
     }
     Write-Output ($result | ConvertTo-Json -Compress)
 } finally {

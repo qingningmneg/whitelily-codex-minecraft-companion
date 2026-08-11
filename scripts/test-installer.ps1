@@ -444,6 +444,19 @@ $bootstrapSecretPath = Join-Path $reportRoot 'bootstrap-secret.txt'
     [System.Text.UTF8Encoding]::new($false)
 )
 
+$componentVerifierSourcePath = Join-Path $PSScriptRoot 'minecraft-component-resource-verifier.ps1'
+$componentPolicyPath = Join-Path $repositoryRoot 'packaging\electron\minecraft-component-pack.json'
+if (
+    -not (Test-Path -LiteralPath $componentVerifierSourcePath -PathType Leaf) -or
+    -not (Test-Path -LiteralPath $componentPolicyPath -PathType Leaf)
+) {
+    throw 'REVIEWED_MINECRAFT_COMPONENT_POLICY_REQUIRED'
+}
+$componentVerifierSource = [System.IO.File]::ReadAllText($componentVerifierSourcePath)
+$componentPolicyBase64 = [Convert]::ToBase64String(
+    [System.IO.File]::ReadAllBytes($componentPolicyPath)
+)
+
 $guestScript = @'
 [CmdletBinding()]
 param(
@@ -483,6 +496,10 @@ $result = [ordered]@{
     controllerObservedBaselineInstallerSha256 = $null
     installedVersion = $null
     managedWorkspaceResources = 0
+    minecraftComponentResources = 0
+    componentPreferencesFresh = $false
+    componentPreferencesUpgradePreserved = $false
+    componentPreferencesKeepPreserved = $false
     success = $false
     stages = [Collections.Generic.List[string]]::new()
     error = $null
@@ -837,6 +854,34 @@ function Assert-ManagedWorkspace {
         }
     }
     return $expectedFiles.Count
+}
+__WHITELILY_REVIEWED_COMPONENT_VERIFIER__
+$reviewedMinecraftComponentPolicy = [Text.Encoding]::UTF8.GetString(
+    [Convert]::FromBase64String('__WHITELILY_REVIEWED_COMPONENT_POLICY__')
+) | ConvertFrom-Json
+$reviewedMinecraftComponentFiles = @($reviewedMinecraftComponentPolicy.files)
+function Assert-ExactComponentPreferences {
+    param(
+        [Parameter(Mandatory = $true)][string]$DataRoot,
+        [Parameter(Mandatory = $true)][string]$ExpectedJson
+    )
+
+    $preferencesPath = Join-Path $DataRoot 'config\minecraft-components.json'
+    $entry = Get-Item -LiteralPath $preferencesPath -Force
+    if (
+        -not ($entry -is [System.IO.FileInfo]) -or
+        $entry.PSIsContainer -or
+        (Test-FileSystemEntryHasAttribute `
+            -Entry $entry `
+            -Attribute ([System.IO.FileAttributes]::ReparsePoint))
+    ) {
+        throw 'component preferences are not an ordinary file'
+    }
+    [byte[]]$actual = [System.IO.File]::ReadAllBytes($preferencesPath)
+    [byte[]]$expected = [System.Text.Encoding]::UTF8.GetBytes($ExpectedJson)
+    if (-not [System.Linq.Enumerable]::SequenceEqual([byte[]]$actual, [byte[]]$expected)) {
+        throw 'component preferences bytes changed'
+    }
 }
 function Invoke-WhiteLilySmoke {
     param([Parameter(Mandatory = $true)][string]$Application)
@@ -1285,6 +1330,8 @@ try {
     $programRoot = Join-Path $localAppDataRoot 'Programs\WhiteLily'
     $dataRoot = Join-Path $localAppDataRoot 'WhiteLily'
     $application = Join-Path $programRoot 'WhiteLily.exe'
+    $freshPreferencesJson = '{"schemaVersion":1,"bridgeEnabled":true,"avatarEnabled":true}'
+    $preservedPreferencesJson = '{"schemaVersion":1,"bridgeEnabled":false,"avatarEnabled":false}'
 
     Add-Type -TypeDefinition @"
 using System;
@@ -1460,6 +1507,13 @@ public static class WhiteLilyInstallerUi {
         throw 'WhiteLily application was not installed'
     }
     Assert-CandidateProductEntry -Version $ExpectedVersion -ProgramRoot $programRoot
+    $result.minecraftComponentResources = Assert-ReviewedMinecraftComponentResources `
+        -ProgramRoot $programRoot `
+        -ReviewedFiles $reviewedMinecraftComponentFiles
+    Assert-ExactComponentPreferences `
+        -DataRoot $dataRoot `
+        -ExpectedJson $freshPreferencesJson
+    $result.componentPreferencesFresh = $true
     $result.stages.Add('clean_installed')
     Invoke-CandidateProcess -Operation 'smoke' -Target $application
     $result.managedWorkspaceResources = Assert-ManagedWorkspace `
@@ -1476,6 +1530,12 @@ public static class WhiteLilyInstallerUi {
     $result.stages.Add('beta1_installed')
 
     New-Item -ItemType Directory -Path (Join-Path $dataRoot 'codex-workspace\.codex') -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $dataRoot 'config') -Force | Out-Null
+    [System.IO.File]::WriteAllText(
+        (Join-Path $dataRoot 'config\minecraft-components.json'),
+        $preservedPreferencesJson,
+        [System.Text.UTF8Encoding]::new($false)
+    )
     $marker = Join-Path $dataRoot 'installer-lifecycle-beta1-marker.txt'
     [System.IO.File]::WriteAllText($marker, 'preserve-beta1-data', [System.Text.UTF8Encoding]::new($false))
     [System.IO.File]::WriteAllText(
@@ -1505,6 +1565,13 @@ public static class WhiteLilyInstallerUi {
     if (-not (Test-Path -LiteralPath $marker -PathType Leaf)) {
         throw 'beta.1 data marker was removed during upgrade'
     }
+    Assert-ExactComponentPreferences `
+        -DataRoot $dataRoot `
+        -ExpectedJson $preservedPreferencesJson
+    $result.componentPreferencesUpgradePreserved = $true
+    $result.minecraftComponentResources = Assert-ReviewedMinecraftComponentResources `
+        -ProgramRoot $programRoot `
+        -ReviewedFiles $reviewedMinecraftComponentFiles
     $result.stages.Add('beta1_upgraded')
     Invoke-CandidateProcess -Operation 'smoke' -Target $application
     $result.managedWorkspaceResources = Assert-ManagedWorkspace `
@@ -1521,6 +1588,9 @@ public static class WhiteLilyInstallerUi {
     if (-not (Test-Path -LiteralPath $marker -PathType Leaf)) {
         throw 'silent Keep Data uninstall removed the beta.1 data marker'
     }
+    Assert-ExactComponentPreferences `
+        -DataRoot $dataRoot `
+        -ExpectedJson $preservedPreferencesJson
     $result.stages.Add('keep_data')
 
     Invoke-CandidateProcess -Operation 'install' -Target $installer
@@ -1528,6 +1598,13 @@ public static class WhiteLilyInstallerUi {
     if (-not (Test-Path -LiteralPath $marker -PathType Leaf)) {
         throw 'reinstall did not preserve the beta.1 data marker'
     }
+    Assert-ExactComponentPreferences `
+        -DataRoot $dataRoot `
+        -ExpectedJson $preservedPreferencesJson
+    $result.componentPreferencesKeepPreserved = $true
+    $result.minecraftComponentResources = Assert-ReviewedMinecraftComponentResources `
+        -ProgramRoot $programRoot `
+        -ReviewedFiles $reviewedMinecraftComponentFiles
     Invoke-CandidateProcess -Operation 'smoke' -Target $application
     $result.managedWorkspaceResources = Assert-ManagedWorkspace `
         -ProgramRoot $programRoot `
@@ -1606,6 +1683,13 @@ public static class WhiteLilyInstallerUi {
     }
 }
 '@
+$guestScript = $guestScript.Replace(
+    '__WHITELILY_REVIEWED_COMPONENT_VERIFIER__',
+    $componentVerifierSource
+).Replace(
+    '__WHITELILY_REVIEWED_COMPONENT_POLICY__',
+    $componentPolicyBase64
+)
 $utf8 = [System.Text.UTF8Encoding]::new($false)
 [System.IO.File]::WriteAllText($guestScriptPath, $guestScript, $utf8)
 
@@ -1778,6 +1862,10 @@ try {
         $report.candidateReportWriteDenied -ne $true -or
         -not [StringComparer]::Ordinal.Equals([string]$report.installedVersion, $version) -or
         [int]$report.managedWorkspaceResources -ne 3 -or
+        [int]$report.minecraftComponentResources -ne 9 -or
+        $report.componentPreferencesFresh -ne $true -or
+        $report.componentPreferencesUpgradePreserved -ne $true -or
+        $report.componentPreferencesKeepPreserved -ne $true -or
         $report.success -ne $true -or
         -not [System.Linq.Enumerable]::SequenceEqual([string[]]$actualStages, [string[]]$expectedStages)
     ) {
