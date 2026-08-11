@@ -4,10 +4,13 @@ import { lstat, open, readFile, realpath } from "node:fs/promises";
 import { resolve } from "node:path";
 
 const productVersion = "0.2.0-beta.2";
-const packageSourceCommit = "ff0221d75b2f3d84729bd6eaf72950c5c3afd9f7";
-const lifecycleValidationCommit = "ff0221d75b2f3d84729bd6eaf72950c5c3afd9f7";
-const lifecycleSha256 = "a63b4bd676c9a2f90df648db62f618021b81e685afabcb5917260e94dd741873";
-const hostPersistedLastWriteTimeUtc = "2026-08-11T04:34:13.0331348Z";
+const packageSourceCommit = "44901a5e8f17bba77378746e4bc04fab6c335962";
+const lifecycleValidationCommit = "44901a5e8f17bba77378746e4bc04fab6c335962";
+const candidateBytes = 229_357_597;
+const candidateSha256 = "baac43d0677b398e55ea92f336e35cc71d34c426b539f0f278ab13dbc74c7ebd";
+const lifecycleBytes = 1_129;
+const lifecycleSha256 = "6f966e8d4a700d3142e043765958b4d164a936a76476affacb8537b3cdb70fb2";
+const hostPersistedLastWriteTimeUtc = "2026-08-11T15:21:33.8495467Z";
 const maxAttestationBytes = 32_768;
 const maxJsonDepth = 32;
 const maxJsonValues = 4_096;
@@ -355,9 +358,11 @@ function checkAttestation(attestation, baseline) {
   equal(candidate.filename, installerName, "ATTESTATION_CANDIDATE_PATH_INVALID");
   if (!Number.isSafeInteger(candidate.bytes) || candidate.bytes <= 0)
     fail("ATTESTATION_CANDIDATE_INVALID");
+  equal(candidate.bytes, candidateBytes, "ATTESTATION_CANDIDATE_INVALID");
   if (!/^[0-9a-f]{64}$/u.test(requiredString(candidate.sha256, "ATTESTATION_CANDIDATE_INVALID"))) {
     fail("ATTESTATION_CANDIDATE_INVALID");
   }
+  equal(candidate.sha256, candidateSha256, "ATTESTATION_CANDIDATE_INVALID");
   equal(candidate.signature, "unsigned", "ATTESTATION_CANDIDATE_INVALID");
   equal(candidate.authenticodeStatus, "NotSigned", "ATTESTATION_CANDIDATE_INVALID");
   const publicBaseline = requiredObject(value.publicBaseline, "ATTESTATION_BASELINE_INVALID");
@@ -454,6 +459,7 @@ async function verifyLocalArtifacts(root, attestation) {
   ]);
   if (!lifecycleEntry && !candidateEntry) return "skipped";
   if (!lifecycleEntry || !candidateEntry) fail("LOCAL_ARTIFACT_PAIR_REQUIRED");
+  if (lifecycleEntry.size !== lifecycleBytes) fail("LIFECYCLE_ARTIFACT_BYTES_INVALID");
   if (candidateEntry.size !== attestation.candidate.bytes) fail("CANDIDATE_ARTIFACT_BYTES_INVALID");
   if ((await sha256File(candidatePath)) !== attestation.candidate.sha256)
     fail("CANDIDATE_ARTIFACT_HASH_INVALID");

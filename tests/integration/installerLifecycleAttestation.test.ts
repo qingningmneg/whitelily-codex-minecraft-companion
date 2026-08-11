@@ -23,11 +23,15 @@ const verifier = resolve(
 );
 const roots: string[] = [];
 const productVersion = "0.2.0-beta.2";
-const packageSourceCommit = "ff0221d75b2f3d84729bd6eaf72950c5c3afd9f7";
-const lifecycleValidationCommit = "ff0221d75b2f3d84729bd6eaf72950c5c3afd9f7";
+const packageSourceCommit = "44901a5e8f17bba77378746e4bc04fab6c335962";
+const lifecycleValidationCommit = "44901a5e8f17bba77378746e4bc04fab6c335962";
+const productionCandidateBytes = 229_357_597;
+const productionCandidateSha256 =
+  "baac43d0677b398e55ea92f336e35cc71d34c426b539f0f278ab13dbc74c7ebd";
+const productionLifecycleBytes = 1_129;
 const productionLifecycleSha256 =
-  "a63b4bd676c9a2f90df648db62f618021b81e685afabcb5917260e94dd741873";
-const productionLifecycleTimestamp = "2026-08-11T04:34:13.0331348Z";
+  "6f966e8d4a700d3142e043765958b4d164a936a76476affacb8537b3cdb70fb2";
+const productionLifecycleTimestamp = "2026-08-11T15:21:33.8495467Z";
 const maxAttestationBytes = 32_768;
 const candidateName = `WhiteLily-${productVersion}-windows-x64-setup.exe`;
 const lifecycleName = `WhiteLily-${productVersion}-windows-x64-installer-lifecycle.json`;
@@ -122,6 +126,18 @@ async function fixture(options: { localArtifacts?: boolean } = {}): Promise<{
   const fixtureVerifierPath = join(root, "verify-installer-lifecycle-attestation.mjs");
   const productionVerifierSource = await readFile(verifier, "utf8");
   const fixtureVerifierSource = productionVerifierSource
+    .replace(
+      `const candidateBytes = ${productionCandidateBytes.toLocaleString("en-US").replaceAll(",", "_")};`,
+      `const candidateBytes = ${candidate.length};`,
+    )
+    .replace(
+      `const candidateSha256 = "${productionCandidateSha256}";`,
+      `const candidateSha256 = "${sha256(candidate)}";`,
+    )
+    .replace(
+      `const lifecycleBytes = ${productionLifecycleBytes.toLocaleString("en-US").replaceAll(",", "_")};`,
+      `const lifecycleBytes = ${Buffer.byteLength(lifecycleText)};`,
+    )
     .replace(
       `const lifecycleSha256 = "${productionLifecycleSha256}";`,
       `const lifecycleSha256 = "${fixtureLifecycleSha256}";`,
@@ -224,11 +240,18 @@ async function mutateLifecycle(
   const fixtureVerifierPath = fixtureVerifierByRoot.get(fixtureRoot.root);
   if (fixtureVerifierPath === undefined) throw new Error("fixture verifier missing");
   const verifierSource = await readFile(fixtureVerifierPath, "utf8");
-  const updatedVerifierSource = verifierSource.replace(
+  const lifecycleBytesPattern = /const lifecycleBytes = [0-9_]+;/u;
+  if (!lifecycleBytesPattern.test(verifierSource))
+    throw new Error("fixture verifier byte count missing");
+  const sizeUpdatedVerifierSource = verifierSource.replace(
+    lifecycleBytesPattern,
+    `const lifecycleBytes = ${Buffer.byteLength(text)};`,
+  );
+  const updatedVerifierSource = sizeUpdatedVerifierSource.replace(
     /const lifecycleSha256 = "[0-9a-f]{64}";/u,
     `const lifecycleSha256 = "${sha256(text)}";`,
   );
-  if (updatedVerifierSource === verifierSource)
+  if (updatedVerifierSource === sizeUpdatedVerifierSource)
     throw new Error("fixture verifier hash not updated");
   await writeFile(fixtureVerifierPath, updatedVerifierSource, "utf8");
 }
@@ -266,19 +289,71 @@ describe("installer lifecycle attestation verifier", () => {
   });
 
   it("rejects exact lifecycle hash and timestamp drift without local artifacts", async () => {
-    const mutations: Array<(value: Record<string, unknown>) => void> = [
-      (value) => (value.lifecycleSha256 = "c".repeat(64)),
-      (value) => (value.hostPersistedLastWriteTimeUtc = "2026-08-11T04:34:13.0331349Z"),
+    const mutations: Array<{
+      mutate: (value: Record<string, unknown>) => void;
+      error: string;
+    }> = [
+      {
+        mutate: (value) => (value.lifecycleSha256 = "c".repeat(64)),
+        error: "ATTESTATION_LIFECYCLE_HASH_INVALID",
+      },
+      {
+        mutate: (value) => (value.hostPersistedLastWriteTimeUtc = "2026-08-11T04:34:13.0331349Z"),
+        error: "ATTESTATION_TIME_INVALID",
+      },
     ];
-    for (const mutate of mutations) {
+    for (const mutation of mutations) {
+      const value = await fixture({ localArtifacts: false });
+      await mutateAttestation(value.attestationPath, mutation.mutate);
+      const result = run(value.root);
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain(`Error: ${mutation.error}`);
+    }
+  });
+
+  it("rejects exact candidate byte and hash pin drift without local artifacts", async () => {
+    for (const mutation of ["bytes", "hash"] as const) {
       const value = await fixture({ localArtifacts: false });
       await mutateAttestation(value.attestationPath, (attestation) => {
-        attestation.lifecycleSha256 = productionLifecycleSha256;
-        attestation.hostPersistedLastWriteTimeUtc = productionLifecycleTimestamp;
-        mutate(attestation);
+        const candidate = attestation.candidate as Record<string, unknown>;
+        const lifecycle = attestation.lifecycle as Record<string, unknown>;
+        if (mutation === "bytes") {
+          candidate.bytes = Number(candidate.bytes) + 1;
+          return;
+        }
+        const changedHash = "c".repeat(64);
+        candidate.sha256 = changedHash;
+        lifecycle.candidateSha256 = changedHash;
+        lifecycle.controllerObservedCandidateSha256 = changedHash;
       });
-      expect(run(value.root, verifier).status).not.toBe(0);
+      const result = run(value.root);
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain("Error: ATTESTATION_CANDIDATE_INVALID");
     }
+  });
+
+  it("rejects lifecycle byte drift even when its exact hash pin is refreshed", async () => {
+    const value = await fixture();
+    const original = await readFile(value.lifecyclePath, "utf8");
+    const changed = `${original.trimEnd()} \n`;
+    expect(Buffer.byteLength(changed)).not.toBe(Buffer.byteLength(original));
+    await writeFile(value.lifecyclePath, changed, "utf8");
+    const changedSha256 = sha256(changed);
+    await mutateAttestation(value.attestationPath, (attestation) => {
+      attestation.lifecycleSha256 = changedSha256;
+    });
+    const fixtureVerifierPath = fixtureVerifierByRoot.get(value.root);
+    if (fixtureVerifierPath === undefined) throw new Error("fixture verifier missing");
+    const source = await readFile(fixtureVerifierPath, "utf8");
+    const changedSource = source.replace(
+      /const lifecycleSha256 = "[0-9a-f]{64}";/u,
+      `const lifecycleSha256 = "${changedSha256}";`,
+    );
+    expect(changedSource).not.toBe(source);
+    await writeFile(fixtureVerifierPath, changedSource, "utf8");
+    const result = run(value.root);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("Error: LIFECYCLE_ARTIFACT_BYTES_INVALID");
   });
 
   it("rejects top-level and nested duplicate evidence keys in either order", async () => {
@@ -471,7 +546,9 @@ describe("installer lifecycle attestation verifier", () => {
     for (const mutate of mutations) {
       const value = await fixture();
       await mutateLifecycle(value, mutate);
-      expect(run(value.root).status).not.toBe(0);
+      const result = run(value.root);
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain("Error: LIFECYCLE_ARTIFACT_FIELDS_INVALID");
     }
   });
 
