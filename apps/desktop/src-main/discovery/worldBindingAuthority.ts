@@ -11,7 +11,8 @@ import { assertWindowsPathsAreOrdinary } from "./windowsReparseProbe.js";
 export { assertWindowsPathsAreOrdinary } from "./windowsReparseProbe.js";
 
 const execFile = promisify(nodeExecFile);
-const MAX_JAVA_PROCESS_SNAPSHOT_BYTES = 65_536;
+const MAX_JAVA_PROCESS_SNAPSHOT_BYTES = 1_048_576;
+const JAVA_PROCESS_SNAPSHOT_TIMEOUT_MS = 10_000;
 const strictUtf8Decoder = new TextDecoder("utf-8", { fatal: true });
 
 export interface JavaProcessSnapshot {
@@ -21,11 +22,25 @@ export interface JavaProcessSnapshot {
   readonly commandLine: string;
 }
 
+export type JavaProcessSnapshotExecFile = (
+  file: string,
+  args: readonly string[],
+  options: {
+    readonly encoding: "buffer";
+    readonly maxBuffer: number;
+    readonly shell: false;
+    readonly timeout: number;
+    readonly windowsHide: true;
+  },
+) => Promise<{ readonly stdout: Buffer }>;
+
 export interface WorldBindingAuthorityOptions {
   configPath: string;
   lanDetector: Pick<LanDetector, "redeemConfirmedProof">;
   readJavaProcessSnapshot?: (pid: number) => Promise<JavaProcessSnapshot>;
   resolveInstancePath?: (snapshot: JavaProcessSnapshot) => Promise<string>;
+  /** Main-process-only child-boundary port; production composition uses the fixed default. */
+  snapshotExecFile?: JavaProcessSnapshotExecFile;
 }
 
 export interface ResolvedJavaInstance {
@@ -44,7 +59,9 @@ export class WorldBindingAuthority {
   constructor(options: WorldBindingAuthorityOptions) {
     this.#configPath = options.configPath;
     this.#lanDetector = options.lanDetector;
-    this.#readJavaProcessSnapshot = options.readJavaProcessSnapshot ?? readJavaProcessSnapshot;
+    const snapshotExecFile: JavaProcessSnapshotExecFile = options.snapshotExecFile ?? execFile;
+    this.#readJavaProcessSnapshot =
+      options.readJavaProcessSnapshot ?? ((pid) => readJavaProcessSnapshot(pid, snapshotExecFile));
     this.#resolveInstancePath = options.resolveInstancePath ?? resolveJavaGameDirectory;
   }
 
@@ -110,7 +127,10 @@ function isJavaExecutable(executablePath: string): boolean {
   return filename === "java.exe" || filename === "javaw.exe";
 }
 
-async function readJavaProcessSnapshot(pid: number): Promise<JavaProcessSnapshot> {
+async function readJavaProcessSnapshot(
+  pid: number,
+  snapshotExecFile: JavaProcessSnapshotExecFile = execFile,
+): Promise<JavaProcessSnapshot> {
   if (!Number.isSafeInteger(pid) || pid < 1) throw new Error("invalid Java process id");
   const command = [
     "$WhiteLilyUtf8NoBom = [System.Text.UTF8Encoding]::new($false)",
@@ -121,17 +141,22 @@ async function readJavaProcessSnapshot(pid: number): Promise<JavaProcessSnapshot
     "$started = [DateTimeOffset](Get-Process -Id $p.ProcessId).StartTime.ToUniversalTime()",
     "[pscustomobject]@{pid=$p.ProcessId;processStartedAt=$started.ToUnixTimeMilliseconds();executablePath=$p.ExecutablePath;commandLine=$p.CommandLine}|ConvertTo-Json -Compress",
   ].join("; ");
-  const { stdout } = await execFile(
-    "powershell.exe",
-    ["-NoProfile", "-NonInteractive", "-Command", command],
-    {
-      encoding: "buffer",
-      maxBuffer: MAX_JAVA_PROCESS_SNAPSHOT_BYTES,
-      shell: false,
-      timeout: 5_000,
-      windowsHide: true,
-    },
-  );
+  let stdout: Buffer;
+  try {
+    ({ stdout } = await snapshotExecFile(
+      "powershell.exe",
+      ["-NoProfile", "-NonInteractive", "-Command", command],
+      {
+        encoding: "buffer",
+        maxBuffer: MAX_JAVA_PROCESS_SNAPSHOT_BYTES,
+        shell: false,
+        timeout: JAVA_PROCESS_SNAPSHOT_TIMEOUT_MS,
+        windowsHide: true,
+      },
+    ));
+  } catch {
+    throw new Error("Java process snapshot unavailable");
+  }
   if (!Buffer.isBuffer(stdout)) throw new Error("invalid Java process snapshot encoding");
   return parseJavaProcessSnapshotOutput(stdout);
 }

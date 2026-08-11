@@ -25,6 +25,7 @@ import { ChildSupervisor, type ChildProcessPort, type SpawnChild } from "./child
 import { ExternalUrlPolicy } from "./externalUrlPolicy.js";
 import { registerIpcHandlers, type IpcMainPort, type IpcSupervisor } from "./ipcRegistry.js";
 import type { MinecraftComponentManager, MinecraftComponentStatus } from "./minecraftComponents.js";
+import { WorldBindingAuthority } from "./discovery/worldBindingAuthority.js";
 
 const idleSnapshot: RuntimeSnapshot = {
   revision: 0,
@@ -134,7 +135,12 @@ class LanContainmentChild extends EventEmitter implements ChildProcessPort {
   }
 }
 
-function createRegistryHarness(snapshot: unknown = idleSnapshot) {
+type WorldAuthorityPort = NonNullable<Parameters<typeof registerIpcHandlers>[0]["worldAuthority"]>;
+
+function createRegistryHarness(
+  snapshot: unknown = idleSnapshot,
+  worldAuthority?: WorldAuthorityPort,
+) {
   const loginExpiresAt = Date.now() + 60_000;
   const handlers = new Map<string, (...args: unknown[]) => unknown>();
   const removedChannels: string[] = [];
@@ -204,6 +210,7 @@ function createRegistryHarness(snapshot: unknown = idleSnapshot) {
     async () => snapshot as RuntimeSnapshot,
   );
   const stopTask = vi.fn(async () => snapshot as RuntimeSnapshot);
+  const bindConfirmedWorld = vi.fn(async () => snapshot as RuntimeSnapshot);
   const supervisor = {
     request: request as IpcSupervisor["request"],
     stopTask,
@@ -213,6 +220,7 @@ function createRegistryHarness(snapshot: unknown = idleSnapshot) {
       runtimeListener = listener;
       return unsubscribeSupervisor;
     },
+    ...(worldAuthority ? { bindConfirmedWorld } : {}),
   } as IpcSupervisor & { activeChildGeneration(): number };
   const published: DesktopRendererEvent[] = [];
   const publishedOwners: Array<OwnerIdentitySnapshot & { childGeneration: number }> = [];
@@ -269,6 +277,7 @@ function createRegistryHarness(snapshot: unknown = idleSnapshot) {
       install: installMinecraftComponents,
       remove: removeMinecraftComponents,
     },
+    ...(worldAuthority ? { worldAuthority } : {}),
   });
   const invoke = (channel: string, ...args: unknown[]) => {
     const handler = handlers.get(channel);
@@ -296,6 +305,7 @@ function createRegistryHarness(snapshot: unknown = idleSnapshot) {
     getMinecraftComponentStatus,
     installMinecraftComponents,
     removeMinecraftComponents,
+    bindConfirmedWorld,
     unsubscribeSupervisor,
   };
 }
@@ -803,6 +813,44 @@ describe("IPC registry", () => {
     await expect(
       invoke(WHITE_LILY_IPC_CHANNELS.detectLanCandidates, { host: "127.0.0.1" }),
     ).rejects.toThrow("invalid IPC input");
+  });
+
+  it("keeps raw Java snapshot child failures opaque across bind-confirmed-world IPC", async () => {
+    const sentinel = "SENSITIVE_STDERR ProcessId = 98765 Get-CimInstance";
+    const javaSession = {
+      pid: 1234,
+      processStartedAt: 100,
+      port: 51321,
+      version: "1.21.5",
+    };
+    const authority = new WorldBindingAuthority({
+      configPath: "unused-by-direct-resolution",
+      lanDetector: { redeemConfirmedProof: async () => javaSession },
+      resolveInstancePath: async () => "C:/Minecraft/Instance",
+      snapshotExecFile: async () => {
+        throw new Error(sentinel);
+      },
+    });
+    const harness = createRegistryHarness(idleSnapshot, {
+      redeem: async () => {
+        await authority.resolveJavaInstance(javaSession);
+        throw new Error("unreachable");
+      },
+    });
+    await harness.invoke(WHITE_LILY_IPC_CHANNELS.confirmLanCandidate, "lan_candidate_1234");
+
+    const failure = await Promise.resolve(
+      harness.invoke(WHITE_LILY_IPC_CHANNELS.bindConfirmedWorld, {
+        expectedRevision: 0,
+        label: "Opaque world",
+      }),
+    ).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toBe("Java process snapshot unavailable");
+    expect((failure as Error).message).not.toContain(sentinel);
+    expect((failure as Error).cause).toBeUndefined();
+    expect(harness.bindConfirmedWorld).not.toHaveBeenCalled();
   });
 
   it("invalidates child connection authority when confirmed LAN identity changes", async () => {

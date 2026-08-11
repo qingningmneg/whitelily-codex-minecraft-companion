@@ -52,6 +52,19 @@ async function configPath(): Promise<string> {
   return path;
 }
 
+async function resolveWithRealPowerShellSnapshotCommand(
+  command: string,
+): Promise<JavaProcessSnapshot> {
+  const authority = new WorldBindingAuthority({
+    configPath: "unused-by-direct-resolution",
+    lanDetector: { redeemConfirmedProof: async () => session },
+    resolveInstancePath: async () => "C:/Minecraft/Instance",
+    snapshotExecFile: async (_file, _args, options) =>
+      execFile("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", command], options),
+  });
+  return (await authority.resolveJavaInstance(session)).snapshot;
+}
+
 describe("WorldBindingAuthority", () => {
   it.skipIf(process.platform !== "win32")(
     "rejects a real junction through the handle-bound Windows reparse attribute check",
@@ -85,23 +98,102 @@ describe("WorldBindingAuthority", () => {
     ).toThrow("invalid Java process snapshot encoding");
   });
 
-  it("rejects a valid JSON snapshot beyond the PowerShell stdout byte limit", () => {
+  it("accepts a bounded valid JSON snapshot above the legacy 64 KiB limit", () => {
     const encoded = Buffer.from(
-      JSON.stringify({ ...snapshot, commandLine: "x".repeat(65_536) }),
+      JSON.stringify({ ...snapshot, commandLine: "x".repeat(131_072) }),
       "utf8",
     );
     expect(encoded.byteLength).toBeGreaterThan(65_536);
+    expect(encoded.byteLength).toBeLessThan(1_048_576);
 
-    expect(() => parseJavaProcessSnapshotOutput(encoded)).toThrow("invalid Java process snapshot");
+    expect(parseJavaProcessSnapshotOutput(encoded).commandLine).toHaveLength(131_072);
   });
 
-  it("accepts a valid snapshot at the exact PowerShell stdout byte limit", () => {
+  it.skipIf(process.platform !== "win32")(
+    "accepts a bounded real PowerShell child snapshot above the legacy 64 KiB limit",
+    async () => {
+      const command = [
+        "$utf8 = [Text.UTF8Encoding]::new($false)",
+        "[Console]::OutputEncoding = $utf8",
+        "$payload = [pscustomobject]@{pid=1234;processStartedAt=100;executablePath='C:/Java/bin/javaw.exe';commandLine=('x' * 131072)} | ConvertTo-Json -Compress",
+        "[Console]::Out.Write($payload)",
+      ].join("; ");
+
+      const received = await resolveWithRealPowerShellSnapshotCommand(command);
+
+      expect(received.commandLine).toHaveLength(131_072);
+    },
+    15_000,
+  );
+
+  it.skipIf(process.platform !== "win32")(
+    "accepts one real PowerShell snapshot child that succeeds after five seconds",
+    async () => {
+      const command = [
+        "$utf8 = [Text.UTF8Encoding]::new($false)",
+        "[Console]::OutputEncoding = $utf8",
+        "Start-Sleep -Milliseconds 5500",
+        "$payload = [pscustomobject]@{pid=1234;processStartedAt=100;executablePath='C:/Java/bin/javaw.exe';commandLine='javaw.exe --gameDir \"C:/Minecraft/Instance\"'} | ConvertTo-Json -Compress",
+        "[Console]::Out.Write($payload)",
+      ].join("; ");
+
+      await expect(resolveWithRealPowerShellSnapshotCommand(command)).resolves.toMatchObject(
+        snapshot,
+      );
+    },
+    25_000,
+  );
+
+  it.skipIf(process.platform !== "win32")(
+    "rejects one real PowerShell snapshot child above the 1 MiB output limit",
+    async () => {
+      const command = [
+        "$utf8 = [Text.UTF8Encoding]::new($false)",
+        "[Console]::OutputEncoding = $utf8",
+        "$payload = [pscustomobject]@{pid=1234;processStartedAt=100;executablePath='C:/Java/bin/javaw.exe';commandLine=('x' * 1048577)} | ConvertTo-Json -Compress",
+        "[Console]::Out.Write($payload)",
+      ].join("; ");
+
+      await expect(resolveWithRealPowerShellSnapshotCommand(command)).rejects.toThrow();
+    },
+    15_000,
+  );
+
+  it("replaces raw snapshot child failures with one fixed opaque error", async () => {
+    const sentinel = "SENSITIVE_STDERR ProcessId = 98765 Get-CimInstance";
+    const authority = new WorldBindingAuthority({
+      configPath: "unused-by-direct-resolution",
+      lanDetector: { redeemConfirmedProof: async () => session },
+      resolveInstancePath: async () => "C:/Minecraft/Instance",
+      snapshotExecFile: async () => {
+        throw new Error(sentinel);
+      },
+    });
+
+    const failure = await authority.resolveJavaInstance(session).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toBe("Java process snapshot unavailable");
+    expect((failure as Error).message).not.toContain(sentinel);
+    expect((failure as Error).cause).toBeUndefined();
+  });
+
+  it("accepts a valid snapshot at the exact 1 MiB PowerShell stdout byte limit", () => {
     const emptyCommandLine = Buffer.from(JSON.stringify({ ...snapshot, commandLine: "" }), "utf8");
-    const commandLine = "x".repeat(65_536 - emptyCommandLine.byteLength);
+    const commandLine = "x".repeat(1_048_576 - emptyCommandLine.byteLength);
     const encoded = Buffer.from(JSON.stringify({ ...snapshot, commandLine }), "utf8");
-    expect(encoded.byteLength).toBe(65_536);
+    expect(encoded.byteLength).toBe(1_048_576);
 
     expect(parseJavaProcessSnapshotOutput(encoded).commandLine).toBe(commandLine);
+  });
+
+  it("rejects a valid snapshot one byte above the 1 MiB limit", () => {
+    const emptyCommandLine = Buffer.from(JSON.stringify({ ...snapshot, commandLine: "" }), "utf8");
+    const commandLine = "x".repeat(1_048_577 - emptyCommandLine.byteLength);
+    const encoded = Buffer.from(JSON.stringify({ ...snapshot, commandLine }), "utf8");
+    expect(encoded.byteLength).toBe(1_048_577);
+
+    expect(() => parseJavaProcessSnapshotOutput(encoded)).toThrow("invalid Java process snapshot");
   });
 
   it.each([
