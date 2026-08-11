@@ -1,16 +1,17 @@
 {
   "attestationSchemaVersion": 1,
   "productVersion": "0.2.0-beta.2",
-  "packageSourceCommit": "e79eacac0b7ba114a48e42299bb777aba62da988",
-  "lifecycleValidationCommit": "0c45623fcbe7345fc9fe484a56dfb36f7cc0c68f",
+  "packageSourceCommit": "ff0221d75b2f3d84729bd6eaf72950c5c3afd9f7",
+  "lifecycleValidationCommit": "ff0221d75b2f3d84729bd6eaf72950c5c3afd9f7",
   "canonicalLifecyclePath": "build/electron-installer/WhiteLily-0.2.0-beta.2-windows-x64-installer-lifecycle.json",
-  "lifecycleSha256": "1d6c10e911ef39d9e555b3347ec57a24ceb86430b8b703f0ab54aa905a814862",
-  "hostPersistedLastWriteTimeUtc": "2026-08-09T21:32:58.4304799Z",
+  "lifecycleSha256": "a63b4bd676c9a2f90df648db62f618021b81e685afabcb5917260e94dd741873",
+  "hostPersistedLastWriteTimeUtc": "2026-08-11T04:34:13.0331348Z",
   "candidate": {
     "filename": "WhiteLily-0.2.0-beta.2-windows-x64-setup.exe",
-    "bytes": 226380179,
-    "sha256": "d0c9f5250ca0b3258a603a067f1e28308c9123b856a07b87e34c8f4b50a47f59",
-    "signature": "unsigned"
+    "bytes": 229357560,
+    "sha256": "a7c3b9c441e93055a4f297611e6e1d528d853c1cf65081cc1a0de3f87f18fda6",
+    "signature": "unsigned",
+    "authenticodeStatus": "NotSigned"
   },
   "publicBaseline": {
     "releaseTag": "v0.2.0-beta.1",
@@ -39,18 +40,24 @@
       "delete_data",
       "candidate_principal_removed"
     ],
-    "candidateSha256": "d0c9f5250ca0b3258a603a067f1e28308c9123b856a07b87e34c8f4b50a47f59",
-    "controllerObservedCandidateSha256": "d0c9f5250ca0b3258a603a067f1e28308c9123b856a07b87e34c8f4b50a47f59",
+    "candidateSha256": "a7c3b9c441e93055a4f297611e6e1d528d853c1cf65081cc1a0de3f87f18fda6",
+    "controllerObservedCandidateSha256": "a7c3b9c441e93055a4f297611e6e1d528d853c1cf65081cc1a0de3f87f18fda6",
     "baselineSha256": "e3ba23e37d62eee8697c7a3af94206357acf3bae0755a61e8b92702aa60a8cd4",
     "controllerObservedBaselineSha256": "e3ba23e37d62eee8697c7a3af94206357acf3bae0755a61e8b92702aa60a8cd4",
     "controllerSid": "S-1-5-18",
     "candidateReportWriteDenied": true,
-    "managedWorkspaceResources": 3
+    "managedWorkspaceResources": 3,
+    "minecraftComponentResources": 9,
+    "componentPreferencesFresh": true,
+    "componentPreferencesUpgradePreserved": true,
+    "componentPreferencesKeepPreserved": true
   },
   "zeroResidue": {
-    "windowsSandbox": 0,
-    "windowsSandboxServer": 0,
-    "windowsSandboxRemoteSession": 0,
-    "sandboxMappings": 0
+    "trackedWindowsSandbox": 0,
+    "sandboxMappings": 0,
+    "sandboxRoots": 0,
+    "lifecycleHivePresent": false,
+    "candidatePrincipalPresent": false,
+    "remoteSessionEnumeration": "not-performed"
   }
 }

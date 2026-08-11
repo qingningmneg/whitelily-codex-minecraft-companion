@@ -42,7 +42,13 @@ interface InstallerLifecycleAttestation {
   canonicalLifecyclePath: string;
   lifecycleSha256: string;
   hostPersistedLastWriteTimeUtc: string;
-  candidate: { filename: string; bytes: number; sha256: string; signature: string };
+  candidate: {
+    filename: string;
+    bytes: number;
+    sha256: string;
+    signature: string;
+    authenticodeStatus: string;
+  };
   publicBaseline: {
     releaseTag: string;
     filename: string;
@@ -57,12 +63,18 @@ interface InstallerLifecycleAttestation {
     controllerSid: string;
     candidateReportWriteDenied: boolean;
     managedWorkspaceResources: number;
+    minecraftComponentResources: number;
+    componentPreferencesFresh: boolean;
+    componentPreferencesUpgradePreserved: boolean;
+    componentPreferencesKeepPreserved: boolean;
   };
   zeroResidue: {
-    windowsSandbox: number;
-    windowsSandboxServer: number;
-    windowsSandboxRemoteSession: number;
+    trackedWindowsSandbox: number;
     sandboxMappings: number;
+    sandboxRoots: number;
+    lifecycleHivePresent: boolean;
+    candidatePrincipalPresent: boolean;
+    remoteSessionEnumeration: string;
   };
 }
 
@@ -99,13 +111,16 @@ describe("public release readiness", () => {
     expect(Number.isNaN(Date.parse(record.hostPersistedLastWriteTimeUtc))).toBe(false);
     expect(record).toMatchObject({
       productVersion: "0.2.0-beta.2",
-      packageSourceCommit: "e79eacac0b7ba114a48e42299bb777aba62da988",
-      lifecycleValidationCommit: "0c45623fcbe7345fc9fe484a56dfb36f7cc0c68f",
+      packageSourceCommit: "ff0221d75b2f3d84729bd6eaf72950c5c3afd9f7",
+      lifecycleValidationCommit: "ff0221d75b2f3d84729bd6eaf72950c5c3afd9f7",
+      lifecycleSha256: "a63b4bd676c9a2f90df648db62f618021b81e685afabcb5917260e94dd741873",
+      hostPersistedLastWriteTimeUtc: "2026-08-11T04:34:13.0331348Z",
       candidate: {
         filename: "WhiteLily-0.2.0-beta.2-windows-x64-setup.exe",
-        bytes: 226_380_179,
-        sha256: "d0c9f5250ca0b3258a603a067f1e28308c9123b856a07b87e34c8f4b50a47f59",
+        bytes: 229_357_560,
+        sha256: "a7c3b9c441e93055a4f297611e6e1d528d853c1cf65081cc1a0de3f87f18fda6",
         signature: "unsigned",
+        authenticodeStatus: "NotSigned",
       },
       publicBaseline: {
         releaseTag: "v0.2.0-beta.1",
@@ -120,12 +135,18 @@ describe("public release readiness", () => {
         controllerSid: "S-1-5-18",
         candidateReportWriteDenied: true,
         managedWorkspaceResources: 3,
+        minecraftComponentResources: 9,
+        componentPreferencesFresh: true,
+        componentPreferencesUpgradePreserved: true,
+        componentPreferencesKeepPreserved: true,
       },
       zeroResidue: {
-        windowsSandbox: 0,
-        windowsSandboxServer: 0,
-        windowsSandboxRemoteSession: 0,
+        trackedWindowsSandbox: 0,
         sandboxMappings: 0,
+        sandboxRoots: 0,
+        lifecycleHivePresent: false,
+        candidatePrincipalPresent: false,
+        remoteSessionEnumeration: "not-performed",
       },
     });
 
