@@ -1744,6 +1744,58 @@ describe("WhiteLily isolated installer lifecycle", () => {
     expect(source).not.toMatch(/\$sandboxProcess\.Kill\(/u);
   });
 
+  it("embeds the file attribute authority in the guest scope that calls it", async () => {
+    const root = await createTemporaryRoot("whitelily-guest-scope-");
+    const ordinaryFile = join(root, "ordinary.txt");
+    const harness = join(root, "verify-guest-helper-scope.ps1");
+    await writeFile(ordinaryFile, "ordinary\n", "utf8");
+    await writeFile(
+      harness,
+      [
+        "param(",
+        "    [Parameter(Mandatory = $true)][string]$LifecycleScript,",
+        "    [Parameter(Mandatory = $true)][string]$OrdinaryFile",
+        ")",
+        "$ErrorActionPreference = 'Stop'",
+        "$scriptText = [IO.File]::ReadAllText($LifecycleScript)",
+        "$guestMatch = [regex]::Match($scriptText, \"(?s)\\$guestScript = @'\\r?\\n(?<guest>.*?)\\r?\\n'@\")",
+        "if (-not $guestMatch.Success) { throw 'GUEST_SCRIPT_MISSING' }",
+        "$tokens = $null",
+        "$errors = $null",
+        "$ast = [Management.Automation.Language.Parser]::ParseInput($guestMatch.Groups['guest'].Value, [ref]$tokens, [ref]$errors)",
+        "if ($errors.Count -ne 0) { throw 'GUEST_SCRIPT_INVALID' }",
+        "$definitions = @($ast.FindAll({",
+        "    param($node)",
+        "    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and",
+        "        $node.Name -eq 'Test-FileSystemEntryHasAttribute'",
+        "}, $true))",
+        "$calls = @($ast.FindAll({",
+        "    param($node)",
+        "    $node -is [Management.Automation.Language.CommandAst] -and",
+        "        $node.GetCommandName() -eq 'Test-FileSystemEntryHasAttribute'",
+        "}, $true))",
+        "if ($definitions.Count -ne 1 -or $calls.Count -lt 1) { throw 'GUEST_ATTRIBUTE_AUTHORITY_MISSING' }",
+        "Invoke-Expression $definitions[0].Extent.Text",
+        "$entry = Get-Item -LiteralPath $OrdinaryFile -Force",
+        "if (Test-FileSystemEntryHasAttribute -Entry $entry -Attribute ([IO.FileAttributes]::ReparsePoint)) { throw 'ORDINARY_FILE_REJECTED' }",
+        '[Console]::Out.WriteLine(\'{"status":"ok"}\')',
+        "",
+      ].join("\r\n"),
+      "utf8",
+    );
+
+    const result = runPowerShell(harness, [
+      "-LifecycleScript",
+      lifecycleScript,
+      "-OrdinaryFile",
+      ordinaryFile,
+    ]);
+
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(result.stdout.trim()).toBe('{"status":"ok"}');
+    expect(result.stderr).toBe("");
+  });
+
   it("fails removal proof when any installed program artifact remains", async () => {
     const root = await createTemporaryRoot("whitelily-removal-proof-");
     const programRoot = join(root, "Programs", "WhiteLily");

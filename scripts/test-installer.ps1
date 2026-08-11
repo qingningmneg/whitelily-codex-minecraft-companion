@@ -504,6 +504,13 @@ $result = [ordered]@{
     stages = [Collections.Generic.List[string]]::new()
     error = $null
 }
+function Test-FileSystemEntryHasAttribute {
+    param(
+        [Parameter(Mandatory = $true)][System.IO.FileSystemInfo]$Entry,
+        [Parameter(Mandatory = $true)][System.IO.FileAttributes]$Attribute
+    )
+    return ($Entry.Attributes -band $Attribute) -eq $Attribute
+}
 function Get-Sha256Hex {
     param([Parameter(Mandatory = $true)][string]$LiteralPath)
 
