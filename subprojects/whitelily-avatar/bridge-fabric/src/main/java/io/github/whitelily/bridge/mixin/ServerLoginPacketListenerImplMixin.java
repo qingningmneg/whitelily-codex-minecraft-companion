@@ -1,5 +1,12 @@
-package io.github.whitelily.bridge;
+package io.github.whitelily.bridge.mixin;
 
+import io.github.whitelily.bridge.BridgeConnectionAccess;
+import io.github.whitelily.bridge.BridgeConnectionApprovalAccess;
+import io.github.whitelily.bridge.BridgeConnectionEndpointAccess;
+import io.github.whitelily.bridge.BridgeLoginDecision;
+import io.github.whitelily.bridge.BridgeNetworkAddresses;
+import io.github.whitelily.bridge.BridgeRuntime;
+import io.github.whitelily.bridge.WhiteLilyBridge;
 import com.mojang.authlib.GameProfile;
 import java.util.UUID;
 import net.minecraft.client.server.IntegratedServer;
@@ -16,13 +23,13 @@ import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 @Mixin(ServerLoginPacketListenerImpl.class)
-abstract class ServerLoginPacketListenerImplMixin {
-  @Shadow @Final MinecraftServer server;
-  @Shadow @Final Connection connection;
-  @Shadow String requestedUsername;
+public abstract class ServerLoginPacketListenerImplMixin {
+  @Shadow @Final protected MinecraftServer server;
+  @Shadow @Final protected Connection connection;
+  @Shadow protected String requestedUsername;
 
   @Shadow
-  abstract void startClientVerification(GameProfile profile);
+  protected abstract void startClientVerification(GameProfile profile);
 
   @Inject(
       method = "handleHello(Lnet/minecraft/network/protocol/login/ServerboundHelloPacket;)V",

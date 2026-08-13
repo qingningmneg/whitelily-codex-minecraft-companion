@@ -23,8 +23,8 @@
     },
     {
       "name": "minecraft-components-manifest.json",
-      "bytes": 1585,
-      "sha256": "91a09da35550b81e0722829e559a50e69deada5e55035608cdb667f6b5fd7985"
+      "bytes": 1784,
+      "sha256": "bcd528825f95d8062865bc77d1979d9a07907b92337cfccae46c9140f453cff1"
     },
     {
       "name": "whitelily-avatar-fabric-1.21.5-0.1.0.jar",
@@ -32,9 +32,9 @@
       "sha256": "fff00f66e4beab2eff1e51f253608b198f43aa0a12443fbe07f7f3fd48278872"
     },
     {
-      "name": "whitelily-bridge-fabric-1.21.5-0.1.0.jar",
-      "bytes": 51837,
-      "sha256": "380721d28236f5ad8206fd8d69af1e5629d741e9d38ec27c26c052c95266b6ce"
+      "name": "whitelily-bridge-fabric-1.21.5-0.1.1.jar",
+      "bytes": 52087,
+      "sha256": "8a6e00d47a28799798ffa5d561156ea7ceb0f697a0beb2cc7c55b34f6f81b514"
     },
     {
       "name": "WhiteLily-LICENSE.txt",

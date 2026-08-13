@@ -7,6 +7,8 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.mojang.authlib.GameProfile;
+import io.github.whitelily.bridge.mixin.PlayerListMixin;
+import io.github.whitelily.bridge.mixin.ServerLoginPacketListenerImplMixin;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.net.InetAddress;
@@ -237,9 +239,7 @@ class ProductionMixinCurrentServerTest {
   private static LoginMixinHarness loginMixin(
       IntegratedServer server, TestConnection connection) {
     LoginMixinHarness mixin = new LoginMixinHarness();
-    mixin.server = server;
-    mixin.connection = connection;
-    mixin.requestedUsername = WhiteLilyBridge.WHITE_LILY_USERNAME;
+    mixin.prepare(server, connection);
     return mixin;
   }
 
@@ -348,8 +348,14 @@ class ProductionMixinCurrentServerTest {
   private static final class LoginMixinHarness extends ServerLoginPacketListenerImplMixin {
     private GameProfile verifiedProfile;
 
+    private void prepare(IntegratedServer server, TestConnection connection) {
+      this.server = server;
+      this.connection = connection;
+      this.requestedUsername = WhiteLilyBridge.WHITE_LILY_USERNAME;
+    }
+
     @Override
-    void startClientVerification(GameProfile profile) {
+    protected void startClientVerification(GameProfile profile) {
       verifiedProfile = profile;
     }
   }

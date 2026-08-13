@@ -1,5 +1,8 @@
-package io.github.whitelily.bridge;
+package io.github.whitelily.bridge.mixin;
 
+import io.github.whitelily.bridge.ApprovedProfileRegistry;
+import io.github.whitelily.bridge.BridgeConnectionApprovalAccess;
+import io.github.whitelily.bridge.WhiteLilyBridge;
 import net.minecraft.client.server.IntegratedServer;
 import net.minecraft.network.Connection;
 import net.minecraft.server.MinecraftServer;
@@ -14,7 +17,7 @@ import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 @Mixin(PlayerList.class)
-abstract class PlayerListMixin {
+public abstract class PlayerListMixin {
   @Shadow @Final private MinecraftServer server;
 
   @Inject(

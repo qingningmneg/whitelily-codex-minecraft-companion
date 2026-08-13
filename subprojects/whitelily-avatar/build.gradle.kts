@@ -105,7 +105,7 @@ project(":bridge-fabric") {
   apply(plugin = "fabric-loom")
   apply(plugin = "java")
 
-  val bridgeVersion = property("mod_version").toString()
+  val bridgeVersion = property("bridge_version").toString()
   val minecraftVersion = property("minecraft_version").toString()
   version = bridgeVersion
   group = property("maven_group").toString()
@@ -237,9 +237,10 @@ fun jsonString(value: String): String =
 
 val minecraftVersion = property("minecraft_version").toString()
 val componentVersion = property("mod_version").toString()
+val bridgeVersion = property("bridge_version").toString()
 val fabricApiVersion = property("fabric_api_version").toString()
 val geckoLibVersion = property("geckolib_version").toString()
-val bridgeOutputName = "whitelily-bridge-fabric-$minecraftVersion-$componentVersion.jar"
+val bridgeOutputName = "whitelily-bridge-fabric-$minecraftVersion-$bridgeVersion.jar"
 val avatarOutputName = "whitelily-avatar-fabric-$minecraftVersion-$componentVersion.jar"
 val fabricApiOutputName = "fabric-api-$fabricApiVersion.jar"
 val geckoLibOutputName = "geckolib-fabric-1.21.5-$geckoLibVersion.jar"
@@ -261,7 +262,7 @@ val stagedOutputNames =
     manifestName,
   )
 val bridgeJar =
-  project(":bridge-fabric").file("build/libs/whitelily-bridge-fabric-$minecraftVersion-$componentVersion.jar")
+  project(":bridge-fabric").file("build/libs/whitelily-bridge-fabric-$minecraftVersion-$bridgeVersion.jar")
 val avatarJar = project(":mod-fabric").file("build/libs/whitelily-avatar-fabric-$componentVersion.jar")
 val stagingDirectory = file("../../build/minecraft-components")
 val stagingDirectoryExistedAtConfiguration = stagingDirectory.exists()
@@ -341,7 +342,7 @@ val stageMinecraftComponents = tasks.register("stageMinecraftComponents") {
           bridgeOutputName,
           bridgeJar,
           "whitelily_bridge",
-          componentVersion,
+          bridgeVersion,
           project.property("bridge_distribution_bytes").toString().toLong(),
           project.property("bridge_distribution_sha256").toString(),
         ),
@@ -433,9 +434,17 @@ val stageMinecraftComponents = tasks.register("stageMinecraftComponents") {
     val artifactManifest =
       preparedArtifacts.map { prepared ->
         val artifact = prepared.artifact
+        val prior =
+          if (artifact.component == "bridge") {
+            "[{\"fileName\": \"whitelily-bridge-fabric-1.21.5-0.1.0.jar\", \"bytes\": 51837, " +
+              "\"sha256\": \"380721d28236f5ad8206fd8d69af1e5629d741e9d38ec27c26c052c95266b6ce\", " +
+              "\"modId\": \"whitelily_bridge\", \"version\": \"0.1.0\"}]"
+          } else {
+            "[]"
+          }
         "    {\"component\": \"${artifact.component}\", \"fileName\": \"${artifact.fileName}\", " +
           "\"bytes\": ${prepared.bytes.size}, \"sha256\": \"${prepared.sha256}\", " +
-          "\"modId\": \"${artifact.modId}\", \"version\": \"${artifact.version}\", \"prior\": []}"
+          "\"modId\": \"${artifact.modId}\", \"version\": \"${artifact.version}\", \"prior\": $prior}"
       }
     val licenseManifest =
       licenses.map { license ->

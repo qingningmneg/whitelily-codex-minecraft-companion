@@ -73,12 +73,20 @@ const DESKTOP_MINECRAFT_COMPONENT_MANIFEST: MinecraftComponentResourceManifest =
   artifacts: Object.freeze([
     Object.freeze({
       component: "bridge" as const,
-      fileName: "whitelily-bridge-fabric-1.21.5-0.1.0.jar",
-      bytes: 51_837,
-      sha256: "380721d28236f5ad8206fd8d69af1e5629d741e9d38ec27c26c052c95266b6ce",
+      fileName: "whitelily-bridge-fabric-1.21.5-0.1.1.jar",
+      bytes: 52_087,
+      sha256: "8a6e00d47a28799798ffa5d561156ea7ceb0f697a0beb2cc7c55b34f6f81b514",
       modId: "whitelily_bridge",
-      version: "0.1.0",
-      prior: Object.freeze([]),
+      version: "0.1.1",
+      prior: Object.freeze([
+        Object.freeze({
+          fileName: "whitelily-bridge-fabric-1.21.5-0.1.0.jar",
+          bytes: 51_837,
+          sha256: "380721d28236f5ad8206fd8d69af1e5629d741e9d38ec27c26c052c95266b6ce",
+          modId: "whitelily_bridge",
+          version: "0.1.0",
+        }),
+      ]),
     }),
     Object.freeze({
       component: "avatar" as const,

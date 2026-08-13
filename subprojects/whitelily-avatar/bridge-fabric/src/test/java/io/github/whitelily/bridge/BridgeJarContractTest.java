@@ -28,9 +28,32 @@ import org.junit.jupiter.api.io.TempDir;
 
 class BridgeJarContractTest {
   private static final String EXPECTED_JAR =
-      "whitelily-bridge-fabric-1.21.5-0.1.0.jar";
+      "whitelily-bridge-fabric-1.21.5-0.1.1.jar";
 
   @TempDir Path temporaryDirectory;
+
+  @Test
+  void mixinPackageDoesNotOwnTheFabricEntrypointOrConnectionApprovalApi() throws Exception {
+    Path source = Path.of(System.getProperty("whitelily.bridge.jar"));
+    try (JarFile jar = new JarFile(source.toFile())) {
+      JsonObject metadata = json(jar, "fabric.mod.json");
+      JsonObject mixins = json(jar, "whitelily_bridge.mixins.json");
+      String mixinPackage = mixins.get("package").getAsString();
+      String entrypoint =
+          metadata
+              .getAsJsonObject("entrypoints")
+              .getAsJsonArray("client")
+              .get(0)
+              .getAsString();
+
+      assertEquals("io.github.whitelily.bridge.mixin", mixinPackage);
+      assertTrue(!entrypoint.startsWith(mixinPackage + "."), "entrypoint owned by mixin package");
+      assertTrue(
+          !"io.github.whitelily.bridge.BridgeConnectionApprovalAccess"
+              .startsWith(mixinPackage + "."),
+          "connection approval API owned by mixin package");
+    }
+  }
 
   @Test
   void exactContractRejectsAnEmbeddedJnaPackage() throws Exception {
@@ -172,7 +195,7 @@ class BridgeJarContractTest {
 
     refmap
         .getAsJsonObject("mappings")
-        .getAsJsonObject("io/github/whitelily/bridge/ConnectionMixin")
+        .getAsJsonObject("io/github/whitelily/bridge/mixin/ConnectionMixin")
         .addProperty(
             "disconnect(Lnet/minecraft/network/DisconnectionDetails;)V", "foreign");
     assertRejectedWithReason(

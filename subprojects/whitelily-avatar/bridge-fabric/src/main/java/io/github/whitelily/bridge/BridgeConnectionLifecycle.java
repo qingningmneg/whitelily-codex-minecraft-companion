@@ -1,9 +1,9 @@
 package io.github.whitelily.bridge;
 
-final class BridgeConnectionLifecycle {
+public final class BridgeConnectionLifecycle {
   private BridgeConnectionLifecycle() {}
 
-  static void clear(
+  public static void clear(
       BridgeConnectionAccess handshakeAccess, BridgeConnectionApprovalAccess approvalAccess) {
     if (handshakeAccess != null) {
       handshakeAccess.whitelily$clearHandshakeProof();

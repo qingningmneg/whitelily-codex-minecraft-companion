@@ -6,7 +6,7 @@ import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.attribute.BasicFileAttributes;
 
-final class BridgeRuntime {
+public final class BridgeRuntime {
   private static final Path BRIDGE_ROOT = bridgeRoot();
   private static final BridgeLoginSelector LOGIN_SELECTOR =
       new BridgeLoginSelector(
@@ -14,7 +14,7 @@ final class BridgeRuntime {
 
   private BridgeRuntime() {}
 
-  static BridgeLoginSelector loginSelector() {
+  public static BridgeLoginSelector loginSelector() {
     return LOGIN_SELECTOR;
   }
 

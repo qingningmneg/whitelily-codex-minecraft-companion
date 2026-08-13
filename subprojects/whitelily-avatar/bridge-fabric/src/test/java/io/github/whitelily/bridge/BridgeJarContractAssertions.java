@@ -20,7 +20,7 @@ import java.util.jar.JarFile;
 import java.util.stream.Collectors;
 
 final class BridgeJarContractAssertions {
-  private static final String EXPECTED_JAR = "whitelily-bridge-fabric-1.21.5-0.1.0.jar";
+  private static final String EXPECTED_JAR = "whitelily-bridge-fabric-1.21.5-0.1.1.jar";
   private static final List<String> ORDERED_ENTRIES =
       List.of(
           "META-INF/MANIFEST.MF",
@@ -47,20 +47,21 @@ final class BridgeJarContractAssertions {
           "io/github/whitelily/bridge/BridgeProofStore.class",
           "io/github/whitelily/bridge/BridgeRequest.class",
           "io/github/whitelily/bridge/BridgeRuntime.class",
-          "io/github/whitelily/bridge/ConnectionMixin.class",
           "io/github/whitelily/bridge/HandshakeProof.class",
           "io/github/whitelily/bridge/HandshakeProofSlot.class",
-          "io/github/whitelily/bridge/MinecraftServerMixin.class",
           "io/github/whitelily/bridge/PendingProfileApprovalSlot$Candidate.class",
           "io/github/whitelily/bridge/PendingProfileApprovalSlot.class",
-          "io/github/whitelily/bridge/PlayerListMixin.class",
-          "io/github/whitelily/bridge/ServerHandshakePacketListenerImplMixin.class",
-          "io/github/whitelily/bridge/ServerLoginPacketListenerImplMixin.class",
           "io/github/whitelily/bridge/WhiteLilyBridge.class",
           "io/github/whitelily/bridge/WhiteLilyBridgeClient.class",
           "io/github/whitelily/bridge/WindowsOwnedFile$Identity.class",
           "io/github/whitelily/bridge/WindowsOwnedFile.class",
           "io/github/whitelily/bridge/WindowsProofHandle.class",
+          "io/github/whitelily/bridge/mixin/",
+          "io/github/whitelily/bridge/mixin/ConnectionMixin.class",
+          "io/github/whitelily/bridge/mixin/MinecraftServerMixin.class",
+          "io/github/whitelily/bridge/mixin/PlayerListMixin.class",
+          "io/github/whitelily/bridge/mixin/ServerHandshakePacketListenerImplMixin.class",
+          "io/github/whitelily/bridge/mixin/ServerLoginPacketListenerImplMixin.class",
           "whitelily-bridge-fabric-refmap.json",
           "whitelily_bridge.mixins.json");
   private static final Set<String> EXACT_ENTRIES = Set.copyOf(ORDERED_ENTRIES);
@@ -110,7 +111,7 @@ final class BridgeJarContractAssertions {
           metadata.keySet());
       assertEquals(1, metadata.get("schemaVersion").getAsInt());
       assertEquals("whitelily_bridge", metadata.get("id").getAsString());
-      assertEquals("0.1.0", metadata.get("version").getAsString());
+      assertEquals("0.1.1", metadata.get("version").getAsString());
       assertEquals("WhiteLily Bridge", metadata.get("name").getAsString());
       assertEquals("client", metadata.get("environment").getAsString());
       JsonObject entrypoints = metadata.getAsJsonObject("entrypoints");
@@ -133,7 +134,7 @@ final class BridgeJarContractAssertions {
           Set.of("required", "package", "compatibilityLevel", "refmap", "client", "injectors"),
           mixins.keySet());
       assertTrue(mixins.get("required").getAsBoolean());
-      assertEquals("io.github.whitelily.bridge", mixins.get("package").getAsString());
+      assertEquals("io.github.whitelily.bridge.mixin", mixins.get("package").getAsString());
       assertEquals("JAVA_21", mixins.get("compatibilityLevel").getAsString());
       assertEquals("whitelily-bridge-fabric-refmap.json", mixins.get("refmap").getAsString());
       assertExactStrings(
@@ -154,76 +155,76 @@ final class BridgeJarContractAssertions {
       assertNotNull(mappings);
       assertEquals(
           Set.of(
-              "io/github/whitelily/bridge/MinecraftServerMixin",
-              "io/github/whitelily/bridge/ConnectionMixin",
-              "io/github/whitelily/bridge/PlayerListMixin",
-              "io/github/whitelily/bridge/ServerHandshakePacketListenerImplMixin",
-              "io/github/whitelily/bridge/ServerLoginPacketListenerImplMixin"),
+              "io/github/whitelily/bridge/mixin/MinecraftServerMixin",
+              "io/github/whitelily/bridge/mixin/ConnectionMixin",
+              "io/github/whitelily/bridge/mixin/PlayerListMixin",
+              "io/github/whitelily/bridge/mixin/ServerHandshakePacketListenerImplMixin",
+              "io/github/whitelily/bridge/mixin/ServerLoginPacketListenerImplMixin"),
           mappings.keySet());
       assertEquals(
           Set.of("disconnect(Lnet/minecraft/network/DisconnectionDetails;)V"),
-          mappings.getAsJsonObject("io/github/whitelily/bridge/ConnectionMixin").keySet());
+          mappings.getAsJsonObject("io/github/whitelily/bridge/mixin/ConnectionMixin").keySet());
       assertEquals(
           Set.of("stopServer()V"),
-          mappings.getAsJsonObject("io/github/whitelily/bridge/MinecraftServerMixin").keySet());
+          mappings.getAsJsonObject("io/github/whitelily/bridge/mixin/MinecraftServerMixin").keySet());
       assertEquals(
           "Lnet/minecraft/class_2535;method_60924(Lnet/minecraft/class_9812;)V",
           mapping(
               mappings,
-              "io/github/whitelily/bridge/ConnectionMixin",
+              "io/github/whitelily/bridge/mixin/ConnectionMixin",
               "disconnect(Lnet/minecraft/network/DisconnectionDetails;)V"),
           "connection disconnect refmap");
       assertEquals(
           Set.of(
               "placeNewPlayer(Lnet/minecraft/network/Connection;Lnet/minecraft/server/level/ServerPlayer;Lnet/minecraft/server/network/CommonListenerCookie;)V",
               "remove(Lnet/minecraft/server/level/ServerPlayer;)V"),
-          mappings.getAsJsonObject("io/github/whitelily/bridge/PlayerListMixin").keySet());
+          mappings.getAsJsonObject("io/github/whitelily/bridge/mixin/PlayerListMixin").keySet());
       assertEquals(
           Set.of(
               "handleIntention(Lnet/minecraft/network/protocol/handshake/ClientIntentionPacket;)V"),
           mappings
               .getAsJsonObject(
-                  "io/github/whitelily/bridge/ServerHandshakePacketListenerImplMixin")
+                  "io/github/whitelily/bridge/mixin/ServerHandshakePacketListenerImplMixin")
               .keySet());
       assertEquals(
           Set.of(
               "handleHello(Lnet/minecraft/network/protocol/login/ServerboundHelloPacket;)V",
               "Lnet/minecraft/server/network/ServerLoginPacketListenerImpl;requestedUsername:Ljava/lang/String;"),
           mappings
-              .getAsJsonObject("io/github/whitelily/bridge/ServerLoginPacketListenerImplMixin")
+              .getAsJsonObject("io/github/whitelily/bridge/mixin/ServerLoginPacketListenerImplMixin")
               .keySet());
       assertEquals(
           "Lnet/minecraft/class_3246;method_12576(Lnet/minecraft/class_2889;)V",
           mapping(
               mappings,
-              "io/github/whitelily/bridge/ServerHandshakePacketListenerImplMixin",
+              "io/github/whitelily/bridge/mixin/ServerHandshakePacketListenerImplMixin",
               "handleIntention(Lnet/minecraft/network/protocol/handshake/ClientIntentionPacket;)V"));
       assertEquals(
           "Lnet/minecraft/class_3248;method_12641(Lnet/minecraft/class_2915;)V",
           mapping(
               mappings,
-              "io/github/whitelily/bridge/ServerLoginPacketListenerImplMixin",
+              "io/github/whitelily/bridge/mixin/ServerLoginPacketListenerImplMixin",
               "handleHello(Lnet/minecraft/network/protocol/login/ServerboundHelloPacket;)V"));
       assertEquals(
           "Lnet/minecraft/class_3248;field_45028:Ljava/lang/String;",
           mapping(
               mappings,
-              "io/github/whitelily/bridge/ServerLoginPacketListenerImplMixin",
+              "io/github/whitelily/bridge/mixin/ServerLoginPacketListenerImplMixin",
               "Lnet/minecraft/server/network/ServerLoginPacketListenerImpl;requestedUsername:Ljava/lang/String;"));
       assertEquals(
           "Lnet/minecraft/server/MinecraftServer;method_3782()V",
-          mapping(mappings, "io/github/whitelily/bridge/MinecraftServerMixin", "stopServer()V"));
+          mapping(mappings, "io/github/whitelily/bridge/mixin/MinecraftServerMixin", "stopServer()V"));
       assertEquals(
           "Lnet/minecraft/class_3324;method_14570(Lnet/minecraft/class_2535;Lnet/minecraft/class_3222;Lnet/minecraft/class_8792;)V",
           mapping(
               mappings,
-              "io/github/whitelily/bridge/PlayerListMixin",
+              "io/github/whitelily/bridge/mixin/PlayerListMixin",
               "placeNewPlayer(Lnet/minecraft/network/Connection;Lnet/minecraft/server/level/ServerPlayer;Lnet/minecraft/server/network/CommonListenerCookie;)V"));
       assertEquals(
           "Lnet/minecraft/class_3324;method_14611(Lnet/minecraft/class_3222;)V",
           mapping(
               mappings,
-              "io/github/whitelily/bridge/PlayerListMixin",
+              "io/github/whitelily/bridge/mixin/PlayerListMixin",
               "remove(Lnet/minecraft/server/level/ServerPlayer;)V"));
       assertEquals(
           mappings,

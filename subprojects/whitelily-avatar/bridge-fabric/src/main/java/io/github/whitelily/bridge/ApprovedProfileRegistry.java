@@ -4,12 +4,12 @@ import java.util.UUID;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 
-final class ApprovedProfileRegistry {
+public final class ApprovedProfileRegistry {
   private static final AtomicReference<Approval> APPROVAL = new AtomicReference<>();
 
   private ApprovedProfileRegistry() {}
 
-  static boolean complete(
+  public static boolean complete(
       BridgeConnectionApprovalAccess connection,
       Object integratedServer,
       UUID profileId,
@@ -28,7 +28,7 @@ final class ApprovedProfileRegistry {
     return true;
   }
 
-  static void revoke(Object integratedServer, UUID profileId) {
+  public static void revoke(Object integratedServer, UUID profileId) {
     if (!WhiteLilyBridge.WHITE_LILY_OFFLINE_UUID.equals(profileId)) {
       return;
     }
@@ -38,7 +38,7 @@ final class ApprovedProfileRegistry {
     }
   }
 
-  static void clearServer(Object integratedServer) {
+  public static void clearServer(Object integratedServer) {
     Approval current = APPROVAL.get();
     if (current != null && current.server == integratedServer) {
       APPROVAL.compareAndSet(current, null);

@@ -3,7 +3,7 @@ package io.github.whitelily.bridge;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicReference;
 
-final class HandshakeProofSlot implements BridgeConnectionAccess {
+public final class HandshakeProofSlot implements BridgeConnectionAccess {
   private final AtomicReference<HandshakeProof> proof = new AtomicReference<>();
 
   @Override

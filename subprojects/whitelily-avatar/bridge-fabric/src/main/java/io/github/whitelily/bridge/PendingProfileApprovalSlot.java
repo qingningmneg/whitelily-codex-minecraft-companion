@@ -3,7 +3,7 @@ package io.github.whitelily.bridge;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicReference;
 
-final class PendingProfileApprovalSlot implements BridgeConnectionApprovalAccess {
+public final class PendingProfileApprovalSlot implements BridgeConnectionApprovalAccess {
   private final AtomicReference<Candidate> candidate = new AtomicReference<>();
 
   void mark(Object server, UUID profileId) {

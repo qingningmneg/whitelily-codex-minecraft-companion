@@ -1,6 +1,6 @@
 package io.github.whitelily.bridge;
 
-final class BridgeLoginSelector {
+public final class BridgeLoginSelector {
   private static final String HOST_PREFIX = "127.0.0.1\0WL1\0";
 
   private final BridgeProofStore proofStore;
@@ -9,7 +9,7 @@ final class BridgeLoginSelector {
     this.proofStore = proofStore;
   }
 
-  static boolean captureHandshake(
+  public static boolean captureHandshake(
       String hostname, int port, boolean loopbackRemote, BridgeConnectionAccess connection) {
     if (!WindowsOwnedFile.isWindows()
         || !loopbackRemote
@@ -30,7 +30,7 @@ final class BridgeLoginSelector {
     return true;
   }
 
-  BridgeLoginDecision select(
+  public BridgeLoginDecision select(
       BridgeConnectionAccess connection,
       boolean integratedServer,
       boolean loopbackRemote,

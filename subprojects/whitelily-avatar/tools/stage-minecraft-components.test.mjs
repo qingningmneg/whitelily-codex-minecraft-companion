@@ -29,7 +29,7 @@ const names = [
   "geckolib-fabric-1.21.5-5.1.0.jar",
   "minecraft-components-manifest.json",
   "whitelily-avatar-fabric-1.21.5-0.1.0.jar",
-  "whitelily-bridge-fabric-1.21.5-0.1.0.jar",
+  "whitelily-bridge-fabric-1.21.5-0.1.1.jar",
 ];
 
 function sha256(bytes) {

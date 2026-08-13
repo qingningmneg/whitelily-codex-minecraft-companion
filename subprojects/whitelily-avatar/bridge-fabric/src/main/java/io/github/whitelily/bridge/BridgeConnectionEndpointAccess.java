@@ -1,5 +1,5 @@
 package io.github.whitelily.bridge;
 
-interface BridgeConnectionEndpointAccess {
+public interface BridgeConnectionEndpointAccess {
   int whitelily$localPort();
 }

@@ -27,7 +27,7 @@ final class ComponentPackJarContractTest {
           .toAbsolutePath()
           .normalize();
   private static final Path BRIDGE =
-      STAGING.resolve("whitelily-bridge-fabric-1.21.5-0.1.0.jar");
+      STAGING.resolve("whitelily-bridge-fabric-1.21.5-0.1.1.jar");
   private static final Path AVATAR =
       STAGING.resolve("whitelily-avatar-fabric-1.21.5-0.1.0.jar");
   private static final Path FABRIC_API =
@@ -150,7 +150,7 @@ final class ComponentPackJarContractTest {
         BRIDGE,
         new ComponentPackPolicy.ExpectedMod(
             "whitelily_bridge",
-            "0.1.0",
+            "0.1.1",
             "client",
             Map.of("minecraft", "=1.21.5", "fabricloader", ">=0.16.14"),
             Set.of(),

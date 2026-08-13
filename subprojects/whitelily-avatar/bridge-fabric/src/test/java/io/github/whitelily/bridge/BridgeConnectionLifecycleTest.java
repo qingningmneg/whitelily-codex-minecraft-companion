@@ -2,6 +2,7 @@ package io.github.whitelily.bridge;
 
 import static org.junit.jupiter.api.Assertions.assertFalse;
 
+import io.github.whitelily.bridge.mixin.ConnectionMixin;
 import java.lang.reflect.Method;
 import java.util.UUID;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;

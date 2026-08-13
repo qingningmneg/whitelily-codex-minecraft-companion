@@ -52,7 +52,7 @@ class BridgePresencePublisherTest {
     assertEquals(42_001, document.get("pid").getAsLong());
     assertEquals(1_725_000_000_123L, document.get("processStartEpochMs").getAsLong());
     assertEquals("1.21.5", document.get("minecraftVersion").getAsString());
-    assertEquals("0.1.0", document.get("bridgeVersion").getAsString());
+    assertEquals("0.1.1", document.get("bridgeVersion").getAsString());
     assertEquals(1_725_000_005_678L, document.get("writtenAt").getAsLong());
 
     opened.orElseThrow().close();

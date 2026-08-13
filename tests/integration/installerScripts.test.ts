@@ -424,7 +424,7 @@ async function createInstalledComponentFixture(): Promise<{
     "GeckoLib-LICENSE.txt",
     "minecraft-components-manifest.json",
     "whitelily-avatar-fabric-1.21.5-0.1.0.jar",
-    "whitelily-bridge-fabric-1.21.5-0.1.0.jar",
+    "whitelily-bridge-fabric-1.21.5-0.1.1.jar",
     "WhiteLily-LICENSE.txt",
     "WhiteLily-NOTICE.txt",
   ];
@@ -521,7 +521,7 @@ async function createInstallerFixture(
     "minecraft-components/GeckoLib-LICENSE.txt",
     "minecraft-components/minecraft-components-manifest.json",
     "minecraft-components/whitelily-avatar-fabric-1.21.5-0.1.0.jar",
-    "minecraft-components/whitelily-bridge-fabric-1.21.5-0.1.0.jar",
+    "minecraft-components/whitelily-bridge-fabric-1.21.5-0.1.1.jar",
     "minecraft-components/WhiteLily-LICENSE.txt",
     "minecraft-components/WhiteLily-NOTICE.txt",
   ];

@@ -1,5 +1,8 @@
-package io.github.whitelily.bridge;
+package io.github.whitelily.bridge.mixin;
 
+import io.github.whitelily.bridge.BridgeConnectionAccess;
+import io.github.whitelily.bridge.BridgeLoginSelector;
+import io.github.whitelily.bridge.BridgeNetworkAddresses;
 import net.minecraft.network.Connection;
 import net.minecraft.network.protocol.handshake.ClientIntent;
 import net.minecraft.network.protocol.handshake.ClientIntentionPacket;
@@ -12,7 +15,7 @@ import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 @Mixin(ServerHandshakePacketListenerImpl.class)
-abstract class ServerHandshakePacketListenerImplMixin {
+public abstract class ServerHandshakePacketListenerImplMixin {
   @Shadow @Final private Connection connection;
 
   @Inject(

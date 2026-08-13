@@ -1,5 +1,12 @@
-package io.github.whitelily.bridge;
+package io.github.whitelily.bridge.mixin;
 
+import io.github.whitelily.bridge.BridgeConnectionAccess;
+import io.github.whitelily.bridge.BridgeConnectionApprovalAccess;
+import io.github.whitelily.bridge.BridgeConnectionEndpointAccess;
+import io.github.whitelily.bridge.BridgeConnectionLifecycle;
+import io.github.whitelily.bridge.HandshakeProof;
+import io.github.whitelily.bridge.HandshakeProofSlot;
+import io.github.whitelily.bridge.PendingProfileApprovalSlot;
 import io.netty.channel.Channel;
 import java.net.InetSocketAddress;
 import java.util.Optional;
@@ -12,7 +19,7 @@ import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 @Mixin(Connection.class)
-abstract class ConnectionMixin
+public abstract class ConnectionMixin
     implements BridgeConnectionAccess,
         BridgeConnectionEndpointAccess,
         BridgeConnectionApprovalAccess {

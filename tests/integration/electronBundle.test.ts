@@ -206,8 +206,8 @@ const minecraftComponentFiles = [
   {
     source: "build/minecraft-components/minecraft-components-manifest.json",
     target: "minecraft-components/minecraft-components-manifest.json",
-    bytes: 1_585,
-    sha256: "91a09da35550b81e0722829e559a50e69deada5e55035608cdb667f6b5fd7985",
+    bytes: 1_784,
+    sha256: "bcd528825f95d8062865bc77d1979d9a07907b92337cfccae46c9140f453cff1",
   },
   {
     source: "build/minecraft-components/whitelily-avatar-fabric-1.21.5-0.1.0.jar",
@@ -216,10 +216,10 @@ const minecraftComponentFiles = [
     sha256: "fff00f66e4beab2eff1e51f253608b198f43aa0a12443fbe07f7f3fd48278872",
   },
   {
-    source: "build/minecraft-components/whitelily-bridge-fabric-1.21.5-0.1.0.jar",
-    target: "minecraft-components/whitelily-bridge-fabric-1.21.5-0.1.0.jar",
-    bytes: 51_837,
-    sha256: "380721d28236f5ad8206fd8d69af1e5629d741e9d38ec27c26c052c95266b6ce",
+    source: "build/minecraft-components/whitelily-bridge-fabric-1.21.5-0.1.1.jar",
+    target: "minecraft-components/whitelily-bridge-fabric-1.21.5-0.1.1.jar",
+    bytes: 52_087,
+    sha256: "8a6e00d47a28799798ffa5d561156ea7ceb0f697a0beb2cc7c55b34f6f81b514",
   },
   {
     source: "build/minecraft-components/WhiteLily-LICENSE.txt",
@@ -707,7 +707,7 @@ describe("deterministic Electron resources", () => {
       label: "tampered bytes",
       mutate: async (fixture: Awaited<ReturnType<typeof createComponentPackVerifierFixture>>) => {
         await writeFile(
-          join(fixture.componentRoot, "whitelily-bridge-fabric-1.21.5-0.1.0.jar"),
+          join(fixture.componentRoot, "whitelily-bridge-fabric-1.21.5-0.1.1.jar"),
           "tampered",
         );
       },
@@ -763,7 +763,7 @@ describe("deterministic Electron resources", () => {
     const fixture = await createComponentPackVerifierFixture();
     try {
       await runComponentPackVerifier(fixture.repository, fixture.manifestPath);
-      const target = "minecraft-components/whitelily-bridge-fabric-1.21.5-0.1.0.jar";
+      const target = "minecraft-components/whitelily-bridge-fabric-1.21.5-0.1.1.jar";
       const payload = Buffer.from("coordinated replacement", "utf8");
       await writeFile(join(fixture.repository, "build", target), payload);
       const manifest = JSON.parse(await readFile(fixture.manifestPath, "utf8")) as {

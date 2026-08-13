@@ -2,7 +2,7 @@ package io.github.whitelily.bridge;
 
 import java.util.UUID;
 
-interface BridgeConnectionApprovalAccess {
+public interface BridgeConnectionApprovalAccess {
   void whitelily$markPendingApproval(Object server, UUID profileId);
 
   boolean whitelily$takePendingApproval(Object server, UUID profileId);

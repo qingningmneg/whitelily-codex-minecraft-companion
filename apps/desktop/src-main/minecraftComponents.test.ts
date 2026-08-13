@@ -31,8 +31,8 @@ import {
 const PROCESS_STARTED_AT = 1_785_196_800_123;
 const BEFORE_PROCESS_START = new Date(PROCESS_STARTED_AT - 10_000);
 const AFTER_PROCESS_START = new Date(PROCESS_STARTED_AT + 10_000);
-const BRIDGE_FILE = "whitelily-bridge-fabric-1.21.5-0.1.0.jar";
-const PRIOR_BRIDGE_FILE = "whitelily-bridge-fabric-1.21.5-0.0.9.jar";
+const BRIDGE_FILE = "whitelily-bridge-fabric-1.21.5-0.1.1.jar";
+const PRIOR_BRIDGE_FILE = "whitelily-bridge-fabric-1.21.5-0.1.0.jar";
 const AVATAR_FILE = "whitelily-avatar-fabric-1.21.5-0.1.0.jar";
 const FABRIC_API_FILE = "fabric-api-0.128.2+1.21.5.jar";
 const GECKOLIB_FILE = "geckolib-fabric-1.21.5-5.1.0.jar";
@@ -87,8 +87,8 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
   await mkdir(mods, { recursive: true });
   await mkdir(resources);
   await mkdir(presence);
-  const bridge = options.bridgeBytes ?? jar("whitelily_bridge", "0.1.0");
-  const priorBridge = jar("whitelily_bridge", "0.0.9");
+  const bridge = options.bridgeBytes ?? jar("whitelily_bridge", "0.1.1");
+  const priorBridge = jar("whitelily_bridge", "0.1.0");
   const avatar = jar("whitelily_avatar", "0.1.0");
   const fabricApi = jar("fabric-api", "0.128.2+1.21.5");
   const geckoLib = jar("geckolib", "5.1.0");
@@ -115,14 +115,14 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
         bytes: bridge.byteLength,
         sha256: sha256(bridge),
         modId: "whitelily_bridge",
-        version: "0.1.0",
+        version: "0.1.1",
         prior: [
           {
             fileName: PRIOR_BRIDGE_FILE,
             bytes: priorBridge.byteLength,
             sha256: sha256(priorBridge),
             modId: "whitelily_bridge",
-            version: "0.0.9",
+            version: "0.1.0",
           },
         ],
       },
@@ -262,7 +262,7 @@ async function writePresence(
       pid: 4200,
       processStartEpochMs: PROCESS_STARTED_AT,
       minecraftVersion: "1.21.5",
-      bridgeVersion: "0.1.0",
+      bridgeVersion: "0.1.1",
       writtenAt: PROCESS_STARTED_AT + 100,
       ...patch,
     })}\n`,

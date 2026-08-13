@@ -9,6 +9,7 @@ import java.util.ArrayList;
 import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
+import io.github.whitelily.bridge.mixin.ConnectionMixin;
 import net.minecraft.network.Connection;
 import net.minecraft.server.network.ServerCommonPacketListenerImpl;
 import net.minecraft.server.network.ServerConfigurationPacketListenerImpl;
@@ -151,7 +152,7 @@ class TerminalLifecycleBytecodeContractTest {
     String callback = "whitelily$clearBridgeConnectionState";
     try (InputStream bytes =
         ConnectionMixin.class.getResourceAsStream(
-            "/io/github/whitelily/bridge/ConnectionMixin.class")) {
+            "/io/github/whitelily/bridge/mixin/ConnectionMixin.class")) {
       assertNotNull(bytes);
       String[] target = {null};
       String[] at = {null};

@@ -1,6 +1,6 @@
 package io.github.whitelily.bridge;
 
-final class HandshakeProof {
+public final class HandshakeProof {
   private final String nonce;
   private final int port;
 
