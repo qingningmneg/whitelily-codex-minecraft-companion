@@ -69,6 +69,7 @@ interface FixtureOptions {
   readonly gameDirOverride?: (fixture: Omit<Fixture, "manager" | "candidateId">) => string;
   readonly loaderId?: string;
   readonly loaderVersion?: string;
+  readonly loaderBytes?: Buffer;
   readonly manifestPatch?: (
     manifest: MinecraftComponentResourceManifest,
   ) => MinecraftComponentResourceManifest;
@@ -92,7 +93,7 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
   const fabricApi = jar("fabric-api", "0.128.2+1.21.5");
   const geckoLib = jar("geckolib", "5.1.0");
   const loaderVersion = options.loaderVersion ?? "0.16.14";
-  const loader = jar(options.loaderId ?? "fabricloader", loaderVersion);
+  const loader = options.loaderBytes ?? jar(options.loaderId ?? "fabricloader", loaderVersion);
   const loaderDirectory = join(root, "libraries");
   const loaderPath = join(
     loaderDirectory,
@@ -270,6 +271,20 @@ async function writePresence(
 }
 
 describe("Minecraft component manager", () => {
+  it("accepts standard signed ZIP data descriptors used by the official Fabric Loader", async () => {
+    const fixture = await createFixture({
+      loaderBytes: dataDescriptorJar("fabricloader", "0.16.14"),
+    });
+    try {
+      await expect(fixture.manager.status(fixture.candidateId)).resolves.toMatchObject({
+        state: "bridge_not_installed",
+        bridgeInstalled: false,
+      });
+    } finally {
+      await fixture.cleanup();
+    }
+  });
+
   it("installs fixed manifest bytes and reports a restart for the running Java instance", async () => {
     const fixture = await createFixture();
     try {
@@ -1293,6 +1308,69 @@ function jar(modId: string, version: string): Buffer {
     ],
     ["fixture.txt", Buffer.from(`${modId}:${version}`, "utf8")],
   ]);
+}
+
+function dataDescriptorJar(modId: string, version: string): Buffer {
+  return zipWithSignedDataDescriptors([
+    [
+      "fabric.mod.json",
+      Buffer.from(
+        JSON.stringify({
+          schemaVersion: 1,
+          id: modId,
+          version,
+          environment: "client",
+        }),
+        "utf8",
+      ),
+    ],
+  ]);
+}
+
+function zipWithSignedDataDescriptors(entries: readonly (readonly [string, Buffer])[]): Buffer {
+  const locals: Buffer[] = [];
+  const centrals: Buffer[] = [];
+  let offset = 0;
+  for (const [name, bytes] of entries) {
+    const encodedName = Buffer.from(name, "utf8");
+    const compressed = deflateRawSync(bytes);
+    const crc = crc32(bytes);
+    const local = Buffer.alloc(30);
+    local.writeUInt32LE(0x04034b50, 0);
+    local.writeUInt16LE(20, 4);
+    local.writeUInt16LE(0x0808, 6);
+    local.writeUInt16LE(8, 8);
+    local.writeUInt16LE(encodedName.byteLength, 26);
+    const descriptor = Buffer.alloc(16);
+    descriptor.writeUInt32LE(0x08074b50, 0);
+    descriptor.writeUInt32LE(crc, 4);
+    descriptor.writeUInt32LE(compressed.byteLength, 8);
+    descriptor.writeUInt32LE(bytes.byteLength, 12);
+    locals.push(local, encodedName, compressed, descriptor);
+
+    const central = Buffer.alloc(46);
+    central.writeUInt32LE(0x02014b50, 0);
+    central.writeUInt16LE(20, 4);
+    central.writeUInt16LE(20, 6);
+    central.writeUInt16LE(0x0808, 8);
+    central.writeUInt16LE(8, 10);
+    central.writeUInt32LE(crc, 16);
+    central.writeUInt32LE(compressed.byteLength, 20);
+    central.writeUInt32LE(bytes.byteLength, 24);
+    central.writeUInt16LE(encodedName.byteLength, 28);
+    central.writeUInt32LE(offset, 42);
+    centrals.push(central, encodedName);
+    offset +=
+      local.byteLength + encodedName.byteLength + compressed.byteLength + descriptor.byteLength;
+  }
+  const centralBytes = Buffer.concat(centrals);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(entries.length, 8);
+  end.writeUInt16LE(entries.length, 10);
+  end.writeUInt32LE(centralBytes.byteLength, 12);
+  end.writeUInt32LE(offset, 16);
+  return Buffer.concat([...locals, centralBytes, end]);
 }
 
 function malformedJarCases(): readonly (readonly [string, Buffer])[] {

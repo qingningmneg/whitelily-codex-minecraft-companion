@@ -176,7 +176,7 @@ export function readFabricMetadata(bytes: Buffer): Readonly<{ id: string; versio
     if (name !== "fabric.mod.json") continue;
     if (
       metadata !== undefined ||
-      (flags & ~0x0800) !== 0 ||
+      (flags & ~(0x0800 | 0x0008)) !== 0 ||
       (method !== 0 && method !== 8) ||
       compressedSize > MAX_FABRIC_METADATA_BYTES ||
       uncompressedSize > MAX_FABRIC_METADATA_BYTES
@@ -197,19 +197,35 @@ export function readFabricMetadata(bytes: Buffer): Readonly<{ id: string; versio
     const localName = strictUtf8(
       bytes.subarray(localOffset + 30, localOffset + 30 + localNameLength),
     );
+    const usesDataDescriptor = (flags & 0x0008) !== 0;
     if (
       localName !== name ||
       localFlags !== flags ||
       localMethod !== method ||
-      localCrc !== crc ||
-      localCompressedSize !== compressedSize ||
-      localUncompressedSize !== uncompressedSize
+      (usesDataDescriptor
+        ? localCrc !== 0 || localCompressedSize !== 0 || localUncompressedSize !== 0
+        : localCrc !== crc ||
+          localCompressedSize !== compressedSize ||
+          localUncompressedSize !== uncompressedSize)
     ) {
       throw new Error("invalid");
     }
     const dataOffset = localOffset + 30 + localNameLength + localExtraLength;
     if (dataOffset + compressedSize > centralOffset) throw new Error("invalid");
     assertBufferRange(bytes, dataOffset, compressedSize);
+    if (usesDataDescriptor) {
+      const descriptorOffset = dataOffset + compressedSize;
+      assertBufferRange(bytes, descriptorOffset, 16);
+      if (
+        descriptorOffset + 16 > centralOffset ||
+        bytes.readUInt32LE(descriptorOffset) !== 0x08074b50 ||
+        bytes.readUInt32LE(descriptorOffset + 4) !== crc ||
+        bytes.readUInt32LE(descriptorOffset + 8) !== compressedSize ||
+        bytes.readUInt32LE(descriptorOffset + 12) !== uncompressedSize
+      ) {
+        throw new Error("invalid");
+      }
+    }
     const compressed = bytes.subarray(dataOffset, dataOffset + compressedSize);
     metadata =
       method === 0
