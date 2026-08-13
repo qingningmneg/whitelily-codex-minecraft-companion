@@ -31,7 +31,7 @@ final class ComponentPackStagingTest {
           "geckolib-fabric-1.21.5-5.1.0.jar",
           "minecraft-components-manifest.json",
           "whitelily-avatar-fabric-1.21.5-0.1.0.jar",
-          "whitelily-bridge-fabric-1.21.5-0.1.1.jar");
+          "whitelily-bridge-fabric-1.21.5-0.1.2.jar");
 
   @Test
   void stagesOnlyTheFixedPortableComponentAndLicenseFiles() throws Exception {
@@ -58,7 +58,7 @@ final class ComponentPackStagingTest {
     assertEquals(4, manifest.getAsJsonArray("artifacts").size());
     assertEquals(4, manifest.getAsJsonArray("licenses").size());
     assertArtifact(
-        manifest, 0, "bridge", "whitelily-bridge-fabric-1.21.5-0.1.1.jar", "whitelily_bridge", "0.1.1");
+        manifest, 0, "bridge", "whitelily-bridge-fabric-1.21.5-0.1.2.jar", "whitelily_bridge", "0.1.2");
     assertArtifact(
         manifest, 1, "avatar", "whitelily-avatar-fabric-1.21.5-0.1.0.jar", "whitelily_avatar", "0.1.0");
     assertArtifact(
@@ -134,19 +134,25 @@ final class ComponentPackStagingTest {
             .append(entry.get("version").getAsString())
             .append("\", \"prior\": ");
         if (entry.get("component").getAsString().equals("bridge")) {
-          JsonObject prior = entry.getAsJsonArray("prior").get(0).getAsJsonObject();
-          result
-              .append("[{\"fileName\": \"")
-              .append(prior.get("fileName").getAsString())
-              .append("\", \"bytes\": ")
-              .append(prior.get("bytes").getAsLong())
-              .append(", \"sha256\": \"")
-              .append(prior.get("sha256").getAsString())
-              .append("\", \"modId\": \"")
-              .append(prior.get("modId").getAsString())
-              .append("\", \"version\": \"")
-              .append(prior.get("version").getAsString())
-              .append("\"}]");
+          result.append('[');
+          JsonArray priorEntries = entry.getAsJsonArray("prior");
+          for (int priorIndex = 0; priorIndex < priorEntries.size(); priorIndex++) {
+            JsonObject prior = priorEntries.get(priorIndex).getAsJsonObject();
+            result
+                .append("{\"fileName\": \"")
+                .append(prior.get("fileName").getAsString())
+                .append("\", \"bytes\": ")
+                .append(prior.get("bytes").getAsLong())
+                .append(", \"sha256\": \"")
+                .append(prior.get("sha256").getAsString())
+                .append("\", \"modId\": \"")
+                .append(prior.get("modId").getAsString())
+                .append("\", \"version\": \"")
+                .append(prior.get("version").getAsString())
+                .append("\"}");
+            if (priorIndex + 1 < priorEntries.size()) result.append(',');
+          }
+          result.append(']');
         } else {
           result.append("[]");
         }
@@ -176,15 +182,24 @@ final class ComponentPackStagingTest {
     assertEquals(modId, artifact.get("modId").getAsString());
     assertEquals(version, artifact.get("version").getAsString());
     if (component.equals("bridge")) {
-      JsonObject prior = artifact.getAsJsonArray("prior").get(0).getAsJsonObject();
-      assertEquals(1, artifact.getAsJsonArray("prior").size());
-      assertEquals("whitelily-bridge-fabric-1.21.5-0.1.0.jar", prior.get("fileName").getAsString());
-      assertEquals(51_837, prior.get("bytes").getAsLong());
+      JsonArray priorEntries = artifact.getAsJsonArray("prior");
+      assertEquals(2, priorEntries.size());
+      JsonObject prior = priorEntries.get(0).getAsJsonObject();
+      assertEquals("whitelily-bridge-fabric-1.21.5-0.1.1.jar", prior.get("fileName").getAsString());
+      assertEquals(52_087, prior.get("bytes").getAsLong());
       assertEquals(
-          "380721d28236f5ad8206fd8d69af1e5629d741e9d38ec27c26c052c95266b6ce",
+          "8a6e00d47a28799798ffa5d561156ea7ceb0f697a0beb2cc7c55b34f6f81b514",
           prior.get("sha256").getAsString());
       assertEquals("whitelily_bridge", prior.get("modId").getAsString());
-      assertEquals("0.1.0", prior.get("version").getAsString());
+      assertEquals("0.1.1", prior.get("version").getAsString());
+      JsonObject legacy = priorEntries.get(1).getAsJsonObject();
+      assertEquals("whitelily-bridge-fabric-1.21.5-0.1.0.jar", legacy.get("fileName").getAsString());
+      assertEquals(51_837, legacy.get("bytes").getAsLong());
+      assertEquals(
+          "380721d28236f5ad8206fd8d69af1e5629d741e9d38ec27c26c052c95266b6ce",
+          legacy.get("sha256").getAsString());
+      assertEquals("whitelily_bridge", legacy.get("modId").getAsString());
+      assertEquals("0.1.0", legacy.get("version").getAsString());
     } else {
       assertEquals(0, artifact.getAsJsonArray("prior").size());
     }

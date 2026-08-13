@@ -25,6 +25,7 @@ import type { ConfirmedWorldBinding } from "../../../src/world/worldProfileStore
 import type { OwnerIdentitySnapshot } from "../../../src/identity/ownerIdentity.js";
 
 const REQUEST_TIMEOUT_MS = 10_000;
+const START_RUNTIME_TIMEOUT_MS = 120_000;
 const EMERGENCY_TIMEOUT_MS = 1_500;
 const SHUTDOWN_EXIT_TIMEOUT_MS = 3_500;
 const FORCE_TERMINATION_CONFIRM_TIMEOUT_MS = 1_000;
@@ -173,6 +174,15 @@ export class ChildSupervisor {
     }
     if (command.kind === "emergency_stop") {
       return this.emergencyStop() as Promise<DesktopCommandResult<C>>;
+    }
+    if (command.kind === "start_runtime") {
+      return this.#sendRequest(command, START_RUNTIME_TIMEOUT_MS, (child) => {
+        this.#quarantineChild(
+          child,
+          new Error("WhiteLily child runtime start acknowledgement timed out"),
+          true,
+        );
+      }) as Promise<DesktopCommandResult<C>>;
     }
     return this.#sendRequest(command, REQUEST_TIMEOUT_MS);
   }

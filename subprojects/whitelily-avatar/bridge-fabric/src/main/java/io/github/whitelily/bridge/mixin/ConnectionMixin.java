@@ -58,6 +58,11 @@ public abstract class ConnectionMixin
   }
 
   @Override
+  public boolean whitelily$hasPendingApproval(Object server, java.util.UUID profileId) {
+    return whitelily$pendingApproval.whitelily$hasPendingApproval(server, profileId);
+  }
+
+  @Override
   public boolean whitelily$takePendingApproval(Object server, java.util.UUID profileId) {
     return whitelily$pendingApproval.whitelily$takePendingApproval(server, profileId);
   }

@@ -1009,6 +1009,46 @@ describe("ChildSupervisor", () => {
     });
   });
 
+  it("allows start_runtime to finish after the ordinary ten-second deadline", async () => {
+    vi.useFakeTimers();
+    const { children, supervisor } = createHarness();
+    supervisor.start();
+
+    const outcome = caught(supervisor.request({ kind: "start_runtime" }));
+    const request = children[0]!.requests()[0]!;
+    await vi.advanceTimersByTimeAsync(10_001);
+
+    children[0]!.respond(
+      successResponse(request.id, runtimeSnapshot(idleSnapshot.revision, "running")),
+    );
+
+    await expect(outcome).resolves.toMatchObject({ lifecycle: "running" });
+    expect(children[0]!.killCalls).toBe(0);
+  });
+
+  it("quarantines an unacknowledged start_runtime at two minutes", async () => {
+    vi.useFakeTimers();
+    const { children, supervisor } = createHarness();
+    supervisor.start();
+
+    const outcome = caught(supervisor.request({ kind: "start_runtime" }));
+    let settled = false;
+    void outcome.then(() => {
+      settled = true;
+    });
+
+    await vi.advanceTimersByTimeAsync(119_999);
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(outcome).resolves.toMatchObject({
+      message: expect.stringContaining("timed out after 120000ms"),
+    });
+    expect(children[0]!.killCalls).toBe(1);
+    await expect(supervisor.request({ kind: "get_status" })).rejects.toThrow("quarantined");
+  });
+
   it.each([
     {
       command: {

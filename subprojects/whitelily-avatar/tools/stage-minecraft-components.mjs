@@ -756,7 +756,8 @@ export async function stageComponentPack(destinationInput, specification, hooks 
     const previousNames = previousDescriptors.map((file) => file.name).sort();
     if (
       previousDescriptors.length !== 9 ||
-      previousNames.some((name, index) => name !== expectedNames[index]) ||
+      new Set(previousNames).size !== previousNames.length ||
+      previousNames.some((name) => !validName(name)) ||
       previousDescriptors.some(
         (file) =>
           !Number.isSafeInteger(file.bytes) ||
@@ -785,7 +786,7 @@ export async function stageComponentPack(destinationInput, specification, hooks 
     await recoverCleanupJournals(parent, base, parentIdentity);
     await assertDirectoryIdentity(parent, parentIdentity);
     if (await pathExists(destination)) {
-      previous = await inspectExactPack(destination, expectedNames, acceptedPrevious);
+      previous = await inspectExactPack(destination, previousNames, acceptedPrevious);
     }
     await assertDirectoryIdentity(parent, parentIdentity);
     created = await createCandidate(candidate, prepared, hooks);
@@ -807,11 +808,11 @@ export async function stageComponentPack(destinationInput, specification, hooks 
       );
       await boundary(hooks, "beforePublishBackup");
       await assertDirectoryIdentity(parent, parentIdentity);
-      await assertSnapshot(destination, previous, expectedNames);
+      await assertSnapshot(destination, previous, previousNames);
       await rename(destination, backup);
       backupPublished = true;
       await assertDirectoryIdentity(parent, parentIdentity);
-      await assertSnapshot(backup, previous, expectedNames);
+      await assertSnapshot(backup, previous, previousNames);
       await boundary(hooks, "afterPublishBackup");
     }
     await boundary(hooks, "beforePublishCandidate");

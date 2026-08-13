@@ -404,6 +404,11 @@ class ProductionMixinCurrentServerTest {
     }
 
     @Override
+    public boolean whitelily$hasPendingApproval(Object server, UUID profileId) {
+      return approval.whitelily$hasPendingApproval(server, profileId);
+    }
+
+    @Override
     public boolean whitelily$takePendingApproval(Object server, UUID profileId) {
       return approval.whitelily$takePendingApproval(server, profileId);
     }

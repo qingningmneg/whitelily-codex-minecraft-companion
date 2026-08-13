@@ -838,8 +838,11 @@ export class DesktopChildServer {
             current.snapshot().lifecycle === "running";
           let selection = this.#runtimeSelection;
           if (!alreadyRunning) {
+            let connection = this.#acceptedConnectionAuthority
+              ? this.#consumeConnectionAuthority(interruptGeneration)
+              : undefined;
             selection = await this.#models.resolveRuntimeSelection();
-            const connection = this.#consumeConnectionAuthority(interruptGeneration);
+            connection ??= this.#consumeConnectionAuthority(interruptGeneration);
             if (!this.#runtime || this.#needsFreshRuntime) {
               await this.#replaceRuntime(
                 interruptGeneration,
@@ -1531,7 +1534,8 @@ export class DesktopChildServer {
       this.#authorityContained &&
       !runtime &&
       !replacement &&
-      !this.#acceptedConnectionAuthority
+      !this.#acceptedConnectionAuthority &&
+      !this.#activeRuntimeConnection
     ) {
       this.#needsFreshRuntime = true;
       this.#stopModelValidation();

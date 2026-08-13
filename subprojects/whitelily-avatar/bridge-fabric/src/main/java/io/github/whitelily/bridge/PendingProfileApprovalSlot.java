@@ -18,6 +18,16 @@ public final class PendingProfileApprovalSlot implements BridgeConnectionApprova
   }
 
   @Override
+  public boolean whitelily$hasPendingApproval(Object server, UUID profileId) {
+    Candidate pending = candidate.get();
+    return server != null
+        && profileId != null
+        && pending != null
+        && pending.server == server
+        && pending.profileId.equals(profileId);
+  }
+
+  @Override
   public boolean whitelily$takePendingApproval(Object server, UUID profileId) {
     Candidate pending = candidate.getAndSet(null);
     return pending != null && pending.server == server && pending.profileId.equals(profileId);

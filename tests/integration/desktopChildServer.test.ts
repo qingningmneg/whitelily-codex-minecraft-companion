@@ -5454,6 +5454,54 @@ describe("DesktopChildServer", () => {
     expect(createRuntime).not.toHaveBeenCalled();
   });
 
+  it("keeps a connection accepted at start valid while cold model resolution finishes", async () => {
+    let now = 1_000;
+    const connections: unknown[] = [];
+    const harness = createHarness({
+      lazyRuntime: true,
+      now: () => now,
+      models: {
+        resolveRuntimeSelection: async () => {
+          now = 11_000;
+          return { modelId: "gpt-5.6-terra", reasoningEffort: "medium" };
+        },
+      },
+      createRuntime: async (connection) => {
+        connections.push(connection);
+        return new RuntimeFacade({
+          lifecycle: {
+            start: async () => undefined,
+            stop: async () => undefined,
+          },
+        });
+      },
+    });
+    harness.send(
+      commandRequest("cold-start-confirm", {
+        kind: "set_confirmed_connection",
+        proof: {
+          nonce: "proof_nonce_coldstart1",
+          port: 51_321,
+          issuedAt: 1_000,
+          expiresAt: 11_000,
+        },
+      }),
+    );
+    await expect(harness.nextResponse()).resolves.toMatchObject({
+      id: "cold-start-confirm",
+      ok: true,
+    });
+
+    harness.send(request("cold-start-runtime", "start_runtime"));
+
+    await expect(harness.nextResponse()).resolves.toMatchObject({
+      id: "cold-start-runtime",
+      ok: true,
+      result: { lifecycle: "running" },
+    });
+    expect(connections).toEqual([{ host: "127.0.0.1", port: 51_321 }]);
+  });
+
   it("requires fresh confirmation after normal and emergency stops", async () => {
     let now = 1_000;
     const harness = createHarness({

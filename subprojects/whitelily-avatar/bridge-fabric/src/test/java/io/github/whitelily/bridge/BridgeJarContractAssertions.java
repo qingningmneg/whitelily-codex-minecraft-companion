@@ -20,7 +20,7 @@ import java.util.jar.JarFile;
 import java.util.stream.Collectors;
 
 final class BridgeJarContractAssertions {
-  private static final String EXPECTED_JAR = "whitelily-bridge-fabric-1.21.5-0.1.1.jar";
+  private static final String EXPECTED_JAR = "whitelily-bridge-fabric-1.21.5-0.1.2.jar";
   private static final List<String> ORDERED_ENTRIES =
       List.of(
           "META-INF/MANIFEST.MF",
@@ -60,6 +60,8 @@ final class BridgeJarContractAssertions {
           "io/github/whitelily/bridge/mixin/ConnectionMixin.class",
           "io/github/whitelily/bridge/mixin/MinecraftServerMixin.class",
           "io/github/whitelily/bridge/mixin/PlayerListMixin.class",
+          "io/github/whitelily/bridge/mixin/RegistrySyncManagerMixin.class",
+          "io/github/whitelily/bridge/mixin/ServerCommonPacketListenerImplAccessor.class",
           "io/github/whitelily/bridge/mixin/ServerHandshakePacketListenerImplMixin.class",
           "io/github/whitelily/bridge/mixin/ServerLoginPacketListenerImplMixin.class",
           "whitelily-bridge-fabric-refmap.json",
@@ -111,7 +113,7 @@ final class BridgeJarContractAssertions {
           metadata.keySet());
       assertEquals(1, metadata.get("schemaVersion").getAsInt());
       assertEquals("whitelily_bridge", metadata.get("id").getAsString());
-      assertEquals("0.1.1", metadata.get("version").getAsString());
+      assertEquals("0.1.2", metadata.get("version").getAsString());
       assertEquals("WhiteLily Bridge", metadata.get("name").getAsString());
       assertEquals("client", metadata.get("environment").getAsString());
       JsonObject entrypoints = metadata.getAsJsonObject("entrypoints");
@@ -141,8 +143,10 @@ final class BridgeJarContractAssertions {
           mixins.getAsJsonArray("client"),
           Set.of(
               "ConnectionMixin",
+              "RegistrySyncManagerMixin",
               "ServerHandshakePacketListenerImplMixin",
               "ServerLoginPacketListenerImplMixin",
+              "ServerCommonPacketListenerImplAccessor",
               "MinecraftServerMixin",
               "PlayerListMixin"));
       JsonObject injectors = mixins.getAsJsonObject("injectors");
@@ -158,12 +162,19 @@ final class BridgeJarContractAssertions {
               "io/github/whitelily/bridge/mixin/MinecraftServerMixin",
               "io/github/whitelily/bridge/mixin/ConnectionMixin",
               "io/github/whitelily/bridge/mixin/PlayerListMixin",
+              "io/github/whitelily/bridge/mixin/ServerCommonPacketListenerImplAccessor",
               "io/github/whitelily/bridge/mixin/ServerHandshakePacketListenerImplMixin",
               "io/github/whitelily/bridge/mixin/ServerLoginPacketListenerImplMixin"),
           mappings.keySet());
       assertEquals(
           Set.of("disconnect(Lnet/minecraft/network/DisconnectionDetails;)V"),
           mappings.getAsJsonObject("io/github/whitelily/bridge/mixin/ConnectionMixin").keySet());
+      assertEquals(
+          Set.of("connection"),
+          mappings
+              .getAsJsonObject(
+                  "io/github/whitelily/bridge/mixin/ServerCommonPacketListenerImplAccessor")
+              .keySet());
       assertEquals(
           Set.of("stopServer()V"),
           mappings.getAsJsonObject("io/github/whitelily/bridge/mixin/MinecraftServerMixin").keySet());
@@ -174,6 +185,13 @@ final class BridgeJarContractAssertions {
               "io/github/whitelily/bridge/mixin/ConnectionMixin",
               "disconnect(Lnet/minecraft/network/DisconnectionDetails;)V"),
           "connection disconnect refmap");
+      assertEquals(
+          "field_45013:Lnet/minecraft/class_2535;",
+          mapping(
+              mappings,
+              "io/github/whitelily/bridge/mixin/ServerCommonPacketListenerImplAccessor",
+              "connection"),
+          "server common connection accessor refmap");
       assertEquals(
           Set.of(
               "placeNewPlayer(Lnet/minecraft/network/Connection;Lnet/minecraft/server/level/ServerPlayer;Lnet/minecraft/server/network/CommonListenerCookie;)V",

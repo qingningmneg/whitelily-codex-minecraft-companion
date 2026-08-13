@@ -90,11 +90,14 @@ export function validateMinecraftComponentManifest(
   if (
     bridgeArtifacts.length !== 1 ||
     bridge?.component !== "bridge" ||
-    bridge.version !== "0.1.1" ||
-    bridge.prior.length !== 1 ||
-    bridge.prior[0]?.fileName !== "whitelily-bridge-fabric-1.21.5-0.1.0.jar" ||
+    bridge.version !== "0.1.2" ||
+    bridge.prior.length !== 2 ||
+    bridge.prior[0]?.fileName !== "whitelily-bridge-fabric-1.21.5-0.1.1.jar" ||
     bridge.prior[0]?.modId !== "whitelily_bridge" ||
-    bridge.prior[0]?.version !== "0.1.0" ||
+    bridge.prior[0]?.version !== "0.1.1" ||
+    bridge.prior[1]?.fileName !== "whitelily-bridge-fabric-1.21.5-0.1.0.jar" ||
+    bridge.prior[1]?.modId !== "whitelily_bridge" ||
+    bridge.prior[1]?.version !== "0.1.0" ||
     !/^whitelily-bridge-fabric-1\.21\.5-[A-Za-z0-9.+_-]+\.jar$/u.test(bridge.fileName) ||
     avatarArtifacts.length !== 3 ||
     avatar?.component !== "avatar" ||

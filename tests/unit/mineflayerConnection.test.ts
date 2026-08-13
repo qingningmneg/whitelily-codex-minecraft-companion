@@ -1002,7 +1002,7 @@ describe("MineflayerConnection", () => {
       expect(harness.botOptions).toEqual([
         expect.objectContaining({
           fakeHost: proof.fakeHost,
-          hideErrors: false,
+          hideErrors: true,
           logErrors: false,
         }),
       ]);

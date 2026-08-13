@@ -28,7 +28,7 @@ export interface MineflayerConnectionDependencies {
     port: number;
     username: "WhiteLily";
     auth: "offline";
-    hideErrors: false;
+    hideErrors: true;
     logErrors: false;
     fakeHost: string;
   }): Bot;
@@ -324,7 +324,7 @@ export class MineflayerConnection {
         port: this.dependencies.config.port,
         username: this.dependencies.config.botUsername,
         auth: "offline",
-        hideErrors: false,
+        hideErrors: true,
         logErrors: false,
         fakeHost: proof.fakeHost,
       });

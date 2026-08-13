@@ -436,7 +436,10 @@ val stageMinecraftComponents = tasks.register("stageMinecraftComponents") {
         val artifact = prepared.artifact
         val prior =
           if (artifact.component == "bridge") {
-            "[{\"fileName\": \"whitelily-bridge-fabric-1.21.5-0.1.0.jar\", \"bytes\": 51837, " +
+            "[{\"fileName\": \"whitelily-bridge-fabric-1.21.5-0.1.1.jar\", \"bytes\": 52087, " +
+              "\"sha256\": \"8a6e00d47a28799798ffa5d561156ea7ceb0f697a0beb2cc7c55b34f6f81b514\", " +
+              "\"modId\": \"whitelily_bridge\", \"version\": \"0.1.1\"}," +
+              "{\"fileName\": \"whitelily-bridge-fabric-1.21.5-0.1.0.jar\", \"bytes\": 51837, " +
               "\"sha256\": \"380721d28236f5ad8206fd8d69af1e5629d741e9d38ec27c26c052c95266b6ce\", " +
               "\"modId\": \"whitelily_bridge\", \"version\": \"0.1.0\"}]"
           } else {
@@ -493,10 +496,26 @@ val stageMinecraftComponents = tasks.register("stageMinecraftComponents") {
               ",\"sha256\":" + jsonString(sha256(bytes)) + "}"
           },
         )
+    val previousFileRequests =
+      listOf(
+        Triple("fabric-api-0.128.2+1.21.5.jar", 2_248_994, "a82fd00827206e911936ed1e0ceaec6eb55d061ca5d3c5d63c7f0031426d29ae"),
+        Triple("Fabric-API-LICENSE.txt", 11_357, "b40930bbcf80744c86c46a12bc9da056641d722716c378f5659b9e555ef833e1"),
+        Triple("geckolib-fabric-1.21.5-5.1.0.jar", 670_425, "885ef4b03cd438c7d2ec9f59bb492f3af6ba2b73aa0493afc4f80801b5a9126c"),
+        Triple("GeckoLib-LICENSE.txt", 1_065, "5f2943625776c6126cd252652f4c57d2fb187d339a20fa065a2b7c619165a52f"),
+        Triple("minecraft-components-manifest.json", 1_784, "bcd528825f95d8062865bc77d1979d9a07907b92337cfccae46c9140f453cff1"),
+        Triple("whitelily-avatar-fabric-1.21.5-0.1.0.jar", 55_627, "fff00f66e4beab2eff1e51f253608b198f43aa0a12443fbe07f7f3fd48278872"),
+        Triple("whitelily-bridge-fabric-1.21.5-0.1.1.jar", 52_087, "8a6e00d47a28799798ffa5d561156ea7ceb0f697a0beb2cc7c55b34f6f81b514"),
+        Triple("WhiteLily-LICENSE.txt", 11_123, "226d0e41f61309952c27fcc11a5140c4e735115f702ff0484ff0c25cfbbeee16"),
+        Triple("WhiteLily-NOTICE.txt", 697, "6323cb4b742d322d61ee47279d71d0f0de496568cf1f2f793fea104a58ab0dde"),
+      ).map { (name, bytes, hash) ->
+        "{\"name\":" + jsonString(name) + ",\"bytes\":" + bytes +
+          ",\"sha256\":" + jsonString(hash) + "}"
+      }
     val request =
       "{\"destination\":" + jsonString(stagingDirectory.absolutePath) +
         ",\"allowPreparedEmptyDestination\":" + !stagingDirectoryExistedAtConfiguration +
-        ",\"specification\":{\"files\":[" + fileRequests.joinToString(",") + "]}}"
+        ",\"specification\":{\"files\":[" + fileRequests.joinToString(",") +
+        "],\"previousFiles\":[" + previousFileRequests.joinToString(",") + "]}}"
     val process = ProcessBuilder("node", stagingTransactionScript.absolutePath)
       .directory(rootProject.projectDir)
       .start()

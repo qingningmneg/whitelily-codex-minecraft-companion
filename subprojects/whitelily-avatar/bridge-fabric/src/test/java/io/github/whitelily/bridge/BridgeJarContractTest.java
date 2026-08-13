@@ -28,7 +28,7 @@ import org.junit.jupiter.api.io.TempDir;
 
 class BridgeJarContractTest {
   private static final String EXPECTED_JAR =
-      "whitelily-bridge-fabric-1.21.5-0.1.1.jar";
+      "whitelily-bridge-fabric-1.21.5-0.1.2.jar";
 
   @TempDir Path temporaryDirectory;
 

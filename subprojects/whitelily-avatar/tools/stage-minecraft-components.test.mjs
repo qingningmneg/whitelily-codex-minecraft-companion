@@ -190,6 +190,27 @@ test("publishes one exact nine-file pack without transaction residue", async (t)
   await assertNoTransactionResidue(root);
 });
 
+test("atomically upgrades an exact reviewed pack when one artifact file name changes", async (t) => {
+  const { root, destination, previousFiles } = await fixture();
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const replacement = await spec(root, "renamed-bridge");
+  const oldBridge = "whitelily-bridge-fabric-1.21.5-0.1.1.jar";
+  const newBridge = "whitelily-bridge-fabric-1.21.5-0.1.2.jar";
+  replacement.files = replacement.files.map((file) =>
+    file.name === oldBridge ? { ...file, name: newBridge } : file,
+  );
+  replacement.previousFiles = previousFiles;
+
+  const result = await stageComponentPack(destination, replacement);
+
+  assert.deepEqual(result, { state: "published", cleanupPending: false });
+  assert.deepEqual(
+    (await readdir(destination)).sort(),
+    names.map((name) => (name === oldBridge ? newBridge : name)).sort(),
+  );
+  await assertNoTransactionResidue(root);
+});
+
 test("syncs and closes every exclusively-created candidate file", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "whitelily-stage-"));
   t.after(() => rm(root, { recursive: true, force: true }));

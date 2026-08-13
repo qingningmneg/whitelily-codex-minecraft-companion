@@ -258,7 +258,7 @@ describe("MineflayerAdapter", () => {
     createBridgeProofIssuer.mockReturnValue({ issue: issueProof, close: closeIssuer });
   });
 
-  it("uses the fixed offline LAN connection and emits lifecycle and owner events once", async () => {
+  it("keeps third-party parser diagnostics off the desktop protocol stream", async () => {
     const bot = new FakeBot();
     createBot.mockReturnValue(bot);
     const adapter = new MineflayerAdapter(config());
@@ -279,7 +279,7 @@ describe("MineflayerAdapter", () => {
       port: 25565,
       username: "WhiteLily",
       auth: "offline",
-      hideErrors: false,
+      hideErrors: true,
       logErrors: false,
       fakeHost: "127.0.0.1\0WL1\0adapter-proof-1",
     });

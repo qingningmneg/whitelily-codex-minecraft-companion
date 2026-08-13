@@ -1,7 +1,9 @@
 import { createHash } from "node:crypto";
+import { execFile as nodeExecFile } from "node:child_process";
 import { type BigIntStats } from "node:fs";
 import { link, lstat, open, readFile, realpath, unlink } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { promisify } from "node:util";
 import type { LanDetector } from "./discovery/lanDetector.js";
 import type { LanObservation } from "./discovery/lanCandidateStore.js";
 import type {
@@ -65,11 +67,14 @@ export interface MinecraftComponentManagerOptions {
   readonly resourceDirectory: string;
   readonly presenceDirectory: string;
   readonly manifest: MinecraftComponentResourceManifest;
+  readonly waitForJavaSessionExit?: (session: Readonly<LanObservation>) => Promise<void>;
 }
 
 const MAX_PRESENCE_BYTES = 4_096;
+const MAX_PROCESS_WAIT_OUTPUT_BYTES = 4_096;
 const FILE_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9.+_-]{0,127}\.jar$/u;
 const strictUtf8Decoder = new TextDecoder("utf-8", { fatal: true });
+const execFile = promisify(nodeExecFile);
 
 type ComponentFailureCode =
   | "MINECRAFT_COMPONENT_AUTHORITY_INVALID"
@@ -151,6 +156,7 @@ class MainMinecraftComponentManager implements MinecraftComponentManager {
   readonly #resourceDirectory: string;
   readonly #presenceDirectory: string;
   readonly #manifest: MinecraftComponentResourceManifest;
+  readonly #waitForJavaSessionExit: (session: Readonly<LanObservation>) => Promise<void>;
   #operationTail: Promise<void> = Promise.resolve();
 
   constructor(options: MinecraftComponentManagerOptions) {
@@ -159,6 +165,7 @@ class MainMinecraftComponentManager implements MinecraftComponentManager {
     this.#resourceDirectory = resolve(options.resourceDirectory);
     this.#presenceDirectory = resolve(options.presenceDirectory);
     this.#manifest = options.manifest;
+    this.#waitForJavaSessionExit = options.waitForJavaSessionExit ?? waitForJavaSessionExit;
   }
 
   status(candidateId: string): Promise<MinecraftComponentStatus> {
@@ -179,10 +186,17 @@ class MainMinecraftComponentManager implements MinecraftComponentManager {
       if (authorized.inventory.artifacts.some(({ state }) => state === "conflict")) {
         return this.#toStatus(authorized);
       }
+      const dependencySafeOrder = [...authorized.inventory.artifacts].sort(
+        (left, right) => installRank(left.artifact) - installRank(right.artifact),
+      );
+      const waitsForExit = dependencySafeOrder.some(
+        (item) => selected.has(item.artifact.component) && item.state === "prior",
+      );
       try {
-        const dependencySafeOrder = [...authorized.inventory.artifacts].sort(
-          (left, right) => installRank(left.artifact) - installRank(right.artifact),
-        );
+        if (waitsForExit) {
+          await this.#waitForJavaSessionExit(authorized.instance.javaSession);
+          await this.#assertAuthorizedInventoryUnchanged(authorized);
+        }
         for (const item of dependencySafeOrder) {
           if (!selected.has(item.artifact.component) || item.state === "current") continue;
           await this.#publishArtifact(authorized, item);
@@ -190,6 +204,12 @@ class MainMinecraftComponentManager implements MinecraftComponentManager {
       } catch (error) {
         if (error instanceof ComponentFailure) throw error;
         throw new ComponentFailure("MINECRAFT_COMPONENT_OPERATION_FAILED");
+      }
+      if (waitsForExit) {
+        const avatarInstalled = authorized.inventory.artifacts
+          .filter(({ artifact }) => artifact.component === "avatar")
+          .every(({ state }) => state === "current");
+        return status("bridge_restart_required", true, false, avatarInstalled, true);
       }
       return this.#status(candidateId);
     });
@@ -337,6 +357,20 @@ class MainMinecraftComponentManager implements MinecraftComponentManager {
     } catch {
       throw new ComponentFailure("MINECRAFT_COMPONENT_MANIFEST_INVALID");
     }
+  }
+
+  async #assertAuthorizedInventoryUnchanged(authorized: AuthorizedInstance): Promise<void> {
+    await assertWindowsPathsAreOrdinary([
+      authorized.gameDirectory.path,
+      authorized.modsDirectory.path,
+      authorized.resourceDirectory.path,
+      ...(await existingArtifactPaths(authorized.modsDirectory.path, this.#manifest)),
+    ]);
+    await assertDirectoryIdentity(authorized.gameDirectory);
+    await assertDirectoryIdentity(authorized.modsDirectory);
+    await assertDirectoryIdentity(authorized.resourceDirectory);
+    const inventory = await scanInventory(authorized.modsDirectory.path, this.#manifest);
+    if (inventory.fingerprint !== authorized.inventory.fingerprint) throw new Error("invalid");
   }
 
   async #publishArtifact(authorized: AuthorizedInstance, item: ArtifactInventory): Promise<void> {
@@ -615,6 +649,33 @@ function installRank(artifact: MinecraftComponentArtifact): number {
 function removeRank(artifact: MinecraftComponentArtifact): number {
   if (artifact.modId === "whitelily_avatar") return 0;
   return artifact.component === "avatar" ? 1 : 2;
+}
+
+async function waitForJavaSessionExit(session: Readonly<LanObservation>): Promise<void> {
+  if (
+    !Number.isSafeInteger(session.pid) ||
+    session.pid < 1 ||
+    !Number.isSafeInteger(session.processStartedAt) ||
+    session.processStartedAt < 1
+  ) {
+    throw new Error("invalid Java session");
+  }
+  const command = [
+    "$ErrorActionPreference = 'Stop'",
+    `$pidValue = [int]${session.pid}`,
+    `$expectedStart = [int64]${session.processStartedAt}`,
+    "$process = Get-Process -Id $pidValue -ErrorAction SilentlyContinue",
+    "if ($null -eq $process) { exit 0 }",
+    "$actualStart = ([DateTimeOffset]$process.StartTime.ToUniversalTime()).ToUnixTimeMilliseconds()",
+    "if ($actualStart -ne $expectedStart) { exit 0 }",
+    "$process.WaitForExit()",
+  ].join("; ");
+  await execFile("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", command], {
+    encoding: "buffer",
+    maxBuffer: MAX_PROCESS_WAIT_OUTPUT_BYTES,
+    shell: false,
+    windowsHide: true,
+  });
 }
 
 async function scanInventory(

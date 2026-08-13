@@ -11,7 +11,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 public final class BridgePresencePublisher implements AutoCloseable {
   public static final String MINECRAFT_VERSION = "1.21.5";
-  public static final String BRIDGE_VERSION = "0.1.1";
+  public static final String BRIDGE_VERSION = "0.1.2";
 
   private static volatile Runnable beforePresenceIdentityHook;
   private static volatile Runnable beforeLinkIdentityHook;

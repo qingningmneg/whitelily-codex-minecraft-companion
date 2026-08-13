@@ -23,12 +23,19 @@ describe("desktop Minecraft component composition", () => {
       artifacts: [
         {
           component: "bridge",
-          fileName: "whitelily-bridge-fabric-1.21.5-0.1.1.jar",
-          bytes: 52_087,
-          sha256: "8a6e00d47a28799798ffa5d561156ea7ceb0f697a0beb2cc7c55b34f6f81b514",
+          fileName: "whitelily-bridge-fabric-1.21.5-0.1.2.jar",
+          bytes: 53_984,
+          sha256: "ac5bfab545b723b2346aeb017b3a6ea3186a6cbced370e16097f3836b128746d",
           modId: "whitelily_bridge",
-          version: "0.1.1",
+          version: "0.1.2",
           prior: [
+            {
+              fileName: "whitelily-bridge-fabric-1.21.5-0.1.1.jar",
+              bytes: 52_087,
+              sha256: "8a6e00d47a28799798ffa5d561156ea7ceb0f697a0beb2cc7c55b34f6f81b514",
+              modId: "whitelily_bridge",
+              version: "0.1.1",
+            },
             {
               fileName: "whitelily-bridge-fabric-1.21.5-0.1.0.jar",
               bytes: 51_837,

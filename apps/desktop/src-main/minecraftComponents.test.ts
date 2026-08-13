@@ -31,8 +31,9 @@ import {
 const PROCESS_STARTED_AT = 1_785_196_800_123;
 const BEFORE_PROCESS_START = new Date(PROCESS_STARTED_AT - 10_000);
 const AFTER_PROCESS_START = new Date(PROCESS_STARTED_AT + 10_000);
-const BRIDGE_FILE = "whitelily-bridge-fabric-1.21.5-0.1.1.jar";
-const PRIOR_BRIDGE_FILE = "whitelily-bridge-fabric-1.21.5-0.1.0.jar";
+const BRIDGE_FILE = "whitelily-bridge-fabric-1.21.5-0.1.2.jar";
+const PRIOR_BRIDGE_FILE = "whitelily-bridge-fabric-1.21.5-0.1.1.jar";
+const LEGACY_BRIDGE_FILE = "whitelily-bridge-fabric-1.21.5-0.1.0.jar";
 const AVATAR_FILE = "whitelily-avatar-fabric-1.21.5-0.1.0.jar";
 const FABRIC_API_FILE = "fabric-api-0.128.2+1.21.5.jar";
 const GECKOLIB_FILE = "geckolib-fabric-1.21.5-5.1.0.jar";
@@ -47,6 +48,7 @@ interface Fixture {
   readonly candidateId: string;
   readonly bridge: Buffer;
   readonly priorBridge: Buffer;
+  readonly legacyBridge: Buffer;
   readonly avatar: Buffer;
   readonly fabricApi: Buffer;
   readonly geckoLib: Buffer;
@@ -76,6 +78,11 @@ interface FixtureOptions {
   readonly managerFactory?: typeof createMinecraftComponentManager;
   readonly bridgeBytes?: Buffer;
   readonly stubWorldBindingAuthority?: boolean;
+  readonly waitForJavaSessionExit?: (session: Readonly<LanObservation>) => Promise<void>;
+  readonly probeRecords?: (
+    call: number,
+    record: JavaListenerProbeRecord,
+  ) => readonly JavaListenerProbeRecord[];
 }
 
 async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
@@ -87,8 +94,9 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
   await mkdir(mods, { recursive: true });
   await mkdir(resources);
   await mkdir(presence);
-  const bridge = options.bridgeBytes ?? jar("whitelily_bridge", "0.1.1");
-  const priorBridge = jar("whitelily_bridge", "0.1.0");
+  const bridge = options.bridgeBytes ?? jar("whitelily_bridge", "0.1.2");
+  const priorBridge = jar("whitelily_bridge", "0.1.1");
+  const legacyBridge = jar("whitelily_bridge", "0.1.0");
   const avatar = jar("whitelily_avatar", "0.1.0");
   const fabricApi = jar("fabric-api", "0.128.2+1.21.5");
   const geckoLib = jar("geckolib", "5.1.0");
@@ -115,12 +123,19 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
         bytes: bridge.byteLength,
         sha256: sha256(bridge),
         modId: "whitelily_bridge",
-        version: "0.1.1",
+        version: "0.1.2",
         prior: [
           {
             fileName: PRIOR_BRIDGE_FILE,
             bytes: priorBridge.byteLength,
             sha256: sha256(priorBridge),
+            modId: "whitelily_bridge",
+            version: "0.1.1",
+          },
+          {
+            fileName: LEGACY_BRIDGE_FILE,
+            bytes: legacyBridge.byteLength,
+            sha256: sha256(legacyBridge),
             modId: "whitelily_bridge",
             version: "0.1.0",
           },
@@ -164,6 +179,7 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
     presence,
     bridge,
     priorBridge,
+    legacyBridge,
     avatar,
     fabricApi,
     geckoLib,
@@ -178,18 +194,17 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
       probeCalls += 1;
       await options.onProbe?.(probeCalls, partial);
       const recordPatch = options.probeRecordPatch?.(probeCalls);
+      const record: JavaListenerProbeRecord = {
+        localAddress: "127.0.0.1",
+        localPort: 51321,
+        pid: 4200,
+        processName: "javaw.exe",
+        processStartedAt: PROCESS_STARTED_AT,
+        version: options.version === undefined ? "1.21.5" : options.version,
+        ...recordPatch,
+      };
       return {
-        records: [
-          {
-            localAddress: "127.0.0.1",
-            localPort: 51321,
-            pid: 4200,
-            processName: "javaw.exe",
-            processStartedAt: PROCESS_STARTED_AT,
-            version: options.version === undefined ? "1.21.5" : options.version,
-            ...recordPatch,
-          },
-        ],
+        records: options.probeRecords?.(probeCalls, record) ?? [record],
         diagnostic: null,
       };
     },
@@ -225,13 +240,20 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
       });
   let manager: ReturnType<typeof createMinecraftComponentManager>;
   try {
-    manager = (options.managerFactory ?? createMinecraftComponentManager)({
-      lanDetector: detector,
-      worldBindingAuthority: authority,
-      resourceDirectory: resources,
-      presenceDirectory: presence,
-      manifest,
-    });
+    manager = (options.managerFactory ?? createMinecraftComponentManager)(
+      Object.assign(
+        {
+          lanDetector: detector,
+          worldBindingAuthority: authority,
+          resourceDirectory: resources,
+          presenceDirectory: presence,
+          manifest,
+        },
+        options.waitForJavaSessionExit
+          ? { waitForJavaSessionExit: options.waitForJavaSessionExit }
+          : {},
+      ) as Parameters<typeof createMinecraftComponentManager>[0],
+    );
   } catch (error) {
     await partial.cleanup();
     throw error;
@@ -262,7 +284,7 @@ async function writePresence(
       pid: 4200,
       processStartEpochMs: PROCESS_STARTED_AT,
       minecraftVersion: "1.21.5",
-      bridgeVersion: "0.1.1",
+      bridgeVersion: "0.1.2",
       writtenAt: PROCESS_STARTED_AT + 100,
       ...patch,
     })}\n`,
@@ -335,26 +357,78 @@ describe("Minecraft component manager", () => {
     }
   });
 
-  it("updates one reviewed prior JAR through a collision-free backup and removes the backup", async () => {
-    const fixture = await createFixture();
-    try {
-      await installFixtureFile(fixture, PRIOR_BRIDGE_FILE, fixture.priorBridge);
+  it.each([
+    [PRIOR_BRIDGE_FILE, "priorBridge"],
+    [LEGACY_BRIDGE_FILE, "legacyBridge"],
+  ] as const)(
+    "updates reviewed prior JAR %s through a collision-free backup and removes the backup",
+    async (priorFile, priorBytes) => {
+      const fixture = await createFixture();
+      try {
+        await installFixtureFile(fixture, priorFile, fixture[priorBytes]);
 
-      await expect(fixture.manager.install(fixture.candidateId, ["bridge"])).resolves.toMatchObject(
-        {
+        await expect(
+          fixture.manager.install(fixture.candidateId, ["bridge"]),
+        ).resolves.toMatchObject({
           state: "bridge_restart_required",
           bridgeInstalled: true,
-        },
-      );
+        });
 
-      expect(await readFile(join(fixture.mods, BRIDGE_FILE))).toEqual(fixture.bridge);
-      await expect(lstat(join(fixture.mods, PRIOR_BRIDGE_FILE))).rejects.toMatchObject({
+        expect(await readFile(join(fixture.mods, BRIDGE_FILE))).toEqual(fixture.bridge);
+        await expect(lstat(join(fixture.mods, priorFile))).rejects.toMatchObject({
+          code: "ENOENT",
+        });
+        await expect(
+          lstat(join(fixture.mods, `${priorFile}.whitelily-disabled`)),
+        ).rejects.toMatchObject({ code: "ENOENT" });
+      } finally {
+        await fixture.cleanup();
+      }
+    },
+  );
+
+  it("waits for the authorized Java session to exit before updating a reviewed prior JAR", async () => {
+    let processVisible = true;
+    let releaseExit!: () => void;
+    const exited = new Promise<void>((resolve) => {
+      releaseExit = resolve;
+    });
+    const waitForJavaSessionExit = vi.fn(async (session: Readonly<LanObservation>) => {
+      expect(session).toMatchObject({ pid: 4200, processStartedAt: PROCESS_STARTED_AT });
+      await exited;
+    });
+    const fixture = await createFixture({
+      waitForJavaSessionExit,
+      probeRecords: (_call, record) => (processVisible ? [record] : []),
+    });
+    const priorPath = await installFixtureFile(fixture, PRIOR_BRIDGE_FILE, fixture.priorBridge);
+    await installFixtureFile(fixture, AVATAR_FILE, fixture.avatar);
+    await installFixtureFile(fixture, FABRIC_API_FILE, fixture.fabricApi);
+    await installFixtureFile(fixture, GECKOLIB_FILE, fixture.geckoLib);
+    try {
+      const installation = fixture.manager.install(fixture.candidateId, ["bridge"]);
+
+      await vi.waitFor(() => expect(waitForJavaSessionExit).toHaveBeenCalledTimes(1), {
+        timeout: 10_000,
+      });
+      expect(await readFile(priorPath)).toEqual(fixture.priorBridge);
+      await expect(lstat(join(fixture.mods, BRIDGE_FILE))).rejects.toMatchObject({
         code: "ENOENT",
       });
-      await expect(
-        lstat(join(fixture.mods, `${PRIOR_BRIDGE_FILE}.whitelily-disabled`)),
-      ).rejects.toMatchObject({ code: "ENOENT" });
+
+      processVisible = false;
+      releaseExit();
+      await expect(installation).resolves.toEqual({
+        state: "bridge_restart_required",
+        bridgeInstalled: true,
+        bridgeActive: false,
+        avatarInstalled: true,
+        restartRequired: true,
+      });
+      expect(await readFile(join(fixture.mods, BRIDGE_FILE))).toEqual(fixture.bridge);
+      await expect(lstat(priorPath)).rejects.toMatchObject({ code: "ENOENT" });
     } finally {
+      releaseExit();
       await fixture.cleanup();
     }
   });
