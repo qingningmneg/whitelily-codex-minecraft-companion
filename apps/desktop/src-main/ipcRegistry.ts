@@ -93,6 +93,7 @@ export interface IpcRegistryOptions {
       enabled: boolean,
     ): Promise<{ revision: number; enabled: boolean }>;
   };
+  requestApplicationQuit?: () => Promise<void>;
   exportSerialized?(serialized: string): Promise<{ status: "cancelled" | "saved" }>;
   exportDiagnostic?(
     exportId: string,
@@ -288,6 +289,17 @@ export function registerIpcHandlers(options: IpcRegistryOptions): () => void {
       return parseRuntimeSnapshot(await options.supervisor.emergencyStop());
     });
     registeredChannels.push(WHITE_LILY_IPC_CHANNELS.emergencyStop);
+    if (options.requestApplicationQuit) {
+      options.ipcMain.handle(WHITE_LILY_IPC_CHANNELS.quitApplication, async (_event, ...args) => {
+        validateNoIpcInput(args);
+        try {
+          await options.requestApplicationQuit?.();
+        } catch {
+          throw new Error("WhiteLily application quit failed");
+        }
+      });
+      registeredChannels.push(WHITE_LILY_IPC_CHANNELS.quitApplication);
+    }
     options.ipcMain.handle(WHITE_LILY_IPC_CHANNELS.readOwnerIdentity, async (_event, ...args) => {
       validateNoIpcInput(args);
       const command = { kind: "read_owner_identity" } as const;

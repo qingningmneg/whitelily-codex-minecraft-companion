@@ -339,12 +339,18 @@ export interface StartupTrayPort {
   destroy(): void;
 }
 
+export function createApplicationQuitRequest(
+  lifecycle: Pick<ApplicationLifecycle, "quit">,
+): () => Promise<void> {
+  return () => lifecycle.quit();
+}
+
 export interface ElectronStartupOptions<TWindow extends StartupWindowPort> {
   app: StartupAppPort;
   supervisor: StartupSupervisorPort;
   createWindow(): TWindow;
   configureWindow(window: TWindow): void;
-  registerIpc(window: TWindow): () => void;
+  registerIpc(window: TWindow, lifecycle: ApplicationLifecycle): () => void;
   createTray(window: TWindow, lifecycle: ApplicationLifecycle): StartupTrayPort;
   loadWindow(window: TWindow): Promise<void>;
   diagnostic(message: string): void;
@@ -473,7 +479,7 @@ export async function startElectronComposition<TWindow extends StartupWindowPort
     options.supervisor.start();
     mainWindow = options.createWindow();
     options.configureWindow(mainWindow);
-    cleanupIpc = options.registerIpc(mainWindow);
+    cleanupIpc = options.registerIpc(mainWindow, lifecycle);
     mainWindow.on(
       "close",
       createCloseToTrayHandler({
@@ -625,7 +631,7 @@ export async function runElectronMain(): Promise<void> {
                 window.webContents.setWindowOpenHandler(externalUrlHandlers.openWindow);
                 window.webContents.on("will-navigate", externalUrlHandlers.navigate);
               },
-              registerIpc: (window) =>
+              registerIpc: (window, lifecycle) =>
                 registerIpcHandlers({
                   ipcMain,
                   supervisor: primary.supervisor,
@@ -647,6 +653,7 @@ export async function runElectronMain(): Promise<void> {
                   minecraftComponentManager,
                   startupSettings,
                   closeToTraySettings,
+                  requestApplicationQuit: createApplicationQuitRequest(lifecycle),
                   exportSerialized: (serialized) =>
                     exportSerializedJson({
                       chooseDestination: () =>

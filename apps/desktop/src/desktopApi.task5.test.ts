@@ -51,6 +51,19 @@ const ownerSnapshot: OwnerIdentitySnapshot = {
 const ownerAuthoritySnapshot = { ...ownerSnapshot, childGeneration: 7 };
 
 describe("Task 5 preload API", () => {
+  it("exposes a frozen zero-argument application quit operation", async () => {
+    const invoke = vi.fn(async () => undefined);
+    const api = createWhiteLilyApi({ invoke, subscribe: vi.fn() });
+
+    await expect(api.quitApplication()).resolves.toBeUndefined();
+    expect(invoke).toHaveBeenCalledWith(WHITE_LILY_IPC_CHANNELS.quitApplication);
+    expect(Object.isFrozen(api)).toBe(true);
+    await expect(
+      (api.quitApplication as (...args: unknown[]) => Promise<void>)("force"),
+    ).rejects.toThrow("invalid");
+    expect(invoke).toHaveBeenCalledTimes(1);
+  });
+
   it("exposes only bounded opaque component operations and parses every result", async () => {
     const status: MinecraftComponentStatus = {
       state: "ready",

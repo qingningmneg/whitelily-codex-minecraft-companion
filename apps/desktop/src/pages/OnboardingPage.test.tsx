@@ -275,6 +275,7 @@ function createApiHarness(
       stop: vi.fn(async () => stoppedSnapshot),
       stopTask: vi.fn(async () => stoppedSnapshot),
       emergencyStop: vi.fn(async () => stoppedSnapshot),
+      quitApplication: vi.fn(async () => undefined),
       readOwnerIdentity,
       updateOwnerIdentity,
       subscribeOwnerIdentity: () => vi.fn(),

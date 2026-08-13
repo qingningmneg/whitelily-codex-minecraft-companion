@@ -224,6 +224,57 @@ button:disabled {
   padding: 0 0.9rem;
 }
 
+.onboarding-topbar-actions {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.65rem;
+}
+
+.application-exit-control {
+  position: relative;
+  display: grid;
+  justify-items: end;
+}
+
+.app-shell > .application-exit-control {
+  position: fixed;
+  z-index: 20;
+  top: 1rem;
+  right: 1rem;
+}
+
+.application-exit-button {
+  min-height: 2.7rem;
+  padding: 0 0.9rem;
+  border: 1px solid #d7d4df;
+  border-radius: 0.8rem;
+  color: var(--text-alert);
+  background: rgb(255 255 255 / 92%);
+  cursor: pointer;
+  font-size: 0.84rem;
+  font-weight: 650;
+  box-shadow: 0 0.25rem 0.8rem rgb(36 33 45 / 8%);
+}
+
+.application-exit-button:hover:not(:disabled) {
+  border-color: #b67f89;
+  background: #fff8f9;
+}
+
+.application-exit-error {
+  position: absolute;
+  top: calc(100% + 0.4rem);
+  right: 0;
+  width: max-content;
+  max-width: min(22rem, calc(100vw - 2rem));
+  padding: 0.45rem 0.65rem;
+  border-radius: 0.55rem;
+  color: var(--text-alert);
+  background: var(--surface-alert);
+  font-size: 0.76rem;
+  box-shadow: 0 0.25rem 0.8rem rgb(36 33 45 / 10%);
+}
+
 .onboarding {
   display: grid;
   width: min(100% - 2rem, 76rem);

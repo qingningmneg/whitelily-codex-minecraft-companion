@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { OwnerIdentitySnapshot } from "../../../src/identity/ownerIdentity";
 import { Sidebar, type AppRoute } from "./components/Sidebar";
+import { ApplicationExitButton } from "./components/ApplicationExitButton";
 import type {
   OwnerIdentityAuthoritySnapshot,
   WhiteLilyAppApi,
@@ -148,14 +149,17 @@ function App({ api }: AppProps) {
               <p className="brand-edition">Public Beta</p>
             </div>
           </div>
-          <button
-            className="locale-button onboarding-locale-button"
-            type="button"
-            onClick={() => updateLocale(locale === "zh-CN" ? "en" : "zh-CN")}
-          >
-            <span aria-hidden="true">↔</span>
-            {locale === "zh-CN" ? "English" : "中文"}
-          </button>
+          <div className="onboarding-topbar-actions">
+            <ApplicationExitButton api={desktopApi} locale={locale} />
+            <button
+              className="locale-button onboarding-locale-button"
+              type="button"
+              onClick={() => updateLocale(locale === "zh-CN" ? "en" : "zh-CN")}
+            >
+              <span aria-hidden="true">↔</span>
+              {locale === "zh-CN" ? "English" : "中文"}
+            </button>
+          </div>
         </header>
         <OnboardingPage
           api={desktopApi}
@@ -177,6 +181,7 @@ function App({ api }: AppProps) {
 
   return (
     <div className="app-shell" lang={locale}>
+      <ApplicationExitButton api={desktopApi} locale={locale} />
       <Sidebar
         locale={locale}
         activeItem={activeNavigation}

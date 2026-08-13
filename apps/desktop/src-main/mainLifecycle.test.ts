@@ -3,6 +3,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   createApplicationBeforeQuitHandler,
+  createApplicationQuitRequest,
   createCloseToTrayHandler,
   createNativeTray,
   prepareElectronPrimary,
@@ -804,6 +805,55 @@ describe("native tray composition", () => {
 });
 
 describe("Electron startup composition", () => {
+  it("creates the production quit request from only the existing lifecycle", async () => {
+    const quit = vi.fn<() => Promise<void>>(async () => undefined);
+    const appQuit = vi.fn();
+    const processKill = vi.fn();
+    const forceTerminate = vi.fn();
+    const lifecycle = { quit, appQuit, processKill, forceTerminate };
+
+    const requestApplicationQuit = createApplicationQuitRequest(lifecycle);
+    await Promise.all([requestApplicationQuit(), requestApplicationQuit()]);
+
+    expect(quit).toHaveBeenCalledTimes(2);
+    expect(appQuit).not.toHaveBeenCalled();
+    expect(processKill).not.toHaveBeenCalled();
+    expect(forceTerminate).not.toHaveBeenCalled();
+  });
+
+  it("gives IPC registration the same lifecycle used by startup and tray", async () => {
+    const { app, diagnostic, supervisor } = createStartupHarness();
+    const mainWindow = new FakeWindow();
+    let requestApplicationQuit: (() => Promise<void>) | undefined;
+    let trayLifecycle: { quit(): Promise<void> } | undefined;
+
+    await startElectronComposition({
+      app,
+      supervisor,
+      createWindow: () => mainWindow,
+      configureWindow: vi.fn(),
+      registerIpc: (_window, lifecycle) => {
+        requestApplicationQuit = () => lifecycle.quit();
+        return () => undefined;
+      },
+      createTray: (_window, lifecycle) => {
+        trayLifecycle = lifecycle;
+        return { destroy: vi.fn() };
+      },
+      loadWindow: async () => undefined,
+      diagnostic,
+    });
+
+    expect(requestApplicationQuit).toBeTypeOf("function");
+    expect(trayLifecycle).toBeDefined();
+    const first = requestApplicationQuit!();
+    const second = trayLifecycle!.quit();
+    await Promise.all([first, second]);
+
+    expect(supervisor.shutdown).toHaveBeenCalledOnce();
+    expect(app.quit).toHaveBeenCalledOnce();
+  });
+
   it("keeps the main window hidden until the verified renderer load completes", async () => {
     const { app, diagnostic, supervisor } = createStartupHarness();
     const mainWindow = new FakeWindow();

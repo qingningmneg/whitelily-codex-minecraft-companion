@@ -45,6 +45,7 @@ function createAppApi(
     start: vi.fn(async () => runningSnapshot),
     stop: vi.fn(async () => runningSnapshot),
     emergencyStop: vi.fn(async () => runningSnapshot),
+    quitApplication: vi.fn(async () => undefined),
     getAccount: vi.fn(async () => ({ status: "signed_out" as const })),
     startChatGptLogin: vi.fn(),
     cancelChatGptLogin: vi.fn(),
@@ -171,6 +172,43 @@ describe("Task 5 application routing", () => {
   afterEach(() => {
     cleanup();
     window.localStorage.clear();
+  });
+
+  it("keeps one accessible application exit control while runtime status is checking", () => {
+    persistOnboardingLocale("en");
+    const harness = createAppApi();
+    harness.api.status = vi.fn(() => new Promise<never>(() => undefined));
+
+    render(<App api={harness.api} />);
+
+    expect(screen.getAllByRole("button", { name: "Quit WhiteLily" })).toHaveLength(1);
+  });
+
+  it("keeps one accessible application exit control across onboarding and main routes", async () => {
+    persistOnboardingLocale("en");
+    const harness = createAppApi();
+    harness.api.status = vi
+      .fn()
+      .mockResolvedValueOnce({ ...runningSnapshot, lifecycle: "stopped" })
+      .mockResolvedValue(runningSnapshot);
+    render(<App api={harness.api} />);
+    const user = userEvent.setup();
+
+    await screen.findByRole("heading", { name: "Sign in to ChatGPT" });
+    const onboardingQuit = screen.getByRole("button", { name: "Quit WhiteLily" });
+    expect(screen.getAllByRole("button", { name: "Quit WhiteLily" })).toHaveLength(1);
+    expect(onboardingQuit.closest(".onboarding-topbar")).not.toBeNull();
+
+    cleanup();
+    const mainHarness = createAppApi();
+    render(<App api={mainHarness.api} />);
+    await screen.findByRole("heading", { name: "Runtime overview" });
+    const mainQuit = screen.getByRole("button", { name: "Quit WhiteLily" });
+    expect(screen.getAllByRole("button", { name: "Quit WhiteLily" })).toHaveLength(1);
+    expect(mainQuit.closest(".application-exit-control")).not.toBeNull();
+    await user.click(screen.getByRole("link", { name: "Settings" }));
+    await screen.findByRole("heading", { name: "Settings" });
+    expect(screen.getAllByRole("button", { name: "Quit WhiteLily" })).toHaveLength(1);
   });
 
   it("routes fixed sidebar destinations and returns to onboarding after connection invalidation", async () => {

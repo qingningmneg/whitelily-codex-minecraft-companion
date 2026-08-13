@@ -81,6 +81,7 @@ export const WHITE_LILY_IPC_CHANNELS = {
   setStartupSetting: "whitelily:set-startup-setting",
   readCloseToTraySetting: "whitelily:read-close-to-tray-setting",
   setCloseToTraySetting: "whitelily:set-close-to-tray-setting",
+  quitApplication: "whitelily:quit-application",
   runtimeEvent: "whitelily:runtime-event",
   ownerIdentityEvent: "whitelily:owner-identity-event",
 } as const;
@@ -113,6 +114,7 @@ export interface WhiteLilyDesktopApi {
   stop(): Promise<RuntimeSnapshot>;
   stopTask(): Promise<RuntimeSnapshot>;
   emergencyStop(): Promise<RuntimeSnapshot>;
+  quitApplication(): Promise<void>;
   readOwnerIdentity(): Promise<OwnerIdentitySnapshot>;
   updateOwnerIdentity(input: {
     expectedRevision: number;
@@ -279,6 +281,10 @@ export function createWhiteLilyApi(transport: PreloadTransport): WhiteLilyAppApi
       return invoke(WHITE_LILY_IPC_CHANNELS.stopTask);
     },
     emergencyStop: () => invoke(WHITE_LILY_IPC_CHANNELS.emergencyStop),
+    quitApplication: async (...args: readonly unknown[]) => {
+      validateNoDesktopApiInput(args);
+      await transport.invoke(WHITE_LILY_IPC_CHANNELS.quitApplication);
+    },
     readOwnerIdentity: async (...args: readonly unknown[]) => {
       validateNoDesktopApiInput(args);
       return parseOwnerIdentityAuthoritySnapshot(

@@ -140,6 +140,7 @@ type WorldAuthorityPort = NonNullable<Parameters<typeof registerIpcHandlers>[0][
 function createRegistryHarness(
   snapshot: unknown = idleSnapshot,
   worldAuthority?: WorldAuthorityPort,
+  requestApplicationQuit: () => Promise<void> = vi.fn(async () => undefined),
 ) {
   const loginExpiresAt = Date.now() + 60_000;
   const handlers = new Map<string, (...args: unknown[]) => unknown>();
@@ -277,6 +278,7 @@ function createRegistryHarness(
       install: installMinecraftComponents,
       remove: removeMinecraftComponents,
     },
+    requestApplicationQuit,
     ...(worldAuthority ? { worldAuthority } : {}),
   });
   const invoke = (channel: string, ...args: unknown[]) => {
@@ -305,6 +307,7 @@ function createRegistryHarness(
     getMinecraftComponentStatus,
     installMinecraftComponents,
     removeMinecraftComponents,
+    requestApplicationQuit,
     bindConfirmedWorld,
     unsubscribeSupervisor,
   };
@@ -320,6 +323,7 @@ describe("IPC registry", () => {
         WHITE_LILY_IPC_CHANNELS.start,
         WHITE_LILY_IPC_CHANNELS.stop,
         WHITE_LILY_IPC_CHANNELS.stopTask,
+        WHITE_LILY_IPC_CHANNELS.quitApplication,
         WHITE_LILY_IPC_CHANNELS.emergencyStop,
         WHITE_LILY_IPC_CHANNELS.readOwnerIdentity,
         WHITE_LILY_IPC_CHANNELS.updateOwnerIdentity,
@@ -362,6 +366,40 @@ describe("IPC registry", () => {
     );
     expect(handlers.has("whitelily:execute")).toBe(false);
     expect(handlers.has("whitelily:open-external")).toBe(false);
+  });
+
+  it("delegates application quit exactly once, rejects input, masks failures, and cleans up", async () => {
+    const requestApplicationQuit = vi.fn(async () => undefined);
+    const harness = createRegistryHarness(idleSnapshot, undefined, requestApplicationQuit);
+
+    await expect(harness.invoke(WHITE_LILY_IPC_CHANNELS.quitApplication)).resolves.toBeUndefined();
+    expect(requestApplicationQuit).toHaveBeenCalledTimes(1);
+    await expect(
+      harness.invoke(WHITE_LILY_IPC_CHANNELS.quitApplication, { force: true }),
+    ).rejects.toThrow("invalid IPC input");
+    expect(requestApplicationQuit).toHaveBeenCalledTimes(1);
+
+    harness.cleanup();
+    expect(harness.handlers.has(WHITE_LILY_IPC_CHANNELS.quitApplication)).toBe(false);
+
+    const sentinel = vi.fn(async () => {
+      throw new Error(String.raw`sentinel PID=1234 C:\private\raw.log`);
+    });
+    const failing = createRegistryHarness(idleSnapshot, undefined, sentinel);
+    let rejection: unknown;
+    try {
+      await failing.invoke(WHITE_LILY_IPC_CHANNELS.quitApplication);
+    } catch (error) {
+      rejection = error;
+    }
+    expect(rejection).toBeInstanceOf(Error);
+    expect((rejection as Error).message).toBe("WhiteLily application quit failed");
+    expect((rejection as Error).cause).toBeUndefined();
+    expect(String(rejection)).not.toContain("sentinel");
+    expect(String(rejection)).not.toContain("1234");
+    expect(String(rejection)).not.toContain("private");
+    expect(sentinel).toHaveBeenCalledTimes(1);
+    failing.cleanup();
   });
 
   it("accepts only opaque candidate IDs and duplicate-free bounded component selections", async () => {
@@ -1433,6 +1471,7 @@ describe("IPC registry", () => {
         WHITE_LILY_IPC_CHANNELS.start,
         WHITE_LILY_IPC_CHANNELS.stop,
         WHITE_LILY_IPC_CHANNELS.stopTask,
+        WHITE_LILY_IPC_CHANNELS.quitApplication,
         WHITE_LILY_IPC_CHANNELS.emergencyStop,
         WHITE_LILY_IPC_CHANNELS.readOwnerIdentity,
         WHITE_LILY_IPC_CHANNELS.updateOwnerIdentity,
@@ -1636,6 +1675,7 @@ describe("typed preload API", () => {
         "start",
         "stop",
         "stopTask",
+        "quitApplication",
         "emergencyStop",
         "readOwnerIdentity",
         "updateOwnerIdentity",
@@ -1682,6 +1722,7 @@ describe("typed preload API", () => {
     await api.start();
     await api.stop();
     await api.stopTask();
+    await api.quitApplication();
     await api.emergencyStop();
     await api.readOwnerIdentity();
     await api.updateOwnerIdentity({ expectedRevision: 7, ownerUsername: "NewOwner" });
@@ -1711,6 +1752,7 @@ describe("typed preload API", () => {
       WHITE_LILY_IPC_CHANNELS.start,
       WHITE_LILY_IPC_CHANNELS.stop,
       WHITE_LILY_IPC_CHANNELS.stopTask,
+      WHITE_LILY_IPC_CHANNELS.quitApplication,
       WHITE_LILY_IPC_CHANNELS.emergencyStop,
       WHITE_LILY_IPC_CHANNELS.readOwnerIdentity,
       WHITE_LILY_IPC_CHANNELS.updateOwnerIdentity,

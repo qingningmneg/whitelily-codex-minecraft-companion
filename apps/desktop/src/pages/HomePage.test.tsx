@@ -108,6 +108,7 @@ function createApiHarness(
       stop: vi.fn(async () => stoppedSnapshot),
       stopTask,
       emergencyStop,
+      quitApplication: vi.fn(async () => undefined),
       readOwnerIdentity: vi.fn(async () => ({
         revision: 0,
         ownerUsername: null,
@@ -957,6 +958,7 @@ describe("bilingual control-center home", () => {
         stop: vi.fn(() => normalStop.promise),
         stopTask: vi.fn(async () => activeSnapshot),
         emergencyStop: vi.fn(() => emergency.promise),
+        quitApplication: vi.fn(async () => undefined),
         readOwnerIdentity: vi.fn(async () => ({
           revision: 0,
           ownerUsername: null,
