@@ -23,15 +23,15 @@ const verifier = resolve(
 );
 const roots: string[] = [];
 const productVersion = "0.2.0-beta.2";
-const packageSourceCommit = "44901a5e8f17bba77378746e4bc04fab6c335962";
-const lifecycleValidationCommit = "44901a5e8f17bba77378746e4bc04fab6c335962";
-const productionCandidateBytes = 229_357_597;
+const packageSourceCommit = "247e52baf79a413a9dd087e7fadce28d24d59113";
+const lifecycleValidationCommit = "247e52baf79a413a9dd087e7fadce28d24d59113";
+const productionCandidateBytes = 229_358_045;
 const productionCandidateSha256 =
-  "baac43d0677b398e55ea92f336e35cc71d34c426b539f0f278ab13dbc74c7ebd";
+  "cc3e8053eda52b1cebd2cd17fd33902c823acff731381c4fc6b60c9eb6c69f0e";
 const productionLifecycleBytes = 1_129;
 const productionLifecycleSha256 =
-  "6f966e8d4a700d3142e043765958b4d164a936a76476affacb8537b3cdb70fb2";
-const productionLifecycleTimestamp = "2026-08-11T15:21:33.8495467Z";
+  "7f57b716d5c0be9caac142ada8b0bdf124c072c8a0f9794b22bcd8a14bbc3263";
+const productionLifecycleTimestamp = "2026-08-13T16:16:18.3500840Z";
 const maxAttestationBytes = 32_768;
 const candidateName = `WhiteLily-${productVersion}-windows-x64-setup.exe`;
 const lifecycleName = `WhiteLily-${productVersion}-windows-x64-installer-lifecycle.json`;
