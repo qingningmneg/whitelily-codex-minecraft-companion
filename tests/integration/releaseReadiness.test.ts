@@ -111,14 +111,14 @@ describe("public release readiness", () => {
     expect(Number.isNaN(Date.parse(record.hostPersistedLastWriteTimeUtc))).toBe(false);
     expect(record).toMatchObject({
       productVersion: "0.2.0-beta.2",
-      packageSourceCommit: "247e52baf79a413a9dd087e7fadce28d24d59113",
-      lifecycleValidationCommit: "247e52baf79a413a9dd087e7fadce28d24d59113",
-      lifecycleSha256: "7f57b716d5c0be9caac142ada8b0bdf124c072c8a0f9794b22bcd8a14bbc3263",
-      hostPersistedLastWriteTimeUtc: "2026-08-13T16:16:18.3500840Z",
+      packageSourceCommit: "3df657bdbc30889aead3722edfddaff0fb3ae55d",
+      lifecycleValidationCommit: "3df657bdbc30889aead3722edfddaff0fb3ae55d",
+      lifecycleSha256: "435527808c0dd101967bc8aa77a1218caec5d2dad367a1f72203418b67a79094",
+      hostPersistedLastWriteTimeUtc: "2026-08-13T23:31:20.8672623Z",
       candidate: {
         filename: "WhiteLily-0.2.0-beta.2-windows-x64-setup.exe",
-        bytes: 229_358_045,
-        sha256: "cc3e8053eda52b1cebd2cd17fd33902c823acff731381c4fc6b60c9eb6c69f0e",
+        bytes: 229_360_405,
+        sha256: "1a45c4e7aa4e52fc7fc73b078bd6a9ae63331c1825ead8445762ee040b09678a",
         signature: "unsigned",
         authenticodeStatus: "NotSigned",
       },
