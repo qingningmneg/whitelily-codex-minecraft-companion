@@ -2402,7 +2402,7 @@ describe("WhiteLilyApp composition", () => {
     });
     if (!production) throw new Error("production runtime was not composed");
 
-    const starting = codex.start();
+    const starting = production.codex.start();
     await expect(transport.nextSent()).resolves.toMatchObject({ id: 1, method: "initialize" });
     transport.receive({
       id: 1,
@@ -2413,21 +2413,16 @@ describe("WhiteLilyApp composition", () => {
         platformOs: "windows",
       },
     });
-    await starting;
     await expect(transport.nextSent()).resolves.toEqual({ method: "initialized", params: {} });
-
-    const companionStarting = production.companion.start("service-live-model");
     await expect(transport.nextSent()).resolves.toEqual({
       id: 2,
-      method: "thread/start",
-      params: {
-        model: "service-live-model",
-        cwd: resolve(files.directory, "codex-workspace"),
-        sandbox: "read-only",
-        approvalPolicy: "never",
-      },
+      method: "config/mcpServer/reload",
+      params: {},
     });
-    transport.receive({ id: 2, result: { thread: { id: "thread-service-live-intent" } } });
+    transport.receive({ id: 2, result: {} });
+    await starting;
+
+    const companionStarting = production.companion.start("service-live-model");
     await expect(transport.nextSent()).resolves.toEqual({
       id: 3,
       method: "thread/start",
@@ -2438,12 +2433,28 @@ describe("WhiteLilyApp composition", () => {
         approvalPolicy: "never",
       },
     });
-    transport.receive({ id: 3, result: { thread: { id: "thread-service-live-execution" } } });
+    transport.receive({ id: 3, result: { thread: { id: "thread-service-live-intent" } } });
+    const executionThreadStart = await transport.nextSent();
+    expect(executionThreadStart).toMatchObject({
+      id: 4,
+      method: "thread/start",
+      params: {
+        model: "service-live-model",
+        cwd: resolve(files.directory, "codex-workspace"),
+        sandbox: "read-only",
+        approvalPolicy: "never",
+      },
+    });
+    if (!("params" in executionThreadStart)) throw new Error("expected thread start parameters");
+    const dynamicTools = (executionThreadStart.params as { dynamicTools?: Array<{ name: string }> })
+      .dynamicTools;
+    expect(dynamicTools?.map((tool) => tool.name)).toEqual(MINECRAFT_TOOL_NAMES);
+    transport.receive({ id: 4, result: { thread: { id: "thread-service-live-execution" } } });
     await companionStarting;
 
     const turn = codex.sendTurn("thread-service-live-execution", "transport pair check");
     await expect(transport.nextSent()).resolves.toEqual({
-      id: 4,
+      id: 5,
       method: "turn/start",
       params: {
         threadId: "thread-service-live-execution",
@@ -2451,7 +2462,7 @@ describe("WhiteLilyApp composition", () => {
         effort: "xhigh",
       },
     });
-    transport.receive({ id: 4, result: { turn: { id: "turn-service-live" } } });
+    transport.receive({ id: 5, result: { turn: { id: "turn-service-live" } } });
     transport.receive({
       method: "turn/completed",
       params: {
@@ -2574,11 +2585,13 @@ describe("externally composed CompanionService startup", () => {
         cwd: harness.directory,
         model: "gpt-5.6-luna",
         reasoningEffort: "low",
+        toolAccess: "none",
       },
       {
         cwd: harness.directory,
         model: "gpt-5.6-luna",
         reasoningEffort: "low",
+        toolAccess: "minecraft",
       },
     ]);
 

@@ -104,7 +104,12 @@ interface PendingTurn {
 class FakeCodexPort implements CodexPort {
   readonly turns: Array<{ threadId: string; text: string }> = [];
   readonly interruptions: Array<{ threadId: string; turnId: string }> = [];
-  readonly startedThreads: Array<{ cwd: string; model: string; reasoningEffort: string }> = [];
+  readonly startedThreads: Array<{
+    cwd: string;
+    model: string;
+    reasoningEffort: string;
+    toolAccess?: "none" | "minecraft";
+  }> = [];
   readonly closedThreads: string[] = [];
   readonly threadLifecycle: string[] = [];
   readonly pendingTurns: PendingTurn[] = [];
@@ -248,6 +253,7 @@ class FakeCodexPort implements CodexPort {
     cwd: string;
     model: string;
     reasoningEffort: string;
+    toolAccess?: "none" | "minecraft";
   }): Promise<string> {
     const call = this.threadStartCalls++;
     const role = this.nextThreadRole;

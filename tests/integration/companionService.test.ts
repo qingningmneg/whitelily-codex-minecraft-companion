@@ -216,8 +216,14 @@ describe("CompanionService lifecycle", () => {
     await value.start();
 
     expect(value.codex.startedThreads).toHaveLength(2);
-    expect(value.codex.startedThreads[0]).toMatchObject({ model: "gpt-5.6-terra" });
-    expect(value.codex.startedThreads[1]).toMatchObject({ model: "gpt-5.6-terra" });
+    expect(value.codex.startedThreads[0]).toMatchObject({
+      model: "gpt-5.6-terra",
+      toolAccess: "none",
+    });
+    expect(value.codex.startedThreads[1]).toMatchObject({
+      model: "gpt-5.6-terra",
+      toolAccess: "minecraft",
+    });
     expect(value.codex.startedThreadIds.intent).not.toBe(value.codex.startedThreadIds.execution);
   });
 

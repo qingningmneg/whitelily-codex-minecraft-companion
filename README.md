@@ -34,14 +34,17 @@ PowerShell 脚本 / CLI
   └─ RuntimeFacade
       └─ WhiteLilyAppLifecycle
           ├─ CompanionService ── TaskController / TurnToolBudget
-          ├─ 本机 Codex app-server
-          └─ 受限 MCP 工具 ── ActionExecutor ── SafetyEngine
-                                             └─ MinecraftPort
-                                                 └─ Mineflayer
-                                                     └─ 127.0.0.1 Minecraft LAN 世界
+          ├─ 本机 MCP ── 受限工具注册表
+          └─ 本机 Codex app-server
+              ├─ 意图线程（无动作工具）
+              └─ 执行线程 dynamic minecraft_* ── 同一受限工具注册表
+                                                    └─ ActionExecutor ── SafetyEngine
+                                                                          └─ MinecraftPort
+                                                                              └─ Mineflayer
+                                                                                  └─ 127.0.0.1 Minecraft LAN 世界
 ```
 
-`RuntimeFacade` 提供稳定的 `start()`、`stop(reason)`、`subscribe()` 和 `snapshot()` 边界。Codex 只能通过受限 MCP 工具提出游戏操作；可信游戏快照、任务租约、预算、安全策略和动作执行器会在调用 Mineflayer 前逐层检查请求。完整依赖关系和停止顺序见[运行时架构](docs/runtime-architecture.md)。
+`RuntimeFacade` 提供稳定的 `start()`、`stop(reason)`、`subscribe()` 和 `snapshot()` 边界。普通对话和意图判断线程没有动作工具；只有已验证任务的执行线程获得受限的动态 Minecraft 工具。动态工具和本机 MCP 复用同一工具注册表，可信游戏快照、任务租约、预算、安全策略和动作执行器会在调用 Mineflayer 前逐层检查请求。完整依赖关系和停止顺序见[运行时架构](docs/runtime-architecture.md)。
 
 PCL2 始终由用户自行启动和操作。WhiteLily 不会启动、控制、点击或修改 PCL2；当前版本只连接用户手动开放到 LAN 的 Minecraft 世界。
 
@@ -207,14 +210,17 @@ PowerShell scripts / CLI
   └─ RuntimeFacade
       └─ WhiteLilyAppLifecycle
           ├─ CompanionService ── TaskController / TurnToolBudget
-          ├─ local Codex app-server
-          └─ constrained MCP tools ── ActionExecutor ── SafetyEngine
-                                                  └─ MinecraftPort
-                                                      └─ Mineflayer
-                                                          └─ 127.0.0.1 Minecraft LAN world
+          ├─ local MCP ── constrained tool registry
+          └─ local Codex app-server
+              ├─ intent thread (no action tools)
+              └─ execution thread dynamic minecraft_* ── same constrained tool registry
+                                                          └─ ActionExecutor ── SafetyEngine
+                                                                                └─ MinecraftPort
+                                                                                    └─ Mineflayer
+                                                                                        └─ 127.0.0.1 Minecraft LAN world
 ```
 
-`RuntimeFacade` exposes the stable `start()`, `stop(reason)`, `subscribe()`, and `snapshot()` boundary. Codex can propose game operations only through constrained MCP tools. Trusted game snapshots, task leases, budgets, safety policy, and the action executor check a request in layers before Mineflayer is called. See [runtime architecture](docs/runtime-architecture.md) for the full dependency direction and stop order.
+`RuntimeFacade` exposes the stable `start()`, `stop(reason)`, `subscribe()`, and `snapshot()` boundary. Ordinary conversation and intent classification receive no action tools; only the execution thread for a validated task receives constrained dynamic Minecraft tools. Dynamic tools and the local MCP endpoint reuse the same registry, so trusted game snapshots, task leases, budgets, safety policy, and the action executor still check every request in layers before Mineflayer is called. See [runtime architecture](docs/runtime-architecture.md) for the full dependency direction and stop order.
 
 PCL2 always remains under user control. WhiteLily does not launch, control, click, or modify PCL2; the current release only connects to a Minecraft world that the user manually opens to LAN.
 

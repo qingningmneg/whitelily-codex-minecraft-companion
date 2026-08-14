@@ -8,10 +8,20 @@ import { mkdirSync, readFileSync, readdirSync, realpathSync, statSync } from "no
 import { createRequire } from "node:module";
 import { dirname, isAbsolute, join, posix, relative, resolve, sep, win32 } from "node:path";
 
+export type JsonRpcRequestId = string | number;
+
+export type JsonRpcServerRequest = {
+  id: JsonRpcRequestId;
+  method: string;
+  params: unknown;
+};
+
+export type JsonRpcRequestHandler = (request: JsonRpcServerRequest) => Promise<unknown>;
+
 export type JsonRpcMessage =
-  | { id: number; method: string; params: unknown }
-  | { id: number; result: unknown }
-  | { id: number; error: unknown }
+  | JsonRpcServerRequest
+  | { id: JsonRpcRequestId; result: unknown }
+  | { id: JsonRpcRequestId; error: unknown }
   | { method: string; params: unknown };
 
 export interface JsonRpcLineTransport {
@@ -201,6 +211,8 @@ const httpProviderArgs = [
   "model_providers.whitelily_openai_http.requires_openai_auth=true",
   "-c",
   "model_providers.whitelily_openai_http.supports_websockets=false",
+  "-c",
+  'mcp_servers.minecraft.url="http://127.0.0.1:32123/mcp"',
 ] as const;
 
 export function createCodexAppServerSpawnSpec(
@@ -731,6 +743,7 @@ export class JsonRpcProcess {
   private stopped = false;
   private closePromise: Promise<void> | undefined;
   private readonly requestTimeoutMs: number;
+  private requestHandler: JsonRpcRequestHandler | undefined;
 
   constructor(
     private readonly transport: JsonRpcLineTransport,
@@ -778,6 +791,14 @@ export class JsonRpcProcess {
     return () => this.notificationListeners.delete(listener);
   }
 
+  onRequest(handler: JsonRpcRequestHandler): () => void {
+    if (this.requestHandler) throw new Error("Codex app-server request handler is already set");
+    this.requestHandler = handler;
+    return () => {
+      if (this.requestHandler === handler) this.requestHandler = undefined;
+    };
+  }
+
   onExit(listener: (error: Error) => void): () => void {
     this.exitListeners.add(listener);
     return () => this.exitListeners.delete(listener);
@@ -805,6 +826,15 @@ export class JsonRpcProcess {
     } catch {
       return;
     }
+    if (
+      "id" in message &&
+      (typeof message.id === "string" || typeof message.id === "number") &&
+      "method" in message &&
+      typeof message.method === "string"
+    ) {
+      void this.answerServerRequest(message).catch(() => undefined);
+      return;
+    }
     if ("id" in message && typeof message.id === "number") {
       const pending = this.pending.get(message.id);
       if (!pending) return;
@@ -819,6 +849,33 @@ export class JsonRpcProcess {
     }
     if ("method" in message && typeof message.method === "string") {
       for (const listener of this.notificationListeners) listener(message);
+    }
+  }
+
+  private async answerServerRequest(request: JsonRpcServerRequest): Promise<void> {
+    const handler = this.requestHandler;
+    let response:
+      { id: JsonRpcRequestId; result: unknown } | { id: JsonRpcRequestId; error: unknown };
+    if (!handler) {
+      response = {
+        id: request.id,
+        error: { code: -32_601, message: "Method not found" },
+      };
+    } else {
+      try {
+        response = { id: request.id, result: await handler(request) };
+      } catch {
+        response = {
+          id: request.id,
+          error: { code: -32_603, message: "Internal error" },
+        };
+      }
+    }
+    if (this.stopped) return;
+    try {
+      this.transport.writeLine(JSON.stringify(response));
+    } catch (error) {
+      this.failAndClose(asError(error, "failed to write Codex app-server response"));
     }
   }
 

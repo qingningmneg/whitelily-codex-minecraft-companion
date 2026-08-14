@@ -3,6 +3,7 @@ import { dirname } from "node:path";
 import { ActionExecutor } from "./actions/actionExecutor.js";
 import { AutonomyScheduler } from "./autonomy/autonomyScheduler.js";
 import { CodexAppServerClient } from "./codex/appServerClient.js";
+import { createMinecraftDynamicTools } from "./codex/minecraftDynamicTools.js";
 import {
   createBundledCodexLaunchConfig,
   resolveDefaultCodexLaunchConfig,
@@ -730,17 +731,27 @@ export function createProductionRuntime(
     latestSnapshot: trustedSnapshots.latest,
     observeSnapshot: trustedSnapshots.publish,
   };
+  codex.configureDynamicTools(createMinecraftDynamicTools(toolDependencies));
 
   const mcp = new McpLifecycle(toolDependencies, {
     workspaceVersion: context.workspaceVersion,
     onActionUnavailable: () => companion!.actionCapabilityLost(),
     reportAuthorityLoss: context.reportAuthorityLoss,
   });
+  const runtimeCodex: AppRuntime["codex"] = {
+    assertChatGptLogin: () => codex.assertChatGptLogin(),
+    start: async () => {
+      await codex.start();
+      await codex.reloadMcpServers();
+    },
+    listModels: () => codex.listModels(),
+    stop: () => codex.stop(),
+  };
 
   return {
     preferredModel,
     mcp,
-    codex,
+    codex: runtimeCodex,
     selectModel,
     switchModel: (selection, commitPreference) =>
       companion!.switchModel(selection, commitPreference),

@@ -9,7 +9,12 @@ export interface CodexPort {
   start(): Promise<void>;
   listModels(): Promise<string[]>;
   validateModelSelection(selection: { modelId: string; reasoningEffort: string }): Promise<boolean>;
-  startThread(input: { cwd: string; model: string; reasoningEffort: string }): Promise<string>;
+  startThread(input: {
+    cwd: string;
+    model: string;
+    reasoningEffort: string;
+    toolAccess?: "none" | "minecraft";
+  }): Promise<string>;
   sendTurn(
     threadId: string,
     text: string,

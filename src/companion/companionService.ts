@@ -467,11 +467,13 @@ export class CompanionService {
         cwd: this.dependencies.cwd,
         model: selection.modelId,
         reasoningEffort: selection.reasoningEffort,
+        toolAccess: "none",
       });
       const executionThreadId = await this.dependencies.codex.startThread({
         cwd: this.dependencies.cwd,
         model: selection.modelId,
         reasoningEffort: selection.reasoningEffort,
+        toolAccess: "minecraft",
       });
       return Object.freeze({ intentThreadId, executionThreadId });
     } catch (error) {

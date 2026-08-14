@@ -203,7 +203,7 @@ describe("CodexAppServerClient", () => {
       method: "initialize",
       params: {
         clientInfo: { name: "whitelily-companion", title: null, version: "0.1.1" },
-        capabilities: { experimentalApi: false, requestAttestation: false },
+        capabilities: { experimentalApi: true, requestAttestation: false },
       },
     });
     harness.receive({ id: 1, result: initialized });
@@ -297,6 +297,111 @@ describe("CodexAppServerClient", () => {
       text: "",
       status: "interrupted",
     });
+  });
+
+  it("grants dynamic Minecraft tools only to an explicitly tool-enabled thread", async () => {
+    const harness = createJsonRpcLineTransportHarness();
+    const client = new CodexAppServerClient(config, dependencies(harness));
+    const dynamicTools = {
+      specs: [
+        {
+          type: "function" as const,
+          name: "minecraft_follow_owner",
+          description: "Follow the configured owner.",
+          inputSchema: { type: "object" },
+          deferLoading: false,
+        },
+      ],
+      call: vi.fn(async () => ({
+        contentItems: [{ type: "inputText" as const, text: '{"status":"completed"}' }],
+        success: true,
+      })),
+    };
+    client.configureDynamicTools(dynamicTools);
+
+    const starting = client.start();
+    await expect(harness.nextSent()).resolves.toEqual({
+      id: 1,
+      method: "initialize",
+      params: {
+        clientInfo: { name: "whitelily-companion", title: null, version: "0.1.1" },
+        capabilities: { experimentalApi: true, requestAttestation: false },
+      },
+    });
+    harness.receive({ id: 1, result: initialized });
+    await starting;
+    await expect(harness.nextSent()).resolves.toEqual({ method: "initialized", params: {} });
+
+    const intent = client.startThread({
+      cwd: "C:/ignored",
+      model: "gpt-5.6-terra",
+      reasoningEffort: "medium",
+      toolAccess: "none",
+    });
+    await expect(harness.nextSent()).resolves.toEqual({
+      id: 2,
+      method: "thread/start",
+      params: {
+        model: "gpt-5.6-terra",
+        cwd: "C:/WhiteLily/codex-workspace",
+        sandbox: "read-only",
+        approvalPolicy: "never",
+      },
+    });
+    harness.receive({ id: 2, result: { thread: { id: "thread-intent" } } });
+    await expect(intent).resolves.toBe("thread-intent");
+
+    const execution = client.startThread({
+      cwd: "C:/ignored",
+      model: "gpt-5.6-terra",
+      reasoningEffort: "medium",
+      toolAccess: "minecraft",
+    });
+    await expect(harness.nextSent()).resolves.toEqual({
+      id: 3,
+      method: "thread/start",
+      params: {
+        model: "gpt-5.6-terra",
+        cwd: "C:/WhiteLily/codex-workspace",
+        sandbox: "read-only",
+        approvalPolicy: "never",
+        dynamicTools: dynamicTools.specs,
+      },
+    });
+    harness.receive({ id: 3, result: { thread: { id: "thread-execution" } } });
+    await expect(execution).resolves.toBe("thread-execution");
+
+    const params = {
+      threadId: "thread-execution",
+      turnId: "turn-1",
+      callId: "call-1",
+      namespace: null,
+      tool: "minecraft_follow_owner",
+      arguments: { distance: 3, turnLease: "a".repeat(43) },
+    };
+    harness.receive({ id: "server-tool-1", method: "item/tool/call", params });
+    await expect(harness.nextSent()).resolves.toEqual({
+      id: "server-tool-1",
+      result: {
+        contentItems: [{ type: "inputText", text: '{"status":"completed"}' }],
+        success: true,
+      },
+    });
+    expect(dynamicTools.call).toHaveBeenCalledWith(params);
+
+    harness.receive({
+      id: "server-tool-2",
+      method: "item/tool/call",
+      params: { ...params, threadId: "thread-intent" },
+    });
+    await expect(harness.nextSent()).resolves.toEqual({
+      id: "server-tool-2",
+      result: {
+        contentItems: [{ type: "inputText", text: '{"error":"Minecraft tool is unavailable"}' }],
+        success: false,
+      },
+    });
+    expect(dynamicTools.call).toHaveBeenCalledTimes(1);
   });
 
   it("refuses an API-key login before spawning the app server", async () => {
