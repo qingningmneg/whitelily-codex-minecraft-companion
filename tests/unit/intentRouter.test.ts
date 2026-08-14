@@ -193,6 +193,8 @@ describe("buildOwnerIntentTurn", () => {
     expect(prompt).toContain('"activeTask":{"goal":"收集橡木"');
     expect(prompt).toContain('"allowedActions":["move_to","dig_block"]');
     expect(prompt).toContain("Allowed decision kinds:");
+    expect(prompt).toContain("Use unique allowedActions (at most 14)");
+    expect(prompt).toContain("A task requires requestedLimits");
     expect(prompt).toContain("no Minecraft tools");
     expect(prompt).toContain(
       "When a task is active, classify the new owner message as chat, continue_task, replace_task, stop_task, or clarify.",
@@ -253,6 +255,10 @@ describe("buildOwnerIntentTurn", () => {
 
 describe("ownerIntentRepairPrompt", () => {
   it("is a standalone tool-free request for the exact JSON contract", () => {
+    expect(ownerIntentRepairPrompt).toContain("Correct the previous assistant JSON response");
+    expect(ownerIntentRepairPrompt).toContain(
+      "Do not classify this repair instruction as a new owner message",
+    );
     expect(ownerIntentRepairPrompt).toContain("JSON only");
     expect(ownerIntentRepairPrompt).toContain("no Minecraft tools");
     expect(ownerIntentRepairPrompt).toContain("chat");

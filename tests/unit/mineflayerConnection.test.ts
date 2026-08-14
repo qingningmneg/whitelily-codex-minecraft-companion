@@ -652,6 +652,30 @@ describe("MineflayerConnection", () => {
     ]);
   });
 
+  it("drops command feedback misparsed by Mineflayer as owner chat", async () => {
+    const harness = createMineflayerConnectionHarness();
+    const connection = new MineflayerConnection(harness.dependencies);
+    const chats: Array<{ username: string; message: string }> = [];
+    connection.onEvent((event) => {
+      if (event.kind === "chat") chats.push({ username: event.username, message: event.message });
+    });
+    void connection.connect();
+    await flushAttempt();
+    const bot = harness.bots[0];
+
+    bot?.emit(
+      "chat",
+      "Owner",
+      "Teleported Owner to WhiteLily]",
+      "chat.type.admin",
+      {},
+      null,
+    );
+    bot?.emit("chat", "Owner", "hello", "chat.type.text", {}, null);
+
+    expect(chats).toEqual([{ username: "Owner", message: "hello" }]);
+  });
+
   it("does not cancel an operation after it unregisters", async () => {
     const harness = createMineflayerConnectionHarness();
     const connection = new MineflayerConnection(harness.dependencies);

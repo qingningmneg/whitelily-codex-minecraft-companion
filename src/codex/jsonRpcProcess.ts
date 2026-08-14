@@ -188,6 +188,21 @@ function codexCommandSpec(
   };
 }
 
+const httpProviderArgs = [
+  "-c",
+  'model_provider="whitelily_openai_http"',
+  "-c",
+  'model_providers.whitelily_openai_http.name="WhiteLilyHTTP"',
+  "-c",
+  'model_providers.whitelily_openai_http.base_url="https://chatgpt.com/backend-api/codex"',
+  "-c",
+  'model_providers.whitelily_openai_http.wire_api="responses"',
+  "-c",
+  "model_providers.whitelily_openai_http.requires_openai_auth=true",
+  "-c",
+  "model_providers.whitelily_openai_http.supports_websockets=false",
+] as const;
+
 export function createCodexAppServerSpawnSpec(
   platform: NodeJS.Platform,
   launch: string | CodexLaunchConfig,
@@ -201,7 +216,7 @@ export function createCodexAppServerSpawnSpec(
   return codexCommandSpec(
     platform,
     executable,
-    ["app-server", "--listen", "stdio://"],
+    [...httpProviderArgs, "app-server", "--listen", "stdio://"],
     controlledEnvironment,
   );
 }

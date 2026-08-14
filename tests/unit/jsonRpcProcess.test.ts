@@ -34,6 +34,21 @@ const reviewedExecutables = [
   "vendor/x86_64-pc-windows-msvc/codex-resources/codex-windows-sandbox-setup.exe",
 ] as const;
 
+const httpProviderArgs = [
+  "-c",
+  'model_provider="whitelily_openai_http"',
+  "-c",
+  'model_providers.whitelily_openai_http.name="WhiteLilyHTTP"',
+  "-c",
+  'model_providers.whitelily_openai_http.base_url="https://chatgpt.com/backend-api/codex"',
+  "-c",
+  'model_providers.whitelily_openai_http.wire_api="responses"',
+  "-c",
+  "model_providers.whitelily_openai_http.requires_openai_auth=true",
+  "-c",
+  "model_providers.whitelily_openai_http.supports_websockets=false",
+] as const;
+
 function createPackagedCodexFixture(): {
   root: string;
   resources: string;
@@ -210,7 +225,7 @@ describe("JsonRpcProcess", () => {
     expect(terminate).toHaveBeenCalledWith(child);
   });
 
-  it("uses a hidden command processor on Windows and strips API credentials", () => {
+  it("forces HTTP through a hidden Windows command processor and strips API credentials", () => {
     const spec = createCodexAppServerSpawnSpec(
       "win32",
       "C:\\WhiteLily\\node_modules\\.bin\\codex.cmd",
@@ -230,7 +245,7 @@ describe("JsonRpcProcess", () => {
         "/d",
         "/s",
         "/c",
-        '""C:\\WhiteLily\\node_modules\\.bin\\codex.cmd" app-server --listen stdio://"',
+        `""C:\\WhiteLily\\node_modules\\.bin\\codex.cmd" ${httpProviderArgs.join(" ")} app-server --listen stdio://"`,
       ],
       env: { PATH: "C:\\Windows" },
       windowsHide: true,
@@ -253,7 +268,7 @@ describe("JsonRpcProcess", () => {
 
       expect(spec).toMatchObject({
         command: launch.executablePath,
-        args: ["app-server", "--listen", "stdio://"],
+        args: [...httpProviderArgs, "app-server", "--listen", "stdio://"],
         env: {
           CODEX_HOME: launch.codexHome,
           PATH: [

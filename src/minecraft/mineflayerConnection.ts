@@ -65,7 +65,7 @@ export class MineflayerTransportFenceError extends Error {
 }
 
 interface BotHandlers {
-  chat: (username: string, message: string) => void;
+  chat: (username: string, message: string, translate: string | null) => void;
   playerJoined: (player: { username: string }) => void;
   playerLeft: (player: { username: string }) => void;
   spawn: () => void;
@@ -390,7 +390,10 @@ export class MineflayerConnection {
 
   private attach(bot: Bot): void {
     const handlers: BotHandlers = {
-      chat: (username, message) => this.emitForBot(bot, { kind: "chat", username, message }),
+      chat: (username, message, translate) => {
+        if (translate === "chat.type.admin") return;
+        this.emitForBot(bot, { kind: "chat", username, message });
+      },
       playerJoined: (player) =>
         this.emitForBot(bot, { kind: "owner_online", username: player.username }),
       playerLeft: (player) =>
