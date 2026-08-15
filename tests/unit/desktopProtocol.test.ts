@@ -16,10 +16,67 @@ const idleSnapshot = {
   codex: { state: "stopped", model: null },
   actions: null,
   task: null,
+  actionQueue: { goal: null, items: [] },
   lastError: null,
 } as const;
 
 describe("desktop protocol v1", () => {
+  it("round-trips a bounded queue projection without authority fields", () => {
+    const actionQueue = {
+      goal: "制作面包",
+      items: [
+        {
+          index: 1,
+          kind: "find_blocks",
+          summary: "寻找成熟小麦",
+          status: "waiting",
+          retryCount: 0,
+          enqueuedAt: "2026-08-15T00:00:00.000Z",
+        },
+      ],
+    } as const;
+    const snapshot = { ...idleSnapshot, actionQueue };
+
+    expect(parseDesktopCommandResult({ kind: "get_status" }, snapshot)).toEqual(snapshot);
+    expect(
+      parseDesktopEvent({
+        version: DESKTOP_PROTOCOL_VERSION,
+        event: { kind: "action_queue", revision: 1, actionQueue },
+      }),
+    ).toEqual({
+      version: DESKTOP_PROTOCOL_VERSION,
+      event: { kind: "action_queue", revision: 1, actionQueue },
+    });
+    expect(JSON.stringify(snapshot.actionQueue)).not.toMatch(/lease|observation|position|"x"/iu);
+
+    for (const invalid of [
+      { ...actionQueue, goal: "花".repeat(161) },
+      { ...actionQueue, authority: "private" },
+      {
+        ...actionQueue,
+        items: [{ ...actionQueue.items[0], enqueuedAt: "2026-08-15 00:00:00" }],
+      },
+      {
+        ...actionQueue,
+        items: [{ ...actionQueue.items[0], leaseId: "private" }],
+      },
+      {
+        ...actionQueue,
+        items: Array.from({ length: 257 }, (_, index) => ({
+          ...actionQueue.items[0],
+          index: index + 1,
+        })),
+      },
+    ]) {
+      expect(() =>
+        parseDesktopCommandResult(
+          { kind: "get_status" },
+          { ...idleSnapshot, actionQueue: invalid },
+        ),
+      ).toThrow("invalid desktop command result");
+    }
+  });
+
   it("parses only exact action capability snapshots and events", () => {
     const ready = {
       state: "ready",

@@ -64,6 +64,7 @@ const idleSnapshot: RuntimeSnapshot = {
   codex: { state: "stopped", model: null },
   actions: null,
   task: null,
+  actionQueue: { goal: null, items: [] },
   lastError: null,
 };
 
@@ -2614,6 +2615,7 @@ describe("DesktopChildServer", () => {
             startedAt: 0,
           },
         },
+        actionQueue: { goal: "stale authority", items: [] },
         lastError: null,
       };
       const stop = vi.fn(async (_reason: TaskStopReason) => {
@@ -2624,6 +2626,7 @@ describe("DesktopChildServer", () => {
           codex: { state: "failed", model: null },
           actions: null,
           task: null,
+          actionQueue: { goal: null, items: [] },
           lastError: { code: "PROFILE_APPLY_FAILED", message: "Runtime contained" },
         };
       });
@@ -2733,6 +2736,7 @@ describe("DesktopChildServer", () => {
           codex: { state: "ready", model: "stale-model" },
           actions: readyActions,
           task: null,
+          actionQueue: { goal: null, items: [] },
           lastError: null,
         }),
         subscribe: () => () => undefined,
@@ -3493,6 +3497,32 @@ describe("DesktopChildServer", () => {
     });
   });
 
+  it("forwards only the strict sanitized action queue runtime event", async () => {
+    const tracked = trackingRuntime();
+    const harness = createHarness({ runtime: tracked.runtime });
+    const actionQueue = {
+      goal: "制作面包",
+      items: [
+        {
+          index: 1,
+          kind: "harvest_crop",
+          summary: "寻找成熟小麦",
+          status: "waiting" as const,
+          retryCount: 0,
+          enqueuedAt: "2026-08-15T00:00:00.000Z",
+        },
+      ],
+    };
+
+    tracked.emit({ kind: "action_queue", revision: 1, actionQueue });
+
+    await expect(harness.nextEvent()).resolves.toEqual({
+      version: DESKTOP_PROTOCOL_VERSION,
+      event: { kind: "action_queue", revision: 1, actionQueue },
+    });
+    expect(JSON.stringify(harness.lines())).not.toMatch(/lease|observation|position/iu);
+  });
+
   it.each([
     {
       label: "normal stop",
@@ -3741,6 +3771,7 @@ describe("DesktopChildServer", () => {
           startedAt: 1_785_369_600_000,
         },
       },
+      actionQueue: { goal: "走到主人身边", items: [] },
       lastError: null,
     };
     const stopTask = vi.fn(async () => {
@@ -3831,6 +3862,7 @@ describe("DesktopChildServer", () => {
           startedAt: 1_785_369_600_000,
         },
       },
+      actionQueue: { goal: "Keep the task contained", items: [] },
       lastError: null,
     };
     const stopRuntime = vi.fn(async () => undefined);
@@ -4656,6 +4688,7 @@ describe("DesktopChildServer", () => {
       codex: { state: "ready", model: "gpt-5.6-terra" },
       actions: readyActions,
       task: null,
+      actionQueue: { goal: null, items: [] },
       lastError: null,
     };
     const runtime = {
@@ -4858,6 +4891,7 @@ describe("DesktopChildServer", () => {
       codex: { state: "ready", model: "gpt-5.6-terra" },
       actions: readyActions,
       task: null,
+      actionQueue: { goal: null, items: [] },
       lastError: null,
     };
     let snapshot = structuredClone(originalSnapshot);
@@ -4930,6 +4964,7 @@ describe("DesktopChildServer", () => {
       codex: { state: "ready", model: "gpt-5.6-terra" },
       actions: readyActions,
       task: null,
+      actionQueue: { goal: null, items: [] },
       lastError: null,
     };
     const runtime = {

@@ -15,6 +15,24 @@ export interface PublicTaskSnapshot {
   readonly budget: TaskBudgetSnapshot;
 }
 
+export type RuntimeActionQueueStatus =
+  "waiting" | "running" | "suspended" | "waiting_permission" | "completed" | "failed" | "cancelled";
+
+export interface RuntimeActionQueueProjection {
+  readonly goal: string | null;
+  readonly items: readonly {
+    readonly index: number;
+    readonly kind: string;
+    readonly summary: string;
+    readonly status: RuntimeActionQueueStatus;
+    readonly retryCount: number;
+    readonly enqueuedAt: string;
+    readonly startedAt?: string | undefined;
+    readonly endedAt?: string | undefined;
+    readonly reason?: string | undefined;
+  }[];
+}
+
 export type ActionCapabilitySnapshot =
   | { readonly state: "starting"; readonly workspaceVersion: string }
   | {
@@ -44,6 +62,7 @@ export interface RuntimeSnapshot {
   };
   readonly actions: ActionCapabilitySnapshot | null;
   readonly task: PublicTaskSnapshot | null;
+  readonly actionQueue: RuntimeActionQueueProjection;
   readonly lastError: { readonly code: string; readonly message: string } | null;
 }
 
@@ -53,6 +72,7 @@ export type RuntimeEventPayload =
   | { readonly kind: "codex"; readonly state: RuntimeSnapshot["codex"] }
   | { readonly kind: "actions"; readonly state: RuntimeSnapshot["actions"] }
   | { readonly kind: "task"; readonly task: PublicTaskSnapshot | null }
+  | { readonly kind: "action_queue"; readonly actionQueue: RuntimeActionQueueProjection }
   | { readonly kind: "error"; readonly error: { readonly code: string; readonly message: string } };
 
 export type RuntimeEvent = RuntimeEventPayload extends infer Event

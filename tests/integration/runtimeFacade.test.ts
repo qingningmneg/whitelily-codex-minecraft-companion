@@ -224,6 +224,72 @@ function createRuntimeFacadeHarness() {
 }
 
 describe("RuntimeFacade", () => {
+  it("publishes a sanitized queue projection and updates its public task goal", () => {
+    const listeners = new Set<() => void>();
+    let items: Array<{
+      id: string;
+      index: number;
+      kind: "jump";
+      summary: string;
+      status: "waiting" | "cancelled";
+      retryCount: number;
+      enqueuedAt: string;
+      reason?: string;
+    }> = [
+      {
+        id: "private-queue-id",
+        index: 1,
+        kind: "jump" as const,
+        summary: "跳一下",
+        status: "waiting" as const,
+        retryCount: 0,
+        enqueuedAt: "2026-08-15T00:00:00.000Z",
+      },
+    ];
+    const task = activeTaskFixture();
+    const events: RuntimeEvent[] = [];
+    const runtime = new RuntimeFacade({
+      lifecycle: { start: async () => undefined, stop: async () => undefined },
+      task: {
+        current: () => task,
+        budget: activeBudgetFixture,
+        stop: () => undefined,
+      },
+      actionQueue: {
+        snapshot: () => ({ items }),
+        subscribe: (listener) => {
+          listeners.add(listener);
+          return () => listeners.delete(listener);
+        },
+      },
+      createPublicTaskId: () => "task_public",
+    });
+    runtime.subscribe((event) => events.push(event));
+
+    expect(runtime.snapshot().actionQueue).toEqual({
+      goal: "Build safely",
+      items: [
+        {
+          index: 1,
+          kind: "jump",
+          summary: "跳一下",
+          status: "waiting",
+          retryCount: 0,
+          enqueuedAt: "2026-08-15T00:00:00.000Z",
+        },
+      ],
+    });
+    expect(JSON.stringify(runtime.snapshot().actionQueue)).not.toContain("private-queue-id");
+
+    items = [{ ...items[0]!, status: "cancelled", reason: "owner_stop" }];
+    for (const listener of listeners) listener();
+
+    expect(events.at(-1)).toMatchObject({
+      kind: "action_queue",
+      actionQueue: { items: [{ status: "cancelled", reason: "owner_stop" }] },
+    });
+  });
+
   it("retains a real MCP readiness failure for diagnostics until a fresh runtime starts", async () => {
     const failed = realActionRuntime({
       state: "failed",

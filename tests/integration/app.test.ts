@@ -2515,6 +2515,65 @@ describe("WhiteLilyApp composition", () => {
     await codex.stop();
   });
 
+  it("projects and logs only the sanitized action queue whitelist", async () => {
+    const files = await createCliHarness();
+    cleanups.push(files.cleanup);
+    const appModule = await import("../../src/app.js");
+    let production: import("../../src/app.js").AppRuntime | undefined;
+    let logPath = "";
+    const runtime = await createRuntimeFacade(files.configPath, {
+      cwd: files.directory,
+      runtimeFactory: (context) => {
+        logPath = context.paths.log;
+        production = appModule.createProductionRuntime(context);
+        return production;
+      },
+    });
+    const queue = production?.actionQueueProjection as CompanionActionQueue | undefined;
+    if (!queue) throw new Error("production action queue projection was not composed");
+
+    queue.enqueue({
+      taskLease: { id: "private-task-lease", startedAt: 1_700_000_000_000 },
+      worldGeneration: 7,
+      action: { kind: "move_to", position: { x: 1_234.5, y: 64, z: -987.5 } },
+      summary: "前往目标",
+      trustedObservationKey: "private-observation-key",
+    });
+
+    let record: Record<string, unknown> | undefined;
+    await vi.waitFor(async () => {
+      const lines = (await readFile(logPath, "utf8"))
+        .trim()
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      record = lines.find((line) => line.event === "action_queue_item_changed");
+      expect(record).toBeDefined();
+    });
+    expect(Object.keys(record!).sort()).toEqual(
+      [
+        "at",
+        "enqueuedAt",
+        "event",
+        "index",
+        "kind",
+        "level",
+        "retryCount",
+        "status",
+        "summary",
+      ].sort(),
+    );
+    expect(JSON.stringify(record)).not.toMatch(
+      /private-task-lease|private-observation-key|1234\.5|-987\.5|position|owner|prompt/iu,
+    );
+    expect(runtime.snapshot().actionQueue.items[0]).toMatchObject({
+      kind: "move_to",
+      summary: "前往目标",
+      status: "waiting",
+    });
+    await runtime.stop("process_exit");
+  });
+
   it("invalidates a startup-created task before component failure cleanup", async () => {
     const files = await createCliHarness();
     cleanups.push(files.cleanup);

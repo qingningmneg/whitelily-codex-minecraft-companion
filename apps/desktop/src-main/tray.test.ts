@@ -16,6 +16,7 @@ const runningSnapshot: RuntimeSnapshot = {
     discoveredToolCount: 15,
   },
   task: null,
+  actionQueue: { goal: null, items: [] },
   lastError: null,
 };
 
@@ -26,6 +27,7 @@ const stoppedSnapshot: RuntimeSnapshot = {
   codex: { state: "stopped", model: null },
   actions: null,
   task: null,
+  actionQueue: { goal: null, items: [] },
   lastError: null,
 };
 

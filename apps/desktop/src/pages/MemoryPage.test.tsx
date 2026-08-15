@@ -66,6 +66,7 @@ function api(overrides: Partial<WhiteLilyTask5Api> = {}): WhiteLilyTask5Api {
         discoveredToolCount: 15,
       },
       task: null,
+      actionQueue: { goal: null, items: [] },
       lastError: null,
     })),
     previewMemoryMigration: vi.fn(async (scope) => ({
@@ -160,6 +161,7 @@ describe("MemoryPage", () => {
         discoveredToolCount: 15,
       },
       task: null,
+      actionQueue: { goal: null, items: [] },
       lastError: null,
     }));
     render(

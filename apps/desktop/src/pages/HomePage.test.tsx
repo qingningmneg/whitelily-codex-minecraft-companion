@@ -54,6 +54,7 @@ const activeSnapshot: RuntimeSnapshot = {
       startedAt: 1_753_603_200_000,
     },
   },
+  actionQueue: { goal: "走到主人身边", items: [] },
   lastError: null,
 };
 
@@ -64,6 +65,7 @@ const stoppedSnapshot: RuntimeSnapshot = {
   codex: { state: "stopped", model: null },
   actions: null,
   task: null,
+  actionQueue: { goal: null, items: [] },
   lastError: null,
 };
 

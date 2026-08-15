@@ -2,7 +2,11 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { dirname } from "node:path";
 import { ActionExecutor } from "./actions/actionExecutor.js";
-import { CompanionActionQueue } from "./actions/actionQueue.js";
+import {
+  CompanionActionQueue,
+  type ActionQueueEvent,
+  type ActionQueueSnapshot,
+} from "./actions/actionQueue.js";
 import { QueuedActionRunner } from "./actions/queuedActionRunner.js";
 import { AutonomyScheduler } from "./autonomy/autonomyScheduler.js";
 import { CodexAppServerClient } from "./codex/appServerClient.js";
@@ -117,6 +121,10 @@ export interface AppRuntime {
   companion: ManagedCompanion;
   executor: ManagedExecutor;
   taskProjection?: Pick<RuntimeTaskProjection, "status" | "subscribe">;
+  actionQueueProjection?: {
+    snapshot(): ActionQueueSnapshot;
+    subscribe(listener: (event: ActionQueueEvent) => void): () => void;
+  };
 }
 
 export interface AppCompositionContext {
@@ -690,6 +698,31 @@ export function createProductionRuntime(
     createId: randomUUID,
     now: () => new Date(),
   });
+  actionQueue.subscribe((event) => {
+    const item = event.item;
+    const fields = {
+      index: item.index,
+      kind: item.kind,
+      summary: item.summary,
+      status: item.status,
+      retryCount: item.retryCount,
+      enqueuedAt: item.enqueuedAt,
+      ...(item.startedAt === undefined ? {} : { startedAt: item.startedAt }),
+      ...(item.endedAt === undefined ? {} : { endedAt: item.endedAt }),
+      ...(item.reason === undefined ? {} : { reason: item.reason }),
+    };
+    void Promise.resolve()
+      .then(() => logger.info("action_queue_item_changed", fields))
+      .catch(() =>
+        Promise.resolve()
+          .then(() =>
+            logger.error("action_queue_log_failed", {
+              code: "queue_log_write_failed",
+            }),
+          )
+          .catch(() => undefined),
+      );
+  });
   const actionRunner = new QueuedActionRunner({
     queue: actionQueue,
     executor,
@@ -783,6 +816,7 @@ export function createProductionRuntime(
       },
       subscribe: (listener) => confirmations.onGameActionsChanged(listener),
     },
+    actionQueueProjection: actionQueue,
   };
 }
 
@@ -1041,6 +1075,15 @@ export async function createRuntimeFacade(
             snapshot: () => actionSnapshot.call(composition.runtime.mcp),
             subscribe: (listener: (snapshot: ActionCapabilitySnapshot | null) => void) =>
               subscribeActions.call(composition.runtime.mcp, listener),
+          },
+        }
+      : {}),
+    ...(composition.runtime.actionQueueProjection
+      ? {
+          actionQueue: {
+            snapshot: () => composition.runtime.actionQueueProjection!.snapshot(),
+            subscribe: (listener: () => void) =>
+              composition.runtime.actionQueueProjection!.subscribe(listener),
           },
         }
       : {}),

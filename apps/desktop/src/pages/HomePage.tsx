@@ -524,6 +524,8 @@ function applyRuntimeEvent(snapshot: RuntimeSnapshot, event: RuntimeEvent): Runt
       return { ...snapshot, revision: event.revision, actions: event.state };
     case "task":
       return { ...snapshot, revision: event.revision, task: event.task };
+    case "action_queue":
+      return { ...snapshot, revision: event.revision, actionQueue: event.actionQueue };
     case "error":
       return { ...snapshot, revision: event.revision, lastError: event.error };
   }
@@ -574,6 +576,8 @@ function eventText(locale: Locale, event: RuntimeEvent): string {
       });
     case "task":
       return translate(locale, event.task ? "activity.taskStarted" : "activity.taskEnded");
+    case "action_queue":
+      return translate(locale, "diagnostics.queue.title");
     case "error":
       return translate(locale, "activity.error", { code: event.error.code });
   }

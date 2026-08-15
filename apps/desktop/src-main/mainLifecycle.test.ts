@@ -725,6 +725,7 @@ describe("native tray composition", () => {
       codex: { state: "stopped", model: null },
       actions: null,
       task: null,
+      actionQueue: { goal: null, items: [] },
       lastError: null,
     };
     const request = vi.fn(async (command: { kind: string }) => {

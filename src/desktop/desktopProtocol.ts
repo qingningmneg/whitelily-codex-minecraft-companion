@@ -106,6 +106,40 @@ const publicTaskSnapshotSchema = z
   })
   .strict();
 
+const canonicalIsoTimeSchema = boundedPublicString(64).refine((value) => {
+  const parsed = new Date(value);
+  return !Number.isNaN(parsed.getTime()) && parsed.toISOString() === value;
+});
+
+const runtimeActionQueueItemSchema = z
+  .object({
+    index: z.number().int().positive().safe(),
+    kind: boundedPublicString(64).refine((value) => value.trim().length > 0),
+    summary: boundedPublicString(160),
+    status: z.enum([
+      "waiting",
+      "running",
+      "suspended",
+      "waiting_permission",
+      "completed",
+      "failed",
+      "cancelled",
+    ]),
+    retryCount: finiteNonnegativeInteger,
+    enqueuedAt: canonicalIsoTimeSchema,
+    startedAt: canonicalIsoTimeSchema.optional(),
+    endedAt: canonicalIsoTimeSchema.optional(),
+    reason: boundedPublicString(240).optional(),
+  })
+  .strict();
+
+const runtimeActionQueueProjectionSchema = z
+  .object({
+    goal: boundedPublicString(160).nullable(),
+    items: z.array(runtimeActionQueueItemSchema).max(256),
+  })
+  .strict();
+
 const minecraftStateSchema = z
   .object({
     state: z.enum(["disconnected", "connecting", "connected", "reconnecting"]),
@@ -162,6 +196,7 @@ const runtimeSnapshotSchema = z
     codex: codexStateSchema,
     actions: actionCapabilitySnapshotSchema.nullable(),
     task: publicTaskSnapshotSchema.nullable(),
+    actionQueue: runtimeActionQueueProjectionSchema,
     lastError: publicErrorSchema.nullable(),
   })
   .strict();
@@ -214,6 +249,13 @@ const runtimeEventSchema = z.discriminatedUnion("kind", [
       kind: z.literal("task"),
       revision: runtimeRevisionSchema,
       task: publicTaskSnapshotSchema.nullable(),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("action_queue"),
+      revision: runtimeRevisionSchema,
+      actionQueue: runtimeActionQueueProjectionSchema,
     })
     .strict(),
   z
@@ -779,7 +821,8 @@ export function isAuthorityFreeTerminalRuntimeSnapshot(snapshot: RuntimeSnapshot
     (snapshot.codex.state === "stopped" || snapshot.codex.state === "failed") &&
     snapshot.codex.model === null &&
     snapshot.actions === null &&
-    snapshot.task === null
+    snapshot.task === null &&
+    snapshot.actionQueue.goal === null
   );
 }
 

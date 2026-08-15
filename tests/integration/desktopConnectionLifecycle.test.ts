@@ -74,6 +74,7 @@ const idleRuntime: RuntimeSnapshot = {
   codex: { state: "stopped", model: null },
   actions: null,
   task: null,
+  actionQueue: { goal: null, items: [] },
   lastError: null,
 };
 

@@ -22,6 +22,7 @@ const runningSnapshot = {
   codex: { state: "ready" as const, model: "live-model" },
   actions: readyActions,
   task: null,
+  actionQueue: { goal: null, items: [] },
   lastError: null,
 };
 
@@ -221,6 +222,7 @@ describe("Task 5 application routing", () => {
         codex: { state: "ready", model: "live-model" },
         actions: readyActions,
         task: null,
+        actionQueue: { goal: null, items: [] },
         lastError: null,
       })),
       start: vi.fn(),
@@ -310,6 +312,7 @@ describe("Task 5 application routing", () => {
         codex: { state: "stopped", model: null },
         actions: null,
         task: null,
+        actionQueue: { goal: null, items: [] },
         lastError: null,
       },
     };
@@ -685,6 +688,7 @@ describe("Task 5 application routing", () => {
           codex: { state: "stopped", model: null },
           actions: null,
           task: null,
+          actionQueue: { goal: null, items: [] },
           lastError: null,
         },
       }),

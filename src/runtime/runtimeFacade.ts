@@ -14,6 +14,8 @@ import type {
   RuntimeEvent,
   RuntimeEventPayload,
   RuntimeAuthorityLoss,
+  RuntimeActionQueueProjection,
+  RuntimeActionQueueStatus,
   RuntimeSnapshot,
 } from "./runtimeEvents.js";
 
@@ -55,6 +57,10 @@ export interface RuntimeFacadeDependencies {
   actions?: {
     snapshot(): ActionCapabilitySnapshot | null;
     subscribe(listener: (snapshot: ActionCapabilitySnapshot | null) => void): () => void;
+  };
+  actionQueue?: {
+    snapshot(): unknown;
+    subscribe(listener: () => void): () => void;
   };
   profile?: {
     apply(profile: CompanionProfile): void;
@@ -127,6 +133,7 @@ export class RuntimeFacade {
   #unsubscribeMinecraft: (() => void) | undefined;
   #unsubscribeAuthority: (() => void) | undefined;
   #unsubscribeActions: (() => void) | undefined;
+  #unsubscribeActionQueue: (() => void) | undefined;
   #taskEventsFenced = false;
   #snapshot: RuntimeSnapshot = {
     revision: 0,
@@ -135,6 +142,7 @@ export class RuntimeFacade {
     codex: { state: "stopped", model: null },
     actions: null,
     task: null,
+    actionQueue: { goal: null, items: [] },
     lastError: null,
   };
   #startPromise: Promise<void> | undefined;
@@ -188,6 +196,19 @@ export class RuntimeFacade {
       });
     } catch {
       this.#failTaskState(false);
+    }
+    if (this.#terminal) return;
+    try {
+      this.#unsubscribeActionQueue = dependencies.actionQueue?.subscribe(() => {
+        if (this.#terminal) return;
+        this.#refreshActionQueue(true);
+      });
+    } catch {
+      this.#failOperationalState(
+        "ACTION_QUEUE_STATE_UNKNOWN",
+        "AI action queue state is unavailable",
+        false,
+      );
     }
     if (this.#terminal) return;
     try {
@@ -303,6 +324,7 @@ export class RuntimeFacade {
     ) {
       this.#refreshTask(false);
     }
+    this.#refreshActionQueue(false);
     return cloneRuntimeSnapshot(this.#snapshot);
   }
 
@@ -637,6 +659,7 @@ export class RuntimeFacade {
       codex: { state: "stopped", model: null },
       actions: null,
       task: null,
+      actionQueue: { goal: null, items: cloneActionQueue(this.#snapshot.actionQueue).items },
       lastError: error,
     };
     const cleanup = Promise.resolve()
@@ -678,6 +701,35 @@ export class RuntimeFacade {
         task: safeTask === null ? null : clonePublicTask(safeTask),
       });
     }
+    this.#refreshActionQueue(publish);
+  }
+
+  #refreshActionQueue(publish: boolean): void {
+    const source = this.#dependencies.actionQueue;
+    if (!source) return;
+    try {
+      const actionQueue = projectActionQueue(source.snapshot(), this.#snapshot.task?.goal ?? null);
+      if (sameActionQueue(this.#snapshot.actionQueue, actionQueue)) return;
+      this.#setActionQueue(actionQueue, publish);
+    } catch {
+      if (this.#terminal) {
+        this.#snapshot = { ...this.#snapshot, actionQueue: { goal: null, items: [] } };
+        return;
+      }
+      this.#failOperationalState(
+        "ACTION_QUEUE_STATE_UNKNOWN",
+        "AI action queue state is unavailable",
+        publish,
+      );
+    }
+  }
+
+  #setActionQueue(actionQueue: RuntimeActionQueueProjection, publish: boolean): void {
+    const safe = cloneActionQueue(actionQueue);
+    this.#snapshot = { ...this.#snapshot, actionQueue: safe };
+    if (publish) {
+      this.#publish({ kind: "action_queue", actionQueue: cloneActionQueue(safe) });
+    }
   }
 
   #recordError(code: string, message: string, publish = true): void {
@@ -718,10 +770,16 @@ export class RuntimeFacade {
     } catch {
       // Action observer teardown cannot affect lifecycle cleanup.
     }
+    try {
+      this.#unsubscribeActionQueue?.();
+    } catch {
+      // Queue observer teardown cannot affect lifecycle cleanup.
+    }
     this.#unsubscribeTask = undefined;
     this.#unsubscribeMinecraft = undefined;
     this.#unsubscribeAuthority = undefined;
     this.#unsubscribeActions = undefined;
+    this.#unsubscribeActionQueue = undefined;
     this.#authorityLossListeners.clear();
   }
 
@@ -764,6 +822,7 @@ export class RuntimeFacade {
       codex: { state: "stopped", model: null },
       actions: null,
       task: null,
+      actionQueue: { goal: null, items: cloneActionQueue(this.#snapshot.actionQueue).items },
       lastError: {
         code: "RUNTIME_REVISION_EXHAUSTED",
         message: "Runtime revision is exhausted",
@@ -1254,6 +1313,12 @@ function cloneRuntimeEvent(event: RuntimeEvent): RuntimeEvent {
         revision: event.revision,
         task: event.task === null ? null : clonePublicTask(event.task),
       };
+    case "action_queue":
+      return {
+        kind: "action_queue",
+        revision: event.revision,
+        actionQueue: cloneActionQueue(event.actionQueue),
+      };
     case "error":
       return {
         kind: "error",
@@ -1266,6 +1331,111 @@ function cloneRuntimeEvent(event: RuntimeEvent): RuntimeEvent {
     default:
       return assertNever(event);
   }
+}
+
+const queueStatuses = new Set<RuntimeActionQueueStatus>([
+  "waiting",
+  "running",
+  "suspended",
+  "waiting_permission",
+  "completed",
+  "failed",
+  "cancelled",
+]);
+
+function projectActionQueue(value: unknown, goal: string | null): RuntimeActionQueueProjection {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("AI action queue state is invalid");
+  }
+  const items = Reflect.get(value, "items");
+  if (!Array.isArray(items) || items.length > 256) {
+    throw new Error("AI action queue state is invalid");
+  }
+  return {
+    goal: goal === null ? null : serializePublicString(goal, 160, []),
+    items: items.map((item) => projectActionQueueItem(item)),
+  };
+}
+
+function projectActionQueueItem(value: unknown): RuntimeActionQueueProjection["items"][number] {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("AI action queue item is invalid");
+  }
+  const index = Reflect.get(value, "index");
+  const kindValue = Reflect.get(value, "kind");
+  const summaryValue = Reflect.get(value, "summary");
+  const status = Reflect.get(value, "status");
+  const retryCount = Reflect.get(value, "retryCount");
+  const enqueuedAt = Reflect.get(value, "enqueuedAt");
+  const startedAt = Reflect.get(value, "startedAt");
+  const endedAt = Reflect.get(value, "endedAt");
+  const reasonValue = Reflect.get(value, "reason");
+  const kind = typeof kindValue === "string" ? serializePublicString(kindValue, 64, []) : null;
+  const summary =
+    typeof summaryValue === "string" ? serializePublicString(summaryValue, 160, []) : null;
+  const reason =
+    reasonValue === undefined
+      ? undefined
+      : typeof reasonValue === "string"
+        ? serializePublicString(reasonValue, 240, [])
+        : null;
+  if (
+    !Number.isSafeInteger(index) ||
+    (index as number) <= 0 ||
+    kind === null ||
+    summary === null ||
+    typeof status !== "string" ||
+    !queueStatuses.has(status as RuntimeActionQueueStatus) ||
+    !Number.isSafeInteger(retryCount) ||
+    (retryCount as number) < 0 ||
+    !isCanonicalIsoTime(enqueuedAt) ||
+    (startedAt !== undefined && !isCanonicalIsoTime(startedAt)) ||
+    (endedAt !== undefined && !isCanonicalIsoTime(endedAt)) ||
+    reason === null
+  ) {
+    throw new Error("AI action queue item is invalid");
+  }
+  return {
+    index: index as number,
+    kind,
+    summary,
+    status: status as RuntimeActionQueueStatus,
+    retryCount: retryCount as number,
+    enqueuedAt,
+    ...(startedAt === undefined ? {} : { startedAt }),
+    ...(endedAt === undefined ? {} : { endedAt }),
+    ...(reason === undefined ? {} : { reason }),
+  };
+}
+
+function isCanonicalIsoTime(value: unknown): value is string {
+  if (typeof value !== "string" || value.length > 64) return false;
+  const parsed = new Date(value);
+  return !Number.isNaN(parsed.getTime()) && parsed.toISOString() === value;
+}
+
+function cloneActionQueue(value: RuntimeActionQueueProjection): RuntimeActionQueueProjection {
+  return {
+    goal: value.goal,
+    items: value.items.map((item) => ({
+      index: item.index,
+      kind: item.kind,
+      summary: item.summary,
+      status: item.status,
+      retryCount: item.retryCount,
+      enqueuedAt: item.enqueuedAt,
+      ...(item.startedAt === undefined ? {} : { startedAt: item.startedAt }),
+      ...(item.endedAt === undefined ? {} : { endedAt: item.endedAt }),
+      ...(item.reason === undefined ? {} : { reason: item.reason }),
+    })),
+  };
+}
+
+function sameActionQueue(
+  left: RuntimeActionQueueProjection,
+  right: RuntimeActionQueueProjection,
+): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
 }
 
 function cloneRuntimeSnapshot(snapshot: RuntimeSnapshot): RuntimeSnapshot {
@@ -1282,6 +1452,7 @@ function cloneRuntimeSnapshot(snapshot: RuntimeSnapshot): RuntimeSnapshot {
     },
     actions: cloneActionCapabilitySnapshot(snapshot.actions),
     task: snapshot.task === null ? null : clonePublicTask(snapshot.task),
+    actionQueue: cloneActionQueue(snapshot.actionQueue),
     lastError:
       snapshot.lastError === null
         ? null
