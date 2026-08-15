@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { FarmingPreferenceStore } from "../../src/profile/farmingPreferenceStore.js";
+import { nodeAtomicJsonFileIo, type AtomicJsonFileIo } from "../../src/storage/atomicJsonFile.js";
 
 const cleanups: Array<() => Promise<void>> = [];
 
@@ -64,6 +65,48 @@ describe("FarmingPreferenceStore", () => {
     await expect(new FarmingPreferenceStore({ rootDirectory }).read()).resolves.toMatchObject({
       revision: 2,
       value: { status: "allowed" },
+    });
+  });
+
+  it("does not commit an approval after its authority is lost before the final write", async () => {
+    const rootDirectory = await mkdtemp(join(tmpdir(), "whitelily-farming-commit-"));
+    cleanups.push(() => rm(rootDirectory, { recursive: true, force: true }));
+    let authorityCurrent = true;
+    let writeEntered!: () => void;
+    const writeEnteredPromise = new Promise<void>((resolve) => {
+      writeEntered = resolve;
+    });
+    let releaseWrite!: () => void;
+    const writeGate = new Promise<void>((resolve) => {
+      releaseWrite = resolve;
+    });
+    let gateFirstTemporaryWrite = true;
+    const fileIo: AtomicJsonFileIo = {
+      ...nodeAtomicJsonFileIo,
+      open: async (path, flags) => {
+        if (gateFirstTemporaryWrite && path.endsWith(".tmp")) {
+          gateFirstTemporaryWrite = false;
+          writeEntered();
+          await writeGate;
+        }
+        return nodeAtomicJsonFileIo.open(path, flags);
+      },
+    };
+    const store = new FarmingPreferenceStore({
+      rootDirectory,
+      clock: () => new Date("2026-08-15T08:00:00.000Z"),
+      fileIo,
+    });
+
+    const approval = store.setAllowed(0, () => authorityCurrent);
+    await writeEnteredPromise;
+    authorityCurrent = false;
+    releaseWrite();
+
+    await expect(approval).rejects.toMatchObject({ code: "DOCUMENT_CONFLICT" });
+    await expect(store.read()).resolves.toMatchObject({
+      revision: 0,
+      value: { status: "unknown" },
     });
   });
 

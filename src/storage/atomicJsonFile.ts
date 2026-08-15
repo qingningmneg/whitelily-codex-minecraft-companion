@@ -260,7 +260,7 @@ export class AtomicJsonFile<T> {
     return this.#clone(backup);
   }
 
-  async write(value: T): Promise<T> {
+  async write(value: T, beforeCommit?: () => void): Promise<T> {
     const normalized = this.#normalize(value);
     const directory = await this.#trustedDirectory(true);
     let targetTemp: PreparedTemp | undefined;
@@ -273,7 +273,7 @@ export class AtomicJsonFile<T> {
         await this.#renameTemp(backupTemp, this.#backupPath, directory);
         backupTemp = undefined;
       }
-      await this.#renameTemp(targetTemp, this.#path, directory);
+      await this.#renameTemp(targetTemp, this.#path, directory, beforeCommit);
       targetTemp = undefined;
       return this.#clone(normalized);
     } finally {
@@ -400,6 +400,7 @@ export class AtomicJsonFile<T> {
     temp: PreparedTemp,
     destination: string,
     directory: TrustedDirectory,
+    beforeCommit?: () => void,
   ): Promise<void> {
     await this.#beforeBoundary({
       operation: "rename",
@@ -424,6 +425,7 @@ export class AtomicJsonFile<T> {
       );
     }
     const trustedDestination = join(directory.operationPath, basename(destination));
+    beforeCommit?.();
     await this.#io.rename(source.operationPath, trustedDestination);
     const published = await this.#requireFile(trustedDestination);
     this.#assertSameIdentity(directory, published.parent, "atomic JSON publish escaped its parent");

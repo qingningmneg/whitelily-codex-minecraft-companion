@@ -71,15 +71,22 @@ export class FarmingPreferenceStore {
     status: Exclude<FarmingPreferenceStatus, "unknown">,
     guard?: () => boolean,
   ): Promise<DocumentEnvelope<FarmingPreference>> {
-    return this.#document.update(expectedRevision, () => {
+    const assertCurrentAuthority = () => {
       if (guard?.() === false) {
         throw new DocumentStoreError("DOCUMENT_CONFLICT", "farming permission authority is stale");
       }
-      return {
-        status,
-        updatedAt: this.#timestamp(),
-      };
-    });
+    };
+    return this.#document.update(
+      expectedRevision,
+      () => {
+        assertCurrentAuthority();
+        return {
+          status,
+          updatedAt: this.#timestamp(),
+        };
+      },
+      { beforeCommit: assertCurrentAuthority },
+    );
   }
 
   #timestamp(): string {

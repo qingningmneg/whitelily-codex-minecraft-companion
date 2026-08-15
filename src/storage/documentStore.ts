@@ -42,6 +42,10 @@ export interface DocumentStoreOptions<T> {
   recoverFrom?: (error: AtomicJsonFileError) => boolean;
 }
 
+export interface DocumentStoreUpdateOptions {
+  readonly beforeCommit?: () => void;
+}
+
 const documentQueues = new Map<string, Promise<unknown>>();
 
 function serializeDocumentOperation<T>(path: string, operation: () => Promise<T>): Promise<T> {
@@ -122,6 +126,7 @@ export class DocumentStore<T> {
   update(
     expectedRevision: number,
     updater: (current: Readonly<T>) => T | Promise<T>,
+    options: DocumentStoreUpdateOptions = {},
   ): Promise<DocumentEnvelope<T>> {
     return this.#coordinate(async () => {
       const current =
@@ -135,7 +140,12 @@ export class DocumentStore<T> {
         );
       }
       const value = this.#validateValue(await updater(this.#clone(current.value)));
-      return this.#clone(await this.#file.write(this.#newEnvelope(current.revision + 1, value)));
+      return this.#clone(
+        await this.#file.write(
+          this.#newEnvelope(current.revision + 1, value),
+          options.beforeCommit,
+        ),
+      );
     });
   }
 
