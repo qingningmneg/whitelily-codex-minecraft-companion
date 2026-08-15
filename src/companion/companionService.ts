@@ -31,6 +31,7 @@ import {
 import type { RuntimeAuthorityLoss } from "../runtime/runtimeEvents.js";
 import { isUnsolicitedActivityAllowed } from "../profile/behaviorPolicy.js";
 import type { CompanionProfile } from "../profile/profileSchema.js";
+import type { FarmingPreferenceAccess } from "../profile/farmingPreferenceStore.js";
 import {
   buildCompanionAutonomousTurn,
   buildCompanionRecoveryTurn,
@@ -48,6 +49,10 @@ import {
   type OwnerIntentDecision,
 } from "./intentRouter.js";
 import { ChatRouter } from "./chatRouter.js";
+import {
+  FarmingPermissionCoordinator,
+  type FarmingPermissionResult,
+} from "./farmingPermissionCoordinator.js";
 import { TaskController, type ActiveTask, type TaskDisclosure } from "./taskController.js";
 
 const repairPrompt = "只返回符合既定结构的 JSON，不要使用 Markdown。";
@@ -77,6 +82,9 @@ const unavailableMessage =
 
 const intentClarificationMessage = "你希望我陪你聊聊天，还是要我在游戏里做一件事？";
 const taskFailureMessage = "这次没能完成，请再试一次。";
+const farmingPermissionQuestion = "我可以在这里种小麦吗？";
+const farmingFallbackConstraint = "不得新建农田，寻找现成的成熟小麦";
+const farmingMutationKinds = new Set(["till_soil", "plant_crop"] as const);
 const filteredModelReply = "好，我知道了。";
 const ambiguousNaturalToolNames = new Set<ToolActionKind>(["say", "jump", "wait"]);
 const ambiguousNaturalToolNamePattern = [...ambiguousNaturalToolNames].join("|");
@@ -231,10 +239,18 @@ function autonomousMicroTaskDisclosure(reason: AutonomyReason): TaskDisclosure {
 }
 
 type CompanionTaskExecutionOutcome = ReturnType<typeof companionTaskExecutionOutcomeSchema.parse>;
-type ValidatedTaskDecision = Exclude<
+type ValidatedTaskDecision = Extract<
   OwnerIntentDecision,
-  { kind: "chat" | "stop_task" | "clarify" }
+  { kind: "start_task" | "continue_task" | "priority_task" | "replace_task" }
 >;
+type FarmingPermissionDecision = Extract<
+  OwnerIntentDecision,
+  {
+    kind: "grant_farming_permission" | "deny_farming_permission" | "revoke_farming_permission";
+  }
+>;
+type TaskControlDecision =
+  ValidatedTaskDecision | Extract<OwnerIntentDecision, { kind: "stop_task" }>;
 
 const taskLimitKeys = [
   "maxToolCalls",
@@ -284,6 +300,7 @@ export interface CompanionServiceDependencies {
   executor: ActionExecutor;
   actionQueue: CompanionActionQueue;
   actionRunner: QueuedActionRunner;
+  farmingPreference: FarmingPreferenceAccess;
   budget: TurnToolBudget;
   taskController: TaskController;
   autonomy: CompanionAutonomyScheduler;
@@ -299,6 +316,11 @@ export interface CompanionServiceDependencies {
   logger?: Pick<SafeLogger, "error">;
   setTimer?: (callback: () => void, milliseconds: number) => ReturnType<typeof setTimeout>;
   clearTimer?: (timer: ReturnType<typeof setTimeout>) => void;
+  setFarmingPermissionTimer?: (
+    callback: () => void,
+    milliseconds: number,
+  ) => ReturnType<typeof setTimeout>;
+  clearFarmingPermissionTimer?: (timer: ReturnType<typeof setTimeout>) => void;
   confirmationNow?: () => Date;
   setConfirmationTimer?: (
     callback: () => void,
@@ -339,6 +361,7 @@ interface IntentStamp {
   readonly ownerRevision: number;
   readonly worldGeneration: number;
   readonly taskLeaseAtDispatch: Readonly<TaskLease> | null;
+  readonly farmingPermissionEpochAtDispatch: number | undefined;
   readonly threadPair: CodexThreadPair;
 }
 
@@ -402,6 +425,7 @@ export class CompanionService {
     milliseconds: number,
   ) => ReturnType<typeof setTimeout>;
   private readonly clearConfirmationTimer: (timer: ReturnType<typeof setTimeout>) => void;
+  private readonly farmingPermissionCoordinator: FarmingPermissionCoordinator;
   private unsubscribe: (() => void) | undefined;
   private unsubscribeActionResult: (() => void) | undefined;
   private mergeTimer: ReturnType<typeof setTimeout> | undefined;
@@ -448,6 +472,16 @@ export class CompanionService {
     this.confirmationNow = dependencies.confirmationNow ?? (() => new Date());
     this.setConfirmationTimer = dependencies.setConfirmationTimer ?? setTimeout;
     this.clearConfirmationTimer = dependencies.clearConfirmationTimer ?? clearTimeout;
+    this.farmingPermissionCoordinator = new FarmingPermissionCoordinator({
+      actionQueue: dependencies.actionQueue,
+      executionContext: () => this.queueExecutionContext(),
+      ...(dependencies.setFarmingPermissionTimer === undefined
+        ? {}
+        : { setTimer: dependencies.setFarmingPermissionTimer }),
+      ...(dependencies.clearFarmingPermissionTimer === undefined
+        ? {}
+        : { clearTimer: dependencies.clearFarmingPermissionTimer }),
+    });
     dependencies.taskController.onTerminal((reason, forceCleanup, task) =>
       this.handleTaskTerminal(reason, forceCleanup, task.lease),
     );
@@ -970,8 +1004,77 @@ export class CompanionService {
           await this.sendOutcomeReply(decision.question, stamp.generation, false);
         }
         return;
+      case "grant_farming_permission":
+      case "deny_farming_permission":
+      case "revoke_farming_permission":
+        await this.applyFarmingPermissionDecision(decision, stamp);
+        return;
       default:
         await this.applyTaskDecision(decision, text, stamp);
+    }
+  }
+
+  private async applyFarmingPermissionDecision(
+    decision: FarmingPermissionDecision,
+    stamp: IntentStamp,
+  ): Promise<void> {
+    if (!this.isIntentCurrent(stamp)) return;
+    const permissionEpoch = stamp.farmingPermissionEpochAtDispatch;
+    const answersActiveTicket =
+      permissionEpoch !== undefined &&
+      this.farmingPermissionCoordinator.isPendingEpoch(permissionEpoch);
+    switch (decision.kind) {
+      case "grant_farming_permission":
+        if (
+          !answersActiveTicket &&
+          this.dependencies.farmingPreference.snapshot().status !== "denied"
+        ) {
+          return;
+        }
+        await this.dependencies.farmingPreference.setAllowed(
+          () =>
+            this.isIntentCurrent(stamp) &&
+            (answersActiveTicket
+              ? this.farmingPermissionCoordinator.isPendingEpoch(permissionEpoch!)
+              : this.dependencies.farmingPreference.snapshot().status === "denied"),
+        );
+        if (!this.isIntentCurrent(stamp)) return;
+        if (
+          answersActiveTicket &&
+          !this.farmingPermissionCoordinator.resolve("allowed", permissionEpoch)
+        ) {
+          return;
+        }
+        if (decision.reply) await this.sendOutcomeReply(decision.reply, stamp.generation, false);
+        if (this.isIntentCurrent(stamp)) {
+          this.queueFarmingPermissionReplan(stamp, "小麦种植权限已明确允许，请重新观察后规划。");
+        }
+        return;
+      case "deny_farming_permission":
+        if (!answersActiveTicket) return;
+        if (!this.farmingPermissionCoordinator.resolve("denied", permissionEpoch)) return;
+        if (decision.reply) await this.sendOutcomeReply(decision.reply, stamp.generation, false);
+        if (this.isIntentCurrent(stamp)) {
+          this.queueFarmingPermissionReplan(stamp, farmingFallbackConstraint);
+        }
+        return;
+      case "revoke_farming_permission": {
+        await this.dependencies.farmingPreference.setDenied();
+        if (!this.isIntentCurrent(stamp)) return;
+        this.farmingPermissionCoordinator.cancel("permission revoked");
+        const task = this.dependencies.taskController.current();
+        if (task) {
+          this.dependencies.actionQueue.cancelKinds(
+            task.lease,
+            farmingMutationKinds,
+            "farming permission revoked",
+          );
+        }
+        if (decision.reply) await this.sendOutcomeReply(decision.reply, stamp.generation, false);
+        if (this.isIntentCurrent(stamp)) {
+          this.queueFarmingPermissionReplan(stamp, farmingFallbackConstraint);
+        }
+      }
     }
   }
 
@@ -995,6 +1098,10 @@ export class CompanionService {
               limits: activeTask.disclosure.limits,
             }
           : null,
+        farmingPermission: {
+          status: this.dependencies.farmingPreference.snapshot().status,
+          pending: this.farmingPermissionCoordinator.isPending(),
+        },
       });
     } catch (error) {
       if (this.isIntentCurrent(stamp)) {
@@ -1069,6 +1176,7 @@ export class CompanionService {
       taskLease === null
         ? null
         : Object.freeze({ id: taskLease.id, startedAt: taskLease.startedAt });
+    const farmingPermissionEpochAtDispatch = this.farmingPermissionCoordinator.pendingEpoch();
     await this.modelSwitchTail;
     const threadPair = this.currentThreadPair();
     if (!threadPair) throw new Error("Companion model authority is unavailable");
@@ -1078,14 +1186,12 @@ export class CompanionService {
       ownerRevision,
       worldGeneration,
       taskLeaseAtDispatch,
+      farmingPermissionEpochAtDispatch,
       threadPair,
     });
   }
 
-  private isTaskDecisionCurrent(
-    decision: Exclude<OwnerIntentDecision, { kind: "chat" | "clarify" }>,
-    stamp: IntentStamp,
-  ): boolean {
+  private isTaskDecisionCurrent(decision: TaskControlDecision, stamp: IntentStamp): boolean {
     if (!this.isIntentCurrent(stamp)) return false;
     if (decision.kind === "start_task") return true;
     const currentLease = this.dependencies.taskController.current()?.lease ?? null;
@@ -1096,7 +1202,7 @@ export class CompanionService {
   }
 
   private async applyTaskDecision(
-    decision: Exclude<OwnerIntentDecision, { kind: "chat" | "clarify" }>,
+    decision: TaskControlDecision,
     text: string,
     stamp: IntentStamp,
   ): Promise<void> {
@@ -1188,6 +1294,70 @@ export class CompanionService {
       `主人消息已处理，请重新观察当前世界并规划当前目标：${task.disclosure.goal}`,
       stamp,
     );
+  }
+
+  private queueFarmingPermissionReplan(stamp: IntentStamp, context: string): void {
+    const task = this.dependencies.taskController.current();
+    if (
+      !task ||
+      stamp.taskLeaseAtDispatch === null ||
+      !sameTaskLease(task.lease, stamp.taskLeaseAtDispatch)
+    ) {
+      return;
+    }
+    this.interruptExecutionTurn();
+    const allowedActions = task.disclosure.expectedActions.filter(
+      (action): action is ToolActionKind => TOOL_ACTION_KINDS.includes(action as ToolActionKind),
+    );
+    this.queueValidatedTask(
+      {
+        kind: "continue_task",
+        naturalReply: null,
+        task: {
+          goal: task.disclosure.goal,
+          allowedActions,
+          requestedLimits: { ...task.disclosure.limits },
+        },
+        memoryCandidates: [],
+      },
+      context,
+      stamp,
+    );
+  }
+
+  private async queueFarmingPermissionReplanFromCurrent(context: string): Promise<void> {
+    if (!this.running || this.dependencies.taskController.current() === null) return;
+    try {
+      const stamp = await this.captureIntentStamp();
+      if (!this.isIntentCurrent(stamp)) return;
+      this.queueFarmingPermissionReplan(stamp, context);
+    } catch (error) {
+      await this.logger.error("farming_permission_replan_failed", { code: errorName(error) });
+    }
+  }
+
+  private beginFarmingPermissionRequest(plotSummary: string): boolean {
+    if (
+      this.dependencies.farmingPreference.snapshot().status !== "unknown" ||
+      this.farmingPermissionCoordinator.isPending()
+    ) {
+      return false;
+    }
+    const result = this.farmingPermissionCoordinator.request({
+      plotSummary,
+      requestedAt: Date.now(),
+    });
+    void result
+      .then((permissionResult) => this.handleFarmingPermissionResult(permissionResult))
+      .catch((error: unknown) =>
+        this.logger.error("farming_permission_result_failed", { code: errorName(error) }),
+      );
+    return true;
+  }
+
+  private async handleFarmingPermissionResult(result: FarmingPermissionResult): Promise<void> {
+    if (result !== "timeout") return;
+    await this.queueFarmingPermissionReplanFromCurrent(farmingFallbackConstraint);
   }
 
   private queueValidatedTask(
@@ -1289,6 +1459,10 @@ export class CompanionService {
           memories: (await this.searchMemories(ownerText)).slice(0, 8),
           ownerMessage: ownerText,
           plan,
+          farmingPermission: {
+            status: this.dependencies.farmingPreference.snapshot().status,
+            pending: this.farmingPermissionCoordinator.isPending(),
+          },
         };
         prompt = buildCompanionTaskExecutionTurn(input);
       } catch (error) {
@@ -1339,6 +1513,10 @@ export class CompanionService {
         return;
       }
 
+      const requestedFarmingPermission =
+        outcome.farmingPermissionRequest == null
+          ? false
+          : this.beginFarmingPermissionRequest(outcome.farmingPermissionRequest.plotSummary);
       taskStopReason = "completed";
       await this.persistTaskExecutionOutcome(task.disclosure.goal, outcome, stamp, ownerText);
       if (!this.isIntentCurrent(stamp)) return;
@@ -1351,7 +1529,11 @@ export class CompanionService {
         this.dependencies.actionQueue.cancelTask(task.lease, "task outcome finished");
         resumeSuspendedGoal = decision.kind === "priority_task";
       }
-      await this.sendOutcomeReply(outcome.reply, stamp.generation, false);
+      if (requestedFarmingPermission) {
+        await this.sendOutcomeReply(farmingPermissionQuestion, stamp.generation, false);
+      } else {
+        await this.sendOutcomeReply(outcome.reply, stamp.generation, false);
+      }
     } catch (error) {
       if (
         task &&
@@ -2327,6 +2509,7 @@ export class CompanionService {
     forceCleanup = false,
     taskLease?: TaskLease,
   ): void {
+    this.farmingPermissionCoordinator.cancel(reason);
     if (taskLease) {
       const key = taskLeaseKey(taskLease);
       if (this.preservedTerminalLeaseKey === key) {

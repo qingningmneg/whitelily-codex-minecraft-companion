@@ -309,6 +309,7 @@ async function runPersistedActionScenario(scenario: PersistedActionScenario) {
           executor,
           actionQueue,
           actionRunner,
+          farmingPreference: createdContext.farmingPreference,
           budget: createdContext.budget,
           taskController: createdContext.taskController,
           autonomy: {

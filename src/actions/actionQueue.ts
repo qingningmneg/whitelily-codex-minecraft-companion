@@ -243,6 +243,13 @@ export class CompanionActionQueue {
     if (item.taskLease.id !== taskLease.id || item.taskLease.startedAt !== taskLease.startedAt) {
       throw new Error("queue item authority mismatch");
     }
+    if (
+      item.kind === "wheat_farming_permission" &&
+      item.status === result &&
+      (result === "completed" || result === "cancelled")
+    ) {
+      return;
+    }
     if (item.status !== "waiting_permission" || item.kind !== "wheat_farming_permission") {
       throw new Error("invalid queue item transition");
     }
@@ -344,6 +351,30 @@ export class CompanionActionQueue {
         item.taskLease.startedAt === taskLease.startedAt &&
         item.action !== undefined &&
         item.status === "waiting"
+      ) {
+        item.status = "cancelled";
+        item.reason = sanitizeDiagnosticText(reason, 240);
+        item.endedAt = this.options.now().toISOString();
+        this.#publishItem(item);
+        cancelled += 1;
+      }
+    }
+    return cancelled;
+  }
+
+  cancelKinds(
+    taskLease: TaskLease,
+    kinds: ReadonlySet<GameAction["kind"]>,
+    reason: string,
+  ): number {
+    let cancelled = 0;
+    for (const item of this.#items) {
+      if (
+        item.taskLease.id === taskLease.id &&
+        item.taskLease.startedAt === taskLease.startedAt &&
+        item.action !== undefined &&
+        kinds.has(item.action.kind) &&
+        (item.status === "waiting" || item.status === "suspended")
       ) {
         item.status = "cancelled";
         item.reason = sanitizeDiagnosticText(reason, 240);

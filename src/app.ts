@@ -55,6 +55,7 @@ import { MineflayerAdapter } from "./minecraft/mineflayerAdapter.js";
 import { ModeManager } from "./mode/modeManager.js";
 import {
   FarmingPreferenceStore,
+  type FarmingPreferenceAccess,
   type FarmingPreference,
 } from "./profile/farmingPreferenceStore.js";
 import { ProfileStore } from "./profile/profileStore.js";
@@ -172,12 +173,6 @@ export interface CreateAppOptions {
   runtimeFactory?: (context: AppCompositionContext) => AppRuntime | Promise<AppRuntime>;
 }
 
-export interface FarmingPreferenceAccess {
-  snapshot(): Readonly<FarmingPreference>;
-  setAllowed(): Promise<Readonly<FarmingPreference>>;
-  setDenied(): Promise<Readonly<FarmingPreference>>;
-}
-
 class RuntimeFarmingPreference implements FarmingPreferenceAccess {
   constructor(
     private readonly store: FarmingPreferenceStore,
@@ -188,19 +183,22 @@ class RuntimeFarmingPreference implements FarmingPreferenceAccess {
     return Object.freeze(structuredClone(this.envelope.value));
   }
 
-  setAllowed(): Promise<Readonly<FarmingPreference>> {
-    return this.setStatus("allowed");
+  setAllowed(guard?: () => boolean): Promise<Readonly<FarmingPreference>> {
+    return this.setStatus("allowed", guard);
   }
 
   setDenied(): Promise<Readonly<FarmingPreference>> {
     return this.setStatus("denied");
   }
 
-  private async setStatus(status: "allowed" | "denied"): Promise<Readonly<FarmingPreference>> {
+  private async setStatus(
+    status: "allowed" | "denied",
+    guard?: () => boolean,
+  ): Promise<Readonly<FarmingPreference>> {
     const expectedRevision = this.envelope.revision;
     const committed =
       status === "allowed"
-        ? await this.store.setAllowed(expectedRevision)
+        ? await this.store.setAllowed(expectedRevision, guard)
         : await this.store.setDenied(expectedRevision);
     this.envelope = committed;
     return this.snapshot();
@@ -796,6 +794,7 @@ export function createProductionRuntime(
     executor,
     actionQueue,
     actionRunner,
+    farmingPreference: context.farmingPreference,
     budget,
     taskController,
     autonomy,

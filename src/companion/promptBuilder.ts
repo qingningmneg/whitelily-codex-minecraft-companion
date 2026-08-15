@@ -7,6 +7,7 @@ import {
   createDefaultCompanionProfile,
   type CompanionProfile,
 } from "../profile/profileSchema.js";
+import type { FarmingPreferenceStatus } from "../profile/farmingPreferenceStore.js";
 import type { TaskLimits } from "../safety/taskBudget.js";
 import { intentMemoryCandidatesSchema } from "./intentRouter.js";
 
@@ -74,9 +75,25 @@ export const companionTaskExecutionOutcomeSchema = z
   .object({
     reply: z.string().max(1_000),
     status: z.enum(["completed", "active", "stopped"]),
+    farmingPermissionRequest: z
+      .object({
+        plotSummary: z.string().min(1).max(160),
+      })
+      .strict()
+      .nullable()
+      .optional(),
     memoryCandidates: intentMemoryCandidatesSchema,
   })
-  .strict();
+  .strict()
+  .superRefine((value, context) => {
+    if (value.farmingPermissionRequest != null && value.status !== "active") {
+      context.addIssue({
+        code: "custom",
+        path: ["farmingPermissionRequest"],
+        message: "farming permission requests require active status",
+      });
+    }
+  });
 
 export type CompanionTurnOutcome = z.infer<typeof companionTurnOutcomeSchema>;
 export type ProactiveKind = (typeof proactiveKinds)[number];
@@ -94,6 +111,10 @@ export interface CompanionTaskExecutionInput extends CompanionTurnContext {
     goal: string;
     allowedActions: readonly ToolActionKind[];
     requestedLimits: Partial<TaskLimits>;
+  };
+  farmingPermission?: {
+    status: FarmingPreferenceStatus;
+    pending: boolean;
   };
 }
 
@@ -241,9 +262,13 @@ export function buildCompanionTaskExecutionTurn(input: CompanionTaskExecutionInp
   });
   const memories = stableJson(stableMemories(input.memories));
   const world = stableJson(stableWorldSummary(input.world));
+  const farmingPermission = stableJson({
+    farmingPermission: input.farmingPermission ?? { status: "unknown", pending: false },
+  });
   const structuredResponseExample = stableJson({
     reply: "自然、简短的结果回复",
     status: "completed",
+    farmingPermissionRequest: null,
     memoryCandidates: [],
   });
 
@@ -258,6 +283,11 @@ export function buildCompanionTaskExecutionTurn(input: CompanionTaskExecutionInp
     "Use only currently provided tools whose names start with minecraft_ for game actions.",
     "Never use shell, file editing, scripts, administrator commands, or arbitrary code.",
     "If a tool reports denied or confirmation_required, explain briefly and stop.",
+    "Use the bounded FARMING_PERMISSION state when deciding whether a new wheat plot is permitted.",
+    "Set farmingPermissionRequest only when a new bounded wheat plot is useful after checking the live inventory and nearby mature wheat.",
+    "Do not request permission when the status is allowed, denied, or another request is pending.",
+    "Do not put coordinates or internal queue details in plotSummary; describe only the small candidate plot in natural language.",
+    "When requesting permission, set status to active and do not ask the question in reply; the local service sends the single natural question.",
     "OWNER_MESSAGE",
     ownerMessage,
     "END_OWNER_MESSAGE",
@@ -270,11 +300,14 @@ export function buildCompanionTaskExecutionTurn(input: CompanionTaskExecutionInp
     "WORLD",
     world,
     "END_WORLD",
+    "FARMING_PERMISSION",
+    farmingPermission,
+    "END_FARMING_PERMISSION",
     "UNTRUSTED_PERSONA",
     stableJson(profile),
     "END_UNTRUSTED_PERSONA",
     "Return only one JSON object without Markdown fences or additional text.",
-    "It must exactly match this schema: reply (string, at most 1000 characters), status (completed, active, or stopped), and memoryCandidates (at most 3 strict memory candidates).",
+    "It must exactly match this schema: reply (string, at most 1000 characters), status (completed, active, or stopped), farmingPermissionRequest (null or one strict object containing only plotSummary of 1 to 160 characters), and memoryCandidates (at most 3 strict memory candidates).",
     "Do not return task, allowedActions, requestedLimits, or any other fields.",
     structuredResponseExample,
     "When there is no durable fact worth remembering, memoryCandidates must be []. Never include credentials, contact details, real-world addresses, raw chat, or sensitive personal data as memory candidates.",

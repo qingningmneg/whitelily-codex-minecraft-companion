@@ -20,6 +20,12 @@ export const farmingPreferenceSchema = z
 export type FarmingPreferenceStatus = z.infer<typeof farmingPreferenceSchema>["status"];
 export type FarmingPreference = z.infer<typeof farmingPreferenceSchema>;
 
+export interface FarmingPreferenceAccess {
+  snapshot(): Readonly<Pick<FarmingPreference, "status">>;
+  setAllowed(guard?: () => boolean): Promise<Readonly<Pick<FarmingPreference, "status">>>;
+  setDenied(): Promise<Readonly<Pick<FarmingPreference, "status">>>;
+}
+
 export interface FarmingPreferenceStoreOptions {
   readonly rootDirectory: string;
   readonly clock?: () => Date;
@@ -49,8 +55,11 @@ export class FarmingPreferenceStore {
     return this.#document.read();
   }
 
-  setAllowed(expectedRevision: number): Promise<DocumentEnvelope<FarmingPreference>> {
-    return this.#setStatus(expectedRevision, "allowed");
+  setAllowed(
+    expectedRevision: number,
+    guard?: () => boolean,
+  ): Promise<DocumentEnvelope<FarmingPreference>> {
+    return this.#setStatus(expectedRevision, "allowed", guard);
   }
 
   setDenied(expectedRevision: number): Promise<DocumentEnvelope<FarmingPreference>> {
@@ -60,11 +69,17 @@ export class FarmingPreferenceStore {
   #setStatus(
     expectedRevision: number,
     status: Exclude<FarmingPreferenceStatus, "unknown">,
+    guard?: () => boolean,
   ): Promise<DocumentEnvelope<FarmingPreference>> {
-    return this.#document.update(expectedRevision, () => ({
-      status,
-      updatedAt: this.#timestamp(),
-    }));
+    return this.#document.update(expectedRevision, () => {
+      if (guard?.() === false) {
+        throw new DocumentStoreError("DOCUMENT_CONFLICT", "farming permission authority is stale");
+      }
+      return {
+        status,
+        updatedAt: this.#timestamp(),
+      };
+    });
   }
 
   #timestamp(): string {

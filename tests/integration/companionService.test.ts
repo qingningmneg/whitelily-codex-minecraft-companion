@@ -5371,6 +5371,352 @@ describe("CompanionService task state", () => {
   );
 });
 
+describe("CompanionService wheat farming permission", () => {
+  const permissionRequestOutcome = JSON.stringify({
+    reply: "",
+    status: "active",
+    farmingPermissionRequest: { plotSummary: "靠近水源的一小块安全空地" },
+    memoryCandidates: [],
+  });
+
+  const breadTask = () =>
+    taskDecision({
+      naturalReply: null,
+      goal: "取得小麦并制作面包",
+      allowedActions: ["find_blocks", "harvest_crop", "till_soil", "plant_crop"],
+      requestedLimits: { maxBlockChanges: 16 },
+    });
+
+  it("falls back after 30 seconds without changing land", async () => {
+    const value = await harness({
+      farmingPreferenceStatus: "unknown",
+      intentResponses: [
+        breadTask(),
+        JSON.stringify({ kind: "chat", reply: "我会继续找现成小麦。", memoryCandidates: [] }),
+      ],
+      executionResponses: [
+        permissionRequestOutcome,
+        taskExecutionOutcome("我去找现成的成熟小麦。", "active"),
+      ],
+    });
+    await value.start();
+
+    await value.emitOwnerText("做一些面包");
+    await value.untilChat("我可以在这里种小麦吗？");
+    expect(value.actionQueue.snapshot().items[0]).toMatchObject({
+      kind: "wheat_farming_permission",
+      status: "waiting_permission",
+    });
+    expect(value.currentFarmingPreferenceStatus()).toBe("unknown");
+    const timer = value.farmingPermissionTimerRecords()[0];
+    expect(timer).toMatchObject({ milliseconds: 30_000, cleared: false });
+
+    const task = value.taskController.current();
+    if (!task) throw new Error("expected active bread task");
+    const turnLease = value.budget.begin(task.lease, {
+      allowedActions: ["get_state", "till_soil"],
+    });
+    const observed = await value.executeRawTool("minecraft_get_state", { turnLease });
+    const tillAttempt = await value.executeRawTool("minecraft_enqueue_actions", {
+      turnLease,
+      actions: [
+        {
+          kind: "till_soil",
+          x: 1,
+          y: 64,
+          z: 1,
+          summary: "等待许可期间不得执行的耕地",
+        },
+      ],
+    });
+    value.budget.end();
+    expect(observed.isError).not.toBe(true);
+    expect(tillAttempt.isError).toBe(true);
+    expect(tillAttempt.text).toContain("Wheat farming permission is required");
+
+    value.fireFarmingPermissionTimer(timer!.id);
+    await value.untilCodexTurns(2);
+
+    expect(value.actionQueue.snapshot().items[0]).toMatchObject({
+      status: "cancelled",
+      reason: "timeout",
+    });
+    expect(value.codex.turnsFor("execution")[1]?.text).toContain(
+      "不得新建农田，寻找现成的成熟小麦",
+    );
+    expect(value.minecraft.calls.filter((call) => call.method === "tillSoil")).toEqual([]);
+    expect(value.minecraft.calls.filter((call) => call.method === "plantCrop")).toEqual([]);
+    await vi.waitFor(() => expect(value.taskController.current()).toBeNull());
+
+    await value.emitOwnerText("可以");
+    await value.untilIntentSettled();
+    expect(value.currentFarmingPreferenceStatus()).toBe("unknown");
+    expect(value.codex.turnsFor("intent")[1]?.text).toContain(
+      '"farmingPermission":{"status":"unknown","pending":false}',
+    );
+  });
+
+  it("does not persist a delayed ticket approval after its 30-second timeout", async () => {
+    const value = await harness({
+      farmingPreferenceStatus: "unknown",
+      intentResponses: [
+        breadTask(),
+        JSON.stringify({
+          kind: "grant_farming_permission",
+          reply: "好，我会在安全范围内种小麦。",
+        }),
+      ],
+      executionResponses: [
+        permissionRequestOutcome,
+        taskExecutionOutcome("我去寻找现成的小麦。", "active"),
+      ],
+    });
+    await value.start();
+
+    await value.emitOwnerText("做一些面包");
+    await value.untilChat("我可以在这里种小麦吗？");
+    value.fireFarmingPermissionTimer(value.farmingPermissionTimerRecords()[0]!.id);
+    await value.untilCodexTurns(2);
+
+    await value.emitOwnerText("可以");
+    await value.untilIntentSettled();
+
+    expect(value.currentFarmingPreferenceStatus()).toBe("unknown");
+  });
+
+  it("does not persist an approval when task authority becomes stale during the write", async () => {
+    const value = await harness({
+      farmingPreferenceStatus: "unknown",
+      gateFarmingPermissionSetAllowed: true,
+      ownerIdentitySnapshot: {
+        revision: 1,
+        ownerUsername: "TestOwner",
+        configured: true,
+        presence: "online",
+      },
+      intentResponses: [
+        breadTask(),
+        JSON.stringify({
+          kind: "grant_farming_permission",
+          reply: "好，我会在安全范围内种小麦。",
+        }),
+      ],
+      executionResponses: [permissionRequestOutcome],
+    });
+    await value.start();
+
+    await value.emitOwnerText("做一些面包");
+    await value.untilChat("我可以在这里种小麦吗？");
+    await value.emitOwnerText("可以");
+    await value.untilFarmingPermissionSetAllowed();
+    value.service.ownerIdentityChanged({
+      revision: 2,
+      ownerUsername: "NewOwner",
+      configured: true,
+      presence: "online",
+    });
+    value.releaseFarmingPermissionSetAllowed();
+    await value.untilIntentSettled();
+
+    expect(value.currentFarmingPreferenceStatus()).toBe("unknown");
+    expect(value.actionQueue.snapshot().items[0]).toMatchObject({ status: "cancelled" });
+  });
+
+  it("persists one conversational approval and resumes the active task", async () => {
+    const value = await harness({
+      farmingPreferenceStatus: "unknown",
+      intentResponses: [
+        breadTask(),
+        JSON.stringify({
+          kind: "grant_farming_permission",
+          reply: "好，我会在安全范围内种小麦。",
+        }),
+      ],
+      executionResponses: [
+        permissionRequestOutcome,
+        taskExecutionOutcome("我继续准备面包。", "active"),
+      ],
+    });
+    await value.start();
+
+    await value.emitOwnerText("做一些面包");
+    await value.untilChat("我可以在这里种小麦吗？");
+    await value.emitOwnerText("可以");
+    await vi.waitFor(() => expect(value.currentFarmingPreferenceStatus()).toBe("allowed"));
+    await value.untilCodexTurns(2);
+
+    expect(value.actionQueue.snapshot().items[0]).toMatchObject({
+      status: "completed",
+      reason: "allowed",
+    });
+    expect(value.codex.turnsFor("intent")[1]?.text).toContain(
+      '"farmingPermission":{"status":"unknown","pending":true}',
+    );
+    expect(value.codex.turnsFor("execution")[1]?.text).toContain(
+      '"farmingPermission":{"status":"allowed","pending":false}',
+    );
+    expect(value.minecraft.chatLog.filter((message) => message.includes("种小麦吗"))).toEqual([
+      "我可以在这里种小麦吗？",
+    ]);
+  });
+
+  it("cancels a permission timer when the owner stops the task", async () => {
+    const value = await harness({
+      farmingPreferenceStatus: "unknown",
+      intentResponses: [breadTask()],
+      executionResponses: [permissionRequestOutcome],
+    });
+    await value.start();
+    await value.emitOwnerText("做一些面包");
+    await value.untilChat("我可以在这里种小麦吗？");
+
+    await emitCommand(value, "!stop");
+
+    expect(value.farmingPermissionTimerRecords()[0]).toMatchObject({ cleared: true });
+    expect(value.actionQueue.snapshot().items[0]).toMatchObject({
+      status: "cancelled",
+      reason: "owner_stop",
+    });
+  });
+
+  it("treats a refusal as task-local fallback without changing land", async () => {
+    const value = await harness({
+      farmingPreferenceStatus: "unknown",
+      intentResponses: [
+        breadTask(),
+        JSON.stringify({
+          kind: "deny_farming_permission",
+          reply: "好，这次不新建农田。",
+        }),
+      ],
+      executionResponses: [
+        permissionRequestOutcome,
+        taskExecutionOutcome("我去寻找现成的成熟小麦。", "active"),
+      ],
+    });
+    await value.start();
+    await value.emitOwnerText("做一些面包");
+    await value.untilChat("我可以在这里种小麦吗？");
+
+    await value.emitOwnerText("这次不可以");
+    await value.untilCodexTurns(2);
+
+    expect(value.currentFarmingPreferenceStatus()).toBe("unknown");
+    expect(value.actionQueue.snapshot().items[0]).toMatchObject({
+      status: "completed",
+      reason: "denied",
+    });
+    expect(value.codex.turnsFor("execution")[1]?.text).toContain(
+      "不得新建农田，寻找现成的成熟小麦",
+    );
+    expect(value.minecraft.calls.filter((call) => call.method === "tillSoil")).toEqual([]);
+    expect(value.minecraft.calls.filter((call) => call.method === "plantCrop")).toEqual([]);
+  });
+
+  it("accepts an explicit global reauthorization without a pending ticket", async () => {
+    const value = await harness({
+      farmingPreferenceStatus: "denied",
+      intentResponses: [
+        JSON.stringify({
+          kind: "grant_farming_permission",
+          reply: "好，以后可以在安全范围内种小麦。",
+        }),
+      ],
+    });
+    await value.start();
+
+    await value.emitOwnerText("以后可以自己种小麦");
+    await value.untilIntentSettled();
+
+    expect(value.currentFarmingPreferenceStatus()).toBe("allowed");
+    expect(value.actionQueue.snapshot().items).toEqual([]);
+  });
+
+  it("does not ask again when global farming permission is already allowed", async () => {
+    const value = await harness({
+      farmingPreferenceStatus: "allowed",
+      intentResponses: [breadTask()],
+      executionResponses: [permissionRequestOutcome],
+    });
+    await value.start();
+
+    await value.emitOwnerText("做一些面包");
+    await vi.waitFor(() => expect(value.taskController.current()).toBeNull());
+
+    expect(value.codex.turnsFor("execution")[0]?.text).toContain(
+      '"farmingPermission":{"status":"allowed","pending":false}',
+    );
+    expect(value.minecraft.chatLog).not.toContain("我可以在这里种小麦吗？");
+    expect(value.farmingPermissionTimerRecords()).toEqual([]);
+    expect(value.actionQueue.snapshot().items).toEqual([]);
+  });
+
+  it("revokes global permission and cancels only queued farming mutations", async () => {
+    const value = await harness({
+      farmingPreferenceStatus: "allowed",
+      deferredTurns: [0],
+      intentResponses: [
+        JSON.stringify({
+          kind: "revoke_farming_permission",
+          reply: "好，以后不会自己种小麦。",
+        }),
+      ],
+      executionResponses: [taskExecutionOutcome("我会改为寻找现成小麦。", "active")],
+    });
+    await value.start();
+    const task = value.taskController.start({
+      goal: "维护小麦地",
+      expectedActions: ["till_soil", "plant_crop", "wait"],
+      limits: {
+        maxToolCalls: 8,
+        maxBlockChanges: 16,
+        maxHorizontalTravel: 32,
+        maxDurationMs: 60_000,
+        maxDangerousOperations: 0,
+      },
+      stopCondition: "完成维护时停止",
+    });
+    const context = value.service.queueExecutionContext();
+    if (!context) throw new Error("expected queue execution context");
+    value.actionQueue.enqueue({
+      taskLease: task.lease,
+      worldGeneration: context.worldGeneration,
+      action: { kind: "till_soil", position: { x: 1, y: 64, z: 1 } },
+      summary: "耕地",
+      trustedObservationKey: "farm-observation",
+    });
+    value.actionQueue.enqueue({
+      taskLease: task.lease,
+      worldGeneration: context.worldGeneration,
+      action: {
+        kind: "plant_crop",
+        position: { x: 1, y: 64, z: 1 },
+        seedName: "wheat_seeds",
+      },
+      summary: "播种",
+      trustedObservationKey: "farm-observation",
+    });
+    value.actionQueue.enqueue({
+      taskLease: task.lease,
+      worldGeneration: context.worldGeneration,
+      action: { kind: "wait", milliseconds: 500 },
+      summary: "短暂等待",
+      trustedObservationKey: "farm-observation",
+    });
+    value.actionRunner.suspend(task.lease, "owner_message");
+
+    await value.emitOwnerText("以后不要自己种了");
+    await value.untilIntentSettled();
+
+    expect(value.currentFarmingPreferenceStatus()).toBe("denied");
+    expect(value.actionQueue.snapshot().items.map(({ status }) => status)).toEqual([
+      "cancelled",
+      "cancelled",
+      "suspended",
+    ]);
+  });
+});
+
 describe("CompanionService zero disclosure privacy regressions", () => {
   it("replaces a model reply containing internal task vocabulary before Minecraft chat", async () => {
     const rawModelOutput = JSON.stringify({

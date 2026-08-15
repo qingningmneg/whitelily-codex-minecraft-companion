@@ -18,6 +18,7 @@ import { TurnToolBudget } from "../../src/mcp/toolBudget.js";
 import { createToolRegistry, type ToolResult } from "../../src/mcp/toolRegistry.js";
 import { FakeMinecraftPort } from "../../src/minecraft/fakeMinecraftPort.js";
 import type { OwnerIdentitySnapshot } from "../../src/identity/ownerIdentity.js";
+import type { FarmingPreferenceStatus } from "../../src/profile/farmingPreferenceStore.js";
 import { ConfirmationStore } from "../../src/safety/confirmationStore.js";
 import { SafetyEngine } from "../../src/safety/safetyEngine.js";
 import {
@@ -477,6 +478,8 @@ export interface CompanionHarnessOptions {
   compatibilityVerified?: boolean;
   safetyPresetAllows?: boolean;
   ownerIdentitySnapshot?: OwnerIdentitySnapshot;
+  farmingPreferenceStatus?: FarmingPreferenceStatus;
+  gateFarmingPermissionSetAllowed?: boolean;
 }
 
 class FakeAutonomyScheduler {
@@ -623,6 +626,26 @@ export async function createCompanionHarness(options: CompanionHarnessOptions = 
     })(),
     now: () => new Date(),
   });
+  let farmingPreferenceStatus = options.farmingPreferenceStatus ?? "unknown";
+  const farmingPermissionSetAllowedReached = deferred<void>();
+  const farmingPermissionSetAllowedRelease = deferred<void>();
+  const farmingPreference = {
+    snapshot: () => Object.freeze({ status: farmingPreferenceStatus }),
+    setAllowed: async (guard?: () => boolean) => {
+      if (guard?.() === false) throw new Error("farming permission authority is stale");
+      if (options.gateFarmingPermissionSetAllowed) {
+        farmingPermissionSetAllowedReached.resolve();
+        await farmingPermissionSetAllowedRelease.promise;
+      }
+      if (guard?.() === false) throw new Error("farming permission authority is stale");
+      farmingPreferenceStatus = "allowed" as const;
+      return Object.freeze({ status: farmingPreferenceStatus });
+    },
+    setDenied: async () => {
+      farmingPreferenceStatus = "denied" as const;
+      return Object.freeze({ status: farmingPreferenceStatus });
+    },
+  };
   let service!: CompanionService;
   const actionRunner = new QueuedActionRunner({
     queue: actionQueue,
@@ -631,6 +654,7 @@ export async function createCompanionHarness(options: CompanionHarnessOptions = 
     safetyContextProvider: async () => ({
       spawn: { x: 0, y: 64, z: 0 },
       owner: { x: 0, y: 64, z: 0 },
+      wheatFarmingAllowed: farmingPreferenceStatus === "allowed",
     }),
   });
   const autonomy = new FakeAutonomyScheduler(options.autonomyCanChat ?? true);
@@ -682,6 +706,11 @@ export async function createCompanionHarness(options: CompanionHarnessOptions = 
     number,
     { callback: () => void; milliseconds: number; cleared: boolean }
   >();
+  let nextFarmingPermissionTimerId = 20_000;
+  const farmingPermissionTimers = new Map<
+    number,
+    { callback: () => void; milliseconds: number; cleared: boolean }
+  >();
   if (options.activeMinecraftWait) {
     minecraft.wait = async (_milliseconds, signal) => {
       activeWaitAbort = signal;
@@ -708,6 +737,7 @@ export async function createCompanionHarness(options: CompanionHarnessOptions = 
     executor,
     actionQueue,
     actionRunner,
+    farmingPreference,
     budget,
     taskController,
     autonomy,
@@ -720,6 +750,7 @@ export async function createCompanionHarness(options: CompanionHarnessOptions = 
     safetyContextProvider: async () => ({
       spawn: { x: 0, y: 64, z: 0 },
       owner: { x: 0, y: 64, z: 0 },
+      wheatFarmingAllowed: farmingPreferenceStatus === "allowed",
     }),
     ownerUsername: () => "TestOwner",
     ...(ownerIdentity === undefined ? {} : { ownerIdentity }),
@@ -747,6 +778,15 @@ export async function createCompanionHarness(options: CompanionHarnessOptions = 
     },
     clearTimer: (timer) => {
       mergeTimers.delete(timer as unknown as number);
+    },
+    setFarmingPermissionTimer: (callback, milliseconds) => {
+      const id = nextFarmingPermissionTimerId++;
+      farmingPermissionTimers.set(id, { callback, milliseconds, cleared: false });
+      return id as unknown as ReturnType<typeof setTimeout>;
+    },
+    clearFarmingPermissionTimer: (timer) => {
+      const record = farmingPermissionTimers.get(timer as unknown as number);
+      if (record) record.cleared = true;
     },
     ...(options.manualConfirmationTimers
       ? {
@@ -778,6 +818,7 @@ export async function createCompanionHarness(options: CompanionHarnessOptions = 
     safetyContextProvider: async () => ({
       spawn: { x: 0, y: 64, z: 0 },
       owner: { x: 0, y: 64, z: 0 },
+      wheatFarmingAllowed: farmingPreferenceStatus === "allowed",
     }),
     ownerUsername: () => "TestOwner",
     latestSnapshot: () => minecraft.world,
@@ -796,6 +837,9 @@ export async function createCompanionHarness(options: CompanionHarnessOptions = 
     executor,
     actionQueue,
     actionRunner,
+    currentFarmingPreferenceStatus: () => farmingPreferenceStatus,
+    untilFarmingPermissionSetAllowed: () => farmingPermissionSetAllowedReached.promise,
+    releaseFarmingPermissionSetAllowed: () => farmingPermissionSetAllowedRelease.resolve(),
     budget,
     taskController,
     taskAuditEvents,
@@ -900,6 +944,20 @@ export async function createCompanionHarness(options: CompanionHarnessOptions = 
       if (!callback) throw new Error("no task deadline is pending");
       taskDeadlineCallback = undefined;
       callback();
+    },
+    farmingPermissionTimerRecords: () =>
+      [...farmingPermissionTimers.entries()].map(([id, record]) => ({
+        id,
+        milliseconds: record.milliseconds,
+        cleared: record.cleared,
+      })),
+    fireFarmingPermissionTimer: (id: number, includeCleared = false) => {
+      const record = farmingPermissionTimers.get(id);
+      if (!record || (record.cleared && !includeCleared)) {
+        throw new Error("no matching farming permission timer is pending");
+      }
+      record.cleared = true;
+      record.callback();
     },
     confirmationTimerRecords: () =>
       [...confirmationTimers.entries()].map(([id, record]) => ({

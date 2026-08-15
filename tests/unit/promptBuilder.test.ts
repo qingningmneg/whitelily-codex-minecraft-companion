@@ -133,6 +133,27 @@ describe("buildCompanionTaskExecutionTurn", () => {
       '"nearbyHostiles":[{"entityId":37,"kind":"zombie","position":{"x":21,"y":64,"z":20}}]',
     );
   });
+
+  it("lets the execution model request one bounded wheat permission without exposing internals", () => {
+    const prompt = buildCompanionTaskExecutionTurn({
+      mode: "friend",
+      ownerMessage: "做一些面包",
+      plan: {
+        goal: "取得并制作面包",
+        allowedActions: ["find_blocks", "harvest_crop", "till_soil", "plant_crop"],
+        requestedLimits: { maxBlockChanges: 16 },
+      },
+      farmingPermission: { status: "unknown", pending: false },
+      world,
+      memories: [],
+    });
+
+    expect(prompt).toContain('"farmingPermission":{"status":"unknown","pending":false}');
+    expect(prompt).toContain("farmingPermissionRequest");
+    expect(prompt).toContain("only when a new bounded wheat plot is useful");
+    expect(prompt).toContain("Do not put coordinates or internal queue details in plotSummary");
+    expect(prompt).not.toContain("制作面包 ->");
+  });
 });
 
 describe("companionTaskExecutionOutcomeSchema", () => {
@@ -158,6 +179,28 @@ describe("companionTaskExecutionOutcomeSchema", () => {
     ).toBe(false);
     expect(
       companionTaskExecutionOutcomeSchema.safeParse({ ...validOutcome, extra: true }).success,
+    ).toBe(false);
+  });
+
+  it("accepts only a bounded structured wheat permission request", () => {
+    expect(
+      companionTaskExecutionOutcomeSchema.safeParse({
+        ...validOutcome,
+        status: "active",
+        farmingPermissionRequest: { plotSummary: "靠近水源的一小块安全空地" },
+      }).success,
+    ).toBe(true);
+    expect(
+      companionTaskExecutionOutcomeSchema.safeParse({
+        ...validOutcome,
+        farmingPermissionRequest: { plotSummary: "安全空地", x: 1 },
+      }).success,
+    ).toBe(false);
+    expect(
+      companionTaskExecutionOutcomeSchema.safeParse({
+        ...validOutcome,
+        farmingPermissionRequest: { plotSummary: "安全空地" },
+      }).success,
     ).toBe(false);
   });
 });
