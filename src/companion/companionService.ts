@@ -103,29 +103,46 @@ const internalModelMetadataPattern =
   /任务披露|minecraft_[a-z0-9_]+|工具调用|预算|租约|停止条件|expectedActions|allowedActions|maxToolCalls|maxBlockChanges|maxHorizontalTravel|maxDurationMs|maxDangerousOperations|leaseId|stopCondition/iu;
 const explicitQueueInternalTokenPattern =
   /QUEUE_SNAPSHOT|minecraft_enqueue_actions|waiting_permission/iu;
-const internalQueueWorkNounPattern =
-  /动作|任务|项|批次|步骤|\bactions?\b|\btasks?\b|\bitems?\b|\bbatches?\b|\bsteps?\b/iu;
-const queueNounMarkerPattern = /队列|\bqueues?\b|\bqueued\b/iu;
-const queueActivityMarkerPattern = /排队/u;
-const executionLifecyclePattern =
-  /待处理|待执行|运行|完成|失败|取消|剩余|还有|下一个|下一项|状态|数量|计数|共|\bpending\b|\brunning\b|\bcompleted\b|\bfailed\b|\bcancelled\b|\bcanceled\b|\bremaining\b|\bnext\b|\bstatus\b|\bcounts?\b/iu;
-const boundedQueueCountPattern = /\b(?:25[0-6]|2[0-4]\d|1?\d?\d)\b/u;
+const anyQueueMarkerPattern = /队列|排队|\bqueues?\b|\bqueued\b/iu;
+const queueWorkRelationPatterns = [
+  /队列(?:中|里|内|上)?(?:的)?\s*(?:(?:目前|当前|现在|仍然|仍|正在|正)\s*)*(?:(?:还没有|没有|还有|仍有|剩余|共有|共|包含|有)\s*)?(?:(?:\d+|[零一二两三四五六七八九十百]+)\s*(?:个|条|批|项)?)?\s*(?:(?:待处理|待执行|正在执行|已完成|已取消|失败)\s*)?(?:的\s*)?(?:动作|任务|项|批次|步骤)/u,
+  /(?:动作|任务|批次|步骤)(?:的)?队列/u,
+  /(?:动作|任务|项|批次|步骤)(?:(?:(?:正在|已经|已)?\s*(?:排入|加入|进入))|(?:(?:正|仍)?在)|位于)\s*(?:该|这个)?队列(?:中|里|内)?/u,
+  /(?:动作|任务|项|批次|步骤)(?:正在|仍在|已经|已)?\s*排队|排队(?:中)?(?:的)?\s*(?:动作|任务|项|批次|步骤)/u,
+  /\bqueued\s+(?:actions?|tasks?|items?|batches?|steps?)\b|\b(?:actions?|tasks?|items?|batches?|steps?)\s+(?:(?:is|are|was|were)\s+)?queued\b/iu,
+  /\b(?:actions?|tasks?|items?|batches?|steps?)\s+(?:(?:is|are|was|were|has|have|had|remain|remains|remained)\s+)?(?:(?:currently|still|already|not|never)\s+)*(?:been\s+)?(?:(?:waiting|pending|remaining|running|suspended)\s+)?(?:in|on|inside|within|from)\s+(?:the\s+)?queues?\b/iu,
+  /\b(?:the\s+)?queues?\s+(?:(?:currently|presently|still|already|now|only)\s+)*(?:of|with|contains?|holds?|includes?|has|have)\s+(?:(?:a\s+few|a\s+couple\s+of|more\s+than|at\s+least|up\s+to|the|an?|no|some|many|several|few|all|both|each|every)\s+)?(?:(?:\d+|(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand|million)(?:[-\s]+(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand|million))*)\s+)?(?:(?:currently|still|already)\s+)*(?:(?:waiting|pending|remaining|next|queued|running|completed|failed|cancelled|canceled|suspended)\s+)*(?:actions?|tasks?|items?|batches?|steps?)\b/iu,
+  /\b(?:the\s+)?queues?\s+(?:(?:pending|remaining|next|queued|running|completed|failed|cancelled|canceled|suspended)\s+)?(?:actions?|tasks?|items?|batches?|steps?)\b/iu,
+  /\b(?:action|task|item|batch|step)\s+queues?\b/iu,
+] as const;
+const queueSubjectStatePatterns = [
+  /队列\s*(?:(?:目前|当前|现在)\s*)?(?:(?:正在|正|仍在|已经|已)\s*)?(?:(?:并没有|还没有|还没|没有|没|并未|仍未|尚未|未|不)\s*)?(?:被\s*)?(?:等待|待处理|待执行|运行|执行|完成|失败|取消|暂停|挂起|剩余|还有|下一个|下一项|共)/u,
+  /队列\s*(?:的\s*)?(?:状态|数量|计数)/u,
+  /队列\s*(?:(?:目前|当前|现在)\s*)?(?:正\s*)?处于\s*(?:等待|待处理|待执行|运行|执行|完成|失败|取消|暂停|挂起)/u,
+  /\b(?:the\s+)?queues?\s+(?:(?:is|are|was|were|has|have|had|isn['’]t|aren['’]t|wasn['’]t|weren['’]t|hasn['’]t|haven['’]t|hadn['’]t|remains?|stays?)\s+)?(?:(?:currently|still|already|not|never|no\s+longer)\s+)*(?:been\s+)?(?:waiting|pending|running|completed|failed|cancelled|canceled|suspended|paused|remaining)\b/iu,
+  /\b(?:the\s+)?queues?\s+(?:status|state|counts?)\b/iu,
+] as const;
+const backlogWorkRelationPatterns = [
+  /(?:还有|仍有)\s*(?:\d+|[一二两三四五六七八九十百]+)\s*(?:个|条|批)?\s*(?:动作|任务|项|批次|步骤)/u,
+  /(?:剩余|下一个|下一项|待处理|待执行)\s*(?:\d+\s*(?:个|条|批)?)?\s*(?:动作|任务|项|批次|步骤)/u,
+  /(?:动作|任务|项|批次|步骤)\s*(?:(?:仍然|依然|仍在|还在|正在|尚未|仍|还|正|未)\s*)?(?:待处理|待执行|剩余)/u,
+  /(?:动作|任务|项|批次|步骤)\s*(?:是\s*)?(?:下一个|下一项)\s*$/u,
+  /\b(?:pending|remaining|next)\s+(?:\d+\s+)?(?:actions?|tasks?|items?|batches?|steps?)\b/iu,
+  /\b(?:\d+\s+)?(?:actions?|tasks?|items?|batches?|steps?)\s+(?:(?:is|are|was|were|remain|remains|remained)\s+)?(?:(?:currently|still|already|not|never|no\s+longer)\s+)*(?:pending|remaining)\b/iu,
+  /\b(?:\d+\s+)?(?:actions?|tasks?|items?|batches?|steps?)\s+(?:(?:is|are|was|were)\s+)?next\s*$/iu,
+] as const;
 const sentenceBoundaryPattern = /[\r\n.!?。！？;；]+/u;
 const transportFailureThreshold = 3;
 
-/** Identifies queue implementation state from monotonic evidence within one sentence. */
+/** Identifies queue implementation state from grammatical relations within one sentence. */
 export function containsQueueStateDisclosure(text: string): boolean {
   if (explicitQueueInternalTokenPattern.test(text)) return true;
   return text.split(sentenceBoundaryPattern).some((sentence) => {
-    const workNoun = internalQueueWorkNounPattern.test(sentence);
-    const queueNounMarker = queueNounMarkerPattern.test(sentence);
-    const queueMarker = queueNounMarker || queueActivityMarkerPattern.test(sentence);
-    const lifecycle = executionLifecyclePattern.test(sentence);
-    const boundedCount = boundedQueueCountPattern.test(sentence);
+    if (queueWorkRelationPatterns.some((pattern) => pattern.test(sentence))) return true;
+    if (queueSubjectStatePatterns.some((pattern) => pattern.test(sentence))) return true;
     return (
-      (queueNounMarker && lifecycle) ||
-      (queueMarker && (workNoun || boundedCount)) ||
-      (workNoun && lifecycle && boundedCount)
+      !anyQueueMarkerPattern.test(sentence) &&
+      backlogWorkRelationPatterns.some((pattern) => pattern.test(sentence))
     );
   });
 }
