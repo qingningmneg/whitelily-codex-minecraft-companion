@@ -263,6 +263,28 @@ describe("MineflayerAdapter", () => {
     createBridgeProofIssuer.mockReturnValue({ issue: issueProof, close: closeIssuer });
   });
 
+  it("fails closed for living methods until their narrow implementations replace placeholders", async () => {
+    const adapter = new MineflayerAdapter(config());
+    const position = { x: 1, y: 64, z: 2 };
+    const signal = new AbortController().signal;
+    const attempts = [
+      () => adapter.inspectBlock(position),
+      () => adapter.findBlocks({ names: ["wheat"], maxDistance: 16, maxResults: 8 }),
+      () => adapter.furnaceSnapshot(position),
+      () => adapter.fish(signal),
+      () => adapter.consumeItem("bread", signal),
+      () => adapter.sleepInBed(position, signal),
+      () => adapter.wakeUp(signal),
+      () => adapter.tillSoil(position, signal),
+      () => adapter.plantCrop(position, "wheat_seeds", signal),
+      () => adapter.harvestCrop(position, "wheat", signal),
+    ];
+
+    for (const attempt of attempts) {
+      await expect(attempt()).rejects.toThrow("living action is not implemented");
+    }
+  });
+
   it("keeps third-party parser diagnostics off the desktop protocol stream", async () => {
     const bot = new FakeBot();
     createBot.mockReturnValue(bot);
@@ -1475,8 +1497,11 @@ describe("MineflayerAdapter", () => {
     ]);
     expect(first.waitForTicks).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(1_000);
+    await flush();
+    expect(createBot).toHaveBeenCalledTimes(2);
     replacement._client.emit("login", { worldState: { name: "custom:mirror_world" } });
     replacement.emit("spawn");
+    await flush();
     const subsequent = executor.execute(
       { kind: "move_to", position: { x: 20, y: 64, z: 20 } },
       context,

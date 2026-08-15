@@ -2,6 +2,13 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { ActionExecutor, type ActionSafety } from "../../src/actions/actionExecutor.js";
 import type { GameAction, SafetyDecision } from "../../src/domain/types.js";
 import { FakeMinecraftPort } from "../../src/minecraft/fakeMinecraftPort.js";
+import type {
+  BlockSearchResult,
+  FoodDelta,
+  FurnaceSnapshot,
+  InspectedBlock,
+  InventoryDelta,
+} from "../../src/minecraft/minecraftPort.js";
 import { ConfirmationStore } from "../../src/safety/confirmationStore.js";
 import { SafetyEngine, type SafetyContext } from "../../src/safety/safetyEngine.js";
 import type { TaskLease } from "../../src/safety/taskBudget.js";
@@ -478,6 +485,17 @@ describe("ActionExecutor", () => {
       { kind: "equip_item", itemName: "iron_helmet", destination: "head" },
       { kind: "attack_hostile", entityId: 5 },
       { kind: "wait", milliseconds: 6 },
+      { kind: "fish" },
+      { kind: "consume_item", itemName: "bread" },
+      { kind: "sleep_in_bed", position: { x: 14, y: 15, z: 16 } },
+      { kind: "wake_up" },
+      { kind: "till_soil", position: { x: 17, y: 18, z: 19 } },
+      {
+        kind: "plant_crop",
+        position: { x: 20, y: 21, z: 22 },
+        seedName: "wheat_seeds",
+      },
+      { kind: "harvest_crop", position: { x: 23, y: 24, z: 25 }, cropName: "wheat" },
     ];
 
     for (const action of actions)
@@ -497,6 +515,13 @@ describe("ActionExecutor", () => {
       { method: "equipItem", args: ["iron_helmet", "head"] },
       { method: "attackHostile", args: [5] },
       { method: "wait", args: [6] },
+      { method: "fish", args: [] },
+      { method: "consumeItem", args: ["bread"] },
+      { method: "sleepInBed", args: [{ x: 14, y: 15, z: 16 }] },
+      { method: "wakeUp", args: [] },
+      { method: "tillSoil", args: [{ x: 17, y: 18, z: 19 }] },
+      { method: "plantCrop", args: [{ x: 20, y: 21, z: 22 }, "wheat_seeds"] },
+      { method: "harvestCrop", args: [{ x: 23, y: 24, z: 25 }, "wheat"] },
     ]);
   });
 
@@ -779,5 +804,66 @@ describe("ActionExecutor", () => {
     expect(Object.isFrozen(laterView)).toBe(true);
     expect(firstView).not.toBe(laterView);
     expect(laterView).not.toBe(callerResult);
+  });
+
+  it("does not expose mutable fake-port read model state", async () => {
+    const minecraft = new FakeMinecraftPort();
+    const inspected: InspectedBlock = {
+      name: "wheat",
+      position: { x: 1, y: 64, z: 2 },
+      properties: { age: 7 },
+    };
+    const furnace: FurnaceSnapshot = {
+      position: { x: 3, y: 64, z: 4 },
+      input: { name: "raw_cod", count: 1 },
+      fuel: { name: "coal", count: 1 },
+      output: null,
+      progress: 0.5,
+    };
+    minecraft.inspectBlockResult = inspected;
+    minecraft.findBlocksResult = { blocks: [inspected], truncated: false };
+    minecraft.furnaceSnapshotResult = furnace;
+
+    const firstBlock = await minecraft.inspectBlock(inspected.position);
+    const firstSearch = await minecraft.findBlocks({
+      names: ["wheat"],
+      maxDistance: 16,
+      maxResults: 8,
+    });
+    const firstFurnace = await minecraft.furnaceSnapshot(furnace.position);
+    (firstBlock as { position: { x: number } }).position.x = 99;
+    (firstSearch as unknown as { blocks: Array<{ name: string }> }).blocks[0]!.name = "stone";
+    (firstFurnace as { progress: number }).progress = 1;
+
+    expect(await minecraft.inspectBlock(inspected.position)).toEqual(inspected);
+    expect(
+      await minecraft.findBlocks({ names: ["wheat"], maxDistance: 16, maxResults: 8 }),
+    ).toEqual({ blocks: [inspected], truncated: false } satisfies BlockSearchResult);
+    expect(await minecraft.furnaceSnapshot(furnace.position)).toEqual(furnace);
+  });
+
+  it("does not expose mutable fake-port living action deltas", async () => {
+    const minecraft = new FakeMinecraftPort();
+    const fishResult: InventoryDelta = {
+      added: [{ name: "cod", count: 1 }],
+      removed: [],
+    };
+    const consumeResult: FoodDelta = {
+      healthBefore: 18,
+      healthAfter: 18,
+      foodBefore: 12,
+      foodAfter: 17,
+    };
+    minecraft.fishResult = fishResult;
+    minecraft.consumeItemResult = consumeResult;
+    const signal = new AbortController().signal;
+
+    const firstFish = await minecraft.fish(signal);
+    const firstConsume = await minecraft.consumeItem("bread", signal);
+    (firstFish as unknown as { added: Array<{ count: number }> }).added[0]!.count = 99;
+    (firstConsume as { foodAfter: number }).foodAfter = 0;
+
+    expect(await minecraft.fish(signal)).toEqual(fishResult);
+    expect(await minecraft.consumeItem("bread", signal)).toEqual(consumeResult);
   });
 });

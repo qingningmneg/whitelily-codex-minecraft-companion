@@ -10,7 +10,16 @@ import {
   type MineflayerSession,
 } from "./mineflayerConnection.js";
 import { createWorldSnapshot, selectSnapshotEntities } from "./mineflayerObservation.js";
-import type { MinecraftEvent, MinecraftPort } from "./minecraftPort.js";
+import type {
+  BlockSearchQuery,
+  BlockSearchResult,
+  FoodDelta,
+  FurnaceSnapshot,
+  InspectedBlock,
+  InventoryDelta,
+  MinecraftEvent,
+  MinecraftPort,
+} from "./minecraftPort.js";
 
 const { goals, pathfinder } = pathfinderPackage;
 
@@ -162,6 +171,18 @@ export class MineflayerAdapter implements MinecraftPort {
     const radius = Math.max(0, Math.min(64, Math.floor(maxDistance)));
     const found = bot.findBlock({ matching: block.id, maxDistance: radius });
     return found ? toVec3(found.position) : null;
+  }
+
+  async inspectBlock(_position: Vec3): Promise<InspectedBlock | null> {
+    throw new Error("living action is not implemented");
+  }
+
+  async findBlocks(_query: BlockSearchQuery): Promise<BlockSearchResult> {
+    throw new Error("living action is not implemented");
+  }
+
+  async furnaceSnapshot(_position: Vec3): Promise<FurnaceSnapshot> {
+    throw new Error("living action is not implemented");
   }
 
   async say(message: string): Promise<void> {
@@ -377,6 +398,34 @@ export class MineflayerAdapter implements MinecraftPort {
       unregister = this.connection.registerActiveOperation(stop);
       signal.addEventListener("abort", onAbort, { once: true });
     });
+  }
+
+  async fish(_signal: AbortSignal): Promise<InventoryDelta> {
+    throw new Error("living action is not implemented");
+  }
+
+  async consumeItem(_itemName: string, _signal: AbortSignal): Promise<FoodDelta> {
+    throw new Error("living action is not implemented");
+  }
+
+  async sleepInBed(_position: Vec3, _signal: AbortSignal): Promise<void> {
+    throw new Error("living action is not implemented");
+  }
+
+  async wakeUp(_signal: AbortSignal): Promise<void> {
+    throw new Error("living action is not implemented");
+  }
+
+  async tillSoil(_position: Vec3, _signal: AbortSignal): Promise<void> {
+    throw new Error("living action is not implemented");
+  }
+
+  async plantCrop(_position: Vec3, _seedName: "wheat_seeds", _signal: AbortSignal): Promise<void> {
+    throw new Error("living action is not implemented");
+  }
+
+  async harvestCrop(_position: Vec3, _cropName: "wheat", _signal: AbortSignal): Promise<void> {
+    throw new Error("living action is not implemented");
   }
 
   private handleConnectionEvent(event: MineflayerConnectionEvent): void {

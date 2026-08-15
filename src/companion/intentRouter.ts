@@ -29,6 +29,10 @@ const toolActionKinds = [
   "find_block",
 ] as const satisfies readonly ToolActionKind[];
 
+function isIntentToolActionKind(action: string): action is (typeof toolActionKinds)[number] {
+  return (toolActionKinds as readonly string[]).includes(action);
+}
+
 const taskLimitKeys = [
   "maxToolCalls",
   "maxBlockChanges",
@@ -201,9 +205,7 @@ export function buildOwnerIntentTurn(input: OwnerIntentContext): string {
     ? {
         goal: boundedWholeCharacters(input.activeTask.goal, 160),
         allowedActions: input.activeTask.allowedActions
-          .filter((action): action is ToolActionKind =>
-            toolActionKinds.includes(action as ToolActionKind),
-          )
+          .filter(isIntentToolActionKind)
           .slice(0, toolActionKinds.length),
         limits: stableLimits(input.activeTask.limits),
       }

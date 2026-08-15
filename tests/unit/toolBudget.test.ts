@@ -1,8 +1,24 @@
 import { describe, expect, it } from "vitest";
-import { TurnToolBudget } from "../../src/mcp/toolBudget.js";
+import { GAME_ACTION_KINDS } from "../../src/domain/types.js";
+import { TOOL_ACTION_KINDS, TurnToolBudget } from "../../src/mcp/toolBudget.js";
 import { TaskControllerBudget } from "../../src/safety/taskBudget.js";
 
 describe("TurnToolBudget", () => {
+  it("exposes every bounded living action and observation kind to task authorization", () => {
+    expect(GAME_ACTION_KINDS).toEqual(
+      expect.arrayContaining([
+        "fish",
+        "consume_item",
+        "sleep_in_bed",
+        "wake_up",
+        "till_soil",
+        "plant_crop",
+        "harvest_crop",
+      ]),
+    );
+    expect(TOOL_ACTION_KINDS).toEqual(expect.arrayContaining(["inspect_block", "find_blocks"]));
+  });
+
   it("locally rejects actions outside a turn allowlist before spending task authority", () => {
     const taskBudget = new TaskControllerBudget();
     const taskLease = taskBudget.begin();

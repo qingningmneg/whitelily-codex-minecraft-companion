@@ -2,7 +2,13 @@ import { randomBytes } from "node:crypto";
 import { GAME_ACTION_KINDS } from "../domain/types.js";
 import { TaskControllerBudget, type TaskLease } from "../safety/taskBudget.js";
 
-export const TOOL_ACTION_KINDS = [...GAME_ACTION_KINDS, "get_state", "find_block"] as const;
+export const TOOL_ACTION_KINDS = [
+  ...GAME_ACTION_KINDS,
+  "get_state",
+  "find_block",
+  "inspect_block",
+  "find_blocks",
+] as const;
 export type ToolActionKind = (typeof TOOL_ACTION_KINDS)[number];
 
 export interface TrustedToolConsumption {

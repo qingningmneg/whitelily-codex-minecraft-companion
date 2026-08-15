@@ -39,7 +39,14 @@ export type GameAction =
       destination: "hand" | "head" | "torso" | "legs" | "feet";
     }
   | { kind: "attack_hostile"; entityId: number }
-  | { kind: "wait"; milliseconds: number };
+  | { kind: "wait"; milliseconds: number }
+  | { kind: "fish" }
+  | { kind: "consume_item"; itemName: string }
+  | { kind: "sleep_in_bed"; position: Vec3 }
+  | { kind: "wake_up" }
+  | { kind: "till_soil"; position: Vec3 }
+  | { kind: "plant_crop"; position: Vec3; seedName: "wheat_seeds" }
+  | { kind: "harvest_crop"; position: Vec3; cropName: "wheat" };
 
 function defineGameActionKinds<const Kinds extends readonly GameAction["kind"][]>(
   kinds: Kinds &
@@ -62,6 +69,13 @@ export const GAME_ACTION_KINDS = defineGameActionKinds([
   "equip_item",
   "attack_hostile",
   "wait",
+  "fish",
+  "consume_item",
+  "sleep_in_bed",
+  "wake_up",
+  "till_soil",
+  "plant_crop",
+  "harvest_crop",
 ] as const);
 
 export type ConfirmableOperation =

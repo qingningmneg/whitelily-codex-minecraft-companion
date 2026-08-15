@@ -332,6 +332,27 @@ export class ActionExecutor {
       case "wait":
         await this.minecraft.wait(action.milliseconds, signal);
         return;
+      case "fish":
+        await this.minecraft.fish(signal);
+        return;
+      case "consume_item":
+        await this.minecraft.consumeItem(action.itemName, signal);
+        return;
+      case "sleep_in_bed":
+        await this.minecraft.sleepInBed(action.position, signal);
+        return;
+      case "wake_up":
+        await this.minecraft.wakeUp(signal);
+        return;
+      case "till_soil":
+        await this.minecraft.tillSoil(action.position, signal);
+        return;
+      case "plant_crop":
+        await this.minecraft.plantCrop(action.position, action.seedName, signal);
+        return;
+      case "harvest_crop":
+        await this.minecraft.harvestCrop(action.position, action.cropName, signal);
+        return;
       default: {
         const exhaustive: never = action;
         throw new Error(`Unhandled action: ${JSON.stringify(exhaustive)}`);
