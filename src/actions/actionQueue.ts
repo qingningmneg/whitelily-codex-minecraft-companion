@@ -362,6 +362,26 @@ export class CompanionActionQueue {
     return cancelled;
   }
 
+  /** Drops every not-yet-running physical action before the AI replans from a fresh observation. */
+  cancelPendingPhysicalActions(taskLease: TaskLease, reason: string): number {
+    let cancelled = 0;
+    for (const item of this.#items) {
+      if (
+        item.taskLease.id === taskLease.id &&
+        item.taskLease.startedAt === taskLease.startedAt &&
+        item.action !== undefined &&
+        (item.status === "waiting" || item.status === "suspended")
+      ) {
+        item.status = "cancelled";
+        item.reason = sanitizeDiagnosticText(reason, 240);
+        item.endedAt = this.options.now().toISOString();
+        this.#publishItem(item);
+        cancelled += 1;
+      }
+    }
+    return cancelled;
+  }
+
   cancelKinds(
     taskLease: TaskLease,
     kinds: ReadonlySet<GameAction["kind"]>,

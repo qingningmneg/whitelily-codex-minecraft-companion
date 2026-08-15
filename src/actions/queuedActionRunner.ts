@@ -28,6 +28,11 @@ export type QueueRunnerEvent =
   | { readonly kind: "world_stale"; readonly taskLease: TaskLease }
   | { readonly kind: "budget_boundary"; readonly taskLease: TaskLease; readonly reason: string };
 
+export interface CompletedQueuedAction {
+  readonly taskLease: TaskLease;
+  readonly action: GameAction;
+}
+
 function taskLeaseKey(taskLease: TaskLease): string {
   return `${taskLease.id}\u0000${taskLease.startedAt}`;
 }
@@ -39,6 +44,7 @@ export class QueuedActionRunner {
   readonly #safetyContextProvider: (() => Promise<SafetyContext>) | undefined;
   readonly #idleWaiters = new Set<() => void>();
   readonly #listeners = new Set<(event: QueueRunnerEvent) => void>();
+  readonly #completedActionListeners = new Set<(event: CompletedQueuedAction) => void>();
   #started = false;
   #scheduled = false;
   #running = false;
@@ -111,6 +117,12 @@ export class QueuedActionRunner {
     return () => this.#listeners.delete(listener);
   }
 
+  /** Internal completion signal; action payloads never enter the public queue projection. */
+  subscribeCompletedAction(listener: (event: CompletedQueuedAction) => void): () => void {
+    this.#completedActionListeners.add(listener);
+    return () => this.#completedActionListeners.delete(listener);
+  }
+
   #schedule(): void {
     if (!this.#started || this.#scheduled || this.#running) return;
     this.#scheduled = true;
@@ -169,7 +181,7 @@ export class QueuedActionRunner {
         result = await this.#executor.execute(item.action, safetyContext);
         if (generation !== this.#generation) return;
       }
-      continueBatch = this.#commitResult(item.id, context, result);
+      continueBatch = this.#commitResult(item, context, result);
     } finally {
       this.#running = false;
       if (generation === this.#generation && continueBatch) this.#schedule();
@@ -177,9 +189,14 @@ export class QueuedActionRunner {
     }
   }
 
-  #commitResult(id: string, context: QueuedActionExecutionContext, result: ActionResult): boolean {
+  #commitResult(
+    item: { readonly id: string; readonly action: GameAction },
+    context: QueuedActionExecutionContext,
+    result: ActionResult,
+  ): boolean {
     if (result.status === "completed") {
-      this.#queue.complete(id, context.taskLease, context.worldGeneration);
+      this.#queue.complete(item.id, context.taskLease, context.worldGeneration);
+      this.#publishCompletedAction({ taskLease: { ...context.taskLease }, action: item.action });
       return true;
     }
     if (result.status === "cancelled") {
@@ -193,7 +210,7 @@ export class QueuedActionRunner {
       return false;
     }
     const reason = result.reason;
-    this.#queue.fail(id, context.taskLease, context.worldGeneration, reason);
+    this.#queue.fail(item.id, context.taskLease, context.worldGeneration, reason);
     this.#batchHadWork = false;
     if (
       reason === "task budget exhausted" ||
@@ -213,6 +230,16 @@ export class QueuedActionRunner {
         listener(event);
       } catch {
         // Lifecycle observers cannot affect queue execution.
+      }
+    }
+  }
+
+  #publishCompletedAction(event: CompletedQueuedAction): void {
+    for (const listener of this.#completedActionListeners) {
+      try {
+        listener({ taskLease: { ...event.taskLease }, action: structuredClone(event.action) });
+      } catch {
+        // Completion observers cannot affect physical action execution.
       }
     }
   }

@@ -87,6 +87,7 @@ const taskFailureMessage = "这次没能完成，请再试一次。";
 const farmingPermissionQuestion = "我可以在这里种小麦吗？";
 const farmingFallbackConstraint = "不得新建农田，寻找现成的成熟小麦";
 const farmingMutationKinds = new Set(["till_soil", "plant_crop"] as const);
+const wheatObservationDelayMs = 60_000;
 const filteredModelReply = "好，我知道了。";
 const ambiguousNaturalToolNames = new Set<ToolActionKind>(["say", "jump", "wait"]);
 const ambiguousNaturalToolNamePattern = [...ambiguousNaturalToolNames].join("|");
@@ -100,11 +101,14 @@ const ambiguousToolInvocationPattern = new RegExp(
 );
 const internalModelMetadataPattern =
   /任务披露|minecraft_[a-z0-9_]+|工具调用|预算|租约|停止条件|expectedActions|allowedActions|maxToolCalls|maxBlockChanges|maxHorizontalTravel|maxDurationMs|maxDangerousOperations|leaseId|stopCondition/iu;
+const queueDisclosurePattern =
+  /队列(?:中|状态|快照|里|还有)|(?:当前|仍)?正在排队|待执行(?:动作|数量|项目)?|queue\s*(?:snapshot|status|contains|has)|queued\s+actions?/iu;
 const transportFailureThreshold = 3;
 
 function containsInternalModelDisclosure(reply: string): boolean {
   return (
     internalModelMetadataPattern.test(reply) ||
+    queueDisclosurePattern.test(reply) ||
     bareInternalToolNamePattern.test(reply) ||
     ambiguousToolInvocationPattern.test(reply)
   );
@@ -323,6 +327,12 @@ export interface CompanionServiceDependencies {
     milliseconds: number,
   ) => ReturnType<typeof setTimeout>;
   clearFarmingPermissionTimer?: (timer: ReturnType<typeof setTimeout>) => void;
+  setFarmObservationTimer?: (
+    callback: () => void,
+    milliseconds: number,
+  ) => ReturnType<typeof setTimeout>;
+  clearFarmObservationTimer?: (timer: ReturnType<typeof setTimeout>) => void;
+  farmObservationNow?: () => number;
   confirmationNow?: () => Date;
   setConfirmationTimer?: (
     callback: () => void,
@@ -429,10 +439,17 @@ export class CompanionService {
   private readonly clearConfirmationTimer: (timer: ReturnType<typeof setTimeout>) => void;
   private readonly farmingPermissionCoordinator: FarmingPermissionCoordinator;
   private readonly farmObservationScheduler = new FarmObservationScheduler();
+  private readonly setFarmObservationTimer: (
+    callback: () => void,
+    milliseconds: number,
+  ) => ReturnType<typeof setTimeout>;
+  private readonly clearFarmObservationTimer: (timer: ReturnType<typeof setTimeout>) => void;
+  private readonly farmObservationNow: () => number;
   private unsubscribe: (() => void) | undefined;
   private unsubscribeActionResult: (() => void) | undefined;
   private mergeTimer: ReturnType<typeof setTimeout> | undefined;
   private confirmationExpiryTimer: ReturnType<typeof setTimeout> | undefined;
+  private farmObservationTimer: ReturnType<typeof setTimeout> | undefined;
   private mergedMessages: string[] = [];
   private generation = 0;
   private messageSequence = 0;
@@ -476,6 +493,9 @@ export class CompanionService {
     this.confirmationNow = dependencies.confirmationNow ?? (() => new Date());
     this.setConfirmationTimer = dependencies.setConfirmationTimer ?? setTimeout;
     this.clearConfirmationTimer = dependencies.clearConfirmationTimer ?? clearTimeout;
+    this.setFarmObservationTimer = dependencies.setFarmObservationTimer ?? setTimeout;
+    this.clearFarmObservationTimer = dependencies.clearFarmObservationTimer ?? clearTimeout;
+    this.farmObservationNow = dependencies.farmObservationNow ?? Date.now;
     this.farmingPermissionCoordinator = new FarmingPermissionCoordinator({
       actionQueue: dependencies.actionQueue,
       executionContext: () => this.queueExecutionContext(),
@@ -499,6 +519,21 @@ export class CompanionService {
         this.logger.error("queue_execution_replan_failed", { code: errorName(error) }),
       );
     });
+    dependencies.actionRunner.subscribeCompletedAction(({ taskLease, action }) => {
+      const task = this.dependencies.taskController.current();
+      if (
+        !this.running ||
+        !task ||
+        !sameTaskLease(task.lease, taskLease) ||
+        action.kind !== "plant_crop"
+      ) {
+        return;
+      }
+      this.scheduleFarmObservation({
+        position: action.position,
+        earliestAt: this.farmObservationNow() + wheatObservationDelayMs,
+      });
+    });
   }
 
   /** Schedules a future AI observation; it never reserves or performs a physical action. */
@@ -512,16 +547,49 @@ export class CompanionService {
       earliestAt: input.earliestAt,
       purpose: "wheat_maturity",
     });
+    this.scheduleFarmObservationTick();
   }
 
   /** Converts due crop checks into an observation-and-replan turn, never a direct harvest. */
   async runDueFarmObservations(now = Date.now()): Promise<number> {
-    const due = this.farmObservationScheduler.due(now);
-    for (const observation of due) {
-      if (observation.worldGeneration !== this.worldGeneration) continue;
-      await this.queueExecutionReplanFromCurrent("小麦成熟时间已到，请先观察后决定是否需要动作。");
+    try {
+      const due = this.farmObservationScheduler.due(now);
+      for (const observation of due) {
+        if (observation.worldGeneration !== this.worldGeneration) continue;
+        this.pendingExecutionReplans += 1;
+        try {
+          await this.queueExecutionReplanFromCurrent(
+            "小麦成熟时间已到，请先观察后决定是否需要动作。",
+          );
+        } finally {
+          this.pendingExecutionReplans -= 1;
+        }
+      }
+      return due.length;
+    } finally {
+      this.scheduleFarmObservationTick();
     }
-    return due.length;
+  }
+
+  private scheduleFarmObservationTick(): void {
+    this.clearFarmObservationTick();
+    const dueAt = this.farmObservationScheduler.nextDueAt();
+    if (dueAt === undefined) return;
+    const milliseconds = Math.max(0, dueAt - this.farmObservationNow());
+    const timer = this.setFarmObservationTimer(() => {
+      if (this.farmObservationTimer === timer) this.farmObservationTimer = undefined;
+      void this.runDueFarmObservations(this.farmObservationNow()).catch((error: unknown) =>
+        this.logger.error("farm_observation_due_failed", { code: errorName(error) }),
+      );
+    }, milliseconds);
+    this.farmObservationTimer = timer;
+    (timer as ReturnType<typeof setTimeout> & { unref?: () => void }).unref?.();
+  }
+
+  private clearFarmObservationTick(): void {
+    if (this.farmObservationTimer === undefined) return;
+    this.clearFarmObservationTimer(this.farmObservationTimer);
+    this.farmObservationTimer = undefined;
   }
 
   /** Memory scope only changes future prompts; it never changes the Minecraft connection. */
@@ -959,6 +1027,7 @@ export class CompanionService {
     }
     if (event.kind === "world_changed") {
       this.farmObservationScheduler.cancelWorld(previousWorldGeneration);
+      this.scheduleFarmObservationTick();
       this.worldInvalidated = true;
       this.dependencies.taskController.stop("world_changed");
       this.invalidateCurrentTurn();
@@ -1396,6 +1465,16 @@ export class CompanionService {
   private async queueExecutionReplanFromRunner(event: QueueRunnerEvent): Promise<void> {
     const task = this.dependencies.taskController.current();
     if (!task || !sameTaskLease(task.lease, event.taskLease)) return;
+    if (
+      event.kind === "action_failed" ||
+      event.kind === "budget_boundary" ||
+      event.kind === "world_stale"
+    ) {
+      this.dependencies.actionQueue.cancelPendingPhysicalActions(
+        task.lease,
+        "discarded before observation replan",
+      );
+    }
     const context =
       event.kind === "batch_completed"
         ? "上一批次已完成，请先观察当前世界再规划下一组动作。"
@@ -2589,6 +2668,8 @@ export class CompanionService {
     forceCleanup = false,
     taskLease?: TaskLease,
   ): void {
+    this.farmObservationScheduler.cancelWorld(this.worldGeneration);
+    this.clearFarmObservationTick();
     this.farmingPermissionCoordinator.cancel(reason);
     if (taskLease) {
       const key = taskLeaseKey(taskLease);

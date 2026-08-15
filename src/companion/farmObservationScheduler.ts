@@ -63,4 +63,12 @@ export class FarmObservationScheduler {
     }
     return due;
   }
+
+  nextDueAt(): number | undefined {
+    return this.#scheduled.reduce<number | undefined>(
+      (earliest, scheduled) =>
+        earliest === undefined || scheduled.earliestAt < earliest ? scheduled.earliestAt : earliest,
+      undefined,
+    );
+  }
 }

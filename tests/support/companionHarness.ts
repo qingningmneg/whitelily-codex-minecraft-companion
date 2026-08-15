@@ -480,6 +480,7 @@ export interface CompanionHarnessOptions {
   ownerIdentitySnapshot?: OwnerIdentitySnapshot;
   farmingPreferenceStatus?: FarmingPreferenceStatus;
   gateFarmingPermissionSetAllowed?: boolean;
+  farmObservationNow?: number;
 }
 
 class FakeAutonomyScheduler {
@@ -711,6 +712,12 @@ export async function createCompanionHarness(options: CompanionHarnessOptions = 
     number,
     { callback: () => void; milliseconds: number; cleared: boolean }
   >();
+  let farmObservationNow = options.farmObservationNow ?? 0;
+  let nextFarmObservationTimerId = 30_000;
+  const farmObservationTimers = new Map<
+    number,
+    { callback: () => void; milliseconds: number; cleared: boolean }
+  >();
   if (options.activeMinecraftWait) {
     minecraft.wait = async (_milliseconds, signal) => {
       activeWaitAbort = signal;
@@ -788,6 +795,16 @@ export async function createCompanionHarness(options: CompanionHarnessOptions = 
       const record = farmingPermissionTimers.get(timer as unknown as number);
       if (record) record.cleared = true;
     },
+    setFarmObservationTimer: (callback, milliseconds) => {
+      const id = nextFarmObservationTimerId++;
+      farmObservationTimers.set(id, { callback, milliseconds, cleared: false });
+      return id as unknown as ReturnType<typeof setTimeout>;
+    },
+    clearFarmObservationTimer: (timer) => {
+      const record = farmObservationTimers.get(timer as unknown as number);
+      if (record) record.cleared = true;
+    },
+    farmObservationNow: () => farmObservationNow,
     ...(options.manualConfirmationTimers
       ? {
           confirmationNow: () => new Date(),
@@ -955,6 +972,23 @@ export async function createCompanionHarness(options: CompanionHarnessOptions = 
       const record = farmingPermissionTimers.get(id);
       if (!record || (record.cleared && !includeCleared)) {
         throw new Error("no matching farming permission timer is pending");
+      }
+      record.cleared = true;
+      record.callback();
+    },
+    farmObservationTimerRecords: () =>
+      [...farmObservationTimers.entries()].map(([id, record]) => ({
+        id,
+        milliseconds: record.milliseconds,
+        cleared: record.cleared,
+      })),
+    setFarmObservationNow: (now: number) => {
+      farmObservationNow = now;
+    },
+    fireFarmObservationTimer: (id: number, includeCleared = false) => {
+      const record = farmObservationTimers.get(id);
+      if (!record || (record.cleared && !includeCleared)) {
+        throw new Error("no matching farm observation timer is pending");
       }
       record.cleared = true;
       record.callback();

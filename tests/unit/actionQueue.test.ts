@@ -669,4 +669,39 @@ describe("CompanionActionQueue", () => {
       "waiting_permission",
     ]);
   });
+
+  it("isolates waiting and suspended physical actions before a fresh observation replan", () => {
+    const queue = new CompanionActionQueue({
+      createId: sequenceIds(),
+      now: () => new Date("2026-08-15T00:00:00.000Z"),
+    });
+    queue.enqueue({
+      taskLease,
+      worldGeneration: 1,
+      action: { kind: "jump" },
+      summary: "old waiting action",
+      trustedObservationKey: "observation-a",
+    });
+    queue.enqueue({
+      taskLease,
+      worldGeneration: 1,
+      action: { kind: "wait", milliseconds: 500 },
+      summary: "old suspended action",
+      trustedObservationKey: "observation-a",
+    });
+    queue.beginPermissionWait({
+      taskLease,
+      worldGeneration: 1,
+      permission: "wheat_farming",
+      summary: "permission remains separate",
+    });
+    queue.suspendTask(taskLease, "owner_message");
+
+    expect(queue.cancelPendingPhysicalActions(taskLease, "observation replan")).toBe(2);
+    expect(queue.snapshot().items.map(({ status }) => status)).toEqual([
+      "cancelled",
+      "cancelled",
+      "waiting_permission",
+    ]);
+  });
 });
