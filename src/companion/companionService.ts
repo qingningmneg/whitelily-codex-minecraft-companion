@@ -3,6 +3,7 @@ import type { CompanionActionQueue } from "../actions/actionQueue.js";
 import type {
   QueuedActionExecutionContext,
   QueuedActionRunner,
+  QueueRunnerEvent,
 } from "../actions/queuedActionRunner.js";
 import type { AutonomyReason } from "../autonomy/autonomyScheduler.js";
 import type { LocalCommand } from "../commands/commandParser.js";
@@ -53,6 +54,7 @@ import {
   FarmingPermissionCoordinator,
   type FarmingPermissionResult,
 } from "./farmingPermissionCoordinator.js";
+import { FarmObservationScheduler } from "./farmObservationScheduler.js";
 import { TaskController, type ActiveTask, type TaskDisclosure } from "./taskController.js";
 
 const repairPrompt = "只返回符合既定结构的 JSON，不要使用 Markdown。";
@@ -426,6 +428,7 @@ export class CompanionService {
   ) => ReturnType<typeof setTimeout>;
   private readonly clearConfirmationTimer: (timer: ReturnType<typeof setTimeout>) => void;
   private readonly farmingPermissionCoordinator: FarmingPermissionCoordinator;
+  private readonly farmObservationScheduler = new FarmObservationScheduler();
   private unsubscribe: (() => void) | undefined;
   private unsubscribeActionResult: (() => void) | undefined;
   private mergeTimer: ReturnType<typeof setTimeout> | undefined;
@@ -464,6 +467,7 @@ export class CompanionService {
   private readonly pendingConfirmationTerminalReasons = new Map<string, "failed" | "owner_stop">();
   private readonly suspendedTaskGoals: SuspendedTaskGoal[] = [];
   private preservedTerminalLeaseKey: string | undefined;
+  private pendingExecutionReplans = 0;
 
   constructor(private readonly dependencies: CompanionServiceDependencies) {
     this.logger = dependencies.logger ?? noOpLogger;
@@ -489,6 +493,35 @@ export class CompanionService {
     dependencies.confirmations.onGameActionsExpired((taskLease) =>
       this.queueFailedConfirmation(taskLease),
     );
+    dependencies.actionRunner.subscribe((event) => {
+      if (!this.running) return;
+      void this.queueExecutionReplanFromRunner(event).catch((error: unknown) =>
+        this.logger.error("queue_execution_replan_failed", { code: errorName(error) }),
+      );
+    });
+  }
+
+  /** Schedules a future AI observation; it never reserves or performs a physical action. */
+  scheduleFarmObservation(input: {
+    position: { x: number; y: number; z: number };
+    earliestAt: number;
+  }): void {
+    this.farmObservationScheduler.schedule({
+      worldGeneration: this.worldGeneration,
+      position: input.position,
+      earliestAt: input.earliestAt,
+      purpose: "wheat_maturity",
+    });
+  }
+
+  /** Converts due crop checks into an observation-and-replan turn, never a direct harvest. */
+  async runDueFarmObservations(now = Date.now()): Promise<number> {
+    const due = this.farmObservationScheduler.due(now);
+    for (const observation of due) {
+      if (observation.worldGeneration !== this.worldGeneration) continue;
+      await this.queueExecutionReplanFromCurrent("小麦成熟时间已到，请先观察后决定是否需要动作。");
+    }
+    return due.length;
   }
 
   /** Memory scope only changes future prompts; it never changes the Minecraft connection. */
@@ -660,18 +693,36 @@ export class CompanionService {
         } catch {
           // Scheduler observation must never affect the action result.
         }
-        // A live execution turn receives the failed tool result and can recover safely.
-        // Fail closed only when no model turn is present to handle the action outcome.
-        if (this.activeExecutionTurn !== undefined) return;
-        if (this.dependencies.taskController.current() === null) return;
-        const error = new Error();
-        error.name = "MinecraftToolError";
-        void this.failTaskOnly(this.generation, error, taskFailureMessage).catch(
-          (failure: unknown) =>
-            this.logger.error("task_failure_containment_failed", {
-              code: errorName(failure),
-            }),
-        );
+        const containFailure = () => {
+          // A live execution turn receives the failed tool result and can recover safely.
+          // Fail closed only when no model turn is present to handle the action outcome.
+          if (!this.running || this.activeExecutionTurn !== undefined) return;
+          if (this.dependencies.taskController.current() === null) return;
+          const error = new Error();
+          error.name = "MinecraftToolError";
+          void this.failTaskOnly(this.generation, error, taskFailureMessage).catch(
+            (failure: unknown) =>
+              this.logger.error("task_failure_containment_failed", {
+                code: errorName(failure),
+              }),
+          );
+        };
+        const queuedActionIsRunning = this.dependencies.actionQueue
+          .snapshot()
+          .items.some((item) => item.status === "running");
+        if (!queuedActionIsRunning) {
+          containFailure();
+          return;
+        }
+        // Let QueuedActionRunner publish its failure event before treating an action failure as
+        // task-terminal. A queued failure owns the next observation-and-replan turn.
+        void Promise.resolve()
+          .then(() => undefined)
+          .then(() => undefined)
+          .then(() => {
+            if (this.pendingExecutionReplans > 0) return;
+            containFailure();
+          });
       });
       this.dependencies.autonomy.start();
       while (this.startupEvents.length > 0) {
@@ -872,6 +923,7 @@ export class CompanionService {
 
   private async handleEvent(event: MinecraftEvent): Promise<void> {
     if (!this.running) return;
+    const previousWorldGeneration = this.worldGeneration;
     if (
       event.kind === "connected" ||
       event.kind === "disconnected" ||
@@ -906,6 +958,7 @@ export class CompanionService {
       return;
     }
     if (event.kind === "world_changed") {
+      this.farmObservationScheduler.cancelWorld(previousWorldGeneration);
       this.worldInvalidated = true;
       this.dependencies.taskController.stop("world_changed");
       this.invalidateCurrentTurn();
@@ -1296,20 +1349,20 @@ export class CompanionService {
     );
   }
 
-  private queueFarmingPermissionReplan(stamp: IntentStamp, context: string): void {
+  private queueFarmingPermissionReplan(stamp: IntentStamp, context: string): Promise<void> {
     const task = this.dependencies.taskController.current();
     if (
       !task ||
       stamp.taskLeaseAtDispatch === null ||
       !sameTaskLease(task.lease, stamp.taskLeaseAtDispatch)
     ) {
-      return;
+      return Promise.resolve();
     }
     this.interruptExecutionTurn();
     const allowedActions = task.disclosure.expectedActions.filter(
       (action): action is ToolActionKind => TOOL_ACTION_KINDS.includes(action as ToolActionKind),
     );
-    this.queueValidatedTask(
+    return this.queueValidatedTask(
       {
         kind: "continue_task",
         naturalReply: null,
@@ -1326,13 +1379,36 @@ export class CompanionService {
   }
 
   private async queueFarmingPermissionReplanFromCurrent(context: string): Promise<void> {
+    await this.queueExecutionReplanFromCurrent(context);
+  }
+
+  private async queueExecutionReplanFromCurrent(context: string): Promise<void> {
     if (!this.running || this.dependencies.taskController.current() === null) return;
     try {
       const stamp = await this.captureIntentStamp();
       if (!this.isIntentCurrent(stamp)) return;
-      this.queueFarmingPermissionReplan(stamp, context);
+      await this.queueFarmingPermissionReplan(stamp, context);
     } catch (error) {
-      await this.logger.error("farming_permission_replan_failed", { code: errorName(error) });
+      await this.logger.error("execution_replan_failed", { code: errorName(error) });
+    }
+  }
+
+  private async queueExecutionReplanFromRunner(event: QueueRunnerEvent): Promise<void> {
+    const task = this.dependencies.taskController.current();
+    if (!task || !sameTaskLease(task.lease, event.taskLease)) return;
+    const context =
+      event.kind === "batch_completed"
+        ? "上一批次已完成，请先观察当前世界再规划下一组动作。"
+        : event.kind === "action_failed"
+          ? "动作批次失败，请先观察当前世界再决定安全的下一步。"
+          : event.kind === "world_stale"
+            ? "世界观察已过期，请先重新观察后规划。"
+            : "预算边界已到，请重新观察并在允许的范围内决定是否继续。";
+    this.pendingExecutionReplans += 1;
+    try {
+      await this.queueExecutionReplanFromCurrent(context);
+    } finally {
+      this.pendingExecutionReplans -= 1;
     }
   }
 
@@ -1364,7 +1440,7 @@ export class CompanionService {
     decision: ValidatedTaskDecision,
     ownerText: string,
     stamp: IntentStamp,
-  ): void {
+  ): Promise<void> {
     const queued = this.executionTurnTail
       .catch(() => undefined)
       .then(() => this.startValidatedTask(decision, ownerText, stamp))
@@ -1372,6 +1448,7 @@ export class CompanionService {
         this.logger.error("companion_task_turn_failed", { code: String(error) }),
       );
     this.executionTurnTail = queued;
+    return queued;
   }
 
   private clearSuspendedTaskGoals(reason: string): void {
@@ -1463,6 +1540,7 @@ export class CompanionService {
             status: this.dependencies.farmingPreference.snapshot().status,
             pending: this.farmingPermissionCoordinator.isPending(),
           },
+          queueSnapshot: this.dependencies.actionQueue.snapshot(),
         };
         prompt = buildCompanionTaskExecutionTurn(input);
       } catch (error) {
@@ -1524,7 +1602,9 @@ export class CompanionService {
         this.dependencies.actionRunner.resumeAfterReplan(task.lease, this.worldGeneration);
       }
       keepTaskAlive =
-        outcome.status === "active" && this.dependencies.actionQueue.hasActiveTask(task.lease);
+        outcome.status === "active" &&
+        (this.dependencies.actionQueue.hasActiveTask(task.lease) ||
+          this.pendingExecutionReplans > 0);
       if (outcome.status !== "active") {
         this.dependencies.actionQueue.cancelTask(task.lease, "task outcome finished");
         resumeSuspendedGoal = decision.kind === "priority_task";

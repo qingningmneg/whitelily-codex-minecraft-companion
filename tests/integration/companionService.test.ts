@@ -5717,6 +5717,95 @@ describe("CompanionService wheat farming permission", () => {
   });
 });
 
+describe("CompanionService adaptive execution replans", () => {
+  it("starts a fresh execution turn after a queued batch completes", async () => {
+    const value = await harness({
+      deferredTurns: [0],
+      intentResponses: [
+        taskDecision({
+          naturalReply: null,
+          goal: "恢复食物储备",
+          allowedActions: ["get_state", "find_blocks", "craft_item", "smelt_item", "fish"],
+        }),
+      ],
+      executionResponses: [
+        taskExecutionOutcome("第一批已入队", "active"),
+        taskExecutionOutcome("已根据新观察调整", "completed"),
+      ],
+    });
+    await value.start();
+    await value.emitOwnerText("我饿了，帮我准备食物");
+    await value.untilCodexTurns(1);
+    const task = value.taskController.current();
+    if (!task) throw new Error("expected active food task");
+    value.actionQueue.enqueue({
+      taskLease: task.lease,
+      worldGeneration: value.service.queueExecutionContext()!.worldGeneration,
+      action: { kind: "jump" },
+      summary: "food preparation step",
+      trustedObservationKey: "food-observation",
+    });
+
+    value.codex.releaseTurnResult(0, taskExecutionOutcome("第一批已入队", "active"));
+    await vi.waitFor(() => expect(value.codex.turnsFor("execution")).toHaveLength(2));
+
+    expect(value.codex.turnsFor("execution")[1]?.text).toContain("批次已完成");
+  });
+
+  it("replans after a queued action failure instead of containing the task first", async () => {
+    const value = await harness({
+      deferredTurns: [0],
+      intentResponses: [
+        taskDecision({
+          naturalReply: null,
+          goal: "恢复食物储备",
+          allowedActions: ["get_state", "find_blocks", "craft_item", "smelt_item", "fish"],
+        }),
+      ],
+      executionResponses: [
+        taskExecutionOutcome("第一批已入队", "active"),
+        taskExecutionOutcome("改用安全替代方案", "completed"),
+      ],
+    });
+    value.minecraft.jump = async () => {
+      throw new Error("path blocked");
+    };
+    await value.start();
+    await value.emitOwnerText("我饿了，帮我准备食物");
+    await value.untilCodexTurns(1);
+    const task = value.taskController.current();
+    if (!task) throw new Error("expected active food task");
+    value.actionQueue.enqueue({
+      taskLease: task.lease,
+      worldGeneration: value.service.queueExecutionContext()!.worldGeneration,
+      action: { kind: "jump" },
+      summary: "food preparation step",
+      trustedObservationKey: "food-observation",
+    });
+
+    value.codex.releaseTurnResult(0, taskExecutionOutcome("第一批已入队", "active"));
+    await vi.waitFor(() => expect(value.codex.turnsFor("execution")).toHaveLength(2));
+
+    expect(value.codex.turnsFor("execution")[1]?.text).toContain("动作批次失败");
+  });
+
+  it("cancels an old-world wheat observation without harvesting", async () => {
+    const value = await harness();
+    await value.start();
+    value.service.scheduleFarmObservation({ position: { x: 4, y: 64, z: 1 }, earliestAt: 1_000 });
+
+    value.minecraft.emit({ kind: "world_changed" });
+    await vi.waitFor(() =>
+      expect((value.service as unknown as { worldInvalidated: boolean }).worldInvalidated).toBe(
+        true,
+      ),
+    );
+
+    await expect(value.service.runDueFarmObservations(1_000)).resolves.toBe(0);
+    expect(value.minecraft.calls.filter((call) => call.method === "harvestCrop")).toEqual([]);
+  });
+});
+
 describe("CompanionService zero disclosure privacy regressions", () => {
   it("replaces a model reply containing internal task vocabulary before Minecraft chat", async () => {
     const rawModelOutput = JSON.stringify({

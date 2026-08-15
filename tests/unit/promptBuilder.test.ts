@@ -59,6 +59,99 @@ function sectionContent(prompt: string, section: (typeof sectionHeaders)[number]
 }
 
 describe("buildCompanionTaskExecutionTurn", () => {
+  it("gives the model live alternatives instead of a cooked-fish macro", () => {
+    const prompt = buildCompanionTaskExecutionTurn({
+      mode: "friend",
+      ownerMessage: "我饿了，帮我准备食物",
+      plan: {
+        goal: "恢复食物储备",
+        allowedActions: ["get_state", "find_blocks", "craft_item", "smelt_item", "fish"],
+        requestedLimits: { maxToolCalls: 16 },
+      },
+      world: {
+        ...world,
+        inventorySummary: [
+          { name: "furnace", count: 1 },
+          { name: "coal", count: 4 },
+        ],
+      },
+      memories: [],
+    });
+
+    expect(prompt).toContain("根据实时背包和世界状态决定下一组动作");
+    expect(prompt).not.toContain("制作鱼竿 -> 钓鱼 -> 挖八块圆石");
+    expect(prompt).toContain("minecraft_enqueue_actions");
+  });
+
+  it("includes nearby survival resources and a deidentified queue snapshot", () => {
+    const prompt = buildCompanionTaskExecutionTurn({
+      mode: "friend",
+      ownerMessage: "准备食物",
+      plan: {
+        goal: "恢复食物储备",
+        allowedActions: ["get_state", "find_blocks", "craft_item", "smelt_item"],
+        requestedLimits: {},
+      },
+      world: {
+        ...world,
+        nearbyBlocks: [
+          { name: "water", position: { x: 1, y: 64, z: 1 } },
+          { name: "crafting_table", position: { x: 2, y: 64, z: 1 } },
+          { name: "furnace", position: { x: 3, y: 64, z: 1 } },
+          { name: "wheat", position: { x: 4, y: 64, z: 1 } },
+          { name: "red_bed", position: { x: 5, y: 64, z: 1 } },
+        ],
+      },
+      memories: [],
+      queueSnapshot: {
+        items: [
+          {
+            id: "private-queue-id",
+            index: 1,
+            kind: "craft_item",
+            summary: "private queue summary",
+            status: "waiting",
+            retryCount: 0,
+            enqueuedAt: "2026-08-15T00:00:00.000Z",
+          },
+        ],
+      },
+    });
+
+    expect(prompt).toContain('"nearbyBlocks":[{"name":"water"');
+    expect(prompt).toContain(
+      '"queue":{"waiting":1,"running":0,"suspended":0,"waitingPermission":0}',
+    );
+    expect(prompt).not.toContain("private-queue-id");
+    expect(prompt).not.toContain("private queue summary");
+  });
+
+  it("sets adaptive food and farming stop boundaries from the live state", () => {
+    const prompt = buildCompanionTaskExecutionTurn({
+      mode: "friend",
+      ownerMessage: "准备食物",
+      plan: {
+        goal: "恢复食物储备",
+        allowedActions: ["find_blocks", "harvest_crop", "smelt_item", "fish"],
+        requestedLimits: {},
+      },
+      world: {
+        ...world,
+        inventorySummary: [
+          { name: "cooked_cod", count: 2 },
+          { name: "wheat", count: 3 },
+        ],
+      },
+      farmingPermission: { status: "unknown", pending: false },
+      memories: [],
+    });
+
+    expect(prompt).toContain("已有熟鱼时不得钓鱼");
+    expect(prompt).toContain("已有小麦时不得申请种地许可");
+    expect(prompt).toContain("权限未知或等待时只可寻找或收割现成小麦");
+    expect(prompt).toContain("不得为等待作物而入队物理动作");
+  });
+
   it("serializes the validated task plan without asking the executor to route intent", () => {
     const prompt = buildCompanionTaskExecutionTurn({
       mode: "friend",
