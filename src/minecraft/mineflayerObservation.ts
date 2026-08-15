@@ -1,5 +1,6 @@
 import type { Bot } from "mineflayer";
 import type { Vec3, WorldSnapshot } from "../domain/types.js";
+import type { InspectedBlock } from "./minecraftPort.js";
 
 const MAX_SNAPSHOT_ENTITIES = 64;
 const MAX_INVENTORY_ITEMS = 36;
@@ -20,6 +21,32 @@ function distanceSquared(
   right: { x: number; y: number; z: number },
 ): number {
   return (left.x - right.x) ** 2 + (left.y - right.y) ** 2 + (left.z - right.z) ** 2;
+}
+
+type MinecraftBlock = NonNullable<ReturnType<Bot["blockAt"]>>;
+
+export function createInspectedBlock(block: MinecraftBlock): InspectedBlock {
+  if (typeof block.name !== "string" || block.name.length === 0 || block.name.length > 64) {
+    throw new Error("block name is invalid");
+  }
+  const properties: Record<string, string | number | boolean> = {};
+  const source = block.getProperties();
+  for (const [rawKey, rawValue] of Object.entries(source).sort(([left], [right]) =>
+    left.localeCompare(right),
+  )) {
+    if (Object.keys(properties).length >= 16) break;
+    if (rawKey.length === 0) continue;
+    const key = rawKey.slice(0, 64);
+    if (Object.hasOwn(properties, key)) continue;
+    if (typeof rawValue === "string") properties[key] = rawValue.slice(0, 64);
+    else if (typeof rawValue === "boolean") properties[key] = rawValue;
+    else if (typeof rawValue === "number" && Number.isFinite(rawValue)) properties[key] = rawValue;
+  }
+  return {
+    name: block.name,
+    position: toVec3(block.position),
+    properties,
+  };
 }
 
 export function selectSnapshotEntities(bot: Bot): Bot["entity"][] {

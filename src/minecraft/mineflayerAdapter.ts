@@ -9,7 +9,11 @@ import {
   type MineflayerConnectionEvent,
   type MineflayerSession,
 } from "./mineflayerConnection.js";
-import { createWorldSnapshot, selectSnapshotEntities } from "./mineflayerObservation.js";
+import {
+  createInspectedBlock,
+  createWorldSnapshot,
+  selectSnapshotEntities,
+} from "./mineflayerObservation.js";
 import type {
   BlockSearchQuery,
   BlockSearchResult,
@@ -79,6 +83,44 @@ function distanceSquared(
   right: { x: number; y: number; z: number },
 ): number {
   return (left.x - right.x) ** 2 + (left.y - right.y) ** 2 + (left.z - right.z) ** 2;
+}
+
+function inventoryCounts(bot: Bot): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const item of bot.inventory.items()) {
+    if (typeof item.name !== "string" || item.name.length === 0 || item.name.length > 64) continue;
+    if (!Number.isSafeInteger(item.count) || item.count <= 0) continue;
+    counts.set(item.name, (counts.get(item.name) ?? 0) + item.count);
+  }
+  return counts;
+}
+
+function inventoryDelta(before: ReadonlyMap<string, number>, after: ReadonlyMap<string, number>) {
+  const names = [...new Set([...before.keys(), ...after.keys()])].sort();
+  const added: Array<{ name: string; count: number }> = [];
+  const removed: Array<{ name: string; count: number }> = [];
+  for (const name of names) {
+    const difference = (after.get(name) ?? 0) - (before.get(name) ?? 0);
+    if (difference > 0 && added.length < 32) added.push({ name, count: difference });
+    if (difference < 0 && removed.length < 32) removed.push({ name, count: -difference });
+  }
+  return { added, removed } satisfies InventoryDelta;
+}
+
+type MinecraftBlock = NonNullable<ReturnType<Bot["blockAt"]>>;
+
+function compareBlockDistance(
+  origin: { x: number; y: number; z: number },
+  left: MinecraftBlock,
+  right: MinecraftBlock,
+): number {
+  const distance = distanceSquared(left.position, origin) - distanceSquared(right.position, origin);
+  if (distance !== 0) return distance;
+  return (
+    left.position.x - right.position.x ||
+    left.position.y - right.position.y ||
+    left.position.z - right.position.z
+  );
 }
 
 function packetSpawnPosition(bot: Bot, packet: unknown): Vec3 | undefined {
@@ -173,12 +215,69 @@ export class MineflayerAdapter implements MinecraftPort {
     return found ? toVec3(found.position) : null;
   }
 
-  async inspectBlock(_position: Vec3): Promise<InspectedBlock | null> {
-    throw new Error("living action is not implemented");
+  async inspectBlock(position: Vec3): Promise<InspectedBlock | null> {
+    const block = this.requireBot().blockAt(minecraftVec3(position));
+    return block ? createInspectedBlock(block) : null;
   }
 
-  async findBlocks(_query: BlockSearchQuery): Promise<BlockSearchResult> {
-    throw new Error("living action is not implemented");
+  async findBlocks(query: BlockSearchQuery): Promise<BlockSearchResult> {
+    const bot = this.requireBot();
+    if (
+      !Number.isSafeInteger(query.maxDistance) ||
+      query.maxDistance < 1 ||
+      query.maxDistance > 64
+    ) {
+      throw new Error("block search distance is invalid");
+    }
+    if (!Number.isSafeInteger(query.maxResults) || query.maxResults < 1 || query.maxResults > 32) {
+      throw new Error("block search result limit is invalid");
+    }
+    if (query.names !== undefined && query.tag !== undefined) {
+      throw new Error("block search must use exact names or one supported tag");
+    }
+
+    let matching: number[] | ((block: MinecraftBlock) => boolean);
+    if (query.names !== undefined) {
+      if (
+        query.names.length < 1 ||
+        query.names.length > 8 ||
+        new Set(query.names).size !== query.names.length
+      ) {
+        throw new Error("block search names are invalid");
+      }
+      matching = query.names.map((name) => {
+        if (name.length < 1 || name.length > 64) throw new Error("block search name is invalid");
+        return this.requireBlock(bot, name).id;
+      });
+    } else {
+      switch (query.tag as string | undefined) {
+        case "bed":
+          matching = (block) => bot.isABed(block);
+          break;
+        case "water":
+          matching = [this.requireBlock(bot, "water").id];
+          break;
+        case "mature_wheat":
+          matching = (block) => block.name === "wheat" && block.getProperties().age === 7;
+          break;
+        default:
+          throw new Error("unsupported block search tag");
+      }
+    }
+
+    const found = bot.findBlocks({
+      matching,
+      maxDistance: query.maxDistance,
+      count: query.maxResults + 1,
+    });
+    const blocks = found
+      .map((position) => bot.blockAt(position))
+      .filter((block): block is MinecraftBlock => block !== null)
+      .sort((left, right) => compareBlockDistance(bot.entity.position, left, right));
+    return {
+      blocks: blocks.slice(0, query.maxResults).map((block) => createInspectedBlock(block)),
+      truncated: blocks.length > query.maxResults,
+    };
   }
 
   async furnaceSnapshot(_position: Vec3): Promise<FurnaceSnapshot> {
@@ -400,20 +499,102 @@ export class MineflayerAdapter implements MinecraftPort {
     });
   }
 
-  async fish(_signal: AbortSignal): Promise<InventoryDelta> {
-    throw new Error("living action is not implemented");
+  async fish(signal: AbortSignal): Promise<InventoryDelta> {
+    this.assertNotAborted(signal);
+    const session = this.requireSession();
+    const bot = session.bot;
+    if (bot.heldItem?.name !== "fishing_rod") throw new Error("fishing rod is not equipped");
+    const water = this.requireBlock(bot, "water");
+    const waterBlock = bot.findBlock({ matching: water.id, maxDistance: 16 });
+    const surface = waterBlock
+      ? bot.blockAt(
+          minecraftVec3({
+            x: waterBlock.position.x,
+            y: waterBlock.position.y + 1,
+            z: waterBlock.position.z,
+          }),
+        )
+      : null;
+    if (!waterBlock || !surface || !["air", "cave_air", "void_air"].includes(surface.name)) {
+      throw new Error("no suitable nearby water for fishing");
+    }
+    const before = inventoryCounts(bot);
+    await this.abortableItemUse(
+      signal,
+      session,
+      () => bot.fish(),
+      () => bot.deactivateItem(),
+    );
+    return inventoryDelta(before, inventoryCounts(bot));
   }
 
-  async consumeItem(_itemName: string, _signal: AbortSignal): Promise<FoodDelta> {
-    throw new Error("living action is not implemented");
+  async consumeItem(itemName: string, signal: AbortSignal): Promise<FoodDelta> {
+    this.assertNotAborted(signal);
+    const session = this.requireSession();
+    const bot = session.bot;
+    const food = bot.registry.foodsByName[itemName];
+    if (!food || !Number.isFinite(food.foodPoints) || food.foodPoints <= 0) {
+      throw new Error("item is not edible");
+    }
+    const item = this.requireItem(bot, itemName);
+    const held = bot.inventory.items().find((candidate) => candidate.name === item.name);
+    if (!held) throw new Error(`missing ${itemName} in inventory`);
+    const healthBefore = bot.health;
+    const foodBefore = bot.food;
+    await this.abortableItemUse(
+      signal,
+      session,
+      async () => {
+        await bot.equip(held, "hand");
+        this.assertActive(session, signal);
+        await bot.consume();
+      },
+      () => bot.deactivateItem(),
+    );
+    const values = [healthBefore, bot.health, foodBefore, bot.food];
+    if (values.some((value) => !Number.isFinite(value))) {
+      throw new Error("food state is invalid");
+    }
+    return {
+      healthBefore,
+      healthAfter: bot.health,
+      foodBefore,
+      foodAfter: bot.food,
+    };
   }
 
-  async sleepInBed(_position: Vec3, _signal: AbortSignal): Promise<void> {
-    throw new Error("living action is not implemented");
+  async sleepInBed(position: Vec3, signal: AbortSignal): Promise<void> {
+    this.assertNotAborted(signal);
+    const session = this.requireSession();
+    const bot = session.bot;
+    const bed = bot.blockAt(minecraftVec3(position));
+    if (!bed || !bot.isABed(bed)) throw new Error("target block is not a bed");
+    if (bed.getProperties().occupied === true) throw new Error("bed is occupied");
+    if (!bot.canDigBlock(bed)) throw new Error("bed is not reachable");
+    const canSleepNow =
+      (bot.time.timeOfDay >= 12_541 && bot.time.timeOfDay <= 23_458) ||
+      (bot.isRaining && bot.thunderState > 0);
+    if (!canSleepNow) throw new Error("sleeping is not allowed now");
+    await this.abortableItemUse(
+      signal,
+      session,
+      () => bot.sleep(bed),
+      async () => {
+        if (bot.isSleeping) await bot.wake();
+      },
+    );
   }
 
-  async wakeUp(_signal: AbortSignal): Promise<void> {
-    throw new Error("living action is not implemented");
+  async wakeUp(signal: AbortSignal): Promise<void> {
+    this.assertNotAborted(signal);
+    const session = this.requireSession();
+    if (!session.bot.isSleeping) return;
+    await this.abortableItemUse(
+      signal,
+      session,
+      () => session.bot.wake(),
+      () => undefined,
+    );
   }
 
   async tillSoil(_position: Vec3, _signal: AbortSignal): Promise<void> {
@@ -708,6 +889,59 @@ export class MineflayerAdapter implements MinecraftPort {
           if (!aborted) finish(asError(error));
           else if (cancellation === "motion") finish(abortError());
         });
+    });
+  }
+
+  private async abortableItemUse<T>(
+    signal: AbortSignal,
+    session: MineflayerSession,
+    operation: () => Promise<T> | T,
+    abortCleanup: () => Promise<void> | void,
+  ): Promise<T> {
+    this.assertActive(session, signal);
+    return await new Promise<T>((resolve, reject) => {
+      let settled = false;
+      let cancelling = false;
+      let unregister: () => void = () => undefined;
+      const finish = (result: { value: T } | { error: Error }) => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener("abort", onAbort);
+        unregister();
+        if ("error" in result) reject(result.error);
+        else resolve(result.value);
+      };
+      const onAbort = () => {
+        if (settled || cancelling) return;
+        cancelling = true;
+        Promise.resolve()
+          .then(() => abortCleanup())
+          .then(
+            () => finish({ error: abortError() }),
+            (error: unknown) => finish({ error: asError(error) }),
+          );
+      };
+      unregister = this.connection.registerActiveOperation(onAbort);
+      signal.addEventListener("abort", onAbort, { once: true });
+      Promise.resolve()
+        .then(() => {
+          this.assertActive(session, signal);
+          return operation();
+        })
+        .then(
+          (value) => {
+            if (cancelling) return;
+            try {
+              this.assertActive(session, signal);
+              finish({ value });
+            } catch (error) {
+              finish({ error: asError(error) });
+            }
+          },
+          (error: unknown) => {
+            if (!cancelling) finish({ error: asError(error) });
+          },
+        );
     });
   }
 

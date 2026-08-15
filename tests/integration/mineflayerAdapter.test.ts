@@ -86,7 +86,10 @@ class FakeFurnace {
 
 class FakeBot extends EventEmitter {
   throwOnEvent: string | undefined;
-  readonly game: { dimension: unknown } = { dimension: "overworld" };
+  readonly game: { dimension: unknown; gameMode: string } = {
+    dimension: "overworld",
+    gameMode: "survival",
+  };
   readonly _client = Object.assign(new EventEmitter(), {
     end: vi.fn(),
     socket: { end: vi.fn(), destroy: vi.fn() },
@@ -102,6 +105,15 @@ class FakeBot extends EventEmitter {
     async (): Promise<void> => undefined,
   );
   readonly activateItem = vi.fn();
+  readonly deactivateItem = vi.fn();
+  readonly fish = vi.fn<() => Promise<void>>(async (): Promise<void> => undefined);
+  readonly consume = vi.fn<() => Promise<void>>(async (): Promise<void> => undefined);
+  readonly sleep = vi.fn<(...args: unknown[]) => Promise<void>>(
+    async (): Promise<void> => undefined,
+  );
+  readonly wake = vi.fn<() => Promise<void>>(async (): Promise<void> => undefined);
+  readonly isABed = vi.fn<(block: unknown) => boolean>(() => false);
+  readonly canDigBlock = vi.fn<(block: unknown) => boolean>(() => true);
   readonly attack = vi.fn();
   readonly dig = vi.fn<(...args: unknown[]) => Promise<void>>(async (): Promise<void> => undefined);
   readonly stopDigging = vi.fn<() => unknown>();
@@ -112,6 +124,9 @@ class FakeBot extends EventEmitter {
   readonly waitForTicks = vi.fn<() => Promise<void>>(async (): Promise<void> => undefined);
   readonly openFurnace = vi.fn<(block: unknown) => Promise<FakeFurnace>>();
   readonly findBlock = vi.fn<(options: unknown) => unknown>(() => null);
+  readonly findBlocks = vi.fn<(options: unknown) => Array<{ x: number; y: number; z: number }>>(
+    () => [],
+  );
   readonly blockAt = vi.fn<(position: unknown) => unknown>(() => null);
   readonly nearestEntity = vi.fn<(predicate: (entity: FakeEntity) => boolean) => FakeEntity | null>(
     () => null,
@@ -122,10 +137,17 @@ class FakeBot extends EventEmitter {
     stop: vi.fn(),
   };
   readonly registry = {
-    blocksByName: { stone: { id: 1, name: "stone" }, furnace: { id: 61, name: "furnace" } },
+    blocksByName: {
+      stone: { id: 1, name: "stone" },
+      water: { id: 9, name: "water" },
+      furnace: { id: 61, name: "furnace" },
+      white_bed: { id: 100, name: "white_bed" },
+    },
     itemsByName: {
       stick: { id: 2, name: "stick" },
       stone: { id: 1, name: "stone" },
+      fishing_rod: { id: 346, name: "fishing_rod" },
+      bread: { id: 297, name: "bread" },
       iron_ore: { id: 15, name: "iron_ore" },
       coal: { id: 263, name: "coal" },
       tnt: { id: 46, name: "tnt" },
@@ -133,6 +155,7 @@ class FakeBot extends EventEmitter {
       flint_and_steel: { id: 259, name: "flint_and_steel" },
       fire_charge: { id: 385, name: "fire_charge" },
     },
+    foodsByName: { bread: { id: 297, name: "bread", foodPoints: 5 } },
   };
   readonly entity = { position: { x: 0, y: 64, z: 0 }, yaw: 0, pitch: 0 };
   inventoryItems: FakeItem[] = [{ name: "stick", count: 2, type: 2 }];
@@ -140,6 +163,8 @@ class FakeBot extends EventEmitter {
   readonly players: Record<string, { entity?: FakeEntity }> = {};
   readonly entities: Record<string, FakeEntity> = {};
   readonly time = { timeOfDay: 1000 };
+  heldItem: FakeItem | null = null;
+  isSleeping = false;
   health = 20;
   food = 20;
   isRaining = false;
@@ -268,13 +293,7 @@ describe("MineflayerAdapter", () => {
     const position = { x: 1, y: 64, z: 2 };
     const signal = new AbortController().signal;
     const attempts = [
-      () => adapter.inspectBlock(position),
-      () => adapter.findBlocks({ names: ["wheat"], maxDistance: 16, maxResults: 8 }),
       () => adapter.furnaceSnapshot(position),
-      () => adapter.fish(signal),
-      () => adapter.consumeItem("bread", signal),
-      () => adapter.sleepInBed(position, signal),
-      () => adapter.wakeUp(signal),
       () => adapter.tillSoil(position, signal),
       () => adapter.plantCrop(position, "wheat_seeds", signal),
       () => adapter.harvestCrop(position, "wheat", signal),
@@ -283,6 +302,376 @@ describe("MineflayerAdapter", () => {
     for (const attempt of attempts) {
       await expect(attempt()).rejects.toThrow("living action is not implemented");
     }
+  });
+
+  it("retracts fishing and rejects late completion after abort", async () => {
+    const bot = new FakeBot();
+    const pendingFish = deferred<void>();
+    bot.heldItem = { name: "fishing_rod", count: 1, type: 346 };
+    bot.inventoryItems = [{ name: "fishing_rod", count: 1, type: 346 }];
+    bot.findBlock.mockReturnValue({ name: "water", position: { x: 2, y: 63, z: 2 } });
+    bot.blockAt.mockReturnValue({ name: "air", position: { x: 2, y: 64, z: 2 } });
+    bot.fish.mockReturnValue(pendingFish.promise);
+    createBot.mockReturnValue(bot);
+    const adapter = new MineflayerAdapter(config());
+    const connecting = adapter.connect();
+    await flush();
+    bot.emit("spawn");
+    await connecting;
+    const controller = new AbortController();
+
+    let rejection: unknown;
+    const fishing = adapter.fish(controller.signal).catch((error: unknown) => {
+      rejection = error;
+    });
+    await flush();
+    expect(bot.fish).toHaveBeenCalledOnce();
+    controller.abort();
+
+    await fishing;
+    expect(rejection).toMatchObject({ name: "AbortError" });
+    expect(bot.deactivateItem).toHaveBeenCalledOnce();
+    pendingFish.resolve();
+    await flush();
+    expect(bot.fish).toHaveBeenCalledOnce();
+  });
+
+  it("returns a bounded inventory delta after successful fishing", async () => {
+    const bot = new FakeBot();
+    bot.heldItem = { name: "fishing_rod", count: 1, type: 346 };
+    bot.inventoryItems = [{ name: "fishing_rod", count: 1, type: 346 }];
+    bot.findBlock.mockReturnValue({ name: "water", position: { x: 2, y: 63, z: 2 } });
+    bot.blockAt.mockReturnValue({ name: "air", position: { x: 2, y: 64, z: 2 } });
+    bot.fish.mockImplementation(async () => {
+      bot.inventoryItems = [
+        { name: "fishing_rod", count: 1, type: 346 },
+        { name: "cod", count: 1, type: 349 },
+      ];
+    });
+    createBot.mockReturnValue(bot);
+    const adapter = new MineflayerAdapter(config());
+    const connecting = adapter.connect();
+    await flush();
+    bot.emit("spawn");
+    await connecting;
+
+    await expect(adapter.fish(new AbortController().signal)).resolves.toEqual({
+      added: [{ name: "cod", count: 1 }],
+      removed: [],
+    });
+  });
+
+  it("refuses fishing without an equipped rod", async () => {
+    const bot = new FakeBot();
+    createBot.mockReturnValue(bot);
+    const adapter = new MineflayerAdapter(config());
+    const connecting = adapter.connect();
+    await flush();
+    bot.emit("spawn");
+    await connecting;
+
+    await expect(adapter.fish(new AbortController().signal)).rejects.toThrow(
+      "fishing rod is not equipped",
+    );
+    expect(bot.findBlock).not.toHaveBeenCalled();
+    expect(bot.fish).not.toHaveBeenCalled();
+  });
+
+  it("refuses fishing without suitable nearby water", async () => {
+    const bot = new FakeBot();
+    bot.heldItem = { name: "fishing_rod", count: 1, type: 346 };
+    bot.inventoryItems = [{ name: "fishing_rod", count: 1, type: 346 }];
+    createBot.mockReturnValue(bot);
+    const adapter = new MineflayerAdapter(config());
+    const connecting = adapter.connect();
+    await flush();
+    bot.emit("spawn");
+    await connecting;
+
+    await expect(adapter.fish(new AbortController().signal)).rejects.toThrow(
+      "no suitable nearby water",
+    );
+    expect(bot.fish).not.toHaveBeenCalled();
+  });
+
+  it("refuses fishing at water without an open surface", async () => {
+    const bot = new FakeBot();
+    bot.heldItem = { name: "fishing_rod", count: 1, type: 346 };
+    bot.inventoryItems = [{ name: "fishing_rod", count: 1, type: 346 }];
+    bot.findBlock.mockReturnValue({ name: "water", position: { x: 2, y: 63, z: 2 } });
+    bot.blockAt.mockReturnValue({ name: "stone", position: { x: 2, y: 64, z: 2 } });
+    createBot.mockReturnValue(bot);
+    const adapter = new MineflayerAdapter(config());
+    const connecting = adapter.connect();
+    await flush();
+    bot.emit("spawn");
+    await connecting;
+
+    await expect(adapter.fish(new AbortController().signal)).rejects.toThrow(
+      "no suitable nearby water",
+    );
+    expect(bot.fish).not.toHaveBeenCalled();
+  });
+
+  it("returns bounded block properties without exposing registry objects", async () => {
+    const bot = new FakeBot();
+    const position = { x: 3, y: 65, z: 4 };
+    const properties = Object.fromEntries([
+      ["age", 7],
+      ["description", "x".repeat(100)],
+      ...Array.from({ length: 20 }, (_, index) => [`property_${index}`, index]),
+    ]);
+    bot.blockAt.mockReturnValue({ name: "wheat", position, getProperties: () => properties });
+    createBot.mockReturnValue(bot);
+    const adapter = new MineflayerAdapter(config());
+    const connecting = adapter.connect();
+    await flush();
+    bot.emit("spawn");
+    await connecting;
+
+    const inspected = await adapter.inspectBlock(position);
+
+    expect(inspected).toMatchObject({ name: "wheat", position });
+    expect(Object.keys(inspected?.properties ?? {})).toHaveLength(16);
+    expect(String(inspected?.properties.description ?? "").length).toBeLessThanOrEqual(64);
+    expect(inspected?.position).not.toBe(position);
+  });
+
+  it("sorts block searches stably, limits results, and reports truncation", async () => {
+    const bot = new FakeBot();
+    const positions = Array.from({ length: 33 }, (_, index) => ({
+      x: 33 - index,
+      y: 64,
+      z: index % 2,
+    }));
+    bot.findBlocks.mockReturnValue(positions);
+    bot.blockAt.mockImplementation((value: unknown) => ({
+      name: "stone",
+      position: value,
+      getProperties: () => ({}),
+    }));
+    createBot.mockReturnValue(bot);
+    const adapter = new MineflayerAdapter(config());
+    const connecting = adapter.connect();
+    await flush();
+    bot.emit("spawn");
+    await connecting;
+
+    const result = await adapter.findBlocks({ names: ["stone"], maxDistance: 64, maxResults: 32 });
+
+    expect(result.blocks).toHaveLength(32);
+    expect(result.truncated).toBe(true);
+    expect(result.blocks[0]?.position).toEqual({ x: 1, y: 64, z: 0 });
+    expect(bot.findBlocks).toHaveBeenCalledWith({ matching: [1], maxDistance: 64, count: 33 });
+  });
+
+  it("rejects unknown exact blocks and unsupported search tags", async () => {
+    const bot = new FakeBot();
+    createBot.mockReturnValue(bot);
+    const adapter = new MineflayerAdapter(config());
+    const connecting = adapter.connect();
+    await flush();
+    bot.emit("spawn");
+    await connecting;
+
+    await expect(
+      adapter.findBlocks({ names: ["unknown_block"], maxDistance: 16, maxResults: 8 }),
+    ).rejects.toThrow("unknown block");
+    await expect(
+      adapter.findBlocks({
+        tag: "valuable_ore" as "bed",
+        maxDistance: 16,
+        maxResults: 8,
+      }),
+    ).rejects.toThrow("unsupported block search tag");
+  });
+
+  it("matches only mature wheat for the mature crop search tag", async () => {
+    const bot = new FakeBot();
+    createBot.mockReturnValue(bot);
+    const adapter = new MineflayerAdapter(config());
+    const connecting = adapter.connect();
+    await flush();
+    bot.emit("spawn");
+    await connecting;
+
+    await adapter.findBlocks({ tag: "mature_wheat", maxDistance: 16, maxResults: 8 });
+    const matching = (
+      bot.findBlocks.mock.calls[0]?.[0] as { matching: (block: unknown) => boolean }
+    ).matching;
+
+    expect(matching({ name: "wheat", getProperties: () => ({ age: 7 }) })).toBe(true);
+    expect(matching({ name: "wheat", getProperties: () => ({ age: 6 }) })).toBe(false);
+    expect(matching({ name: "carrots", getProperties: () => ({ age: 7 }) })).toBe(false);
+  });
+
+  it("consumes only registered inventory food and returns health and hunger changes", async () => {
+    const bot = new FakeBot();
+    const bread = { name: "bread", count: 1, type: 297 };
+    bot.inventoryItems = [bread];
+    bot.health = 18;
+    bot.food = 12;
+    bot.consume.mockImplementation(async () => {
+      bot.food = 17;
+    });
+    createBot.mockReturnValue(bot);
+    const adapter = new MineflayerAdapter(config());
+    const connecting = adapter.connect();
+    await flush();
+    bot.emit("spawn");
+    await connecting;
+
+    await expect(adapter.consumeItem("bread", new AbortController().signal)).resolves.toEqual({
+      healthBefore: 18,
+      healthAfter: 18,
+      foodBefore: 12,
+      foodAfter: 17,
+    });
+    expect(bot.equip).toHaveBeenCalledWith(bread, "hand");
+    expect(bot.consume).toHaveBeenCalledOnce();
+  });
+
+  it("refuses non-food items before equipping or consuming them", async () => {
+    const bot = new FakeBot();
+    bot.inventoryItems = [{ name: "stick", count: 2, type: 2 }];
+    createBot.mockReturnValue(bot);
+    const adapter = new MineflayerAdapter(config());
+    const connecting = adapter.connect();
+    await flush();
+    bot.emit("spawn");
+    await connecting;
+
+    await expect(adapter.consumeItem("stick", new AbortController().signal)).rejects.toThrow(
+      "item is not edible",
+    );
+    expect(bot.equip).not.toHaveBeenCalled();
+    expect(bot.consume).not.toHaveBeenCalled();
+  });
+
+  it("sleeps only in an unoccupied reachable bed at night", async () => {
+    const bot = new FakeBot();
+    const position = { x: 2, y: 64, z: 2 };
+    const bed = { name: "white_bed", position, getProperties: () => ({ occupied: false }) };
+    bot.time.timeOfDay = 13_000;
+    bot.blockAt.mockReturnValue(bed);
+    bot.isABed.mockReturnValue(true);
+    bot.sleep.mockImplementation(async () => {
+      bot.isSleeping = true;
+    });
+    createBot.mockReturnValue(bot);
+    const adapter = new MineflayerAdapter(config());
+    const connecting = adapter.connect();
+    await flush();
+    bot.emit("spawn");
+    await connecting;
+
+    await expect(
+      adapter.sleepInBed(position, new AbortController().signal),
+    ).resolves.toBeUndefined();
+    expect(bot.canDigBlock).toHaveBeenCalledWith(bed);
+    expect(bot.sleep).toHaveBeenCalledWith(bed);
+  });
+
+  it("refuses occupied beds and daytime sleep before calling Mineflayer sleep", async () => {
+    const bot = new FakeBot();
+    const position = { x: 2, y: 64, z: 2 };
+    bot.blockAt.mockReturnValue({
+      name: "white_bed",
+      position,
+      getProperties: () => ({ occupied: true }),
+    });
+    bot.isABed.mockReturnValue(true);
+    bot.time.timeOfDay = 13_000;
+    createBot.mockReturnValue(bot);
+    const adapter = new MineflayerAdapter(config());
+    const connecting = adapter.connect();
+    await flush();
+    bot.emit("spawn");
+    await connecting;
+
+    await expect(adapter.sleepInBed(position, new AbortController().signal)).rejects.toThrow(
+      "bed is occupied",
+    );
+    bot.blockAt.mockReturnValue({
+      name: "white_bed",
+      position,
+      getProperties: () => ({ occupied: false }),
+    });
+    bot.time.timeOfDay = 1_000;
+    await expect(adapter.sleepInBed(position, new AbortController().signal)).rejects.toThrow(
+      "sleeping is not allowed now",
+    );
+    expect(bot.sleep).not.toHaveBeenCalled();
+  });
+
+  it("wakes a sleeping bot when the sleep action is aborted", async () => {
+    const bot = new FakeBot();
+    const position = { x: 2, y: 64, z: 2 };
+    const pendingSleep = deferred<void>();
+    bot.time.timeOfDay = 13_000;
+    bot.blockAt.mockReturnValue({
+      name: "white_bed",
+      position,
+      getProperties: () => ({ occupied: false }),
+    });
+    bot.isABed.mockReturnValue(true);
+    bot.sleep.mockReturnValue(pendingSleep.promise);
+    bot.wake.mockImplementation(async () => {
+      bot.isSleeping = false;
+    });
+    createBot.mockReturnValue(bot);
+    const adapter = new MineflayerAdapter(config());
+    const connecting = adapter.connect();
+    await flush();
+    bot.emit("spawn");
+    await connecting;
+    const controller = new AbortController();
+    let rejection: unknown;
+    const sleeping = adapter.sleepInBed(position, controller.signal).catch((error: unknown) => {
+      rejection = error;
+    });
+    await flush();
+    bot.isSleeping = true;
+
+    controller.abort();
+
+    await sleeping;
+    expect(rejection).toMatchObject({ name: "AbortError" });
+    expect(bot.wake).toHaveBeenCalledOnce();
+    pendingSleep.resolve();
+    await flush();
+  });
+
+  it("treats waking while already awake as an idempotent success", async () => {
+    const bot = new FakeBot();
+    createBot.mockReturnValue(bot);
+    const adapter = new MineflayerAdapter(config());
+    const connecting = adapter.connect();
+    await flush();
+    bot.emit("spawn");
+    await connecting;
+
+    await expect(adapter.wakeUp(new AbortController().signal)).resolves.toBeUndefined();
+    expect(bot.wake).not.toHaveBeenCalled();
+    bot.isSleeping = true;
+    await expect(adapter.wakeUp(new AbortController().signal)).resolves.toBeUndefined();
+    expect(bot.wake).toHaveBeenCalledOnce();
+  });
+
+  it("fails every living and observation method closed while disconnected", async () => {
+    const adapter = new MineflayerAdapter(config());
+    const position = { x: 1, y: 64, z: 2 };
+    const signal = new AbortController().signal;
+    const attempts = [
+      () => adapter.inspectBlock(position),
+      () => adapter.findBlocks({ names: ["stone"], maxDistance: 16, maxResults: 8 }),
+      () => adapter.fish(signal),
+      () => adapter.consumeItem("bread", signal),
+      () => adapter.sleepInBed(position, signal),
+      () => adapter.wakeUp(signal),
+    ];
+
+    for (const attempt of attempts) await expect(attempt()).rejects.toThrow("not connected");
   });
 
   it("keeps third-party parser diagnostics off the desktop protocol stream", async () => {
