@@ -309,6 +309,17 @@ export class CompanionActionQueue {
     }
   }
 
+  hasActiveTask(taskLease: TaskLease): boolean {
+    return this.#items.some(
+      (item) =>
+        item.taskLease.id === taskLease.id &&
+        item.taskLease.startedAt === taskLease.startedAt &&
+        item.status !== "completed" &&
+        item.status !== "failed" &&
+        item.status !== "cancelled",
+    );
+  }
+
   snapshot(): ActionQueueSnapshot {
     const start = Math.max(0, this.#items.length - 256);
     return {

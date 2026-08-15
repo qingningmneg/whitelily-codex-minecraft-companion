@@ -36,7 +36,7 @@ export type TaskAuditData =
 export type TaskAuditCallback = (event: TaskAuditEvent, data: TaskAuditData) => void;
 
 export interface TaskControllerDependencies {
-  onTerminal?: (reason: TaskStopReason, forceCleanup: boolean) => void;
+  onTerminal?: (reason: TaskStopReason, forceCleanup: boolean, task: ActiveTask) => void;
   ownerIdentityRevision?: () => number;
   setTimer?: (callback: () => void, milliseconds: number) => ReturnType<typeof setTimeout>;
   clearTimer?: (timer: ReturnType<typeof setTimeout>) => void;
@@ -72,7 +72,7 @@ export class TaskController {
   private activeOwnerIdentityRevision: number | undefined;
   private deadlineTimer: ReturnType<typeof setTimeout> | undefined;
   private readonly terminalListeners = new Set<
-    (reason: TaskStopReason, forceCleanup: boolean) => void
+    (reason: TaskStopReason, forceCleanup: boolean, task: ActiveTask) => void
   >();
   private readonly setTimer: (
     callback: () => void,
@@ -192,7 +192,9 @@ export class TaskController {
     return result;
   }
 
-  onTerminal(listener: (reason: TaskStopReason, forceCleanup: boolean) => void): () => void {
+  onTerminal(
+    listener: (reason: TaskStopReason, forceCleanup: boolean, task: ActiveTask) => void,
+  ): () => void {
     this.terminalListeners.add(listener);
     return () => this.terminalListeners.delete(listener);
   }
@@ -219,13 +221,13 @@ export class TaskController {
     this.clearDeadline();
     if (!budgetAlreadyStopped) this.budget.invalidate(reason);
     try {
-      this.dependencies.onTerminal?.(reason, forceTerminalCleanup);
+      this.dependencies.onTerminal?.(reason, forceTerminalCleanup, cloneActiveTask(active));
     } catch {
       // Terminal observers cannot affect task lifecycle or lease invalidation.
     }
     for (const listener of this.terminalListeners) {
       try {
-        listener(reason, forceTerminalCleanup);
+        listener(reason, forceTerminalCleanup, cloneActiveTask(active));
       } catch {
         // Terminal observers cannot affect task lifecycle or lease invalidation.
       }

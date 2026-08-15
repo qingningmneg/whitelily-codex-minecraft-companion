@@ -3,6 +3,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as nativeDelay } from "node:timers/promises";
 import { ActionExecutor } from "../../src/actions/actionExecutor.js";
+import { CompanionActionQueue } from "../../src/actions/actionQueue.js";
+import { QueuedActionRunner } from "../../src/actions/queuedActionRunner.js";
 import { parseLocalCommand } from "../../src/commands/commandParser.js";
 import { ChatRouter } from "../../src/companion/chatRouter.js";
 import { CompanionService } from "../../src/companion/companionService.js";
@@ -614,6 +616,23 @@ export async function createCompanionHarness(options: CompanionHarnessOptions = 
         taskController.reserveAdditionalTravel(lease, horizontalTravel),
     },
   );
+  const actionQueue = new CompanionActionQueue({
+    createId: (() => {
+      let next = 0;
+      return () => `queue-${++next}`;
+    })(),
+    now: () => new Date(),
+  });
+  let service!: CompanionService;
+  const actionRunner = new QueuedActionRunner({
+    queue: actionQueue,
+    executor,
+    executionContext: () => service?.queueExecutionContext() ?? null,
+    safetyContextProvider: async () => ({
+      spawn: { x: 0, y: 64, z: 0 },
+      owner: { x: 0, y: 64, z: 0 },
+    }),
+  });
   const autonomy = new FakeAutonomyScheduler(options.autonomyCanChat ?? true);
   let ownerIdentitySnapshot = options.ownerIdentitySnapshot
     ? { ...options.ownerIdentitySnapshot }
@@ -679,7 +698,7 @@ export async function createCompanionHarness(options: CompanionHarnessOptions = 
       });
     };
   }
-  const service = new CompanionService({
+  service = new CompanionService({
     minecraft,
     codex,
     mode,
@@ -687,6 +706,8 @@ export async function createCompanionHarness(options: CompanionHarnessOptions = 
     state,
     confirmations,
     executor,
+    actionQueue,
+    actionRunner,
     budget,
     taskController,
     autonomy,
@@ -770,6 +791,8 @@ export async function createCompanionHarness(options: CompanionHarnessOptions = 
     savedStates: state.savedStates,
     confirmations,
     executor,
+    actionQueue,
+    actionRunner,
     budget,
     taskController,
     taskAuditEvents,

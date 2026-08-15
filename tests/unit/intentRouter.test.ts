@@ -65,6 +65,16 @@ describe("parseOwnerIntentDecision", () => {
       },
       memoryCandidates: [],
     },
+    {
+      kind: "priority_task",
+      naturalReply: "好，我先来帮你。",
+      task: {
+        goal: "来到主人身边并等待",
+        allowedActions: ["get_state", "follow_owner", "wait"],
+        requestedLimits: { maxToolCalls: 4, maxHorizontalTravel: 64 },
+      },
+      memoryCandidates: [],
+    },
     { kind: "stop_task", reply: "好，我停下来了。" },
     { kind: "clarify", question: "你希望我陪你聊天，还是过去找你？" },
   ])("accepts $kind", (decision) => {
@@ -200,6 +210,9 @@ describe("buildOwnerIntentTurn", () => {
     expect(activePrompt).toContain(
       "Use continue_task for the active goal and replace_task for a different requested goal",
     );
+    expect(activePrompt).toContain(
+      "Use priority_task for a temporary help request that should preserve the active goal",
+    );
   });
 
   it("places owner text as bounded JSON data behind a tool-free semantic boundary", () => {
@@ -230,7 +243,7 @@ describe("buildOwnerIntentTurn", () => {
     expect(prompt).toContain("A task requires requestedLimits");
     expect(prompt).toContain("no Minecraft tools");
     expect(prompt).toContain(
-      "When a task is active, classify the new owner message as chat, continue_task, replace_task, stop_task, or clarify.",
+      "When a task is active, classify the new owner message as chat, continue_task, priority_task, replace_task, stop_task, or clarify.",
     );
     expect(prompt).toContain("Chat and clarify do not revoke or expand the active task.");
     expect(prompt).not.toContain("lease");

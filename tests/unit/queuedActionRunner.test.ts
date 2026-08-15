@@ -305,6 +305,43 @@ describe("QueuedActionRunner", () => {
     expect(queue.snapshot().items[0]?.status).toBe("completed");
   });
 
+  it("holds actions enqueued after suspension until the replan gate opens", async () => {
+    const queue = new CompanionActionQueue({
+      createId: () => "queue-1",
+      now: () => new Date("2026-08-15T00:00:00.000Z"),
+    });
+    let executions = 0;
+    const runner = new QueuedActionRunner({
+      queue,
+      executor: {
+        execute: async () => {
+          executions += 1;
+          return { status: "completed" };
+        },
+        stopAll: () => undefined,
+      },
+      executionContext: () => ({ taskLease, worldGeneration: 1, safetyContext }),
+    });
+    runner.start();
+    runner.suspend(taskLease, "owner_message");
+    queue.enqueue({
+      taskLease,
+      worldGeneration: 1,
+      action: { kind: "jump" },
+      summary: "暂停期间入队",
+      trustedObservationKey: "observation-a",
+    });
+
+    await runner.waitForIdle();
+    expect(executions).toBe(0);
+    expect(queue.snapshot().items[0]?.status).toBe("waiting");
+
+    runner.resumeAfterReplan(taskLease, 1);
+    await runner.waitForIdle();
+    expect(executions).toBe(1);
+    expect(queue.snapshot().items[0]?.status).toBe("completed");
+  });
+
   it("reports stale queued work when the world generation changes", async () => {
     const queue = new CompanionActionQueue({
       createId: () => "queue-1",

@@ -1,4 +1,4 @@
-import type { ActionResult } from "./actionExecutor.js";
+import type { ActionResult, StopAllOptions } from "./actionExecutor.js";
 import type { CompanionActionQueue } from "./actionQueue.js";
 import type { GameAction } from "../domain/types.js";
 import type { SafetyContext } from "../safety/safetyEngine.js";
@@ -6,19 +6,20 @@ import type { TaskLease } from "../safety/taskBudget.js";
 
 interface QueuedActionExecutor {
   execute(action: GameAction, context: SafetyContext): Promise<ActionResult>;
-  stopAll(): void;
+  stopAll(options?: StopAllOptions): void;
 }
 
 export interface QueuedActionExecutionContext {
   readonly taskLease: TaskLease;
   readonly worldGeneration: number;
-  readonly safetyContext: SafetyContext;
+  readonly safetyContext?: SafetyContext;
 }
 
 export interface QueuedActionRunnerOptions {
   readonly queue: CompanionActionQueue;
   readonly executor: QueuedActionExecutor;
   readonly executionContext: () => QueuedActionExecutionContext | null;
+  readonly safetyContextProvider?: () => Promise<SafetyContext>;
 }
 
 export type QueueRunnerEvent =
@@ -27,10 +28,15 @@ export type QueueRunnerEvent =
   | { readonly kind: "world_stale"; readonly taskLease: TaskLease }
   | { readonly kind: "budget_boundary"; readonly taskLease: TaskLease; readonly reason: string };
 
+function taskLeaseKey(taskLease: TaskLease): string {
+  return `${taskLease.id}\u0000${taskLease.startedAt}`;
+}
+
 export class QueuedActionRunner {
   readonly #queue: CompanionActionQueue;
   readonly #executor: QueuedActionExecutor;
   readonly #executionContext: () => QueuedActionExecutionContext | null;
+  readonly #safetyContextProvider: (() => Promise<SafetyContext>) | undefined;
   readonly #idleWaiters = new Set<() => void>();
   readonly #listeners = new Set<(event: QueueRunnerEvent) => void>();
   #started = false;
@@ -39,11 +45,13 @@ export class QueuedActionRunner {
   #generation = 0;
   #batchHadWork = false;
   #worldStaleEventPending = false;
+  #suspendedTaskKey: string | undefined;
 
   constructor(options: QueuedActionRunnerOptions) {
     this.#queue = options.queue;
     this.#executor = options.executor;
     this.#executionContext = options.executionContext;
+    this.#safetyContextProvider = options.safetyContextProvider;
   }
 
   start(): void {
@@ -69,7 +77,8 @@ export class QueuedActionRunner {
     this.#assertCurrentTask(taskLease);
     this.#generation += 1;
     this.#batchHadWork = false;
-    this.#executor.stopAll();
+    this.#suspendedTaskKey = taskLeaseKey(taskLease);
+    this.#executor.stopAll({ preserveTask: true });
     this.#queue.suspendTask(taskLease, reason);
   }
 
@@ -77,6 +86,7 @@ export class QueuedActionRunner {
     this.#assertCurrentTask(taskLease);
     this.#generation += 1;
     this.#batchHadWork = false;
+    if (this.#suspendedTaskKey === taskLeaseKey(taskLease)) this.#suspendedTaskKey = undefined;
     this.#executor.stopAll();
     this.#queue.cancelTask(taskLease, reason);
   }
@@ -86,6 +96,7 @@ export class QueuedActionRunner {
     if (context.worldGeneration !== worldGeneration) {
       throw new Error("runner world generation mismatch");
     }
+    if (this.#suspendedTaskKey === taskLeaseKey(taskLease)) this.#suspendedTaskKey = undefined;
     this.#queue.resumeTaskAfterReplan(taskLease, worldGeneration);
     this.#schedule();
   }
@@ -116,6 +127,10 @@ export class QueuedActionRunner {
       this.#resolveIdle();
       return;
     }
+    if (this.#suspendedTaskKey === taskLeaseKey(context.taskLease)) {
+      this.#resolveIdle();
+      return;
+    }
     const item = this.#queue.claimNext(context.taskLease, context.worldGeneration);
     if (!item) {
       if (this.#batchHadWork) {
@@ -130,11 +145,28 @@ export class QueuedActionRunner {
     const generation = this.#generation;
     let continueBatch = false;
     try {
-      let result = await this.#executor.execute(item.action, context.safetyContext);
+      let safetyContext: SafetyContext;
+      try {
+        safetyContext = context.safetyContext ?? (await this.#requiredSafetyContextProvider()());
+      } catch (error) {
+        if (generation === this.#generation) {
+          const reason = String(error);
+          this.#queue.fail(item.id, context.taskLease, context.worldGeneration, reason);
+          this.#batchHadWork = false;
+          this.#publish({
+            kind: "action_failed",
+            taskLease: { ...context.taskLease },
+            reason,
+          });
+        }
+        return;
+      }
+      if (generation !== this.#generation) return;
+      let result = await this.#executor.execute(item.action, safetyContext);
       if (generation !== this.#generation) return;
       if (result.status === "failed" && result.worldMutated === false) {
         this.#queue.recordTransportRetry(item.id, context.taskLease, context.worldGeneration);
-        result = await this.#executor.execute(item.action, context.safetyContext);
+        result = await this.#executor.execute(item.action, safetyContext);
         if (generation !== this.#generation) return;
       }
       continueBatch = this.#commitResult(item.id, context, result);
@@ -195,6 +227,11 @@ export class QueuedActionRunner {
       throw new Error("runner task lease mismatch");
     }
     return context;
+  }
+
+  #requiredSafetyContextProvider(): () => Promise<SafetyContext> {
+    if (!this.#safetyContextProvider) throw new Error("runner safety context is unavailable");
+    return this.#safetyContextProvider;
   }
 
   #resolveIdle(): void {

@@ -1,4 +1,9 @@
 import { ActionExecutor } from "../actions/actionExecutor.js";
+import type { CompanionActionQueue } from "../actions/actionQueue.js";
+import type {
+  QueuedActionExecutionContext,
+  QueuedActionRunner,
+} from "../actions/queuedActionRunner.js";
 import type { AutonomyReason } from "../autonomy/autonomyScheduler.js";
 import type { LocalCommand } from "../commands/commandParser.js";
 import type { CodexPort, CodexTurnResult } from "../codex/codexPort.js";
@@ -226,9 +231,9 @@ function autonomousMicroTaskDisclosure(reason: AutonomyReason): TaskDisclosure {
 }
 
 type CompanionTaskExecutionOutcome = ReturnType<typeof companionTaskExecutionOutcomeSchema.parse>;
-type ValidatedTaskDecision = Extract<
+type ValidatedTaskDecision = Exclude<
   OwnerIntentDecision,
-  { kind: "start_task" | "continue_task" | "replace_task" }
+  { kind: "chat" | "stop_task" | "clarify" }
 >;
 
 const taskLimitKeys = [
@@ -277,6 +282,8 @@ export interface CompanionServiceDependencies {
   state: StateStore;
   confirmations: ConfirmationStore;
   executor: ActionExecutor;
+  actionQueue: CompanionActionQueue;
+  actionRunner: QueuedActionRunner;
   budget: TurnToolBudget;
   taskController: TaskController;
   autonomy: CompanionAutonomyScheduler;
@@ -335,6 +342,11 @@ interface IntentStamp {
   readonly threadPair: CodexThreadPair;
 }
 
+interface SuspendedTaskGoal {
+  readonly taskLease: Readonly<TaskLease>;
+  readonly disclosure: TaskDisclosure;
+}
+
 const noOpLogger: Pick<SafeLogger, "error"> = { error: async () => undefined };
 
 function splitForMinecraft(reply: string, maxLength = 240): string[] {
@@ -366,6 +378,15 @@ function taskLeaseKey(taskLease: TaskLease): string {
 
 function sameTaskLease(first: TaskLease, second: TaskLease): boolean {
   return first.id === second.id && first.startedAt === second.startedAt;
+}
+
+function cloneTaskDisclosure(disclosure: TaskDisclosure): TaskDisclosure {
+  return {
+    goal: disclosure.goal,
+    expectedActions: [...disclosure.expectedActions],
+    limits: { ...disclosure.limits },
+    stopCondition: disclosure.stopCondition,
+  };
 }
 
 export class CompanionService {
@@ -417,6 +438,8 @@ export class CompanionService {
   };
   private locallyContainedTaskLeaseKey: string | undefined;
   private readonly pendingConfirmationTerminalReasons = new Map<string, "failed" | "owner_stop">();
+  private readonly suspendedTaskGoals: SuspendedTaskGoal[] = [];
+  private preservedTerminalLeaseKey: string | undefined;
 
   constructor(private readonly dependencies: CompanionServiceDependencies) {
     this.logger = dependencies.logger ?? noOpLogger;
@@ -425,8 +448,8 @@ export class CompanionService {
     this.confirmationNow = dependencies.confirmationNow ?? (() => new Date());
     this.setConfirmationTimer = dependencies.setConfirmationTimer ?? setTimeout;
     this.clearConfirmationTimer = dependencies.clearConfirmationTimer ?? clearTimeout;
-    dependencies.taskController.onTerminal((reason, forceCleanup) =>
-      this.handleTaskTerminal(reason, forceCleanup),
+    dependencies.taskController.onTerminal((reason, forceCleanup, task) =>
+      this.handleTaskTerminal(reason, forceCleanup, task.lease),
     );
     dependencies.confirmations.onGameActionsChanged(() => this.scheduleConfirmationExpiry());
     dependencies.confirmations.onGameActionsExpired((taskLease) =>
@@ -564,6 +587,7 @@ export class CompanionService {
       if (generation !== this.generation) return;
       this.dependencies.confirmations.clear();
       this.dependencies.executor.stopAll();
+      this.dependencies.actionRunner.start();
       this.dependencies.mode.resetModeFromProfile();
       this.dependencies.mode.completeTask();
       this.unfinishedTaskSummary = persisted.unfinishedTaskSummary;
@@ -883,6 +907,8 @@ export class CompanionService {
   }
 
   private onOwnerMessage(message: string): void {
+    const activeTask = this.dependencies.taskController.current();
+    if (activeTask) this.dependencies.actionRunner.suspend(activeTask.lease, "owner_message");
     if (!this.codexHealthy || this.currentThreadPair() === undefined) return;
     this.mergedMessages.push(message);
     if (this.mergeTimer !== undefined) return;
@@ -937,6 +963,7 @@ export class CompanionService {
         await this.persistIntentMemories(decision.memoryCandidates, text, stamp);
         if (this.isIntentCurrent(stamp))
           await this.sendOutcomeReply(decision.reply, stamp.generation, false);
+        if (this.isIntentCurrent(stamp)) this.queueCurrentTaskReplan(stamp);
         return;
       case "clarify":
         if (this.isIntentCurrent(stamp)) {
@@ -1076,6 +1103,7 @@ export class CompanionService {
     if (!this.isTaskDecisionCurrent(decision, stamp)) return;
     if (decision.kind === "stop_task") {
       this.revokeCurrentTask("owner_stop");
+      this.clearSuspendedTaskGoals("owner stop");
       this.unfinishedTaskSummary = null;
       if (this.isIntentCurrent(stamp)) await this.persist();
       if (decision.reply && this.isIntentCurrent(stamp)) {
@@ -1089,6 +1117,7 @@ export class CompanionService {
       (this.dependencies.taskController.current() !== null || this.autonomousRequestCount > 0)
     ) {
       this.revokeCurrentTask("owner_stop");
+      this.clearSuspendedTaskGoals("task replaced");
       this.unfinishedTaskSummary = null;
       if (this.isIntentCurrent(stamp)) await this.persist();
       if (!this.isIntentCurrent(stamp)) return;
@@ -1113,14 +1142,95 @@ export class CompanionService {
       }
       this.interruptExecutionTurn();
     }
+    if (decision.kind === "priority_task") {
+      const currentTask = this.dependencies.taskController.current();
+      if (currentTask) {
+        this.interruptExecutionTurn();
+        this.dependencies.confirmations.clearGameActions();
+        this.suspendedTaskGoals.push({
+          taskLease: Object.freeze({ ...currentTask.lease }),
+          disclosure: cloneTaskDisclosure(currentTask.disclosure),
+        });
+        this.preservedTerminalLeaseKey = taskLeaseKey(currentTask.lease);
+        this.dependencies.taskController.stop("owner_stop");
+        this.dependencies.budget.end();
+        this.dependencies.mode.completeTask();
+      }
+    }
 
+    this.queueValidatedTask(decision, text, stamp);
+  }
+
+  private queueCurrentTaskReplan(stamp: IntentStamp): void {
+    const task = this.dependencies.taskController.current();
+    if (
+      !task ||
+      stamp.taskLeaseAtDispatch === null ||
+      !sameTaskLease(task.lease, stamp.taskLeaseAtDispatch)
+    ) {
+      return;
+    }
+    this.interruptExecutionTurn();
+    const allowedActions = task.disclosure.expectedActions.filter(
+      (action): action is ToolActionKind => TOOL_ACTION_KINDS.includes(action as ToolActionKind),
+    );
+    this.queueValidatedTask(
+      {
+        kind: "continue_task",
+        naturalReply: null,
+        task: {
+          goal: task.disclosure.goal,
+          allowedActions,
+          requestedLimits: { ...task.disclosure.limits },
+        },
+        memoryCandidates: [],
+      },
+      `主人消息已处理，请重新观察当前世界并规划当前目标：${task.disclosure.goal}`,
+      stamp,
+    );
+  }
+
+  private queueValidatedTask(
+    decision: ValidatedTaskDecision,
+    ownerText: string,
+    stamp: IntentStamp,
+  ): void {
     const queued = this.executionTurnTail
       .catch(() => undefined)
-      .then(() => this.startValidatedTask(decision, text, stamp))
+      .then(() => this.startValidatedTask(decision, ownerText, stamp))
       .catch((error: unknown) =>
         this.logger.error("companion_task_turn_failed", { code: String(error) }),
       );
     this.executionTurnTail = queued;
+  }
+
+  private clearSuspendedTaskGoals(reason: string): void {
+    for (const suspended of this.suspendedTaskGoals.splice(0)) {
+      this.dependencies.actionQueue.cancelTask(suspended.taskLease, reason);
+    }
+  }
+
+  private async resumeLatestSuspendedGoal(stamp: IntentStamp): Promise<void> {
+    const suspended = this.suspendedTaskGoals.pop();
+    if (!suspended || !this.isIntentCurrent(stamp)) return;
+    this.dependencies.actionQueue.cancelTask(suspended.taskLease, "priority task replan");
+    const allowedActions = suspended.disclosure.expectedActions.filter(
+      (action): action is ToolActionKind => TOOL_ACTION_KINDS.includes(action as ToolActionKind),
+    );
+    await this.startValidatedTask(
+      {
+        kind: "start_task",
+        naturalReply: null,
+        task: {
+          goal: suspended.disclosure.goal,
+          allowedActions,
+          requestedLimits: { ...suspended.disclosure.limits },
+        },
+        memoryCandidates: [],
+      },
+      `优先帮助任务已完成，请重新观察当前世界并规划原目标：${suspended.disclosure.goal}`,
+      stamp,
+    );
   }
 
   private async startValidatedTask(
@@ -1132,6 +1242,8 @@ export class CompanionService {
     let task: ActiveTask | undefined;
     let prepared: TaskDisclosure | undefined;
     let taskStopReason: TaskStopReason = "failed";
+    let keepTaskAlive = false;
+    let resumeSuspendedGoal = false;
     try {
       if (!this.isIntentCurrent(stamp)) return;
       if (decision.kind === "continue_task") {
@@ -1230,6 +1342,15 @@ export class CompanionService {
       taskStopReason = "completed";
       await this.persistTaskExecutionOutcome(task.disclosure.goal, outcome, stamp, ownerText);
       if (!this.isIntentCurrent(stamp)) return;
+      if (decision.kind === "continue_task" && outcome.status === "active") {
+        this.dependencies.actionRunner.resumeAfterReplan(task.lease, this.worldGeneration);
+      }
+      keepTaskAlive =
+        outcome.status === "active" && this.dependencies.actionQueue.hasActiveTask(task.lease);
+      if (outcome.status !== "active") {
+        this.dependencies.actionQueue.cancelTask(task.lease, "task outcome finished");
+        resumeSuspendedGoal = decision.kind === "priority_task";
+      }
       await this.sendOutcomeReply(outcome.reply, stamp.generation, false);
     } catch (error) {
       if (
@@ -1250,13 +1371,21 @@ export class CompanionService {
         this.dependencies.taskController.current()?.id === task.id
       ) {
         if (
-          taskStopReason !== "completed" ||
-          !this.dependencies.confirmations.hasGameActions(task.lease)
+          !keepTaskAlive &&
+          (taskStopReason !== "completed" ||
+            !this.dependencies.confirmations.hasGameActions(task.lease))
         ) {
           this.dependencies.taskController.stop(taskStopReason);
         }
       }
       this.turnWorkCount -= 1;
+      if (
+        resumeSuspendedGoal &&
+        this.isIntentCurrent(stamp) &&
+        this.dependencies.taskController.current() === null
+      ) {
+        await this.resumeLatestSuspendedGoal(stamp);
+      }
     }
   }
 
@@ -1296,6 +1425,15 @@ export class CompanionService {
       this.mergeTimer !== undefined ||
       this.mergedMessages.length > 0
     );
+  }
+
+  queueExecutionContext(): QueuedActionExecutionContext | null {
+    const task = this.dependencies.taskController.current();
+    if (!task) return null;
+    return {
+      taskLease: { ...task.lease },
+      worldGeneration: this.worldGeneration,
+    };
   }
 
   private async performAutonomousTurn(
@@ -2166,15 +2304,37 @@ export class CompanionService {
   }
 
   private revokeCurrentTask(reason: TaskStopReason): void {
+    const activeTask = this.dependencies.taskController.current();
     this.interruptExecutionTurn();
     this.dependencies.confirmations.clear();
-    this.dependencies.executor.stopAll();
+    if (activeTask) {
+      try {
+        this.dependencies.actionRunner.cancelTask(activeTask.lease, reason);
+      } catch {
+        this.dependencies.executor.stopAll();
+        this.dependencies.actionQueue.cancelTask(activeTask.lease, reason);
+      }
+    } else {
+      this.dependencies.executor.stopAll();
+    }
     this.dependencies.taskController.stop(reason);
     this.dependencies.budget.end();
     this.dependencies.mode.completeTask();
   }
 
-  private handleTaskTerminal(reason: TaskStopReason, forceCleanup = false): void {
+  private handleTaskTerminal(
+    reason: TaskStopReason,
+    forceCleanup = false,
+    taskLease?: TaskLease,
+  ): void {
+    if (taskLease) {
+      const key = taskLeaseKey(taskLease);
+      if (this.preservedTerminalLeaseKey === key) {
+        this.preservedTerminalLeaseKey = undefined;
+      } else {
+        this.dependencies.actionQueue.cancelTask(taskLease, reason);
+      }
+    }
     this.pendingConfirmationTerminalReasons.clear();
     try {
       this.dependencies.confirmations.clearGameActions();

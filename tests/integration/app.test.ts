@@ -15,6 +15,8 @@ import {
   type OwnerIdentityProvider,
 } from "../../src/app.js";
 import { ActionExecutor } from "../../src/actions/actionExecutor.js";
+import { CompanionActionQueue } from "../../src/actions/actionQueue.js";
+import { QueuedActionRunner } from "../../src/actions/queuedActionRunner.js";
 import { CodexAppServerClient } from "../../src/codex/appServerClient.js";
 import type { CodexPort, CodexTurnResult } from "../../src/codex/codexPort.js";
 import { ChatRouter } from "../../src/companion/chatRouter.js";
@@ -281,7 +283,21 @@ async function runPersistedActionScenario(scenario: PersistedActionScenario) {
           spawn: { x: 0, y: 64, z: 0 },
           owner: { ...(minecraft?.world.ownerPosition ?? { x: 0, y: 64, z: 0 }) },
         });
-        const service = new CompanionService({
+        const actionQueue = new CompanionActionQueue({
+          createId: (() => {
+            let next = 0;
+            return () => `queue-${++next}`;
+          })(),
+          now: () => new Date(),
+        });
+        let service!: CompanionService;
+        const actionRunner = new QueuedActionRunner({
+          queue: actionQueue,
+          executor,
+          executionContext: () => service?.queueExecutionContext() ?? null,
+          safetyContextProvider,
+        });
+        service = new CompanionService({
           minecraft,
           codex,
           mode: createdContext.mode,
@@ -289,6 +305,8 @@ async function runPersistedActionScenario(scenario: PersistedActionScenario) {
           state: new StateStore(createdContext.paths.state),
           confirmations,
           executor,
+          actionQueue,
+          actionRunner,
           budget: createdContext.budget,
           taskController: createdContext.taskController,
           autonomy: {

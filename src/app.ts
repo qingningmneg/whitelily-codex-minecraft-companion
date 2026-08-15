@@ -1,6 +1,9 @@
 import { mkdir, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { dirname } from "node:path";
 import { ActionExecutor } from "./actions/actionExecutor.js";
+import { CompanionActionQueue } from "./actions/actionQueue.js";
+import { QueuedActionRunner } from "./actions/queuedActionRunner.js";
 import { AutonomyScheduler } from "./autonomy/autonomyScheduler.js";
 import { CodexAppServerClient } from "./codex/appServerClient.js";
 import { createMinecraftDynamicTools } from "./codex/minecraftDynamicTools.js";
@@ -683,6 +686,16 @@ export function createProductionRuntime(
   );
 
   let companion: CompanionService | undefined;
+  const actionQueue = new CompanionActionQueue({
+    createId: randomUUID,
+    now: () => new Date(),
+  });
+  const actionRunner = new QueuedActionRunner({
+    queue: actionQueue,
+    executor,
+    executionContext: () => companion?.queueExecutionContext() ?? null,
+    safetyContextProvider,
+  });
   const autonomy = new AutonomyScheduler({
     mode,
     minecraft,
@@ -702,6 +715,8 @@ export function createProductionRuntime(
     state,
     confirmations,
     executor,
+    actionQueue,
+    actionRunner,
     budget,
     taskController,
     autonomy,

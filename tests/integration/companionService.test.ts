@@ -963,9 +963,9 @@ describe("CompanionService lifecycle", () => {
     });
   });
 
-  it("routes chat during an active task without pre-cancelling its deferred execution", async () => {
+  it("routes chat without revoking the task and replans its suspended work", async () => {
     const value = await harness({
-      deferredTurns: [0],
+      deferredTurns: [0, 1],
       intentResponses: [
         JSON.stringify({
           kind: "start_task",
@@ -987,20 +987,119 @@ describe("CompanionService lifecycle", () => {
     const activeTask = value.taskController.current();
     if (!activeTask) throw new Error("expected an active task");
     const auditBeforeChat = [...value.taskAuditEvents];
-    const budgetBeforeChat = [...value.budgetEvents];
 
     await value.emitOwnerText("tell me something while you wait");
     await value.untilChat("今天天气确实不错。");
+    await vi.waitFor(() => expect(value.codex.turnsFor("execution")).toHaveLength(2));
 
     expect(value.taskController.current()?.id).toBe(activeTask.id);
     expect(value.taskAuditEvents).toEqual(auditBeforeChat);
-    expect(value.budgetEvents).toEqual(budgetBeforeChat);
-    expect(value.codex.interruptions).not.toContainEqual({
+    expect(value.codex.interruptions).toContainEqual({
       threadId: value.codex.startedThreadIds.execution,
       turnId: "turn-1",
     });
-    expect(value.codex.turnsFor("execution")).toHaveLength(1);
-    expect(value.minecraft.chatLog.at(-1)).toBe("今天天气确实不错。");
+    expect(value.codex.turnsFor("execution")[1]?.text).toContain("重新观察当前世界");
+    expect(value.minecraft.chatLog).toContain("今天天气确实不错。");
+  });
+
+  it("stops physical work before the owner intent turn resolves", async () => {
+    const value = await harness({
+      activeMinecraftWait: true,
+      deferredTurns: [0],
+      deferredIntentTurns: [1],
+      intentResponses: [
+        JSON.stringify({
+          kind: "start_task",
+          naturalReply: null,
+          task: {
+            goal: "继续等待",
+            allowedActions: ["wait"],
+            requestedLimits: {},
+          },
+          memoryCandidates: [],
+        }),
+        JSON.stringify({ kind: "chat", reply: "稍等，我先回应你。", memoryCandidates: [] }),
+      ],
+      executionResponses: [taskExecutionOutcome("仍在等待", "active")],
+    });
+    await value.start();
+    await value.emitOwnerText("开始等待");
+    await value.untilCodexTurns(1);
+    const activeTask = value.taskController.current();
+    if (!activeTask) throw new Error("expected an active task");
+    const runningAction = value.executor.execute(
+      { kind: "wait", milliseconds: 10_000 },
+      {
+        owner: { x: 0, y: 64, z: 0 },
+        taskLease: activeTask.lease,
+      },
+    );
+    await value.untilActiveWaitStarted();
+
+    await value.emitOwnerText("先听我说一句");
+
+    expect(value.activeWaitWasAborted()).toBe(true);
+    await expect(runningAction).resolves.toEqual({ status: "cancelled" });
+    expect(value.taskController.current()?.id).toBe(activeTask.id);
+    expect(value.codex.turnsFor("intent")).toHaveLength(2);
+  });
+
+  it("runs a priority help task before replanning the suspended goal", async () => {
+    const value = await harness({
+      activeMinecraftWait: true,
+      deferredTurns: [0, 1, 2],
+      intentResponses: [
+        JSON.stringify({
+          kind: "start_task",
+          naturalReply: null,
+          task: {
+            goal: "继续收集煤炭",
+            allowedActions: ["get_state", "wait"],
+            requestedLimits: {},
+          },
+          memoryCandidates: [],
+        }),
+        JSON.stringify({
+          kind: "priority_task",
+          naturalReply: "好，我先来帮你。",
+          task: {
+            goal: "来到主人身边并等待",
+            allowedActions: ["get_state", "follow_owner", "wait"],
+            requestedLimits: {},
+          },
+          memoryCandidates: [],
+        }),
+      ],
+      executionResponses: [taskExecutionOutcome("重新规划原目标。", "active")],
+    });
+    await value.start();
+    await value.emitOwnerText("继续收集煤炭");
+    await value.untilCodexTurns(1);
+    const oldTask = value.taskController.current();
+    if (!oldTask) throw new Error("expected an active task");
+    value.actionQueue.enqueue({
+      taskLease: oldTask.lease,
+      worldGeneration: 0,
+      action: { kind: "wait", milliseconds: 10_000 },
+      summary: "旧目标等待动作",
+      trustedObservationKey: "observation-old",
+    });
+    await value.untilActiveWaitStarted();
+
+    await value.emitOwnerText("先来帮我一下");
+    await vi.waitFor(() => expect(value.codex.turnsFor("execution")).toHaveLength(2));
+    value.codex.releaseTurnResult(1, taskExecutionOutcome("我到你身边了。", "completed"));
+    await vi.waitFor(() => expect(value.codex.turnsFor("execution")).toHaveLength(3));
+
+    const executionTurns = value.codex.turnsFor("execution");
+    expect(executionTurns[1]?.text).toContain("来到主人身边并等待");
+    expect(executionTurns[2]?.text).toContain("继续收集煤炭");
+    expect(executionTurns[2]?.text).toContain("重新观察");
+    expect(value.actionQueue.snapshot().items[0]).toMatchObject({
+      status: "cancelled",
+      reason: "priority task replan",
+    });
+    expect(value.taskController.current()?.disclosure.goal).toBe("继续收集煤炭");
   });
 
   describe("active task intent semantics and fences", () => {
@@ -1128,6 +1227,14 @@ describe("CompanionService lifecycle", () => {
         { spawn: { x: 0, y: 64, z: 0 }, owner: { x: 0, y: 64, z: 0 } },
       );
       await value.untilActiveWaitStarted();
+      value.actionQueue.enqueue({
+        taskLease: oldTask.lease,
+        worldGeneration: 0,
+        action: { kind: "jump" },
+        summary: "停止时应清理的动作",
+        trustedObservationKey: "observation-stop",
+      });
+      await vi.waitFor(() => expect(value.actionQueue.snapshot().items[0]?.status).toBe("running"));
 
       await value.emitOwnerText("stop the task");
       await value.untilChat("Stopped as requested.");
@@ -1140,6 +1247,10 @@ describe("CompanionService lifecycle", () => {
       });
       expect(value.confirmations.get(genericConfirmation.id)).toBeUndefined();
       expect(value.taskController.isLeaseLive(oldTask.lease)).toBe(false);
+      expect(value.actionQueue.snapshot().items[0]).toMatchObject({
+        status: "cancelled",
+        reason: "owner_stop",
+      });
       expect(value.codex.turnsFor("execution")).toHaveLength(1);
       expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:owner_stop"]);
     });
@@ -1147,6 +1258,7 @@ describe("CompanionService lifecycle", () => {
     it("clarify leaves the active task, confirmation, execution, and lease unchanged", async () => {
       const value = await harness({
         deferredTurns: [0],
+        activeMinecraftWait: true,
         intentResponses: [
           initialDecision,
           JSON.stringify({ kind: "clarify", question: "Which direction?" }),
@@ -1161,12 +1273,24 @@ describe("CompanionService lifecycle", () => {
         { kind: "look_at", position: { x: 1, y: 64, z: 1 } },
         task.lease,
       );
+      value.actionQueue.enqueue({
+        taskLease: task.lease,
+        worldGeneration: 0,
+        action: { kind: "wait", milliseconds: 10_000 },
+        summary: "等待主人澄清",
+        trustedObservationKey: "observation-clarify",
+      });
+      await value.untilActiveWaitStarted();
 
       await value.emitOwnerText("change it somehow");
       await value.untilChat("Which direction?");
 
       expect(value.taskController.current()).toMatchObject({ id: task.id, lease: task.lease });
       expect(value.confirmations.get(confirmation.id)).toBeDefined();
+      expect(value.actionQueue.snapshot().items[0]).toMatchObject({
+        status: "suspended",
+        reason: "owner_message",
+      });
       expect(value.codex.interruptions).toEqual([]);
       expect(value.taskAuditEvents).toEqual(["task_started"]);
     });
@@ -1174,6 +1298,7 @@ describe("CompanionService lifecycle", () => {
     it("continues under the same lease after interrupting only the active execution turn", async () => {
       const value = await harness({
         deferredTurns: [0, 1],
+        activeMinecraftWait: true,
         intentResponses: [initialDecision, replacementDecision("continue_task")],
         executionResponses: [
           taskExecutionOutcome("stale first execution", "active"),
@@ -1184,6 +1309,21 @@ describe("CompanionService lifecycle", () => {
       await startPlayerTurn(value, "watch the path");
       const task = value.taskController.current();
       if (!task) throw new Error("expected an active task");
+      value.actionQueue.enqueue({
+        taskLease: task.lease,
+        worldGeneration: 0,
+        action: { kind: "wait", milliseconds: 10_000 },
+        summary: "被消息中断的动作",
+        trustedObservationKey: "observation-continue",
+      });
+      value.actionQueue.enqueue({
+        taskLease: task.lease,
+        worldGeneration: 0,
+        action: { kind: "jump" },
+        summary: "重新规划后可继续的动作",
+        trustedObservationKey: "observation-continue",
+      });
+      await value.untilActiveWaitStarted();
 
       await value.emitOwnerText("continue with only a state check");
       await vi.waitFor(() => expect(value.codex.turnsFor("execution")).toHaveLength(2), {
@@ -1195,11 +1335,20 @@ describe("CompanionService lifecycle", () => {
         turnId: "turn-1",
       });
       expect(value.taskController.current()).toMatchObject({ id: task.id, lease: task.lease });
+      expect(value.actionQueue.snapshot().items.map(({ status }) => status)).toEqual([
+        "suspended",
+        "suspended",
+      ]);
       expect(value.budgetTaskLeaseIds).toEqual([task.lease.id, task.lease.id]);
       expect(value.taskAuditEvents).toEqual(["task_started"]);
 
       value.codex.releaseTurnResult(1, taskExecutionOutcome("narrow continuation", "active"));
       await value.untilChat("narrow continuation");
+      await value.actionRunner.waitForIdle();
+      expect(value.actionQueue.snapshot().items.map(({ status }) => status)).toEqual([
+        "cancelled",
+        "completed",
+      ]);
       expect(value.taskAuditEvents.filter((event) => event === "task_started")).toHaveLength(1);
     });
 
@@ -2253,6 +2402,16 @@ describe("CompanionService lifecycle", () => {
     );
     const confirmation = value.confirmations.create("pending", { kind: "memory_clear" });
     await value.untilActiveWaitStarted();
+    const activeTask = value.taskController.current();
+    if (!activeTask) throw new Error("expected an active task");
+    value.actionQueue.enqueue({
+      taskLease: activeTask.lease,
+      worldGeneration: 0,
+      action: { kind: "jump" },
+      summary: "旧世界排队动作",
+      trustedObservationKey: "observation-world",
+    });
+    await vi.waitFor(() => expect(value.actionQueue.snapshot().items[0]?.status).toBe("running"));
 
     value.minecraft.emit({ kind: "world_changed" });
 
@@ -2266,6 +2425,10 @@ describe("CompanionService lifecycle", () => {
     ).toEqual({ ok: false, reason: "task lease is invalid" });
     expect(value.activeWaitWasAborted()).toBe(true);
     expect(value.confirmations.get(confirmation.id)).toBeUndefined();
+    expect(value.actionQueue.snapshot().items[0]).toMatchObject({
+      status: "cancelled",
+      reason: "world_changed",
+    });
     expect(value.mode.snapshot()).toMatchObject({ paused: true, taskId: null });
 
     const savesBeforeReconnectSequence = value.savedStates.length;

@@ -22,6 +22,10 @@ export type ActionResult =
 
 export type ActionResultListener = (result: Readonly<ActionResult>) => void;
 
+export interface StopAllOptions {
+  readonly preserveTask?: boolean;
+}
+
 interface Deferred<T> {
   promise: Promise<T>;
   resolve(value: T): void;
@@ -137,8 +141,8 @@ export class ActionExecutor {
     return () => this.resultListeners.delete(listener);
   }
 
-  stopAll(): void {
-    this.beforeStopAll();
+  stopAll(options: StopAllOptions = {}): void {
+    if (!options.preserveTask) this.beforeStopAll();
     const stoppedGeneration = this.generation;
     this.generation += 1;
     for (const job of this.jobs) {
