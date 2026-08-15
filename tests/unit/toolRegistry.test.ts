@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { createToolRegistry, MINECRAFT_TOOL_NAMES } from "../../src/mcp/toolRegistry.js";
 import type { ActionSafety } from "../../src/actions/actionExecutor.js";
 import type { GameAction, WorldSnapshot } from "../../src/domain/types.js";
@@ -41,6 +41,23 @@ describe("Minecraft MCP tools", () => {
     expect(Object.keys(createToolRegistry(harness.dependencies)).sort()).toEqual(
       [...MINECRAFT_TOOL_NAMES].sort(),
     );
+    expect(MINECRAFT_TOOL_NAMES).toEqual(
+      expect.arrayContaining([
+        "minecraft_inspect_block",
+        "minecraft_find_blocks",
+        "minecraft_get_furnace_state",
+      ]),
+    );
+    expect(MINECRAFT_TOOL_NAMES).not.toEqual(
+      expect.arrayContaining([
+        "minecraft_fish",
+        "minecraft_consume_item",
+        "minecraft_sleep_in_bed",
+        "minecraft_till_soil",
+        "minecraft_plant_crop",
+        "minecraft_harvest_crop",
+      ]),
+    );
   });
 
   it("does not expose generic shell, script, command, or arbitrary entity attack tools", () => {
@@ -80,6 +97,120 @@ describe("Minecraft MCP tools", () => {
         }),
       ),
     ).toThrow();
+    expect(() =>
+      tool.schema.parse(
+        leased(harness, {
+          actions: [
+            { kind: "fish", summary: "钓一条鱼" },
+            { kind: "consume_item", itemName: "bread", summary: "吃面包" },
+            { kind: "sleep_in_bed", x: 1, y: 64, z: 1, summary: "睡觉" },
+            { kind: "wake_up", summary: "醒来" },
+            { kind: "till_soil", x: 2, y: 64, z: 2, summary: "耕地" },
+            {
+              kind: "plant_crop",
+              x: 2,
+              y: 64,
+              z: 2,
+              seedName: "wheat_seeds",
+              summary: "播种小麦",
+            },
+            {
+              kind: "harvest_crop",
+              x: 3,
+              y: 64,
+              z: 3,
+              cropName: "wheat",
+              summary: "收割小麦",
+            },
+          ],
+        }),
+      ),
+    ).not.toThrow();
+    expect(() =>
+      tool.schema.parse(
+        leased(harness, {
+          actions: [
+            {
+              kind: "plant_crop",
+              x: 1,
+              y: 64,
+              z: 1,
+              seedName: "carrot",
+              summary: "种胡萝卜",
+            },
+          ],
+        }),
+      ),
+    ).toThrow();
+  });
+
+  it("rejects farming mutations until wheat farming permission is present", async () => {
+    const harness = createToolRegistryHarness();
+    const tools = createToolRegistry(harness.dependencies);
+
+    await expect(
+      tools.minecraft_enqueue_actions.execute(
+        leased(harness, {
+          actions: [
+            { kind: "till_soil", x: 20, y: 64, z: 20, summary: "耕地" },
+            {
+              kind: "plant_crop",
+              x: 20,
+              y: 64,
+              z: 20,
+              seedName: "wheat_seeds",
+              summary: "播种",
+            },
+          ],
+        }),
+      ),
+    ).resolves.toEqual({ text: '{"error":"Wheat farming permission is required"}', isError: true });
+    expect(harness.actionQueue.snapshot().items).toEqual([]);
+  });
+
+  it("charges every crop mutation as a block change and tilling as dangerous", async () => {
+    const harness = createToolRegistryHarness();
+    const taskBudget = new TaskControllerBudget();
+    const taskLease = taskBudget.begin({ maxBlockChanges: 3, maxDangerousOperations: 1 });
+    const budget = new TurnToolBudget(taskBudget);
+    const turnLease = budget.begin(taskLease, {
+      allowedActions: ["till_soil", "plant_crop", "harvest_crop"],
+    });
+    const tools = createToolRegistry({
+      ...harness.dependencies,
+      budget,
+      safetyContextProvider: async () => ({
+        spawn: { x: -100, y: 64, z: -100 },
+        owner: { x: 0, y: 64, z: 0 },
+        wheatFarmingAllowed: true,
+      }),
+    });
+
+    await expect(
+      tools.minecraft_enqueue_actions.execute({
+        actions: [
+          { kind: "till_soil", x: 20, y: 64, z: 20, summary: "耕地" },
+          {
+            kind: "plant_crop",
+            x: 20,
+            y: 64,
+            z: 20,
+            seedName: "wheat_seeds",
+            summary: "播种",
+          },
+          {
+            kind: "harvest_crop",
+            x: 21,
+            y: 64,
+            z: 20,
+            cropName: "wheat",
+            summary: "收割",
+          },
+        ],
+        turnLease,
+      }),
+    ).resolves.toEqual({ text: '{"status":"queued","count":3}' });
+    expect(taskBudget.snapshot()).toMatchObject({ blockChanges: 3, dangerousOperations: 1 });
   });
 
   it("enqueues a safe batch atomically with a trusted observation key and one model call", async () => {
@@ -292,6 +423,18 @@ describe("Minecraft MCP tools", () => {
         schema: tools.minecraft_find_block.schema,
         input: leased(harness, { blockName: "stone", maxDistance: 1 }),
       },
+      {
+        schema: tools.minecraft_inspect_block.schema,
+        input: leased(harness, { x: 1, y: 2, z: 3 }),
+      },
+      {
+        schema: tools.minecraft_find_blocks.schema,
+        input: leased(harness, { names: ["stone"], maxDistance: 1, maxResults: 1 }),
+      },
+      {
+        schema: tools.minecraft_get_furnace_state.schema,
+        input: leased(harness, { x: 1, y: 2, z: 3 }),
+      },
       { schema: tools.minecraft_say.schema, input: leased(harness, { message: "safe" }) },
       {
         schema: tools.minecraft_move_to.schema,
@@ -388,6 +531,30 @@ describe("Minecraft MCP tools", () => {
         leased(harness, { blockName: "stone", maxDistance: 65 }),
       ),
     ).toThrow();
+    expect(() =>
+      tools.minecraft_find_blocks.schema.parse(
+        leased(harness, { tag: "lava", maxDistance: 16, maxResults: 8 }),
+      ),
+    ).toThrow();
+    expect(() =>
+      tools.minecraft_find_blocks.schema.parse(
+        leased(harness, {
+          names: Array.from({ length: 9 }, () => "stone"),
+          maxDistance: 16,
+          maxResults: 8,
+        }),
+      ),
+    ).toThrow();
+    expect(() =>
+      tools.minecraft_find_blocks.schema.parse(
+        leased(harness, { names: ["stone"], maxDistance: 65, maxResults: 8 }),
+      ),
+    ).toThrow();
+    expect(() =>
+      tools.minecraft_find_blocks.schema.parse(
+        leased(harness, { names: ["stone"], maxDistance: 16, maxResults: 33 }),
+      ),
+    ).toThrow();
     expect(tools.minecraft_wait.schema.parse(leased(harness, { milliseconds: 100 }))).toEqual(
       leased(harness, { milliseconds: 100 }),
     );
@@ -478,6 +645,30 @@ describe("Minecraft MCP tools", () => {
       }),
     ).resolves.toMatchObject({ isError: true });
     await expect(
+      tools.minecraft_inspect_block.execute({
+        x: 1,
+        y: 64,
+        z: 1,
+        turnLease: invalidLease,
+      }),
+    ).resolves.toMatchObject({ isError: true });
+    await expect(
+      tools.minecraft_find_blocks.execute({
+        names: ["stone"],
+        maxDistance: 8,
+        maxResults: 4,
+        turnLease: invalidLease,
+      }),
+    ).resolves.toMatchObject({ isError: true });
+    await expect(
+      tools.minecraft_get_furnace_state.execute({
+        x: 1,
+        y: 64,
+        z: 1,
+        turnLease: invalidLease,
+      }),
+    ).resolves.toMatchObject({ isError: true });
+    await expect(
       tools.minecraft_move_to.execute({ x: 1, y: 64, z: 0, turnLease: invalidLease }),
     ).resolves.toMatchObject({ isError: true });
     await expect(
@@ -488,6 +679,318 @@ describe("Minecraft MCP tools", () => {
     expect(sharedSnapshotReads).toBe(0);
     expect(harness.minecraft.calls).toEqual([]);
     expect(harness.budget.snapshot().totalCalls).toBe(0);
+  });
+
+  it("fails closed when read tools are not authorized for the turn", async () => {
+    const harness = createToolRegistryHarness();
+    const taskBudget = new TaskControllerBudget();
+    const budget = new TurnToolBudget(taskBudget);
+    const turnLease = budget.begin(taskBudget.begin(), { allowedActions: ["get_state"] });
+    const tools = createToolRegistry({ ...harness.dependencies, budget });
+
+    await expect(
+      tools.minecraft_inspect_block.execute({ x: 1, y: 64, z: 1, turnLease }),
+    ).resolves.toEqual({ text: '{"error":"tool action is not allowed"}', isError: true });
+    await expect(
+      tools.minecraft_find_blocks.execute({
+        tag: "water",
+        maxDistance: 16,
+        maxResults: 4,
+        turnLease,
+      }),
+    ).resolves.toEqual({ text: '{"error":"tool action is not allowed"}', isError: true });
+    await expect(
+      tools.minecraft_get_furnace_state.execute({ x: 2, y: 64, z: 2, turnLease }),
+    ).resolves.toEqual({ text: '{"error":"tool action is not allowed"}', isError: true });
+    expect(harness.minecraft.calls).toEqual([]);
+    expect(taskBudget.snapshot().toolCalls).toBe(0);
+  });
+
+  it("executes bounded read tools only for trusted observed coordinates", async () => {
+    const harness = createToolRegistryHarness();
+    const wheat = {
+      name: "wheat",
+      position: { x: 1, y: 64, z: 1 },
+      properties: { age: 7 },
+    } as const;
+    const furnacePosition = { x: 2, y: 64, z: 2 };
+    harness.minecraft.world.nearbyBlocks = [
+      { name: "wheat", position: wheat.position },
+      { name: "furnace", position: furnacePosition },
+    ];
+    harness.minecraft.inspectBlockResult = wheat;
+    harness.minecraft.findBlocksResult = { blocks: [wheat], truncated: false };
+    harness.minecraft.furnaceSnapshotResult = {
+      position: furnacePosition,
+      input: { name: "raw_cod", count: 1 },
+      fuel: { name: "coal", count: 1 },
+      output: null,
+      progress: 0.25,
+    };
+    const tools = createToolRegistry(harness.dependencies);
+
+    await expect(
+      tools.minecraft_inspect_block.execute(leased(harness, wheat.position)),
+    ).resolves.toEqual({ text: JSON.stringify({ block: wheat }) });
+    await expect(
+      tools.minecraft_find_blocks.execute(
+        leased(harness, { tag: "mature_wheat", maxDistance: 16, maxResults: 8 }),
+      ),
+    ).resolves.toEqual({ text: JSON.stringify({ blocks: [wheat], truncated: false }) });
+    await expect(
+      tools.minecraft_get_furnace_state.execute(leased(harness, furnacePosition)),
+    ).resolves.toEqual({
+      text: JSON.stringify({ furnace: harness.minecraft.furnaceSnapshotResult }),
+    });
+
+    await expect(
+      tools.minecraft_inspect_block.execute(leased(harness, { x: 30, y: 64, z: 30 })),
+    ).resolves.toEqual({ text: '{"error":"block position was not observed"}', isError: true });
+    await expect(
+      tools.minecraft_get_furnace_state.execute(leased(harness, { x: 31, y: 64, z: 31 })),
+    ).resolves.toEqual({ text: '{"error":"block position was not observed"}', isError: true });
+    expect(harness.minecraft.calls).not.toContainEqual(
+      expect.objectContaining({ method: "inspectBlock", args: [{ x: 30, y: 64, z: 30 }] }),
+    );
+    expect(harness.minecraft.calls).not.toContainEqual(
+      expect.objectContaining({ method: "furnaceSnapshot", args: [{ x: 31, y: 64, z: 31 }] }),
+    );
+  });
+
+  it("does not reuse an old-world block observation after the world generation changes", async () => {
+    const harness = createToolRegistryHarness();
+    const observed = {
+      ...structuredClone(harness.minecraft.world),
+      nearbyBlocks: [{ name: "furnace", position: { x: 2, y: 64, z: 2 } }],
+    };
+    const fresh = { ...structuredClone(harness.minecraft.world), nearbyBlocks: [] };
+    let liveSnapshot = observed;
+    harness.minecraft.snapshot = async () => structuredClone(liveSnapshot);
+    harness.minecraft.furnaceSnapshotResult = {
+      position: { x: 2, y: 64, z: 2 },
+      input: null,
+      fuel: null,
+      output: null,
+      progress: 0,
+    };
+    const tools = createToolRegistry({
+      ...harness.dependencies,
+      latestSnapshot: () => structuredClone(observed),
+    });
+
+    await expect(
+      tools.minecraft_get_furnace_state.execute(leased(harness, { x: 2, y: 64, z: 2 })),
+    ).resolves.toEqual({
+      text: JSON.stringify({ furnace: harness.minecraft.furnaceSnapshotResult }),
+    });
+    liveSnapshot = fresh;
+    harness.setWorldGeneration(1);
+    await expect(
+      tools.minecraft_get_furnace_state.execute(leased(harness, { x: 2, y: 64, z: 2 })),
+    ).resolves.toEqual({ text: '{"error":"block position was not observed"}', isError: true });
+    expect(
+      harness.minecraft.calls.filter((call) => call.method === "furnaceSnapshot"),
+    ).toHaveLength(1);
+  });
+
+  it("rejects read results when the world changes while the adapter call is pending", async () => {
+    const harness = createToolRegistryHarness();
+    const blockPosition = { x: 1, y: 64, z: 1 };
+    const furnacePosition = { x: 2, y: 64, z: 2 };
+    harness.minecraft.world.nearbyBlocks = [
+      { name: "wheat", position: blockPosition },
+      { name: "furnace", position: furnacePosition },
+    ];
+    const tools = createToolRegistry(harness.dependencies);
+
+    let resolveInspect!: (value: typeof harness.minecraft.inspectBlockResult) => void;
+    harness.minecraft.inspectBlock = async () =>
+      new Promise((resolve) => {
+        resolveInspect = resolve;
+      });
+    const inspect = tools.minecraft_inspect_block.execute(leased(harness, blockPosition));
+    await vi.waitFor(() => expect(resolveInspect).toBeTypeOf("function"));
+    harness.setWorldGeneration(1);
+    resolveInspect({ name: "wheat", position: blockPosition, properties: { age: 7 } });
+    await expect(inspect).resolves.toEqual({
+      text: '{"error":"world changed during block observation"}',
+      isError: true,
+    });
+
+    let resolveSearch!: (value: typeof harness.minecraft.findBlocksResult) => void;
+    harness.minecraft.findBlocks = async () =>
+      new Promise((resolve) => {
+        resolveSearch = resolve;
+      });
+    const search = tools.minecraft_find_blocks.execute(
+      leased(harness, { names: ["wheat"], maxDistance: 16, maxResults: 8 }),
+    );
+    await vi.waitFor(() => expect(resolveSearch).toBeTypeOf("function"));
+    harness.setWorldGeneration(2);
+    resolveSearch({
+      blocks: [{ name: "wheat", position: blockPosition, properties: { age: 7 } }],
+      truncated: false,
+    });
+    await expect(search).resolves.toEqual({
+      text: '{"error":"world changed during block observation"}',
+      isError: true,
+    });
+
+    let resolveFurnace!: (value: typeof harness.minecraft.furnaceSnapshotResult) => void;
+    harness.minecraft.furnaceSnapshot = async () =>
+      new Promise((resolve) => {
+        resolveFurnace = resolve;
+      });
+    const furnace = tools.minecraft_get_furnace_state.execute(leased(harness, furnacePosition));
+    await vi.waitFor(() => expect(resolveFurnace).toBeTypeOf("function"));
+    harness.setWorldGeneration(3);
+    resolveFurnace({
+      position: furnacePosition,
+      input: null,
+      fuel: null,
+      output: null,
+      progress: 0,
+    });
+    await expect(furnace).resolves.toEqual({
+      text: '{"error":"world changed during block observation"}',
+      isError: true,
+    });
+  });
+
+  it("rejects read results with unknown or oversized output fields", async () => {
+    const harness = createToolRegistryHarness();
+    const position = { x: 1, y: 64, z: 1 };
+    harness.minecraft.world.nearbyBlocks = [
+      { name: "wheat", position },
+      { name: "furnace", position: { x: 2, y: 64, z: 2 } },
+    ];
+    const tools = createToolRegistry(harness.dependencies);
+
+    harness.minecraft.inspectBlockResult = {
+      name: "wheat",
+      position,
+      properties: { age: 7 },
+      secret: "must not be serialized",
+    } as unknown as typeof harness.minecraft.inspectBlockResult;
+    await expect(tools.minecraft_inspect_block.execute(leased(harness, position))).resolves.toEqual(
+      {
+        text: '{"error":"trusted block inspection is unavailable"}',
+        isError: true,
+      },
+    );
+
+    harness.minecraft.findBlocksResult = {
+      blocks: [
+        {
+          name: "wheat",
+          position: { ...position, secret: "hidden" },
+          properties: { age: 7 },
+        },
+      ],
+      truncated: false,
+    } as unknown as typeof harness.minecraft.findBlocksResult;
+    await expect(
+      tools.minecraft_find_blocks.execute(
+        leased(harness, { names: ["wheat"], maxDistance: 16, maxResults: 8 }),
+      ),
+    ).resolves.toEqual({ text: '{"error":"trusted block search is unavailable"}', isError: true });
+
+    harness.minecraft.furnaceSnapshotResult = {
+      position: { x: 2, y: 64, z: 2 },
+      input: { name: "raw_cod", count: 1, secret: "hidden" },
+      fuel: null,
+      output: null,
+      progress: 0,
+    } as unknown as typeof harness.minecraft.furnaceSnapshotResult;
+    await expect(
+      tools.minecraft_get_furnace_state.execute(leased(harness, { x: 2, y: 64, z: 2 })),
+    ).resolves.toEqual({
+      text: '{"error":"trusted furnace state is unavailable"}',
+      isError: true,
+    });
+
+    harness.minecraft.inspectBlockResult = {
+      name: "wheat",
+      position,
+      properties: { note: "x".repeat(65) },
+    };
+    await expect(tools.minecraft_inspect_block.execute(leased(harness, position))).resolves.toEqual(
+      {
+        text: '{"error":"trusted block inspection is unavailable"}',
+        isError: true,
+      },
+    );
+  });
+
+  it("binds inspected blocks and furnace state to the requested coordinate", async () => {
+    const harness = createToolRegistryHarness();
+    const requested = { x: 1, y: 64, z: 1 };
+    harness.minecraft.world.nearbyBlocks = [
+      { name: "wheat", position: requested },
+      { name: "furnace", position: { x: 2, y: 64, z: 2 } },
+    ];
+    harness.minecraft.inspectBlockResult = {
+      name: "wheat",
+      position: { x: 30, y: 64, z: 30 },
+      properties: { age: 7 },
+    };
+    harness.minecraft.furnaceSnapshotResult = {
+      position: { x: 31, y: 64, z: 31 },
+      input: null,
+      fuel: null,
+      output: null,
+      progress: 0,
+    };
+    const tools = createToolRegistry(harness.dependencies);
+
+    await expect(
+      tools.minecraft_inspect_block.execute(leased(harness, requested)),
+    ).resolves.toEqual({
+      text: '{"error":"trusted block inspection is unavailable"}',
+      isError: true,
+    });
+    await expect(
+      tools.minecraft_get_furnace_state.execute(leased(harness, { x: 2, y: 64, z: 2 })),
+    ).resolves.toEqual({
+      text: '{"error":"trusted furnace state is unavailable"}',
+      isError: true,
+    });
+  });
+
+  it("binds block search results to exact names, tags, and the requested radius", async () => {
+    const harness = createToolRegistryHarness();
+    harness.minecraft.world.botPosition = { x: 0, y: 64, z: 0 };
+    const tools = createToolRegistry(harness.dependencies);
+
+    harness.minecraft.findBlocksResult = {
+      blocks: [{ name: "dirt", position: { x: 1, y: 64, z: 0 }, properties: {} }],
+      truncated: false,
+    };
+    await expect(
+      tools.minecraft_find_blocks.execute(
+        leased(harness, { names: ["stone"], maxDistance: 16, maxResults: 8 }),
+      ),
+    ).resolves.toEqual({ text: '{"error":"trusted block search is unavailable"}', isError: true });
+
+    harness.minecraft.findBlocksResult = {
+      blocks: [{ name: "stone", position: { x: 17, y: 64, z: 0 }, properties: {} }],
+      truncated: false,
+    };
+    await expect(
+      tools.minecraft_find_blocks.execute(
+        leased(harness, { names: ["stone"], maxDistance: 16, maxResults: 8 }),
+      ),
+    ).resolves.toEqual({ text: '{"error":"trusted block search is unavailable"}', isError: true });
+
+    harness.minecraft.findBlocksResult = {
+      blocks: [{ name: "wheat", position: { x: 1, y: 64, z: 0 }, properties: { age: 6 } }],
+      truncated: false,
+    };
+    await expect(
+      tools.minecraft_find_blocks.execute(
+        leased(harness, { tag: "mature_wheat", maxDistance: 16, maxResults: 8 }),
+      ),
+    ).resolves.toEqual({ text: '{"error":"trusted block search is unavailable"}', isError: true });
   });
 
   it("consumes classifier-derived dangerous operations through the trusted task budget", async () => {

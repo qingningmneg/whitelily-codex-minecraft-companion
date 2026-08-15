@@ -43,6 +43,84 @@ function waitsForAbort(signal: AbortSignal): Promise<void> {
   return new Promise((_, reject) => signal.addEventListener("abort", () => reject(abortError())));
 }
 
+const livingActions = [
+  {
+    label: "fish",
+    action: { kind: "fish" } as const,
+    timeout: 60_000,
+    install: (minecraft: FakeMinecraftPort) => {
+      minecraft.fish = async (signal) => {
+        await waitsForAbort(signal);
+        return { added: [], removed: [] };
+      };
+    },
+  },
+  {
+    label: "consume_item",
+    action: { kind: "consume_item", itemName: "bread" } as const,
+    timeout: 10_000,
+    install: (minecraft: FakeMinecraftPort) => {
+      minecraft.consumeItem = async (_itemName, signal) => {
+        await waitsForAbort(signal);
+        return { healthBefore: 20, healthAfter: 20, foodBefore: 10, foodAfter: 15 };
+      };
+    },
+  },
+  {
+    label: "sleep_in_bed",
+    action: { kind: "sleep_in_bed", position: { x: 1, y: 64, z: 1 } } as const,
+    timeout: 20_000,
+    install: (minecraft: FakeMinecraftPort) => {
+      minecraft.sleepInBed = (_position, signal) => waitsForAbort(signal);
+    },
+  },
+  {
+    label: "wake_up",
+    action: { kind: "wake_up" } as const,
+    timeout: 10_000,
+    install: (minecraft: FakeMinecraftPort) => {
+      minecraft.wakeUp = (signal) => waitsForAbort(signal);
+    },
+  },
+  {
+    label: "till_soil",
+    action: { kind: "till_soil", position: { x: 2, y: 64, z: 2 } } as const,
+    timeout: 15_000,
+    install: (minecraft: FakeMinecraftPort) => {
+      minecraft.tillSoil = (_position, signal) => waitsForAbort(signal);
+    },
+  },
+  {
+    label: "plant_crop",
+    action: {
+      kind: "plant_crop",
+      position: { x: 2, y: 64, z: 2 },
+      seedName: "wheat_seeds",
+    } as const,
+    timeout: 15_000,
+    install: (minecraft: FakeMinecraftPort) => {
+      minecraft.plantCrop = (_position, _seedName, signal) => waitsForAbort(signal);
+    },
+  },
+  {
+    label: "harvest_crop",
+    action: {
+      kind: "harvest_crop",
+      position: { x: 3, y: 64, z: 3 },
+      cropName: "wheat",
+    } as const,
+    timeout: 15_000,
+    install: (minecraft: FakeMinecraftPort) => {
+      minecraft.harvestCrop = (_position, _cropName, signal) => waitsForAbort(signal);
+    },
+  },
+] satisfies readonly {
+  label: string;
+  action: GameAction;
+  timeout: number;
+  install(minecraft: FakeMinecraftPort): void;
+}[];
+
 afterEach(() => vi.useRealTimers());
 
 describe("ActionExecutor", () => {
@@ -374,6 +452,66 @@ describe("ActionExecutor", () => {
     await vi.advanceTimersByTimeAsync(11_000);
     await expect(wait).resolves.toEqual({ status: "failed", reason: "action timed out" });
     expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each(livingActions)("times out $label with conservative mutation evidence", async (entry) => {
+    vi.useFakeTimers();
+    const minecraft = new FakeMinecraftPort();
+    entry.install(minecraft);
+    const executor = createActionExecutorHarness(minecraft, { kind: "allow" });
+    const result = executor.execute(entry.action, {
+      ...context,
+      wheatFarmingAllowed: true,
+    });
+
+    await vi.advanceTimersByTimeAsync(entry.timeout);
+
+    await expect(result).resolves.toEqual({
+      status: "failed",
+      reason: "action timed out",
+      worldMutated: true,
+    });
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each(livingActions)("cancels $label when the owner preempts the queue", async (entry) => {
+    const minecraft = new FakeMinecraftPort();
+    entry.install(minecraft);
+    const executor = createActionExecutorHarness(minecraft, { kind: "allow" });
+    const result = executor.execute(entry.action, {
+      ...context,
+      wheatFarmingAllowed: true,
+    });
+    await vi.waitFor(() => expect(executor.pendingCount()).toBe(1));
+
+    executor.stopAll({ preserveTask: true });
+
+    await expect(result).resolves.toEqual({ status: "cancelled" });
+  });
+
+  it("defaults living failures to mutated and accepts only explicit adapter no-mutation evidence", async () => {
+    const minecraft = new FakeMinecraftPort();
+    const unchanged = Object.assign(new Error("cast was never sent"), { worldMutated: false });
+    minecraft.fish = async () => {
+      throw unchanged;
+    };
+    minecraft.consumeItem = async () => {
+      throw new Error("consume status is unknown");
+    };
+    const executor = createActionExecutorHarness(minecraft, { kind: "allow" });
+
+    await expect(executor.execute({ kind: "fish" }, context)).resolves.toEqual({
+      status: "failed",
+      reason: "Error: cast was never sent",
+      worldMutated: false,
+    });
+    await expect(
+      executor.execute({ kind: "consume_item", itemName: "bread" }, context),
+    ).resolves.toEqual({
+      status: "failed",
+      reason: "Error: consume status is unknown",
+      worldMutated: true,
+    });
   });
 
   it("does not publish a smelt timeout until physical cancellation settles", async () => {

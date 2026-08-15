@@ -77,6 +77,47 @@ export const queuedActionSpecSchema = z.discriminatedUnion("kind", [
       summary,
     })
     .strict(),
+  z.object({ kind: z.literal("fish"), summary }).strict(),
+  z.object({ kind: z.literal("consume_item"), itemName: identifier, summary }).strict(),
+  z
+    .object({
+      kind: z.literal("sleep_in_bed"),
+      x: coordinate,
+      y: coordinate,
+      z: coordinate,
+      summary,
+    })
+    .strict(),
+  z.object({ kind: z.literal("wake_up"), summary }).strict(),
+  z
+    .object({
+      kind: z.literal("till_soil"),
+      x: coordinate,
+      y: coordinate,
+      z: coordinate,
+      summary,
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("plant_crop"),
+      x: coordinate,
+      y: coordinate,
+      z: coordinate,
+      seedName: z.literal("wheat_seeds"),
+      summary,
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("harvest_crop"),
+      x: coordinate,
+      y: coordinate,
+      z: coordinate,
+      cropName: z.literal("wheat"),
+      summary,
+    })
+    .strict(),
 ]);
 
 export type QueuedActionSpec = z.infer<typeof queuedActionSpecSchema>;
@@ -111,5 +152,25 @@ export function queuedActionSpecToGameAction(spec: QueuedActionSpec): GameAction
       };
     case "wait":
       return { kind: spec.kind, milliseconds: spec.milliseconds };
+    case "fish":
+    case "wake_up":
+      return { kind: spec.kind };
+    case "consume_item":
+      return { kind: spec.kind, itemName: spec.itemName };
+    case "sleep_in_bed":
+    case "till_soil":
+      return { kind: spec.kind, position: { x: spec.x, y: spec.y, z: spec.z } };
+    case "plant_crop":
+      return {
+        kind: spec.kind,
+        position: { x: spec.x, y: spec.y, z: spec.z },
+        seedName: spec.seedName,
+      };
+    case "harvest_crop":
+      return {
+        kind: spec.kind,
+        position: { x: spec.x, y: spec.y, z: spec.z },
+        cropName: spec.cropName,
+      };
   }
 }

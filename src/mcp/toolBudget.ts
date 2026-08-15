@@ -8,6 +8,7 @@ export const TOOL_ACTION_KINDS = [
   "find_block",
   "inspect_block",
   "find_blocks",
+  "get_furnace_state",
 ] as const;
 export type ToolActionKind = (typeof TOOL_ACTION_KINDS)[number];
 

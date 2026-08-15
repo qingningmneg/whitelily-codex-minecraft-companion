@@ -26,7 +26,17 @@ describe("Minecraft dynamic tools", () => {
     const dynamicTools = createMinecraftDynamicTools(harness.dependencies);
 
     expect(dynamicTools.specs.map((spec) => spec.name)).toEqual(MINECRAFT_EXECUTION_TOOL_NAMES);
+    expect(dynamicTools.specs.map((spec) => spec.name)).toEqual(
+      expect.arrayContaining([
+        "minecraft_inspect_block",
+        "minecraft_find_blocks",
+        "minecraft_get_furnace_state",
+      ]),
+    );
     expect(dynamicTools.specs.map((spec) => spec.name)).not.toContain("minecraft_move_to");
+    expect(dynamicTools.specs.map((spec) => spec.name)).not.toEqual(
+      expect.arrayContaining(["minecraft_fish", "minecraft_till_soil", "minecraft_sleep_in_bed"]),
+    );
     const enqueue = dynamicTools.specs.find(
       (spec) => spec.type === "function" && spec.name === "minecraft_enqueue_actions",
     );
@@ -58,6 +68,30 @@ describe("Minecraft dynamic tools", () => {
       { kind: "jump", status: "waiting" },
     ]);
     expect(harness.budget.snapshot()).toMatchObject({ totalCalls: 1 });
+  });
+
+  it("executes bounded observation calls through the safe tool registry", async () => {
+    const harness = createToolRegistryHarness();
+    harness.minecraft.findBlocksResult = { blocks: [], truncated: false };
+    const dynamicTools = createMinecraftDynamicTools(harness.dependencies);
+
+    await expect(
+      dynamicTools.call(
+        callParams("minecraft_find_blocks", {
+          tag: "water",
+          maxDistance: 16,
+          maxResults: 8,
+          turnLease: harness.turnLease,
+        }),
+      ),
+    ).resolves.toEqual({
+      contentItems: [{ type: "inputText", text: '{"blocks":[],"truncated":false}' }],
+      success: true,
+    });
+    expect(harness.minecraft.calls).toContainEqual({
+      method: "findBlocks",
+      args: [{ tag: "water", maxDistance: 16, maxResults: 8 }],
+    });
   });
 
   it("rejects malformed arguments before they reach Minecraft", async () => {
