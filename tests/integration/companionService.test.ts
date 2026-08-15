@@ -204,8 +204,18 @@ describe("queue state disclosure classifier", () => {
   it.each([
     ["There are 2 actions in the queue.", true],
     ["还有 2 个动作待处理。", true],
+    ["队列共 2 项，下一项是采矿。", true],
+    ["Queue status: 2 pending actions.", true],
+    ["Queue status: pending.", true],
+    ["队列状态：待处理。", true],
+    ["主人，队列中还有 2 项。", true],
+    ["朋友，队列中还有 2 项。", true],
     ["我在服务器队列里等朋友。", false],
     ["当前正在排队等朋友。", false],
+    ["我正在排队等朋友。", false],
+    ["我和朋友正在排队挖矿。", false],
+    ["I'm waiting in the server queue to craft with friends.", false],
+    ["排队失败后仍能聊天。", false],
   ])("classifies %j as %s", (text, expected) => {
     expect(containsQueueStateDisclosure(text)).toBe(expected);
   });

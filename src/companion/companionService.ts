@@ -103,26 +103,31 @@ const internalModelMetadataPattern =
   /任务披露|minecraft_[a-z0-9_]+|工具调用|预算|租约|停止条件|expectedActions|allowedActions|maxToolCalls|maxBlockChanges|maxHorizontalTravel|maxDurationMs|maxDangerousOperations|leaseId|stopCondition/iu;
 const explicitQueueInternalTokenPattern =
   /QUEUE_SNAPSHOT|minecraft_enqueue_actions|waiting_permission/iu;
-const queueMarkerPattern = /队列|\bqueue\b/iu;
-const queueLifecyclePattern = /排队|待处理|待执行|\bpending\b|\bqueued\b|\bwaiting\b|\brunning\b/iu;
-const internalActionPattern =
-  /动作|任务|项目|批次|采矿|挖矿|合成|耕地|播种|收割|\bactions?\b|\btasks?\b|\bitems?\b|\bbatches?\b|\bmining\b|\bcrafting\b|\bharvesting\b/iu;
-const queueStatePattern =
-  /\d+|数量|状态|下一项|剩余|还有|共|\bstatus\b|\bnext\b|\bremaining\b|\bthere\s+are\b|\bcontains\b|\bhas\b/iu;
-const publicWaitingPattern = /服务器|朋友|玩家|人|\bserver\b|\bfriends?\b|\bpeople\b/iu;
+const internalQueueWorkNounPattern =
+  /动作|任务|项|批次|步骤|\bactions?\b|\btasks?\b|\bitems?\b|\bbatches?\b|\bsteps?\b/iu;
+const queueNounMarkerPattern = /队列|\bqueues?\b|\bqueued\b/iu;
+const queueActivityMarkerPattern = /排队/u;
+const executionLifecyclePattern =
+  /待处理|待执行|运行|完成|失败|取消|剩余|还有|下一个|下一项|状态|数量|计数|共|\bpending\b|\brunning\b|\bcompleted\b|\bfailed\b|\bcancelled\b|\bcanceled\b|\bremaining\b|\bnext\b|\bstatus\b|\bcounts?\b/iu;
+const boundedQueueCountPattern = /\b(?:25[0-6]|2[0-4]\d|1?\d?\d)\b/u;
+const sentenceBoundaryPattern = /[\r\n.!?。！？;；]+/u;
 const transportFailureThreshold = 3;
 
-/** Identifies queue implementation state without treating ordinary waiting-in-line chat as internal. */
+/** Identifies queue implementation state from monotonic evidence within one sentence. */
 export function containsQueueStateDisclosure(text: string): boolean {
   if (explicitQueueInternalTokenPattern.test(text)) return true;
-  const action = internalActionPattern.test(text);
-  const queueOrLifecycle = queueMarkerPattern.test(text) || queueLifecyclePattern.test(text);
-  if (action && queueOrLifecycle) return true;
-  return (
-    queueMarkerPattern.test(text) &&
-    queueStatePattern.test(text) &&
-    !publicWaitingPattern.test(text)
-  );
+  return text.split(sentenceBoundaryPattern).some((sentence) => {
+    const workNoun = internalQueueWorkNounPattern.test(sentence);
+    const queueNounMarker = queueNounMarkerPattern.test(sentence);
+    const queueMarker = queueNounMarker || queueActivityMarkerPattern.test(sentence);
+    const lifecycle = executionLifecyclePattern.test(sentence);
+    const boundedCount = boundedQueueCountPattern.test(sentence);
+    return (
+      (queueNounMarker && lifecycle) ||
+      (queueMarker && (workNoun || boundedCount)) ||
+      (workNoun && lifecycle && boundedCount)
+    );
+  });
 }
 
 function containsInternalModelDisclosure(reply: string): boolean {
