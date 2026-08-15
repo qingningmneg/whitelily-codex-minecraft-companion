@@ -102,7 +102,7 @@ const ambiguousToolInvocationPattern = new RegExp(
 const internalModelMetadataPattern =
   /任务披露|minecraft_[a-z0-9_]+|工具调用|预算|租约|停止条件|expectedActions|allowedActions|maxToolCalls|maxBlockChanges|maxHorizontalTravel|maxDurationMs|maxDangerousOperations|leaseId|stopCondition/iu;
 const queueDisclosurePattern =
-  /队列(?:中|状态|快照|里|还有)|(?:当前|仍)?正在排队|待执行(?:动作|数量|项目)?|queue\s*(?:snapshot|status|contains|has)|queued\s+actions?/iu;
+  /队列|待执行(?:动作|数量|项目)?|(?:任务|动作|状态|数量|项目|当前)\S{0,16}排队|排队\S{0,16}(?:任务|动作|待执行|状态|数量|项目|\d+\s*[项个])|\bqueue\b\s*(?::|：|=|\d|status|snapshot|contains|has|items?|next|pending|running|waiting)|\bqueued\s+actions?/iu;
 const transportFailureThreshold = 3;
 
 function containsInternalModelDisclosure(reply: string): boolean {

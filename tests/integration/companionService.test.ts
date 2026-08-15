@@ -5924,6 +5924,55 @@ describe("CompanionService zero disclosure privacy regressions", () => {
     expect(value.minecraft.chatLog).toEqual([naturalFilteredReply]);
   });
 
+  it("filters a bare queue count and next-action disclosure before Minecraft chat", async () => {
+    const value = await harness({
+      intentResponses: [
+        JSON.stringify({
+          kind: "chat",
+          reply: "队列共 2 项，下一项是采矿。",
+          memoryCandidates: [],
+        }),
+      ],
+    });
+    await value.start();
+
+    await value.emitOwnerText("继续");
+    await value.untilChat(naturalFilteredReply);
+
+    expect(value.minecraft.chatLog).toEqual([naturalFilteredReply]);
+  });
+
+  it("filters an English queue status disclosure before Minecraft chat", async () => {
+    const value = await harness({
+      intentResponses: [
+        JSON.stringify({
+          kind: "chat",
+          reply: "Queue status: 2 pending actions.",
+          memoryCandidates: [],
+        }),
+      ],
+    });
+    await value.start();
+
+    await value.emitOwnerText("continue");
+    await value.untilChat(naturalFilteredReply);
+
+    expect(value.minecraft.chatLog).toEqual([naturalFilteredReply]);
+  });
+
+  it("preserves ordinary chat about waiting in line", async () => {
+    const reply = "我正在排队等朋友。";
+    const value = await harness({
+      intentResponses: [JSON.stringify({ kind: "chat", reply, memoryCandidates: [] })],
+    });
+    await value.start();
+
+    await value.emitOwnerText("你在做什么");
+    await value.untilTurnSettled();
+
+    expect(value.minecraft.chatLog).toEqual([reply]);
+  });
+
   it("replaces a model reply containing internal task vocabulary before Minecraft chat", async () => {
     const rawModelOutput = JSON.stringify({
       kind: "chat",
