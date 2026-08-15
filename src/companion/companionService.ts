@@ -101,14 +101,34 @@ const ambiguousToolInvocationPattern = new RegExp(
 );
 const internalModelMetadataPattern =
   /任务披露|minecraft_[a-z0-9_]+|工具调用|预算|租约|停止条件|expectedActions|allowedActions|maxToolCalls|maxBlockChanges|maxHorizontalTravel|maxDurationMs|maxDangerousOperations|leaseId|stopCondition/iu;
-const queueDisclosurePattern =
-  /队列|待执行(?:动作|数量|项目)?|(?:任务|动作|状态|数量|项目|当前)\S{0,16}排队|排队\S{0,16}(?:任务|动作|待执行|状态|数量|项目|\d+\s*[项个])|\bqueue\b\s*(?::|：|=|\d|status|snapshot|contains|has|items?|next|pending|running|waiting)|\bqueued\s+actions?/iu;
+const explicitQueueInternalTokenPattern =
+  /QUEUE_SNAPSHOT|minecraft_enqueue_actions|waiting_permission/iu;
+const queueMarkerPattern = /队列|\bqueue\b/iu;
+const queueLifecyclePattern = /排队|待处理|待执行|\bpending\b|\bqueued\b|\bwaiting\b|\brunning\b/iu;
+const internalActionPattern =
+  /动作|任务|项目|批次|采矿|挖矿|合成|耕地|播种|收割|\bactions?\b|\btasks?\b|\bitems?\b|\bbatches?\b|\bmining\b|\bcrafting\b|\bharvesting\b/iu;
+const queueStatePattern =
+  /\d+|数量|状态|下一项|剩余|还有|共|\bstatus\b|\bnext\b|\bremaining\b|\bthere\s+are\b|\bcontains\b|\bhas\b/iu;
+const publicWaitingPattern = /服务器|朋友|玩家|人|\bserver\b|\bfriends?\b|\bpeople\b/iu;
 const transportFailureThreshold = 3;
+
+/** Identifies queue implementation state without treating ordinary waiting-in-line chat as internal. */
+export function containsQueueStateDisclosure(text: string): boolean {
+  if (explicitQueueInternalTokenPattern.test(text)) return true;
+  const action = internalActionPattern.test(text);
+  const queueOrLifecycle = queueMarkerPattern.test(text) || queueLifecyclePattern.test(text);
+  if (action && queueOrLifecycle) return true;
+  return (
+    queueMarkerPattern.test(text) &&
+    queueStatePattern.test(text) &&
+    !publicWaitingPattern.test(text)
+  );
+}
 
 function containsInternalModelDisclosure(reply: string): boolean {
   return (
     internalModelMetadataPattern.test(reply) ||
-    queueDisclosurePattern.test(reply) ||
+    containsQueueStateDisclosure(reply) ||
     bareInternalToolNamePattern.test(reply) ||
     ambiguousToolInvocationPattern.test(reply)
   );

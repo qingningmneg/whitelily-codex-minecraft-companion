@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { MinecraftEvent } from "../../src/minecraft/minecraftPort.js";
 import type { OwnerIdentitySnapshot } from "../../src/identity/ownerIdentity.js";
 import { TOOL_ACTION_KINDS } from "../../src/mcp/toolBudget.js";
+import { containsQueueStateDisclosure } from "../../src/companion/companionService.js";
 import {
   createCompanionHarness,
   outcome,
@@ -198,6 +199,17 @@ function activeConfirmationOutcome(reply = "ready", goal = "finish confirmed tra
   void goal;
   return taskExecutionOutcome(reply, "active");
 }
+
+describe("queue state disclosure classifier", () => {
+  it.each([
+    ["There are 2 actions in the queue.", true],
+    ["还有 2 个动作待处理。", true],
+    ["我在服务器队列里等朋友。", false],
+    ["当前正在排队等朋友。", false],
+  ])("classifies %j as %s", (text, expected) => {
+    expect(containsQueueStateDisclosure(text)).toBe(expected);
+  });
+});
 
 afterEach(async () => {
   vi.useRealTimers();
