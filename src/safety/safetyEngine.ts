@@ -14,6 +14,7 @@ export interface SafetyContext {
   isValuableItem?: boolean;
   taskLease?: TaskLease;
   reservedHorizontalTravel?: number;
+  wheatFarmingAllowed?: boolean;
 }
 
 export interface SafetyLimits {
@@ -98,6 +99,18 @@ export class SafetyEngine {
 
   private permanentDecision(action: GameAction, context: SafetyContext): SafetyDecision | null {
     const risk = classifyActionRisk(action, context);
+    const changesBlocks =
+      action.kind === "place_block" ||
+      action.kind === "dig_block" ||
+      action.kind === "till_soil" ||
+      action.kind === "plant_crop" ||
+      action.kind === "harvest_crop";
+    if (
+      (action.kind === "till_soil" || action.kind === "plant_crop") &&
+      context.wheatFarmingAllowed !== true
+    ) {
+      return { kind: "deny", reason: "Wheat farming permission is required" };
+    }
     if (action.kind === "place_block" && canonicalMinecraftName(action.blockName) === "tnt") {
       return { kind: "deny", reason: "TNT is permanently forbidden" };
     }
@@ -116,15 +129,12 @@ export class SafetyEngine {
       };
     }
 
-    if (
-      (action.kind === "place_block" || action.kind === "dig_block") &&
-      context.spawn === undefined
-    ) {
+    if (changesBlocks && context.spawn === undefined) {
       return { kind: "deny", reason: "World spawn is unknown; block changes are disabled" };
     }
 
     if (
-      (action.kind === "place_block" || action.kind === "dig_block") &&
+      changesBlocks &&
       context.spawn !== undefined &&
       horizontalDistance(action.position, context.spawn) <= this.limits.spawnProtectionRadius
     ) {

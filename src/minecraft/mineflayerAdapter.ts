@@ -36,6 +36,15 @@ const FUEL_OUTPUT_CAPACITY: Readonly<Record<string, number>> = {
   coal: 8,
   charcoal: 8,
 };
+const AIR_BLOCK_NAMES = new Set(["air", "cave_air", "void_air"]);
+const HOE_ITEM_NAMES = new Set([
+  "wooden_hoe",
+  "stone_hoe",
+  "iron_hoe",
+  "golden_hoe",
+  "diamond_hoe",
+  "netherite_hoe",
+]);
 
 export interface MineflayerAdapterConfig {
   host: "127.0.0.1";
@@ -105,6 +114,17 @@ function inventoryDelta(before: ReadonlyMap<string, number>, after: ReadonlyMap<
     if (difference < 0 && removed.length < 32) removed.push({ name, count: -difference });
   }
   return { added, removed } satisfies InventoryDelta;
+}
+
+function furnaceItemSnapshot(item: { name: string; count: number } | null) {
+  if (!item) return null;
+  if (typeof item.name !== "string" || item.name.length < 1 || item.name.length > 64) {
+    throw new Error("furnace item name is invalid");
+  }
+  if (!Number.isSafeInteger(item.count) || item.count <= 0) {
+    throw new Error("furnace item count is invalid");
+  }
+  return { name: item.name, count: item.count };
 }
 
 type MinecraftBlock = NonNullable<ReturnType<Bot["blockAt"]>>;
@@ -280,8 +300,34 @@ export class MineflayerAdapter implements MinecraftPort {
     };
   }
 
-  async furnaceSnapshot(_position: Vec3): Promise<FurnaceSnapshot> {
-    throw new Error("living action is not implemented");
+  async furnaceSnapshot(position: Vec3): Promise<FurnaceSnapshot> {
+    const bot = this.requireBot();
+    const block = bot.blockAt(minecraftVec3(position));
+    if (!block || !["furnace", "blast_furnace", "smoker"].includes(block.name)) {
+      throw new Error("target block is not a furnace");
+    }
+    const window = await bot.openFurnace(block);
+    try {
+      const rawProgress = window.progress as unknown;
+      const progress = rawProgress === null || rawProgress === undefined ? 0 : rawProgress;
+      if (
+        typeof progress !== "number" ||
+        !Number.isFinite(progress) ||
+        progress < 0 ||
+        progress > 1
+      ) {
+        throw new Error("furnace progress is invalid");
+      }
+      return {
+        position: toVec3(block.position),
+        input: furnaceItemSnapshot(window.inputItem()),
+        fuel: furnaceItemSnapshot(window.fuelItem()),
+        output: furnaceItemSnapshot(window.outputItem()),
+        progress,
+      };
+    } finally {
+      window.close();
+    }
   }
 
   async say(message: string): Promise<void> {
@@ -369,9 +415,19 @@ export class MineflayerAdapter implements MinecraftPort {
     const session = this.requireSession();
     const bot = session.bot;
     const item = this.requireItem(bot, itemName);
-    const recipe = bot.recipesFor(item.id, null, 1, null)[0];
+    let craftingTable: MinecraftBlock | null = null;
+    let recipe = bot.recipesFor(item.id, null, 1, null)[0];
+    if (!recipe) {
+      craftingTable = bot.findBlock({
+        matching: this.requireBlock(bot, "crafting_table").id,
+        maxDistance: 16,
+      });
+      if (craftingTable) recipe = bot.recipesFor(item.id, null, 1, craftingTable)[0];
+    }
     if (!recipe) throw new Error(`no craftable recipe for ${itemName}`);
-    await this.abortable(signal, session, "fence", () => bot.craft(recipe, count));
+    await this.abortable(signal, session, "fence", () =>
+      bot.craft(recipe, count, craftingTable ?? undefined),
+    );
   }
 
   async smeltItem(itemName: string, count: number, signal: AbortSignal): Promise<void> {
@@ -380,11 +436,6 @@ export class MineflayerAdapter implements MinecraftPort {
     const session = this.requireSession();
     const bot = session.bot;
     const item = this.requireItem(bot, itemName);
-    const input = bot.inventory
-      .items()
-      .find((candidate) => candidate.name === item.name && candidate.count >= count);
-    if (!input) throw new Error(`missing ${itemName} in inventory`);
-    const fuel = this.findFuel(bot, count);
     const furnace = bot.findBlock({
       matching: this.requireBlock(bot, "furnace").id,
       maxDistance: 16,
@@ -405,13 +456,47 @@ export class MineflayerAdapter implements MinecraftPort {
         window = await bot.openFurnace(furnace);
         try {
           this.assertActive(session, signal);
-          if (window.inputItem() || window.outputItem() || window.fuelItem()) {
-            throw new Error("furnace must be empty before smelting");
+          const existingInput = window.inputItem();
+          const existingOutput = window.outputItem();
+          const existingFuel = window.fuelItem();
+          if (existingInput && existingInput.name !== itemName) {
+            throw new Error("furnace input is incompatible");
           }
-          await window.putInput(input.type, null, count);
-          this.assertActive(session, signal);
-          await window.putFuel(fuel.type, null, fuel.count);
-          this.assertActive(session, signal);
+          if (existingOutput && !existingInput) {
+            throw new Error("furnace output compatibility cannot be verified");
+          }
+          if (existingOutput && existingInput?.name !== itemName) {
+            throw new Error("furnace output is incompatible");
+          }
+          if (existingOutput && existingOutput.count >= count) {
+            await window.takeOutput();
+            return;
+          }
+          const representedOutput = existingOutput?.count ?? 0;
+          const representedInput = existingInput?.count ?? 0;
+          const missingInputCount = Math.max(0, count - representedOutput - representedInput);
+          if (missingInputCount > 0) {
+            const input = bot.inventory
+              .items()
+              .find(
+                (candidate) => candidate.name === item.name && candidate.count >= missingInputCount,
+              );
+            if (!input) throw new Error(`missing ${itemName} in inventory`);
+            await window.putInput(input.type, null, missingInputCount);
+            this.assertActive(session, signal);
+          }
+          const existingFuelCapacity = existingFuel
+            ? (FUEL_OUTPUT_CAPACITY[existingFuel.name] ?? 0) * existingFuel.count
+            : 0;
+          if (existingFuel && existingFuelCapacity === 0) {
+            throw new Error("furnace fuel is incompatible");
+          }
+          const missingFuelOutput = Math.max(0, count - representedOutput - existingFuelCapacity);
+          if (missingFuelOutput > 0) {
+            const fuel = this.findFuel(bot, missingFuelOutput);
+            await window.putFuel(fuel.type, null, fuel.count);
+            this.assertActive(session, signal);
+          }
           for (let tick = 0; tick < MAX_SMELT_WAIT_TICKS; tick += 1) {
             const output = window.outputItem();
             if (output && output.count >= count) {
@@ -515,7 +600,7 @@ export class MineflayerAdapter implements MinecraftPort {
           }),
         )
       : null;
-    if (!waterBlock || !surface || !["air", "cave_air", "void_air"].includes(surface.name)) {
+    if (!waterBlock || !surface || !AIR_BLOCK_NAMES.has(surface.name)) {
       throw new Error("no suitable nearby water for fishing");
     }
     const before = inventoryCounts(bot);
@@ -597,16 +682,60 @@ export class MineflayerAdapter implements MinecraftPort {
     );
   }
 
-  async tillSoil(_position: Vec3, _signal: AbortSignal): Promise<void> {
-    throw new Error("living action is not implemented");
+  async tillSoil(position: Vec3, signal: AbortSignal): Promise<void> {
+    this.assertNotAborted(signal);
+    const session = this.requireSession();
+    const bot = session.bot;
+    const soil = bot.blockAt(minecraftVec3(position));
+    const above = bot.blockAt(minecraftVec3({ x: position.x, y: position.y + 1, z: position.z }));
+    if (!soil || (soil.name !== "dirt" && soil.name !== "grass_block")) {
+      throw new Error("target block cannot be tilled");
+    }
+    if (!above || !AIR_BLOCK_NAMES.has(above.name)) {
+      throw new Error("space above soil is blocked");
+    }
+    const hoe = bot.inventory.items().find((item) => HOE_ITEM_NAMES.has(item.name));
+    if (!hoe) throw new Error("missing hoe");
+    await this.abortable(signal, session, "fence", async () => {
+      await bot.equip(hoe, "hand");
+      this.assertActive(session, signal);
+      await bot.activateBlock(soil);
+    });
   }
 
-  async plantCrop(_position: Vec3, _seedName: "wheat_seeds", _signal: AbortSignal): Promise<void> {
-    throw new Error("living action is not implemented");
+  async plantCrop(position: Vec3, seedName: "wheat_seeds", signal: AbortSignal): Promise<void> {
+    this.assertNotAborted(signal);
+    if (seedName !== "wheat_seeds") throw new Error("unsupported crop seed");
+    const session = this.requireSession();
+    const bot = session.bot;
+    const farmland = bot.blockAt(minecraftVec3(position));
+    const above = bot.blockAt(minecraftVec3({ x: position.x, y: position.y + 1, z: position.z }));
+    if (!farmland || farmland.name !== "farmland") {
+      throw new Error("target block is not farmland");
+    }
+    if (!above || !AIR_BLOCK_NAMES.has(above.name)) {
+      throw new Error("space above farmland is blocked");
+    }
+    if (!Number.isFinite(above.light) || above.light < 8) {
+      throw new Error("insufficient light for wheat");
+    }
+    const seeds = bot.inventory.items().find((item) => item.name === seedName && item.count > 0);
+    if (!seeds) throw new Error("missing wheat_seeds in inventory");
+    await this.abortable(signal, session, "fence", async () => {
+      await bot.equip(seeds, "hand");
+      this.assertActive(session, signal);
+      await bot.placeBlock(farmland, new PrismarineVec3(0, 1, 0));
+    });
   }
 
-  async harvestCrop(_position: Vec3, _cropName: "wheat", _signal: AbortSignal): Promise<void> {
-    throw new Error("living action is not implemented");
+  async harvestCrop(position: Vec3, cropName: "wheat", signal: AbortSignal): Promise<void> {
+    this.assertNotAborted(signal);
+    if (cropName !== "wheat") throw new Error("unsupported crop");
+    const session = this.requireSession();
+    const block = session.bot.blockAt(minecraftVec3(position));
+    if (!block || block.name !== "wheat") throw new Error("target block is not wheat");
+    if (block.getProperties().age !== 7) throw new Error("crop is not mature");
+    await this.abortable(signal, session, "dig", () => session.bot.dig(block));
   }
 
   private handleConnectionEvent(event: MineflayerConnectionEvent): void {

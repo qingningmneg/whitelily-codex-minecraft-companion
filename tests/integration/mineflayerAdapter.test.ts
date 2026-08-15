@@ -71,6 +71,7 @@ class FakeFurnace {
   input: FakeItem | null = null;
   fuel: FakeItem | null = null;
   output: FakeItem | null = null;
+  progress: number | null = 0;
   readonly close = vi.fn();
   readonly inputItem = vi.fn(() => this.input);
   readonly fuelItem = vi.fn(() => this.fuel);
@@ -105,6 +106,9 @@ class FakeBot extends EventEmitter {
     async (): Promise<void> => undefined,
   );
   readonly activateItem = vi.fn();
+  readonly activateBlock = vi.fn<(...args: unknown[]) => Promise<void>>(
+    async (): Promise<void> => undefined,
+  );
   readonly deactivateItem = vi.fn();
   readonly fish = vi.fn<() => Promise<void>>(async (): Promise<void> => undefined);
   readonly consume = vi.fn<() => Promise<void>>(async (): Promise<void> => undefined);
@@ -121,6 +125,7 @@ class FakeBot extends EventEmitter {
   readonly craft = vi.fn<(...args: unknown[]) => Promise<void>>(
     async (): Promise<void> => undefined,
   );
+  readonly recipesFor = vi.fn<(...args: unknown[]) => unknown[]>(() => []);
   readonly waitForTicks = vi.fn<() => Promise<void>>(async (): Promise<void> => undefined);
   readonly openFurnace = vi.fn<(block: unknown) => Promise<FakeFurnace>>();
   readonly findBlock = vi.fn<(options: unknown) => unknown>(() => null);
@@ -142,12 +147,20 @@ class FakeBot extends EventEmitter {
       water: { id: 9, name: "water" },
       furnace: { id: 61, name: "furnace" },
       white_bed: { id: 100, name: "white_bed" },
+      crafting_table: { id: 58, name: "crafting_table" },
+      wheat: { id: 59, name: "wheat" },
+      dirt: { id: 3, name: "dirt" },
+      grass_block: { id: 2, name: "grass_block" },
+      farmland: { id: 60, name: "farmland" },
+      air: { id: 0, name: "air" },
     },
     itemsByName: {
       stick: { id: 2, name: "stick" },
       stone: { id: 1, name: "stone" },
       fishing_rod: { id: 346, name: "fishing_rod" },
       bread: { id: 297, name: "bread" },
+      wheat_seeds: { id: 295, name: "wheat_seeds" },
+      wooden_hoe: { id: 290, name: "wooden_hoe" },
       iron_ore: { id: 15, name: "iron_ore" },
       coal: { id: 263, name: "coal" },
       tnt: { id: 46, name: "tnt" },
@@ -288,20 +301,265 @@ describe("MineflayerAdapter", () => {
     createBridgeProofIssuer.mockReturnValue({ issue: issueProof, close: closeIssuer });
   });
 
-  it("fails closed for living methods until their narrow implementations replace placeholders", async () => {
+  it("refuses immature wheat without changing the block", async () => {
+    const bot = new FakeBot();
+    const position = { x: 4, y: 64, z: 4 };
+    bot.blockAt.mockReturnValue({
+      name: "wheat",
+      position,
+      getProperties: () => ({ age: 6 }),
+    });
+    createBot.mockReturnValue(bot);
     const adapter = new MineflayerAdapter(config());
-    const position = { x: 1, y: 64, z: 2 };
-    const signal = new AbortController().signal;
-    const attempts = [
-      () => adapter.furnaceSnapshot(position),
-      () => adapter.tillSoil(position, signal),
-      () => adapter.plantCrop(position, "wheat_seeds", signal),
-      () => adapter.harvestCrop(position, "wheat", signal),
-    ];
+    const connecting = adapter.connect();
+    await flush();
+    bot.emit("spawn");
+    await connecting;
 
-    for (const attempt of attempts) {
-      await expect(attempt()).rejects.toThrow("living action is not implemented");
-    }
+    await expect(
+      adapter.harvestCrop(position, "wheat", new AbortController().signal),
+    ).rejects.toThrow("crop is not mature");
+    expect(bot.dig).not.toHaveBeenCalled();
+  });
+
+  it("uses a trusted nearby crafting table when the recipe requires one", async () => {
+    const bot = new FakeBot();
+    const recipe = { result: { id: 297 } };
+    const craftingTable = { name: "crafting_table", position: { x: 2, y: 64, z: 2 } };
+    bot.recipesFor.mockImplementation((_itemId, _metadata, _count, table) =>
+      table ? [recipe] : [],
+    );
+    bot.findBlock.mockReturnValue(craftingTable);
+    createBot.mockReturnValue(bot);
+    const adapter = new MineflayerAdapter(config());
+    const connecting = adapter.connect();
+    await flush();
+    bot.emit("spawn");
+    await connecting;
+
+    await adapter.craftItem("bread", 1, new AbortController().signal);
+
+    expect(bot.findBlock).toHaveBeenCalledWith({ matching: 58, maxDistance: 16 });
+    expect(bot.craft).toHaveBeenCalledWith(recipe, 1, craftingTable);
+  });
+
+  it("tills only unobstructed dirt or grass with an available hoe", async () => {
+    const bot = new FakeBot();
+    const position = { x: 4, y: 64, z: 4 };
+    const dirt = { name: "dirt", position, getProperties: () => ({}) };
+    const air = { name: "air", position: { x: 4, y: 65, z: 4 }, getProperties: () => ({}) };
+    const hoe = { name: "wooden_hoe", count: 1, type: 290 };
+    bot.inventoryItems = [hoe];
+    bot.blockAt.mockImplementation((value: unknown) =>
+      (value as { y: number }).y === 65 ? air : dirt,
+    );
+    createBot.mockReturnValue(bot);
+    const adapter = new MineflayerAdapter(config());
+    const connecting = adapter.connect();
+    await flush();
+    bot.emit("spawn");
+    await connecting;
+
+    await adapter.tillSoil(position, new AbortController().signal);
+
+    expect(bot.equip).toHaveBeenCalledWith(hoe, "hand");
+    expect(bot.activateBlock).toHaveBeenCalledWith(dirt);
+  });
+
+  it("refuses tilling obstructed or unsupported ground and refuses to work without a hoe", async () => {
+    const bot = new FakeBot();
+    const position = { x: 4, y: 64, z: 4 };
+    const ground = { name: "stone", position, getProperties: () => ({}) };
+    const above = { name: "air", position: { x: 4, y: 65, z: 4 }, getProperties: () => ({}) };
+    bot.blockAt.mockImplementation((value: unknown) =>
+      (value as { y: number }).y === 65 ? above : ground,
+    );
+    createBot.mockReturnValue(bot);
+    const adapter = new MineflayerAdapter(config());
+    const connecting = adapter.connect();
+    await flush();
+    bot.emit("spawn");
+    await connecting;
+
+    await expect(adapter.tillSoil(position, new AbortController().signal)).rejects.toThrow(
+      "target block cannot be tilled",
+    );
+    ground.name = "dirt";
+    above.name = "stone";
+    await expect(adapter.tillSoil(position, new AbortController().signal)).rejects.toThrow(
+      "space above soil is blocked",
+    );
+    above.name = "air";
+    await expect(adapter.tillSoil(position, new AbortController().signal)).rejects.toThrow(
+      "missing hoe",
+    );
+    expect(bot.activateBlock).not.toHaveBeenCalled();
+  });
+
+  it("plants wheat seeds only on lit unobstructed farmland", async () => {
+    const bot = new FakeBot();
+    const position = { x: 4, y: 64, z: 4 };
+    const farmland = { name: "farmland", position, getProperties: () => ({}) };
+    const air = {
+      name: "air",
+      position: { x: 4, y: 65, z: 4 },
+      light: 9,
+      getProperties: () => ({}),
+    };
+    const seeds = { name: "wheat_seeds", count: 2, type: 295 };
+    bot.inventoryItems = [seeds];
+    bot.blockAt.mockImplementation((value: unknown) =>
+      (value as { y: number }).y === 65 ? air : farmland,
+    );
+    createBot.mockReturnValue(bot);
+    const adapter = new MineflayerAdapter(config());
+    const connecting = adapter.connect();
+    await flush();
+    bot.emit("spawn");
+    await connecting;
+
+    await adapter.plantCrop(position, "wheat_seeds", new AbortController().signal);
+
+    expect(bot.equip).toHaveBeenCalledWith(seeds, "hand");
+    expect(bot.placeBlock).toHaveBeenCalledWith(farmland, expect.objectContaining({ y: 1 }));
+  });
+
+  it("refuses planting on non-farmland, blocked, dark, or seedless targets", async () => {
+    const bot = new FakeBot();
+    const position = { x: 4, y: 64, z: 4 };
+    const farmland = { name: "dirt", position, getProperties: () => ({}) };
+    const air = {
+      name: "air",
+      position: { x: 4, y: 65, z: 4 },
+      light: 9,
+      getProperties: () => ({}),
+    };
+    bot.blockAt.mockImplementation((value: unknown) =>
+      (value as { y: number }).y === 65 ? air : farmland,
+    );
+    createBot.mockReturnValue(bot);
+    const adapter = new MineflayerAdapter(config());
+    const connecting = adapter.connect();
+    await flush();
+    bot.emit("spawn");
+    await connecting;
+
+    await expect(
+      adapter.plantCrop(position, "wheat_seeds", new AbortController().signal),
+    ).rejects.toThrow("target block is not farmland");
+    farmland.name = "farmland";
+    air.name = "stone";
+    await expect(
+      adapter.plantCrop(position, "wheat_seeds", new AbortController().signal),
+    ).rejects.toThrow("space above farmland is blocked");
+    air.name = "air";
+    air.light = 7;
+    await expect(
+      adapter.plantCrop(position, "wheat_seeds", new AbortController().signal),
+    ).rejects.toThrow("insufficient light for wheat");
+    air.light = 9;
+    await expect(
+      adapter.plantCrop(position, "wheat_seeds", new AbortController().signal),
+    ).rejects.toThrow("missing wheat_seeds in inventory");
+    expect(bot.placeBlock).not.toHaveBeenCalled();
+  });
+
+  it("harvests mature wheat through the cancellable dig path", async () => {
+    const bot = new FakeBot();
+    const position = { x: 4, y: 64, z: 4 };
+    const wheat = { name: "wheat", position, getProperties: () => ({ age: 7 }) };
+    bot.blockAt.mockReturnValue(wheat);
+    createBot.mockReturnValue(bot);
+    const adapter = new MineflayerAdapter(config());
+    const connecting = adapter.connect();
+    await flush();
+    bot.emit("spawn");
+    await connecting;
+
+    await adapter.harvestCrop(position, "wheat", new AbortController().signal);
+
+    expect(bot.dig).toHaveBeenCalledWith(wheat);
+  });
+
+  it("reads a bounded furnace snapshot and always closes the window", async () => {
+    const bot = new FakeBot();
+    const position = { x: 5, y: 64, z: 5 };
+    const block = { name: "furnace", position, getProperties: () => ({ lit: true }) };
+    const furnace = new FakeFurnace();
+    furnace.input = { name: "raw_cod", type: 349, count: 2 };
+    furnace.fuel = { name: "coal", type: 263, count: 1 };
+    furnace.output = { name: "cooked_cod", type: 350, count: 1 };
+    furnace.progress = 0.5;
+    bot.blockAt.mockReturnValue(block);
+    bot.openFurnace.mockResolvedValue(furnace);
+    createBot.mockReturnValue(bot);
+    const adapter = new MineflayerAdapter(config());
+    const connecting = adapter.connect();
+    await flush();
+    bot.emit("spawn");
+    await connecting;
+
+    await expect(adapter.furnaceSnapshot(position)).resolves.toEqual({
+      position,
+      input: { name: "raw_cod", count: 2 },
+      fuel: { name: "coal", count: 1 },
+      output: { name: "cooked_cod", count: 1 },
+      progress: 0.5,
+    });
+    expect(furnace.close).toHaveBeenCalledOnce();
+  });
+
+  it("continues compatible partial furnace input and fuel", async () => {
+    const bot = new FakeBot();
+    const furnace = new FakeFurnace();
+    furnace.input = { name: "iron_ore", type: 15, count: 1 };
+    furnace.fuel = { name: "coal", type: 263, count: 1 };
+    furnace.putInput.mockImplementation(async (type, _metadata, count) => {
+      furnace.input = { name: "iron_ore", type, count: (furnace.input?.count ?? 0) + count };
+    });
+    bot.inventoryItems = [{ name: "iron_ore", type: 15, count: 1 }];
+    bot.findBlock.mockReturnValue({ name: "furnace", position: { x: 1, y: 64, z: 1 } });
+    bot.openFurnace.mockResolvedValue(furnace);
+    bot.waitForTicks.mockImplementation(async () => {
+      furnace.output = { name: "iron_ingot", type: 265, count: 2 };
+    });
+    createBot.mockReturnValue(bot);
+    const adapter = new MineflayerAdapter(config());
+    const connecting = adapter.connect();
+    await flush();
+    bot.emit("spawn");
+    await connecting;
+
+    await adapter.smeltItem("iron_ore", 2, new AbortController().signal);
+
+    expect(furnace.putInput).toHaveBeenCalledWith(15, null, 1);
+    expect(furnace.putFuel).not.toHaveBeenCalled();
+    expect(furnace.takeOutput).toHaveBeenCalledOnce();
+    expect(furnace.close).toHaveBeenCalledOnce();
+  });
+
+  it("refuses a furnace containing incompatible input", async () => {
+    const bot = new FakeBot();
+    const furnace = new FakeFurnace();
+    furnace.input = { name: "gold_ore", type: 14, count: 1 };
+    bot.inventoryItems = [
+      { name: "iron_ore", type: 15, count: 1 },
+      { name: "coal", type: 263, count: 1 },
+    ];
+    bot.findBlock.mockReturnValue({ name: "furnace", position: { x: 1, y: 64, z: 1 } });
+    bot.openFurnace.mockResolvedValue(furnace);
+    createBot.mockReturnValue(bot);
+    const adapter = new MineflayerAdapter(config());
+    const connecting = adapter.connect();
+    await flush();
+    bot.emit("spawn");
+    await connecting;
+
+    await expect(adapter.smeltItem("iron_ore", 1, new AbortController().signal)).rejects.toThrow(
+      "furnace input is incompatible",
+    );
+    expect(furnace.putInput).not.toHaveBeenCalled();
+    expect(furnace.close).toHaveBeenCalledOnce();
   });
 
   it("retracts fishing and rejects late completion after abort", async () => {
@@ -665,10 +923,14 @@ describe("MineflayerAdapter", () => {
     const attempts = [
       () => adapter.inspectBlock(position),
       () => adapter.findBlocks({ names: ["stone"], maxDistance: 16, maxResults: 8 }),
+      () => adapter.furnaceSnapshot(position),
       () => adapter.fish(signal),
       () => adapter.consumeItem("bread", signal),
       () => adapter.sleepInBed(position, signal),
       () => adapter.wakeUp(signal),
+      () => adapter.tillSoil(position, signal),
+      () => adapter.plantCrop(position, "wheat_seeds", signal),
+      () => adapter.harvestCrop(position, "wheat", signal),
     ];
 
     for (const attempt of attempts) await expect(attempt()).rejects.toThrow("not connected");
