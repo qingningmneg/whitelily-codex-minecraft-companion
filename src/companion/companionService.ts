@@ -602,6 +602,9 @@ export class CompanionService {
         } catch {
           // Scheduler observation must never affect the action result.
         }
+        // A live execution turn receives the failed tool result and can recover safely.
+        // Fail closed only when no model turn is present to handle the action outcome.
+        if (this.activeExecutionTurn !== undefined) return;
         if (this.dependencies.taskController.current() === null) return;
         const error = new Error();
         error.name = "MinecraftToolError";

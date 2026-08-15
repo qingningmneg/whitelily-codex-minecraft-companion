@@ -258,6 +258,7 @@ describe("buildOwnerIntentTurn", () => {
           count: index,
         })),
         nearbyHostiles: Array.from({ length: 9 }, (_, index) => ({
+          entityId: index + 1,
           kind: `hostile-${index}`,
           position: { x: index, y: 64, z: 0 },
         })),

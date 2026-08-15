@@ -218,6 +218,11 @@ describe("createWorldSnapshot", () => {
     expect(first.inventorySummary).toHaveLength(36);
     expect(first.nearbyEntities).toHaveLength(64);
     expect(first.nearbyHostiles).toHaveLength(64);
+    expect(first.nearbyHostiles[0]).toMatchObject({
+      entityId: 0,
+      kind: "hostile_0",
+      position: { x: 1, y: 64, z: 0 },
+    });
     expect(hostileEntityIds).toHaveLength(70);
     expect(droppedItemEntityIds).toEqual(new Set([100, 101]));
     expect(first).not.toBe(second);

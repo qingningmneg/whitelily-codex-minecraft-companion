@@ -180,6 +180,7 @@ function stableWorldSummary(world: unknown) {
     nearbyHostiles: boundedArray(snapshot.nearbyHostiles, maximumHostiles).map((hostile) => {
       const hostileEntry = asRecord(hostile);
       return {
+        entityId: finiteNumber(hostileEntry.entityId),
         kind: boundedText(hostileEntry.kind, 64),
         position: boundedPosition(hostileEntry.position),
       };
@@ -253,6 +254,7 @@ export function buildCompanionTaskExecutionTurn(input: CompanionTaskExecutionInp
     "Use only the authorized actions listed in TASK_PLAN. Do not add, replace, or expand actions or requested limits.",
     "Call an authorized minecraft_* dynamic tool directly when an action is needed.",
     "Call the authorized Minecraft action tool as the next tool call. Do not make planning, discovery, or unrelated tool calls first.",
+    "For minecraft_follow_owner, distance is the desired gap from the owner in blocks (integer 2 through 16), not a travel budget; when the owner asks WhiteLily to come beside them without specifying a gap, use distance 2. Never copy maxHorizontalTravel into distance.",
     "Use only currently provided tools whose names start with minecraft_ for game actions.",
     "Never use shell, file editing, scripts, administrator commands, or arbitrary code.",
     "If a tool reports denied or confirmation_required, explain briefly and stop.",

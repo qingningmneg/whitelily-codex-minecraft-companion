@@ -1766,6 +1766,57 @@ describe("CompanionService lifecycle", () => {
         data: { reason: "completed", expectedActionCategoryCount: 2 },
       });
     });
+
+    it("returns a live action failure to the executor turn so it can recover", async () => {
+      const value = await harness({
+        deferredTurns: [0],
+        intentResponses: [
+          taskDecision({
+            naturalReply: null,
+            goal: "recover from a blocked route",
+            allowedActions: ["move_to"],
+            requestedLimits: { maxToolCalls: 2, maxHorizontalTravel: 20 },
+          }),
+        ],
+        executionResponses: [taskExecutionOutcome("recovered")],
+      });
+      value.minecraft.moveTo = async () => {
+        throw new Error("path blocked");
+      };
+      await value.start();
+      await startPlayerTurn(value, "recover from a blocked route");
+
+      const failed = await value.executeRawTool("minecraft_move_to", {
+        x: 5,
+        y: 64,
+        z: 0,
+        turnLease: value.budgetLeases[0],
+      });
+
+      expect(failed).toEqual({
+        text: '{"status":"failed","reason":"Error: path blocked"}',
+        isError: true,
+      });
+      expect(value.taskController.current()).not.toBeNull();
+      expect(value.codex.interruptions).toEqual([]);
+      expect(value.minecraft.chatLog).toEqual([]);
+      expect(value.taskAuditEvents).toEqual(["task_started"]);
+
+      value.minecraft.moveTo = async () => undefined;
+      const recovered = await value.executeRawTool("minecraft_move_to", {
+        x: 6,
+        y: 64,
+        z: 0,
+        turnLease: value.budgetLeases[0],
+      });
+      expect(recovered).toEqual({ text: '{"status":"completed"}' });
+
+      value.codex.releaseTurnResult(0);
+      await value.untilTurnSettled();
+
+      expect(value.minecraft.chatLog).toEqual(["recovered"]);
+      expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:completed"]);
+    });
   });
 
   it.each(["friend", "balanced", "autonomous"] as const)(
@@ -5640,7 +5691,7 @@ describe("CompanionService task failure containment", () => {
     expect(value.minecraft.chatLog).toEqual([naturalTaskFailure, "普通聊天仍然可用。"]);
   });
 
-  it("keeps one Minecraft tool failure inside the current task failure", async () => {
+  it("keeps one Minecraft tool failure inside the current execution turn", async () => {
     const toolEntered = deferredValue<void>();
     const releaseToolFailure = deferredValue<void>();
     const value = await harness({
@@ -5678,29 +5729,29 @@ describe("CompanionService task failure containment", () => {
       { spawn: { x: 0, y: 64, z: 0 }, owner: { x: 0, y: 64, z: 0 } },
     );
     releaseToolFailure.resolve();
-    await expect(failingTool).resolves.toMatchObject({ isError: true });
-    await value.untilChat(naturalTaskFailure);
-    await expect(queued).resolves.toEqual({ status: "cancelled" });
+    await expect(failingTool).resolves.toEqual({
+      text: '{"status":"failed","reason":"Error: PRIVATE_MINECRAFT_TOOL_FAILURE"}',
+      isError: true,
+    });
+    await expect(queued).resolves.toEqual({ status: "completed" });
 
-    expect(value.taskController.isLeaseLive(taskLease)).toBe(false);
-    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:failed"]);
-    expect(value.taskTerminalReasons).toEqual(["failed"]);
-    expect(value.confirmations.get(pending.id)).toBeUndefined();
+    expect(value.taskController.isLeaseLive(taskLease)).toBe(true);
+    expect(value.taskAuditEvents).toEqual(["task_started"]);
+    expect(value.taskTerminalReasons).toEqual([]);
+    expect(value.confirmations.get(pending.id)).toBeDefined();
     expect(value.executor.pendingCount()).toBe(0);
-    expect(value.budget.snapshot().active).toBe(false);
-    expect(
-      await value.executeRawTool("minecraft_jump", {
-        turnLease,
-      }),
-    ).toMatchObject({ isError: true });
+    expect(value.budget.snapshot().active).toBe(true);
     expect(value.mode.snapshot().paused).toBe(false);
-    expect(value.minecraft.chatLog).toEqual([naturalTaskFailure]);
+    expect(value.minecraft.chatLog).toEqual([]);
     expect(value.minecraft.chatLog.join("\n")).not.toContain("PRIVATE_MINECRAFT_TOOL_FAILURE");
     expect((value.service as unknown as { codexHealthy: boolean }).codexHealthy).toBe(true);
 
-    await value.emitOwnerText("你好呀");
-    await value.untilChat("工具失败后也能继续聊天。");
-    expect(value.minecraft.chatLog).toEqual([naturalTaskFailure, "工具失败后也能继续聊天。"]);
+    await emitCommand(value, "!stop");
+
+    expect(value.taskController.isLeaseLive(taskLease)).toBe(false);
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:owner_stop"]);
+    expect(value.confirmations.get(pending.id)).toBeUndefined();
+    expect(value.budget.snapshot().active).toBe(false);
   });
 
   it("contains one failed confirmed action immediately despite multiple confirmation tickets", async () => {

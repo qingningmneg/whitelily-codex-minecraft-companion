@@ -19,7 +19,7 @@ export interface WorldSnapshot {
   inventorySummary: Array<{ name: string; count: number }>;
   nearbyBlocks?: Array<{ name: string; position: Vec3 }>;
   nearbyEntities?: Array<{ id: number; kind: string; position: Vec3 }>;
-  nearbyHostiles: Array<{ kind: string; position: Vec3 }>;
+  nearbyHostiles: Array<{ entityId: number; kind: string; position: Vec3 }>;
 }
 
 export type GameAction =

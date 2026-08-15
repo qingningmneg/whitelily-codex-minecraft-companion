@@ -188,7 +188,10 @@ function isTrustedWorldSnapshot(snapshot: unknown): snapshot is WorldSnapshot {
     ) ||
     snapshot.nearbyHostiles.some(
       (entry) =>
-        !isRecord(entry) || typeof entry.kind !== "string" || !isTrustedPosition(entry.position),
+        !isRecord(entry) ||
+        !Number.isSafeInteger(entry.entityId) ||
+        typeof entry.kind !== "string" ||
+        !isTrustedPosition(entry.position),
     )
   ) {
     return false;
@@ -393,7 +396,8 @@ export function createToolRegistry(dependencies: ToolRegistryDependencies) {
         runAction({ kind: "move_to", position: { x, y, z } }, lease),
     },
     minecraft_follow_owner: {
-      description: "Follow the configured owner at a bounded distance.",
+      description:
+        "Follow the configured owner with a gap of 2 to 16 blocks. The distance is the owner gap, not a travel budget. Use 2 when the owner asks WhiteLily to come beside them without specifying a gap.",
       schema: z.object({ distance: z.number().int().min(2).max(16), ...leaseShape }).strict(),
       execute: async ({
         distance,

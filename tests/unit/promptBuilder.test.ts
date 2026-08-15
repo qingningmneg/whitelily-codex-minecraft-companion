@@ -98,8 +98,40 @@ describe("buildCompanionTaskExecutionTurn", () => {
     });
 
     expect(prompt).toContain("Call the authorized Minecraft action tool as the next tool call");
+    expect(prompt).toContain(
+      "For minecraft_follow_owner, distance is the desired gap from the owner",
+    );
+    expect(prompt).toContain("use distance 2");
+    expect(prompt).toContain("Never copy maxHorizontalTravel into distance");
     expect(prompt).not.toContain("tool_search");
     expect(prompt).not.toContain("update_plan");
+  });
+
+  it("includes authorized hostile entity IDs needed by the attack tool", () => {
+    const prompt = buildCompanionTaskExecutionTurn({
+      mode: "autonomous",
+      ownerMessage: "clear the nearby hostile",
+      plan: {
+        goal: "clear the nearby hostile",
+        allowedActions: ["attack_hostile"],
+        requestedLimits: { maxDangerousOperations: 1 },
+      },
+      world: {
+        ...world,
+        nearbyHostiles: [
+          {
+            entityId: 37,
+            kind: "zombie",
+            position: { x: 21, y: 64, z: 20 },
+          },
+        ],
+      },
+      memories: [],
+    });
+
+    expect(prompt).toContain(
+      '"nearbyHostiles":[{"entityId":37,"kind":"zombie","position":{"x":21,"y":64,"z":20}}]',
+    );
   });
 });
 
@@ -530,6 +562,7 @@ describe("buildCompanionTurn", () => {
           count: index,
         })),
         nearbyHostiles: Array.from({ length: 9 }, (_, index) => ({
+          entityId: index + 1,
           kind: `hostile-${index}`,
           position: { x: index, y: 64, z: 0 },
         })),

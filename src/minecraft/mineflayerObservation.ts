@@ -63,6 +63,7 @@ export function createWorldSnapshot(
       position: toVec3(entity.position),
     })),
     nearbyHostiles: hostiles.map((entity) => ({
+      entityId: entity.id,
       kind: entity.name ?? entity.type,
       position: toVec3(entity.position),
     })),

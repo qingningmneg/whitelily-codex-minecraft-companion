@@ -32,6 +32,9 @@ describe("Minecraft dynamic tools", () => {
     expect(followOwner).toMatchObject({
       type: "function",
       name: "minecraft_follow_owner",
+      description: expect.stringContaining(
+        "Use 2 when the owner asks WhiteLily to come beside them",
+      ),
       deferLoading: false,
       inputSchema: {
         type: "object",
