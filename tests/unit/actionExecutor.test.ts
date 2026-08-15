@@ -397,7 +397,7 @@ describe("ActionExecutor", () => {
     );
   });
 
-  it("retries only navigation and never retries irreversible actions", async () => {
+  it("never retries actions inside ActionExecutor", async () => {
     const minecraft = new FakeMinecraftPort();
     let moves = 0;
     minecraft.moveTo = async () => {
@@ -429,7 +429,7 @@ describe("ActionExecutor", () => {
     await executor.execute({ kind: "craft_item", itemName: "stick", count: 1 }, context);
     await executor.execute({ kind: "smelt_item", itemName: "iron_ingot", count: 1 }, context);
 
-    expect(moves).toBe(2);
+    expect(moves).toBe(1);
     expect(places).toBe(1);
     expect(crafts).toBe(1);
     expect(smelts).toBe(1);

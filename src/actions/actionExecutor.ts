@@ -18,7 +18,7 @@ export type ActionResult =
       status: "confirmation_invalid";
       reason: "missing" | "expired" | "wrong_operation" | "wrong_task";
     }
-  | { status: "failed"; reason: string };
+  | { status: "failed"; reason: string; worldMutated?: boolean };
 
 export type ActionResultListener = (result: Readonly<ActionResult>) => void;
 
@@ -220,7 +220,7 @@ export class ActionExecutor {
         job.controller?.abort();
       }, this.timeoutFor(job.action));
       try {
-        await this.dispatchWithRetries(job.action, job.controller.signal);
+        await this.dispatch(job.action, job.controller.signal);
         this.finishUser(
           job,
           job.timedOut
@@ -284,18 +284,6 @@ export class ActionExecutor {
     if (action.kind === "wait") return Math.min(action.milliseconds + 1_000, 11_000);
     if (action.kind === "dig_block" || action.kind === "place_block") return 15_000;
     return 10_000;
-  }
-
-  private async dispatchWithRetries(action: GameAction, signal: AbortSignal): Promise<void> {
-    const attempts = action.kind === "move_to" || action.kind === "follow_owner" ? 2 : 1;
-    for (let attempt = 1; attempt <= attempts; attempt += 1) {
-      try {
-        await this.dispatch(action, signal);
-        return;
-      } catch (error) {
-        if (signal.aborted || isAbortError(error) || attempt === attempts) throw error;
-      }
-    }
   }
 
   private async dispatch(action: GameAction, signal: AbortSignal): Promise<void> {
