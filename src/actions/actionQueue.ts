@@ -78,6 +78,26 @@ function sanitizeDiagnosticText(value: string, maximum: number): string {
   return truncateCharacters(redactPublicText(value), maximum);
 }
 
+function taskLeaseKey(taskLease: TaskLease): string {
+  return `${taskLease.id}\u0000${taskLease.startedAt}`;
+}
+
+function canonicalValue(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalValue).join(",")}]`;
+  if (typeof value === "object" && value !== null) {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalValue(record[key])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function normalizeFailureReason(value: string): string {
+  return sanitizeDiagnosticText(value, 240).trim().toLocaleLowerCase("en-US").replace(/\s+/gu, " ");
+}
+
 export class CompanionActionQueue {
   readonly #items: QueueItem[] = [];
   readonly #listeners = new Set<(event: ActionQueueEvent) => void>();
@@ -85,31 +105,71 @@ export class CompanionActionQueue {
   constructor(private readonly options: CompanionActionQueueOptions) {}
 
   enqueue(input: QueueAdmission): QueueItemSnapshot {
-    const activeForTask = this.#items.filter(
-      (item) =>
-        item.taskLease.id === input.taskLease.id &&
-        item.taskLease.startedAt === input.taskLease.startedAt &&
-        item.status !== "completed" &&
-        item.status !== "failed" &&
-        item.status !== "cancelled",
-    ).length;
-    if (activeForTask >= 256) throw new Error("queue capacity exhausted");
-    const item: QueueItem = {
-      id: this.#createId(),
-      taskLease: { ...input.taskLease },
-      worldGeneration: input.worldGeneration,
-      kind: input.action.kind,
-      action: structuredClone(input.action),
-      summary: sanitizeDiagnosticText(input.summary, 160),
-      trustedObservationKey: input.trustedObservationKey,
-      enqueuedAt: this.options.now().toISOString(),
-      status: "waiting",
-      retryCount: 0,
-    };
-    this.#items.push(item);
-    const snapshot = this.#snapshotItem(item, this.#items.length);
-    this.#publish(snapshot);
-    return snapshot;
+    return this.enqueueBatch([input])[0]!;
+  }
+
+  assertBatchCanEnqueue(inputs: readonly QueueAdmission[]): void {
+    const additions = new Map<string, number>();
+    for (const input of inputs) {
+      const key = taskLeaseKey(input.taskLease);
+      additions.set(key, (additions.get(key) ?? 0) + 1);
+      const failedByReason = new Map<string, number>();
+      const actionKey = canonicalValue(input.action);
+      for (const item of this.#items) {
+        if (
+          item.status !== "failed" ||
+          item.reason === undefined ||
+          item.action === undefined ||
+          taskLeaseKey(item.taskLease) !== key ||
+          item.trustedObservationKey !== input.trustedObservationKey ||
+          canonicalValue(item.action) !== actionKey
+        ) {
+          continue;
+        }
+        const reason = normalizeFailureReason(item.reason);
+        failedByReason.set(reason, (failedByReason.get(reason) ?? 0) + 1);
+      }
+      if ([...failedByReason.values()].some((count) => count >= 3)) {
+        throw new Error("semantic action retry exhausted");
+      }
+    }
+    for (const [key, count] of additions) {
+      const active = this.#items.filter(
+        (item) =>
+          taskLeaseKey(item.taskLease) === key &&
+          item.status !== "completed" &&
+          item.status !== "failed" &&
+          item.status !== "cancelled",
+      ).length;
+      if (active + count > 256) throw new Error("queue capacity exhausted");
+    }
+  }
+
+  enqueueBatch(inputs: readonly QueueAdmission[]): readonly QueueItemSnapshot[] {
+    this.assertBatchCanEnqueue(inputs);
+    const knownIds = new Set(this.#items.map((item) => item.id));
+    const enqueuedAt = this.options.now().toISOString();
+    const items = inputs.map((input): QueueItem => {
+      const id = this.#createUniqueId(knownIds);
+      knownIds.add(id);
+      return {
+        id,
+        taskLease: { ...input.taskLease },
+        worldGeneration: input.worldGeneration,
+        kind: input.action.kind,
+        action: structuredClone(input.action),
+        summary: sanitizeDiagnosticText(input.summary, 160),
+        trustedObservationKey: input.trustedObservationKey,
+        enqueuedAt,
+        status: "waiting",
+        retryCount: 0,
+      };
+    });
+    const start = this.#items.length;
+    this.#items.push(...items);
+    const snapshots = items.map((item, index) => this.#snapshotItem(item, start + index + 1));
+    for (const snapshot of snapshots) this.#publish(snapshot);
+    return snapshots;
   }
 
   beginPermissionWait(input: PermissionQueueAdmission): QueueItemSnapshot {
@@ -276,7 +336,8 @@ export class CompanionActionQueue {
     }
   }
 
-  cancelWaiting(taskLease: TaskLease, reason: string): void {
+  cancelWaiting(taskLease: TaskLease, reason: string): number {
+    let cancelled = 0;
     for (const item of this.#items) {
       if (
         item.taskLease.id === taskLease.id &&
@@ -288,8 +349,10 @@ export class CompanionActionQueue {
         item.reason = sanitizeDiagnosticText(reason, 240);
         item.endedAt = this.options.now().toISOString();
         this.#publishItem(item);
+        cancelled += 1;
       }
     }
+    return cancelled;
   }
 
   cancelTask(taskLease: TaskLease, reason: string): void {
@@ -335,9 +398,13 @@ export class CompanionActionQueue {
   }
 
   #createId(): string {
+    return this.#createUniqueId(new Set(this.#items.map((item) => item.id)));
+  }
+
+  #createUniqueId(knownIds: ReadonlySet<string>): string {
     const id = this.options.createId();
     if (!/^[A-Za-z0-9_-]{1,64}$/u.test(id)) throw new Error("invalid queue item id");
-    if (this.#items.some((item) => item.id === id)) throw new Error("queue item id collision");
+    if (knownIds.has(id)) throw new Error("queue item id collision");
     return id;
   }
 

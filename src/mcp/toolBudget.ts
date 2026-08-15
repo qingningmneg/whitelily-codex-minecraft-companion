@@ -137,6 +137,64 @@ export class TurnToolBudget {
     return { ok: true, snapshot: this.snapshot() };
   }
 
+  consumeQueuedActions(
+    kinds: readonly ToolActionKind[],
+    lease?: string,
+    trustedConsumption: {
+      blockChanges?: number;
+      horizontalTravel?: number;
+      dangerousOperations?: number;
+    } = {},
+  ): BudgetConsumeResult {
+    const authorization = this.checkLease(lease);
+    if (!authorization.ok) return authorization;
+    if (
+      this.allowedActions !== undefined &&
+      kinds.some((kind) => !this.allowedActions!.has(kind))
+    ) {
+      return { ok: false, reason: "tool action is not allowed" };
+    }
+    const taskLease = this.taskLease;
+    if (!taskLease) return { ok: false, reason: "tool turn lease is invalid" };
+    const taskResult = this.taskBudget.consume({
+      lease: taskLease,
+      kind: "enqueue_actions",
+      now: this.taskBudget.currentTime(),
+      ...(trustedConsumption.blockChanges === undefined
+        ? {}
+        : { blockChanges: trustedConsumption.blockChanges }),
+      ...(trustedConsumption.horizontalTravel === undefined
+        ? {}
+        : { horizontalTravel: trustedConsumption.horizontalTravel }),
+      ...(trustedConsumption.dangerousOperations === undefined
+        ? {}
+        : { dangerousOperations: trustedConsumption.dangerousOperations }),
+    });
+    if (!taskResult.ok) return { ok: false, reason: "tool call budget exhausted" };
+    this.totalCalls += 1;
+    this.attemptedDigCount += kinds.filter((kind) => kind === "dig_block").length;
+    this.attemptedPlaceCount += kinds.filter((kind) => kind === "place_block").length;
+    if (trustedConsumption.horizontalTravel !== undefined) {
+      this.recordHorizontalTravel(trustedConsumption.horizontalTravel);
+    }
+    return { ok: true, snapshot: this.snapshot() };
+  }
+
+  consumeQueueControl(lease?: string): BudgetConsumeResult {
+    const authorization = this.checkLease(lease);
+    if (!authorization.ok) return authorization;
+    const taskLease = this.taskLease;
+    if (!taskLease) return { ok: false, reason: "tool turn lease is invalid" };
+    const taskResult = this.taskBudget.consume({
+      lease: taskLease,
+      kind: "queue_control",
+      now: this.taskBudget.currentTime(),
+    });
+    if (!taskResult.ok) return { ok: false, reason: "tool call budget exhausted" };
+    this.totalCalls += 1;
+    return { ok: true, snapshot: this.snapshot() };
+  }
+
   recordHorizontalTravel(distance: number): void {
     if (!this.active) return;
     if (distance < 0) throw new Error("travel distance cannot be negative");

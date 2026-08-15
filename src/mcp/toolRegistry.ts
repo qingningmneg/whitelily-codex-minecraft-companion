@@ -1,9 +1,16 @@
+import { createHash } from "node:crypto";
 import * as z from "zod/v4";
 import type { ActionExecutor, ActionResult } from "../actions/actionExecutor.js";
+import type { CompanionActionQueue, QueueAdmission } from "../actions/actionQueue.js";
 import type { GameAction, Vec3, WorldSnapshot } from "../domain/types.js";
 import type { MinecraftPort } from "../minecraft/minecraftPort.js";
 import { classifyActionRisk } from "../safety/actionRisk.js";
 import type { SafetyContext } from "../safety/safetyEngine.js";
+import {
+  queuedActionSpecSchema,
+  queuedActionSpecToGameAction,
+  type QueuedActionSpec,
+} from "./queuedActionSchema.js";
 import { TurnToolBudget, type ToolActionKind, type TrustedToolConsumption } from "./toolBudget.js";
 
 export const MINECRAFT_TOOL_NAMES = Object.freeze([
@@ -22,9 +29,23 @@ export const MINECRAFT_TOOL_NAMES = Object.freeze([
   "minecraft_equip_item",
   "minecraft_attack_hostile",
   "minecraft_wait",
+  "minecraft_enqueue_actions",
+  "minecraft_get_action_queue",
+  "minecraft_cancel_queued_actions",
 ] as const);
 
 export type MinecraftToolName = (typeof MINECRAFT_TOOL_NAMES)[number];
+
+export const MINECRAFT_EXECUTION_TOOL_NAMES = Object.freeze([
+  "minecraft_get_state",
+  "minecraft_find_block",
+  "minecraft_say",
+  "minecraft_enqueue_actions",
+  "minecraft_get_action_queue",
+  "minecraft_cancel_queued_actions",
+] as const satisfies readonly MinecraftToolName[]);
+
+export type MinecraftExecutionToolName = (typeof MINECRAFT_EXECUTION_TOOL_NAMES)[number];
 
 export interface ToolResult {
   text: string;
@@ -45,6 +66,8 @@ export interface ToolRegistryDependencies {
   ownerUsername: () => string;
   latestSnapshot?: () => WorldSnapshot | undefined;
   observeSnapshot?: (snapshot: WorldSnapshot) => void;
+  actionQueue: CompanionActionQueue;
+  worldGeneration: () => number;
 }
 
 export interface TrustedSnapshotStore {
@@ -77,6 +100,9 @@ const turnLease = z
 const leaseShape = { turnLease };
 const positionSchema = z.object({ ...positionShape, ...leaseShape }).strict();
 const emptySchema = z.object(leaseShape).strict();
+const enqueueActionsSchema = z
+  .object({ actions: z.array(queuedActionSpecSchema).min(1).max(64), ...leaseShape })
+  .strict();
 const entityId = z.number().int().positive().safe();
 const count = z.number().int().min(1).max(64);
 
@@ -159,6 +185,23 @@ function isTrustedPosition(position: unknown): position is Vec3 {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function canonicalValue(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalValue).join(",")}]`;
+  if (isRecord(value)) {
+    return `{${Object.keys(value)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalValue(value[key])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function observationKey(snapshot: WorldSnapshot, worldGeneration: number): string {
+  return createHash("sha256")
+    .update(canonicalValue({ snapshot, worldGeneration }), "utf8")
+    .digest("base64url");
 }
 
 function isTrustedWorldSnapshot(snapshot: unknown): snapshot is WorldSnapshot {
@@ -311,6 +354,87 @@ export function createToolRegistry(dependencies: ToolRegistryDependencies) {
     }
   };
 
+  const enqueueActions = async (
+    specs: readonly QueuedActionSpec[],
+    lease: string,
+  ): Promise<ToolResult> => {
+    const invalidLease = checkLease(lease);
+    if (invalidLease) return invalidLease;
+    const taskLease = dependencies.budget.currentTaskLease(lease);
+    if (!taskLease) return errorResult("tool turn lease is invalid");
+    const failAttempt = (message: string): ToolResult => {
+      const consumed = dependencies.budget.consumeQueueControl(lease);
+      return consumed.ok ? errorResult(message) : errorResult(consumed.reason);
+    };
+    let snapshot: WorldSnapshot;
+    let baseContext: SafetyContext;
+    let worldGeneration: number;
+    try {
+      snapshot = await takeSnapshot();
+      baseContext = await dependencies.safetyContextProvider();
+      worldGeneration = dependencies.worldGeneration();
+      if (!Number.isSafeInteger(worldGeneration) || worldGeneration < 0) {
+        throw new Error("trusted world generation is unavailable");
+      }
+    } catch (error) {
+      return failAttempt(safeMessage(error));
+    }
+    const trustedObservationKey = observationKey(snapshot, worldGeneration);
+    const actions = specs.map(queuedActionSpecToGameAction);
+    const admissions: QueueAdmission[] = actions.map((action, index) => ({
+      taskLease,
+      worldGeneration,
+      action,
+      summary: specs[index]!.summary,
+      trustedObservationKey,
+    }));
+    try {
+      dependencies.actionQueue.assertBatchCanEnqueue(admissions);
+    } catch (error) {
+      return errorResult(safeMessage(error));
+    }
+
+    let simulatedPosition = structuredClone(snapshot.botPosition);
+    let horizontalTravel = 0;
+    let blockChanges = 0;
+    let dangerousOperations = 0;
+    for (const action of actions) {
+      if (action.kind === "dig_block" || action.kind === "place_block") blockChanges += 1;
+      if (action.kind === "move_to" || action.kind === "follow_owner") {
+        const destination =
+          action.kind === "move_to" ? action.position : snapshotPosition(snapshot, "ownerPosition");
+        if (!isTrustedPosition(destination)) {
+          return failAttempt("trusted movement distance is unavailable");
+        }
+        const distance = trustedTravel(simulatedPosition, destination);
+        if (!Number.isFinite(distance)) {
+          return failAttempt("trusted movement distance is unavailable");
+        }
+        horizontalTravel += distance;
+        simulatedPosition = { ...destination };
+      }
+      if (action.kind === "collect_dropped" && !hasDroppedItem(snapshot, action.entityId)) {
+        return failAttempt("dropped entity ID is not present in the latest snapshot");
+      }
+      dangerousOperations += classifyActionRisk(
+        action,
+        actionContext(baseContext, action, dependencies.budget),
+      ).dangerousOperations;
+    }
+    const reserved = dependencies.budget.consumeQueuedActions(
+      actions.map((action) => action.kind),
+      lease,
+      { blockChanges, horizontalTravel, dangerousOperations },
+    );
+    if (!reserved.ok) return errorResult(reserved.reason);
+    try {
+      const queued = dependencies.actionQueue.enqueueBatch(admissions);
+      return { text: stringify({ status: "queued", count: queued.length }) };
+    } catch (error) {
+      return errorResult(safeMessage(error));
+    }
+  };
+
   const registry = {
     minecraft_get_state: {
       description: "Read the current bounded Minecraft state.",
@@ -383,6 +507,39 @@ export function createToolRegistry(dependencies: ToolRegistryDependencies) {
         message: string;
         turnLease: string;
       }): Promise<ToolResult> => runAction({ kind: "say", message }, lease),
+    },
+    minecraft_enqueue_actions: {
+      description:
+        "Atomically append 1 to 64 explicit physical actions to the current private task queue.",
+      schema: enqueueActionsSchema,
+      execute: async ({
+        actions,
+        turnLease: lease,
+      }: {
+        actions: QueuedActionSpec[];
+        turnLease: string;
+      }): Promise<ToolResult> => enqueueActions(actions, lease),
+    },
+    minecraft_get_action_queue: {
+      description: "Read the redacted private action queue projection for planning.",
+      schema: emptySchema,
+      execute: async ({ turnLease: lease }: { turnLease: string }): Promise<ToolResult> => {
+        const consumed = dependencies.budget.consumeQueueControl(lease);
+        if (!consumed.ok) return errorResult(consumed.reason);
+        return { text: stringify(dependencies.actionQueue.snapshot()) };
+      },
+    },
+    minecraft_cancel_queued_actions: {
+      description: "Cancel only not-yet-started actions owned by the current task lease.",
+      schema: emptySchema,
+      execute: async ({ turnLease: lease }: { turnLease: string }): Promise<ToolResult> => {
+        const consumed = dependencies.budget.consumeQueueControl(lease);
+        if (!consumed.ok) return errorResult(consumed.reason);
+        const taskLease = dependencies.budget.currentTaskLease(lease);
+        if (!taskLease) return errorResult("tool turn lease is invalid");
+        const cancelled = dependencies.actionQueue.cancelWaiting(taskLease, "model_replanned");
+        return { text: stringify({ status: "cancelled", count: cancelled }) };
+      },
     },
     minecraft_move_to: {
       description: "Move WhiteLily to exact coordinates through the local safety gate.",

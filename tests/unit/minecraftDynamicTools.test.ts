@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { MINECRAFT_TOOL_NAMES } from "../../src/mcp/toolRegistry.js";
+import { MINECRAFT_EXECUTION_TOOL_NAMES } from "../../src/mcp/toolRegistry.js";
 import { createMinecraftDynamicTools } from "../../src/codex/minecraftDynamicTools.js";
 import type { JsonValue } from "../../src/codex/generated/serde_json/JsonValue.js";
 import type { DynamicToolCallParams } from "../../src/codex/generated/v2/DynamicToolCallParams.js";
@@ -21,50 +21,42 @@ function callParams(
 }
 
 describe("Minecraft dynamic tools", () => {
-  it("exposes every reviewed Minecraft action as a non-deferred top-level function", () => {
+  it("exposes reads, chat, and bounded queue controls without direct physical actions", () => {
     const harness = createToolRegistryHarness();
     const dynamicTools = createMinecraftDynamicTools(harness.dependencies);
 
-    expect(dynamicTools.specs.map((spec) => spec.name)).toEqual(MINECRAFT_TOOL_NAMES);
-    const followOwner = dynamicTools.specs.find(
-      (spec) => spec.type === "function" && spec.name === "minecraft_follow_owner",
+    expect(dynamicTools.specs.map((spec) => spec.name)).toEqual(MINECRAFT_EXECUTION_TOOL_NAMES);
+    expect(dynamicTools.specs.map((spec) => spec.name)).not.toContain("minecraft_move_to");
+    const enqueue = dynamicTools.specs.find(
+      (spec) => spec.type === "function" && spec.name === "minecraft_enqueue_actions",
     );
-    expect(followOwner).toMatchObject({
+    expect(enqueue).toMatchObject({
       type: "function",
-      name: "minecraft_follow_owner",
-      description: expect.stringContaining(
-        "Use 2 when the owner asks WhiteLily to come beside them",
-      ),
+      name: "minecraft_enqueue_actions",
       deferLoading: false,
       inputSchema: {
         type: "object",
         additionalProperties: false,
-        required: ["distance", "turnLease"],
-        properties: {
-          distance: { type: "integer", minimum: 2, maximum: 16 },
-          turnLease: { type: "string", pattern: "^[A-Za-z0-9_-]{43}$" },
-        },
+        required: ["actions", "turnLease"],
       },
     });
   });
 
-  it("executes a valid call through the existing safe tool registry", async () => {
+  it("executes a valid queue call through the safe tool registry", async () => {
     const harness = createToolRegistryHarness();
-    harness.minecraft.world.ownerPosition = { x: 4, y: 64, z: 3 };
     const dynamicTools = createMinecraftDynamicTools(harness.dependencies);
 
     await expect(
       dynamicTools.call(
-        callParams("minecraft_follow_owner", { distance: 3, turnLease: harness.turnLease }),
+        callParams("minecraft_enqueue_actions", {
+          actions: [{ kind: "jump", summary: "跳一下" }],
+          turnLease: harness.turnLease,
+        }),
       ),
-    ).resolves.toEqual({
-      contentItems: [{ type: "inputText", text: '{"status":"completed"}' }],
-      success: true,
-    });
-    expect(harness.minecraft.calls).toContainEqual({
-      method: "followOwner",
-      args: ["TestOwner", 3],
-    });
+    ).resolves.toMatchObject({ success: true });
+    expect(harness.actionQueue.snapshot().items).toMatchObject([
+      { kind: "jump", status: "waiting" },
+    ]);
     expect(harness.budget.snapshot()).toMatchObject({ totalCalls: 1 });
   });
 
@@ -74,10 +66,9 @@ describe("Minecraft dynamic tools", () => {
 
     await expect(
       dynamicTools.call(
-        callParams("minecraft_follow_owner", {
-          distance: 1,
+        callParams("minecraft_enqueue_actions", {
+          actions: [{ kind: "jump", summary: "跳一下", unexpected: true }],
           turnLease: harness.turnLease,
-          unexpected: true,
         }),
       ),
     ).resolves.toEqual({
@@ -98,7 +89,12 @@ describe("Minecraft dynamic tools", () => {
     };
     await expect(dynamicTools.call(callParams("shell", {}))).resolves.toEqual(expected);
     await expect(
-      dynamicTools.call(callParams("minecraft_follow_owner", {}, "mcp__minecraft")),
+      dynamicTools.call(callParams("minecraft_enqueue_actions", {}, "mcp__minecraft")),
+    ).resolves.toEqual(expected);
+    await expect(
+      dynamicTools.call(
+        callParams("minecraft_move_to", { x: 1, y: 64, z: 1, turnLease: harness.turnLease }),
+      ),
     ).resolves.toEqual(expected);
     expect(harness.minecraft.calls).toEqual([]);
   });

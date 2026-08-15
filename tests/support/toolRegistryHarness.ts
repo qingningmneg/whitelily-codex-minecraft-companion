@@ -1,4 +1,5 @@
 import { ActionExecutor, type ActionSafety } from "../../src/actions/actionExecutor.js";
+import { CompanionActionQueue } from "../../src/actions/actionQueue.js";
 import type { SafetyDecision } from "../../src/domain/types.js";
 import { FakeMinecraftPort } from "../../src/minecraft/fakeMinecraftPort.js";
 import type { ToolRegistryDependencies } from "../../src/mcp/toolRegistry.js";
@@ -26,6 +27,12 @@ export function createToolRegistryHarness(
     new ConfirmationStore(),
     () => "TestOwner",
   );
+  let nextQueueId = 0;
+  const actionQueue = new CompanionActionQueue({
+    createId: () => `queue-${++nextQueueId}`,
+    now: () => new Date("2026-08-15T00:00:00.000Z"),
+  });
+  let worldGeneration = 0;
   const safetyContextProvider = async (): Promise<SafetyContext> => ({
     spawn: { x: -100, y: 64, z: -100 },
     owner: { x: 0, y: 64, z: 0 },
@@ -37,12 +44,15 @@ export function createToolRegistryHarness(
     safetyContextProvider,
     ownerUsername: () => "TestOwner",
     latestSnapshot: () => minecraft.world,
+    actionQueue,
+    worldGeneration: () => worldGeneration,
   };
   return {
     minecraft,
     budget,
     contexts,
     executor,
+    actionQueue,
     dependencies,
     get turnLease(): string {
       return activeLease;
@@ -50,6 +60,9 @@ export function createToolRegistryHarness(
     beginTurn(): string {
       activeLease = budget.begin();
       return activeLease;
+    },
+    setWorldGeneration(value: number): void {
+      worldGeneration = value;
     },
   };
 }

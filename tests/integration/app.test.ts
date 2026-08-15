@@ -29,6 +29,7 @@ import { verifyMinecraftMcp, type McpReadinessSnapshot } from "../../src/mcp/mcp
 import {
   createToolRegistry,
   createTrustedSnapshotStore,
+  MINECRAFT_EXECUTION_TOOL_NAMES,
   MINECRAFT_TOOL_NAMES,
   type ToolResult,
 } from "../../src/mcp/toolRegistry.js";
@@ -342,6 +343,8 @@ async function runPersistedActionScenario(scenario: PersistedActionScenario) {
           budget: createdContext.budget,
           safetyContextProvider,
           ownerUsername: () => "TestOwner",
+          actionQueue,
+          worldGeneration: () => service.queueExecutionContext()?.worldGeneration ?? 0,
         });
         const begin = createdContext.budget.begin.bind(createdContext.budget);
         createdContext.budget.begin = (taskLease, authorization = {}) => {
@@ -425,6 +428,10 @@ describe("WhiteLilyApp composition", () => {
       confirmations,
       () => "TestOwner",
     );
+    const actionQueue = new CompanionActionQueue({
+      createId: () => "queue-1",
+      now: () => new Date("2026-08-15T00:00:00.000Z"),
+    });
     const mcp = new McpLifecycle(
       {
         minecraft,
@@ -435,6 +442,8 @@ describe("WhiteLilyApp composition", () => {
           owner: { x: 0, y: 64, z: 0 },
         }),
         ownerUsername: () => "TestOwner",
+        actionQueue,
+        worldGeneration: () => 0,
       },
       {
         workspaceVersion: provisioned.contentVersion,
@@ -1092,6 +1101,10 @@ describe("WhiteLilyApp composition", () => {
     );
     const budget = new TurnToolBudget();
     const firstLease = budget.begin();
+    const actionQueue = new CompanionActionQueue({
+      createId: () => "queue-1",
+      now: () => new Date("2026-08-15T00:00:00.000Z"),
+    });
     const tools = createToolRegistry({
       minecraft,
       executor,
@@ -1100,6 +1113,8 @@ describe("WhiteLilyApp composition", () => {
       ownerUsername: () => "TestOwner",
       latestSnapshot: snapshots.latest,
       observeSnapshot: snapshots.publish,
+      actionQueue,
+      worldGeneration: () => 0,
     });
 
     await expect(
@@ -2466,7 +2481,7 @@ describe("WhiteLilyApp composition", () => {
     if (!("params" in executionThreadStart)) throw new Error("expected thread start parameters");
     const dynamicTools = (executionThreadStart.params as { dynamicTools?: Array<{ name: string }> })
       .dynamicTools;
-    expect(dynamicTools?.map((tool) => tool.name)).toEqual(MINECRAFT_TOOL_NAMES);
+    expect(dynamicTools?.map((tool) => tool.name)).toEqual(MINECRAFT_EXECUTION_TOOL_NAMES);
     transport.receive({ id: 4, result: { thread: { id: "thread-service-live-execution" } } });
     await companionStarting;
 

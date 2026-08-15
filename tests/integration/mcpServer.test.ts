@@ -114,7 +114,7 @@ describe("loopback MCP server", () => {
     ).resolves.toEqual({
       state: "ready",
       listening: true,
-      discoveredToolCount: 15,
+      discoveredToolCount: MINECRAFT_TOOL_NAMES.length,
       errorCode: null,
     });
     expect(harness.minecraft.calls).toEqual([]);

@@ -745,6 +745,8 @@ export function createProductionRuntime(
     ownerUsername,
     latestSnapshot: trustedSnapshots.latest,
     observeSnapshot: trustedSnapshots.publish,
+    actionQueue,
+    worldGeneration: () => companion?.queueExecutionContext()?.worldGeneration ?? 0,
   };
   codex.configureDynamicTools(createMinecraftDynamicTools(toolDependencies));
 

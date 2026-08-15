@@ -88,6 +88,77 @@ describe("CompanionActionQueue", () => {
     ).not.toThrow();
   });
 
+  it("rejects an over-capacity batch without appending a partial prefix", () => {
+    const queue = new CompanionActionQueue({
+      createId: sequenceIds(),
+      now: () => new Date("2026-08-15T00:00:00.000Z"),
+    });
+    for (let index = 0; index < 255; index += 1) {
+      queue.enqueue({
+        taskLease,
+        worldGeneration: 1,
+        action: { kind: "jump" },
+        summary: `动作 ${index}`,
+        trustedObservationKey: "observation-a",
+      });
+    }
+
+    expect(() =>
+      queue.enqueueBatch([
+        {
+          taskLease,
+          worldGeneration: 1,
+          action: { kind: "jump" },
+          summary: "动作 256",
+          trustedObservationKey: "observation-a",
+        },
+        {
+          taskLease,
+          worldGeneration: 1,
+          action: { kind: "jump" },
+          summary: "动作 257",
+          trustedObservationKey: "observation-a",
+        },
+      ]),
+    ).toThrow("queue capacity exhausted");
+    expect(queue.snapshot().items).toHaveLength(255);
+  });
+
+  it("allows two semantic retries and rejects the third under the same observation and failure", () => {
+    const queue = new CompanionActionQueue({
+      createId: sequenceIds(),
+      now: () => new Date("2026-08-15T00:00:00.000Z"),
+    });
+    const admission = {
+      taskLease,
+      worldGeneration: 1,
+      action: { kind: "move_to", position: { x: 2, y: 64, z: 3 } } as const,
+      summary: "前往目标",
+      trustedObservationKey: "observation-a",
+    };
+    for (const reason of [" Block   missing ", "block missing", "BLOCK MISSING"]) {
+      queue.enqueue(admission);
+      const item = queue.claimNext(taskLease, 1);
+      if (!item) throw new Error("expected queued action");
+      queue.fail(item.id, taskLease, 1, reason);
+    }
+
+    expect(() => queue.enqueue(admission)).toThrow("semantic action retry exhausted");
+    expect(queue.snapshot().items).toHaveLength(3);
+    expect(() =>
+      queue.enqueue({
+        ...admission,
+        trustedObservationKey: "observation-b",
+      }),
+    ).not.toThrow();
+    expect(() =>
+      queue.enqueue({
+        ...admission,
+        action: { kind: "move_to", position: { x: 3, y: 64, z: 3 } },
+      }),
+    ).not.toThrow();
+  });
+
   it("rejects a duplicate opaque queue item id", () => {
     const queue = new CompanionActionQueue({
       createId: () => "duplicate-id",

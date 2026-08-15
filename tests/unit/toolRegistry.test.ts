@@ -49,6 +49,214 @@ describe("Minecraft MCP tools", () => {
     expect(names).not.toMatch(/shell|script|javascript|command|attack_entity|use_held_item/);
   });
 
+  it("accepts explicit bounded queued actions and rejects executable or forged payloads", () => {
+    const harness = createToolRegistryHarness();
+    const tool = createToolRegistry(harness.dependencies).minecraft_enqueue_actions;
+
+    expect(() =>
+      tool.schema.parse(leased(harness, { actions: [{ kind: "jump", summary: "跳一下" }] })),
+    ).not.toThrow();
+    expect(() =>
+      tool.schema.parse(
+        leased(harness, { actions: [{ kind: "shell", command: "dir", summary: "运行" }] }),
+      ),
+    ).toThrow();
+    expect(() =>
+      tool.schema.parse(
+        leased(harness, {
+          actions: [{ kind: "jump", summary: "跳一下", trustedObservationKey: "forged" }],
+        }),
+      ),
+    ).toThrow();
+    expect(() =>
+      tool.schema.parse(
+        leased(harness, { actions: [{ kind: "jump", summary: "跳一下", extra: true }] }),
+      ),
+    ).toThrow();
+    expect(() =>
+      tool.schema.parse(
+        leased(harness, {
+          actions: Array.from({ length: 65 }, () => ({ kind: "jump", summary: "跳一下" })),
+        }),
+      ),
+    ).toThrow();
+  });
+
+  it("enqueues a safe batch atomically with a trusted observation key and one model call", async () => {
+    const taskBudget = new TaskControllerBudget();
+    const taskLease = taskBudget.begin({ maxToolCalls: 1 });
+    const budget = new TurnToolBudget(taskBudget);
+    const turnLease = budget.begin(taskLease, { allowedActions: ["jump", "wait"] });
+    const harness = createToolRegistryHarness();
+    const tools = createToolRegistry({ ...harness.dependencies, budget });
+
+    await expect(
+      tools.minecraft_enqueue_actions.execute({
+        actions: [
+          { kind: "jump", summary: "跳一下" },
+          { kind: "wait", milliseconds: 500, summary: "等一会儿" },
+        ],
+        turnLease,
+      }),
+    ).resolves.toEqual({
+      text: expect.stringContaining('"status":"queued"'),
+    });
+    expect(harness.actionQueue.snapshot().items).toMatchObject([
+      { kind: "jump", summary: "跳一下", status: "waiting" },
+      { kind: "wait", summary: "等一会儿", status: "waiting" },
+    ]);
+    expect(JSON.stringify(harness.actionQueue.snapshot())).not.toContain("trustedObservationKey");
+    expect(taskBudget.snapshot()).toMatchObject({ toolCalls: 1 });
+  });
+
+  it("rejects a disallowed queued action without appending or spending the model call", async () => {
+    const taskBudget = new TaskControllerBudget();
+    const taskLease = taskBudget.begin();
+    const budget = new TurnToolBudget(taskBudget);
+    const turnLease = budget.begin(taskLease, { allowedActions: ["jump"] });
+    const harness = createToolRegistryHarness();
+    const tools = createToolRegistry({ ...harness.dependencies, budget });
+
+    await expect(
+      tools.minecraft_enqueue_actions.execute({
+        actions: [
+          { kind: "jump", summary: "跳一下" },
+          { kind: "dig_block", x: 1, y: 64, z: 1, blockName: "stone", summary: "挖石头" },
+        ],
+        turnLease,
+      }),
+    ).resolves.toEqual({ text: '{"error":"tool action is not allowed"}', isError: true });
+    expect(harness.actionQueue.snapshot().items).toEqual([]);
+    expect(taskBudget.snapshot()).toMatchObject({ toolCalls: 0, blockChanges: 0 });
+  });
+
+  it("reserves aggregate block and trusted travel budgets for a queued batch", async () => {
+    const taskBudget = new TaskControllerBudget();
+    const taskLease = taskBudget.begin({ maxBlockChanges: 1, maxHorizontalTravel: 5 });
+    const budget = new TurnToolBudget(taskBudget);
+    const turnLease = budget.begin(taskLease, { allowedActions: ["move_to", "dig_block"] });
+    const harness = createToolRegistryHarness();
+    const tools = createToolRegistry({ ...harness.dependencies, budget });
+
+    await expect(
+      tools.minecraft_enqueue_actions.execute({
+        actions: [
+          { kind: "move_to", x: 3, y: 64, z: 4, summary: "前往石头" },
+          { kind: "dig_block", x: 3, y: 64, z: 4, blockName: "stone", summary: "挖石头" },
+        ],
+        turnLease,
+      }),
+    ).resolves.toEqual({ text: '{"status":"queued","count":2}' });
+    expect(taskBudget.snapshot()).toMatchObject({
+      toolCalls: 1,
+      blockChanges: 1,
+      horizontalTravel: 5,
+    });
+  });
+
+  it("rejects a physical budget overflow without appending a partial batch", async () => {
+    const taskBudget = new TaskControllerBudget();
+    const taskLease = taskBudget.begin({ maxBlockChanges: 1 });
+    const budget = new TurnToolBudget(taskBudget);
+    const turnLease = budget.begin(taskLease, { allowedActions: ["dig_block"] });
+    const harness = createToolRegistryHarness();
+    const tools = createToolRegistry({ ...harness.dependencies, budget });
+
+    await expect(
+      tools.minecraft_enqueue_actions.execute({
+        actions: [
+          { kind: "dig_block", x: 1, y: 64, z: 1, blockName: "stone", summary: "挖一" },
+          { kind: "dig_block", x: 2, y: 64, z: 1, blockName: "stone", summary: "挖二" },
+        ],
+        turnLease,
+      }),
+    ).resolves.toEqual({ text: '{"error":"tool call budget exhausted"}', isError: true });
+    expect(harness.actionQueue.snapshot().items).toEqual([]);
+    expect(taskBudget.snapshot()).toMatchObject({
+      active: false,
+      stopReason: "budget_exhausted",
+      toolCalls: 0,
+      blockChanges: 0,
+    });
+  });
+
+  it("returns a redacted queue projection and cancels only its task waiting actions", async () => {
+    const harness = createToolRegistryHarness();
+    const tools = createToolRegistry(harness.dependencies);
+    await tools.minecraft_enqueue_actions.execute(
+      leased(harness, {
+        actions: [
+          { kind: "jump", summary: "password=hunter2" },
+          { kind: "wait", milliseconds: 500, summary: "等待" },
+        ],
+      }),
+    );
+
+    const projection = await tools.minecraft_get_action_queue.execute(leased(harness));
+    expect(projection.text).not.toContain("hunter2");
+    expect(projection.text).not.toContain("turnLease");
+    await expect(tools.minecraft_cancel_queued_actions.execute(leased(harness))).resolves.toEqual({
+      text: '{"status":"cancelled","count":2}',
+    });
+    expect(harness.actionQueue.snapshot().items.map((item) => item.status)).toEqual([
+      "cancelled",
+      "cancelled",
+    ]);
+  });
+
+  it("rejects an invalid queue lease before reading snapshots or changing the queue", async () => {
+    const harness = createToolRegistryHarness();
+    let snapshotReads = 0;
+    const tools = createToolRegistry({
+      ...harness.dependencies,
+      latestSnapshot: () => {
+        snapshotReads += 1;
+        return harness.minecraft.world;
+      },
+    });
+
+    await expect(
+      tools.minecraft_enqueue_actions.execute({
+        actions: [{ kind: "jump", summary: "跳一下" }],
+        turnLease: "x".repeat(43),
+      }),
+    ).resolves.toMatchObject({ isError: true });
+    expect(snapshotReads).toBe(0);
+    expect(harness.actionQueue.snapshot().items).toEqual([]);
+  });
+
+  it("allows two same-failure retries, rejects the third, and resets on real changes", async () => {
+    const harness = createToolRegistryHarness();
+    const tools = createToolRegistry(harness.dependencies);
+    const input = leased(harness, {
+      actions: [{ kind: "move_to" as const, x: 2, y: 64, z: 3, summary: "前往目标" }],
+    });
+    const taskLease = harness.budget.currentTaskLease(harness.turnLease);
+    if (!taskLease) throw new Error("expected active task lease");
+    for (const reason of [" Block   missing ", "block missing", "BLOCK MISSING"]) {
+      await tools.minecraft_enqueue_actions.execute(input);
+      const item = harness.actionQueue.claimNext(taskLease, 0);
+      if (!item) throw new Error("expected queued action");
+      harness.actionQueue.fail(item.id, taskLease, 0, reason);
+    }
+
+    await expect(tools.minecraft_enqueue_actions.execute(input)).resolves.toEqual({
+      text: '{"error":"semantic action retry exhausted"}',
+      isError: true,
+    });
+    harness.minecraft.world.health -= 1;
+    await expect(tools.minecraft_enqueue_actions.execute(input)).resolves.toEqual({
+      text: '{"status":"queued","count":1}',
+    });
+    await expect(
+      tools.minecraft_enqueue_actions.execute(
+        leased(harness, {
+          actions: [{ kind: "move_to", x: 3, y: 64, z: 3, summary: "前往新目标" }],
+        }),
+      ),
+    ).resolves.toEqual({ text: '{"status":"queued","count":1}' });
+  });
+
   it("consumes before safety context or Minecraft reads and reports unavailable turn as an error", async () => {
     const harness = createToolRegistryHarness({ begun: false });
     const result = await createToolRegistry(harness.dependencies).minecraft_get_state.execute(

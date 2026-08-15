@@ -780,6 +780,9 @@ export async function createCompanionHarness(options: CompanionHarnessOptions = 
       owner: { x: 0, y: 64, z: 0 },
     }),
     ownerUsername: () => "TestOwner",
+    latestSnapshot: () => minecraft.world,
+    actionQueue,
+    worldGeneration: () => service.queueExecutionContext()?.worldGeneration ?? 0,
   });
   return {
     directory,

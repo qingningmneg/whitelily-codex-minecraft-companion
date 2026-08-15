@@ -1,8 +1,8 @@
 import * as z from "zod/v4";
 import {
   createToolRegistry,
-  MINECRAFT_TOOL_NAMES,
-  type MinecraftToolName,
+  MINECRAFT_EXECUTION_TOOL_NAMES,
+  type MinecraftExecutionToolName,
   type ToolDefinition,
   type ToolRegistryDependencies,
 } from "../mcp/toolRegistry.js";
@@ -23,19 +23,19 @@ function failure(message: string): DynamicToolCallResponse {
   };
 }
 
-function isMinecraftToolName(value: string): value is MinecraftToolName {
-  return (MINECRAFT_TOOL_NAMES as readonly string[]).includes(value);
+function isMinecraftToolName(value: string): value is MinecraftExecutionToolName {
+  return (MINECRAFT_EXECUTION_TOOL_NAMES as readonly string[]).includes(value);
 }
 
 export function createMinecraftDynamicTools(
   dependencies: ToolRegistryDependencies,
 ): MinecraftDynamicTools {
   const registry = createToolRegistry(dependencies) as unknown as Record<
-    MinecraftToolName,
+    MinecraftExecutionToolName,
     ToolDefinition<unknown>
   >;
   const specs = Object.freeze(
-    MINECRAFT_TOOL_NAMES.map((name): DynamicToolSpec => {
+    MINECRAFT_EXECUTION_TOOL_NAMES.map((name): DynamicToolSpec => {
       const tool = registry[name];
       return Object.freeze({
         type: "function" as const,
