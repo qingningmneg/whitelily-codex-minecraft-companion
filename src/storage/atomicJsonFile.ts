@@ -89,6 +89,7 @@ export interface AtomicJsonFileOptions<T> {
   validate(value: unknown): T;
   io?: AtomicJsonFileIo;
   randomId?: () => string;
+  recoverFromBackup?: boolean;
   recoverFrom?: (error: AtomicJsonFileError) => boolean;
   beforeBoundary?: (context: AtomicJsonBoundaryContext) => void | Promise<void>;
 }
@@ -157,6 +158,7 @@ export class AtomicJsonFile<T> {
   readonly #validate: (value: unknown) => T;
   readonly #io: AtomicJsonFileIo;
   readonly #randomId: () => string;
+  readonly #recoverFromBackup: boolean;
   readonly #recoverFrom: (error: AtomicJsonFileError) => boolean;
   readonly #beforeBoundary: (context: AtomicJsonBoundaryContext) => Promise<void>;
 
@@ -183,6 +185,7 @@ export class AtomicJsonFile<T> {
     this.#validate = options.validate;
     this.#io = options.io ?? nodeAtomicJsonFileIo;
     this.#randomId = options.randomId ?? randomUUID;
+    this.#recoverFromBackup = options.recoverFromBackup ?? true;
     this.#recoverFrom = options.recoverFrom ?? (() => true);
     this.#beforeBoundary = async (context) => {
       await options.beforeBoundary?.(context);
@@ -212,11 +215,23 @@ export class AtomicJsonFile<T> {
       if (
         !(error instanceof AtomicJsonFileError) ||
         error.code !== "ATOMIC_JSON_INVALID" ||
+        !this.#recoverFromBackup ||
         !this.#recoverFrom(error)
       ) {
         throw error;
       }
       primaryError = error;
+    }
+
+    if (!this.#recoverFromBackup) {
+      const backup = await this.#resolveFile(this.#backupPath, true);
+      if (backup !== undefined) {
+        throw new AtomicJsonFileError(
+          "ATOMIC_JSON_RECOVERY_FAILED",
+          "atomic JSON backup recovery is disabled",
+        );
+      }
+      return undefined;
     }
 
     let backup: T;

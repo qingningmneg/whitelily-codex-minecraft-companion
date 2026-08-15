@@ -42,6 +42,7 @@ import { createCompanionHarness } from "../support/companionHarness.js";
 import { TaskController } from "../../src/companion/taskController.js";
 import { TaskControllerBudget } from "../../src/safety/taskBudget.js";
 import { ProfileStore } from "../../src/profile/profileStore.js";
+import { FarmingPreferenceStore } from "../../src/profile/farmingPreferenceStore.js";
 import { createJsonRpcLineTransportHarness } from "../support/jsonRpcProcessHarness.js";
 import type { OwnerIdentitySnapshot } from "../../src/identity/ownerIdentity.js";
 import { provisionCodexWorkspace } from "../../apps/desktop/src-main/codexWorkspaceProvisioner.js";
@@ -1075,9 +1076,11 @@ describe("WhiteLilyApp composition", () => {
           minecraft: FakeMinecraftPort,
           ownerUsername: () => string,
           snapshots: ReturnType<typeof createTrustedSnapshotStore>,
+          wheatFarmingAllowed?: () => boolean,
         ) => () => Promise<{
           spawn?: { x: number; y: number; z: number };
           owner: { x: number; y: number; z: number };
+          wheatFarmingAllowed?: boolean;
         }>;
       }
     ).createTrustedSafetyContextProvider;
@@ -1091,7 +1094,20 @@ describe("WhiteLilyApp composition", () => {
     world.worldSpawn = { x: 120, y: 70, z: -45 };
     world.botPosition = { x: 140, y: 70, z: -45 };
     const snapshots = createTrustedSnapshotStore();
-    const safetyContextProvider = createProvider(minecraft, () => "TestOwner", snapshots);
+    let farmingAllowed = true;
+    const safetyContextProvider = createProvider(
+      minecraft,
+      () => "TestOwner",
+      snapshots,
+      () => farmingAllowed,
+    );
+    await expect(safetyContextProvider()).resolves.toMatchObject({
+      wheatFarmingAllowed: true,
+    });
+    farmingAllowed = false;
+    await expect(safetyContextProvider()).resolves.toMatchObject({
+      wheatFarmingAllowed: false,
+    });
     const confirmations = new ConfirmationStore();
     const executor = new ActionExecutor(
       minecraft,
@@ -2234,6 +2250,63 @@ describe("WhiteLilyApp composition", () => {
       mode: "autonomous",
       persona: "live replacement",
     });
+    await runtime.stop("process_exit");
+  });
+
+  it("loads and atomically updates the global farming preference projection", async () => {
+    const files = await createCliHarness();
+    cleanups.push(files.cleanup);
+    const preferenceRoot = join(files.directory, "config");
+    await mkdir(preferenceRoot, { recursive: true });
+    const persistedStore = new FarmingPreferenceStore({
+      rootDirectory: preferenceRoot,
+      clock: () => new Date("2026-08-15T08:00:00.000Z"),
+    });
+    await persistedStore.setAllowed(0);
+    let context: AppCompositionContext | undefined;
+    const runtime = await createRuntimeFacade(files.configPath, {
+      cwd: files.directory,
+      runtimeFactory: (createdContext) => {
+        context = createdContext;
+        return {
+          preferredModel: createdContext.config.codex.preferredModel,
+          mcp: { start: async () => undefined, stop: async () => undefined },
+          codex: {
+            assertChatGptLogin: async () => undefined,
+            start: async () => undefined,
+            listModels: async () => [createdContext.config.codex.preferredModel],
+            stop: async () => undefined,
+          },
+          selectModel: (_available, preferred) => preferred,
+          switchModel: async (_selection, commitPreference) => commitPreference(),
+          minecraft: { connect: async () => undefined, disconnect: async () => undefined },
+          companion: {
+            start: async () => undefined,
+            switchModel: async (_selection, commitPreference) => commitPreference(),
+            stop: async () => undefined,
+          },
+          executor: { stopAll: () => undefined },
+        };
+      },
+    });
+    if (!context) throw new Error("runtime context was not composed");
+
+    expect(context.farmingPreference.snapshot().status).toBe("allowed");
+    await context.farmingPreference.setDenied();
+    expect(context.farmingPreference.snapshot().status).toBe("denied");
+    await expect(
+      new FarmingPreferenceStore({ rootDirectory: preferenceRoot }).read(),
+    ).resolves.toMatchObject({
+      revision: 2,
+      value: { status: "denied" },
+    });
+
+    const external = new FarmingPreferenceStore({ rootDirectory: preferenceRoot });
+    await external.setAllowed(2);
+    await expect(context.farmingPreference.setDenied()).rejects.toMatchObject({
+      code: "DOCUMENT_CONFLICT",
+    });
+    expect(context.farmingPreference.snapshot().status).toBe("denied");
     await runtime.stop("process_exit");
   });
 

@@ -38,6 +38,7 @@ export interface DocumentStoreOptions<T> {
   defaultValue(): T;
   clock?: () => Date;
   fileIo?: AtomicJsonFileIo;
+  recoverFromBackup?: boolean;
   recoverFrom?: (error: AtomicJsonFileError) => boolean;
 }
 
@@ -85,6 +86,9 @@ export class DocumentStore<T> {
       rootDirectory: options.rootDirectory,
       validate: (value) => this.#validateEnvelope(value),
       ...(options.fileIo === undefined ? {} : { io: options.fileIo }),
+      ...(options.recoverFromBackup === undefined
+        ? {}
+        : { recoverFromBackup: options.recoverFromBackup }),
       recoverFrom:
         options.recoverFrom ??
         ((error) =>

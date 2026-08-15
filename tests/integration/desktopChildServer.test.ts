@@ -1,5 +1,5 @@
 import { PassThrough } from "node:stream";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -14,7 +14,11 @@ import {
   type DesktopCommand,
   type DesktopRequest,
 } from "../../src/desktop/desktopProtocol.js";
-import { runDesktopChild, type DesktopChildServices } from "../../src/desktop/childMain.js";
+import {
+  createDefaultDesktopChildServices,
+  runDesktopChild,
+  type DesktopChildServices,
+} from "../../src/desktop/childMain.js";
 import { RuntimeFacade } from "../../src/runtime/runtimeFacade.js";
 import { ActionCapabilityError } from "../../src/app.js";
 import { MineflayerBridgeError } from "../../src/minecraft/mineflayerConnection.js";
@@ -29,6 +33,7 @@ import {
   type ResolvedModelSelection,
 } from "../../src/codex/modelCatalog.js";
 import { ModelPreferenceStore } from "../../src/codex/modelPreferenceStore.js";
+import { FarmingPreferenceStore } from "../../src/profile/farmingPreferenceStore.js";
 import type { MinecraftEvent } from "../../src/minecraft/minecraftPort.js";
 import type { RuntimeEvent, RuntimeSnapshot } from "../../src/runtime/runtimeEvents.js";
 import type { TaskStopReason } from "../../src/safety/taskBudget.js";
@@ -321,6 +326,46 @@ afterEach(async () => {
 });
 
 describe("DesktopChildServer", () => {
+  it("passes the same config-scoped farming preference store into desktop runtimes", async () => {
+    const rootDirectory = await mkdtemp(join(tmpdir(), "whitelily-farming-child-"));
+    try {
+      const configPath = join(rootDirectory, "config.toml");
+      const preferenceRoot = join(rootDirectory, "config");
+      await Promise.all([
+        writeFile(configPath, validConfig, "utf8"),
+        mkdir(preferenceRoot, { recursive: true }),
+      ]);
+      const seeded = new FarmingPreferenceStore({ rootDirectory: preferenceRoot });
+      await seeded.setAllowed(0);
+      let runtimeStore: FarmingPreferenceStore | undefined;
+      const services = await createDefaultDesktopChildServices(
+        { configPath, cwd: rootDirectory },
+        "0.2.0-beta.2",
+        async (_configPath, _connection, _revision, _selection, _ownerIdentity, farmingStore) => {
+          runtimeStore = farmingStore;
+          return new RuntimeFacade({
+            lifecycle: { start: async () => undefined, stop: async () => undefined },
+          });
+        },
+      );
+
+      await services.createRuntime(
+        { host: "127.0.0.1", port: 25565 },
+        0,
+        { modelId: "gpt-5.6-terra", reasoningEffort: "low" },
+        { compatibilityVerified: true, requestedPreset: "standard" },
+      );
+
+      expect(runtimeStore).toBeDefined();
+      await expect(runtimeStore!.read()).resolves.toMatchObject({
+        revision: 1,
+        value: { status: "allowed" },
+      });
+    } finally {
+      await rm(rootDirectory, { recursive: true, force: true });
+    }
+  });
+
   it("reads and updates owner identity without exposing config input", async () => {
     const ownerIdentity = ownerHarness("OldOwner");
     const harness = createHarness({ ownerIdentity });

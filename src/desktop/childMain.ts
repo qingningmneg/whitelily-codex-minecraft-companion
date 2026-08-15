@@ -13,6 +13,7 @@ import { loadConfig, resolveCoreAppPaths } from "../config/loadConfig.js";
 import { arch, platform, release } from "node:os";
 import { DiagnosticExporter } from "../diagnostics/diagnosticExporter.js";
 import { ProfileStore } from "../profile/profileStore.js";
+import { FarmingPreferenceStore } from "../profile/farmingPreferenceStore.js";
 import { MemoryMigration } from "../memory/memoryMigration.js";
 import { MemoryStore } from "../memory/memoryStore.js";
 import { ScopedMemoryStore } from "../memory/scopedMemoryStore.js";
@@ -69,6 +70,7 @@ export interface DesktopChildMainDependencies {
     initialRevision: number,
     selection: ResolvedModelSelection,
     ownerIdentity: OwnerIdentityAccess,
+    farmingPreferenceStore: FarmingPreferenceStore,
   ) => Promise<RuntimeFacade>;
   createServices?: (
     context: DesktopChildServiceContext,
@@ -182,7 +184,7 @@ function resolveApplicationVersion(value: string | undefined): string {
   return value;
 }
 
-async function createDefaultDesktopChildServices(
+export async function createDefaultDesktopChildServices(
   context: DesktopChildServiceContext,
   appVersion: string,
   injectedRuntimeFactory?: (
@@ -191,6 +193,7 @@ async function createDefaultDesktopChildServices(
     initialRevision: number,
     selection: ResolvedModelSelection,
     ownerIdentity: OwnerIdentityAccess,
+    farmingPreferenceStore: FarmingPreferenceStore,
   ) => Promise<RuntimeFacade>,
 ): Promise<DesktopChildServices> {
   const paths = resolveCoreAppPaths(context.configPath, {
@@ -213,6 +216,9 @@ async function createDefaultDesktopChildServices(
     legacyConfigCandidate,
   });
   const profiles = new ProfileStore({ rootDirectory: paths.profiles });
+  const farmingPreferenceStore = new FarmingPreferenceStore({
+    rootDirectory: dirname(paths.profiles),
+  });
   const ownerIdentity = await OwnerIdentityService.open(paths.config);
   let activePrivateWorldProof: string | undefined;
   const worldProfiles = new WorldProfileStore({
@@ -276,6 +282,7 @@ async function createDefaultDesktopChildServices(
               runtimeModelSelection: selection,
               worldSafety,
               ownerIdentity,
+              farmingPreferenceStore,
             })
         : (connection, initialRevision, selection) =>
             injectedRuntimeFactory(
@@ -284,6 +291,7 @@ async function createDefaultDesktopChildServices(
               initialRevision,
               selection,
               ownerIdentity,
+              farmingPreferenceStore,
             ),
   };
 }

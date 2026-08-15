@@ -53,6 +53,10 @@ import { StateStore } from "./memory/stateStore.js";
 import type { MinecraftEvent, MinecraftPort } from "./minecraft/minecraftPort.js";
 import { MineflayerAdapter } from "./minecraft/mineflayerAdapter.js";
 import { ModeManager } from "./mode/modeManager.js";
+import {
+  FarmingPreferenceStore,
+  type FarmingPreference,
+} from "./profile/farmingPreferenceStore.js";
 import { ProfileStore } from "./profile/profileStore.js";
 import type { CompanionProfile } from "./profile/profileSchema.js";
 import { OwnerIdentityError, type OwnerIdentitySnapshot } from "./identity/ownerIdentity.js";
@@ -136,6 +140,7 @@ export interface AppCompositionContext {
   budget: TurnToolBudget;
   taskController: TaskController;
   ownerIdentity: OwnerIdentityProvider;
+  farmingPreference: FarmingPreferenceAccess;
   logger: Pick<SafeLogger, "info" | "error">;
   workspaceVersion: string;
   reportAuthorityLoss(event: RuntimeAuthorityLoss): void;
@@ -163,7 +168,43 @@ export interface CreateAppOptions {
   workspaceVersion?: string;
   worldSafety?: RuntimeSafetyConfiguration;
   ownerIdentity?: OwnerIdentityProvider;
+  farmingPreferenceStore?: FarmingPreferenceStore;
   runtimeFactory?: (context: AppCompositionContext) => AppRuntime | Promise<AppRuntime>;
+}
+
+export interface FarmingPreferenceAccess {
+  snapshot(): Readonly<FarmingPreference>;
+  setAllowed(): Promise<Readonly<FarmingPreference>>;
+  setDenied(): Promise<Readonly<FarmingPreference>>;
+}
+
+class RuntimeFarmingPreference implements FarmingPreferenceAccess {
+  constructor(
+    private readonly store: FarmingPreferenceStore,
+    private envelope: Awaited<ReturnType<FarmingPreferenceStore["read"]>>,
+  ) {}
+
+  snapshot(): Readonly<FarmingPreference> {
+    return Object.freeze(structuredClone(this.envelope.value));
+  }
+
+  setAllowed(): Promise<Readonly<FarmingPreference>> {
+    return this.setStatus("allowed");
+  }
+
+  setDenied(): Promise<Readonly<FarmingPreference>> {
+    return this.setStatus("denied");
+  }
+
+  private async setStatus(status: "allowed" | "denied"): Promise<Readonly<FarmingPreference>> {
+    const expectedRevision = this.envelope.revision;
+    const committed =
+      status === "allowed"
+        ? await this.store.setAllowed(expectedRevision)
+        : await this.store.setDenied(expectedRevision);
+    this.envelope = committed;
+    return this.snapshot();
+  }
 }
 
 interface RuntimeCompositionObservers {
@@ -343,15 +384,19 @@ export function createTrustedSafetyContextProvider(
   minecraft: Pick<MinecraftPort, "snapshot">,
   ownerUsername: () => string,
   trustedSnapshots: TrustedSnapshotStore,
+  wheatFarmingAllowed: () => boolean = () => false,
 ): () => Promise<SafetyContext> {
   return async (): Promise<SafetyContext> => {
     const snapshot = await minecraft.snapshot(ownerUsername());
     trustedSnapshots.publish(snapshot);
     const owner = structuredClone(snapshot.ownerPosition ?? snapshot.botPosition);
-    if (snapshot.worldSpawn === undefined) return { owner };
+    if (snapshot.worldSpawn === undefined) {
+      return { owner, wheatFarmingAllowed: wheatFarmingAllowed() };
+    }
     return {
       spawn: structuredClone(snapshot.worldSpawn),
       owner,
+      wheatFarmingAllowed: wheatFarmingAllowed(),
     };
   };
 }
@@ -691,6 +736,7 @@ export function createProductionRuntime(
     minecraft,
     ownerUsername,
     trustedSnapshots,
+    () => context.farmingPreference.snapshot().status === "allowed",
   );
 
   let companion: CompanionService | undefined;
@@ -1127,6 +1173,13 @@ async function composeApp(
   const config = await loadConfig(paths.config, options.confirmedMinecraftConnection);
   await initializeStorage(paths);
   const activeProfile = await new ProfileStore({ rootDirectory: paths.profiles }).read();
+  const farmingPreferenceStore =
+    options.farmingPreferenceStore ??
+    new FarmingPreferenceStore({ rootDirectory: dirname(paths.profiles) });
+  const farmingPreference = new RuntimeFarmingPreference(
+    farmingPreferenceStore,
+    await farmingPreferenceStore.read(),
+  );
   const taskBudget = new TaskControllerBudget();
   const logger = new SafeLogger(paths.log);
   const audit = new AuditLogger(paths.audit);
@@ -1162,6 +1215,7 @@ async function composeApp(
     budget: new TurnToolBudget(taskBudget),
     taskController,
     ownerIdentity,
+    farmingPreference,
     logger,
     workspaceVersion:
       options.workspaceVersion ?? process.env.WHITELILY_WORKSPACE_VERSION ?? "development",
