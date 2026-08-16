@@ -40,7 +40,7 @@
 - Consumes: Zod 4、现有稳定 JSON 协议约定。
 - Produces: `AvatarModelId`、`AvatarModelRecord`、`AvatarModelCatalogSnapshot`、`AvatarModelControlRequest`、`AvatarModelControlState`、`parseAvatarModelControlRequest()`、`parseAvatarModelControlState()`。
 
-- [ ] **Step 1: 写稳定标识、目录顺序和协议联合类型的失败测试**
+- [x] **Step 1: 写稳定标识、目录顺序和协议联合类型的失败测试**
 
 ```ts
 it("accepts the prepare-ready-commit protocol and fixes builtin order", () => {
@@ -60,13 +60,13 @@ it.each(["", "../escape", "C:\\outside.glb", "https://host/model.glb"])(
 );
 ```
 
-- [ ] **Step 2: 运行测试并确认红灯**
+- [x] **Step 2: 运行测试并确认红灯**
 
 Run: `npx vitest run tests/unit/avatarModelSchemas.test.ts`
 
 Expected: FAIL，提示无法导入 `src/avatar/avatarModelSchemas.ts`。
 
-- [ ] **Step 3: 建立唯一的 TypeScript 协议定义**
+- [x] **Step 3: 建立唯一的 TypeScript 协议定义**
 
 ```ts
 export const BUILTIN_AVATAR_MODEL_IDS = [
@@ -140,6 +140,7 @@ export interface AvatarModelCatalogSnapshot {
 
 export interface AvatarRuntimeDescriptor {
   readonly modelId: string;
+  readonly origin: "builtin" | "imported";
   readonly format: AvatarModelFormat;
   readonly resourcePath: string;
   readonly sha256: string;
@@ -181,7 +182,7 @@ export interface AvatarModelControlState {
 
 控制协议使用同一个 `requestId` 完成三种操作：`prepare` 携带只读 `AvatarRuntimeDescriptor`，`commit` 只引用已 `ready` 的模型，`cancel` 释放尚未提交候选。状态的 `phase` 固定为 `preparing | ready | committed | cancelled | failed`；`committed` 明确表示首个完整可见帧已经成功，而不是仅完成文件加载。
 
-- [ ] **Step 4: 写 JSON Schema 与三份跨语言固定夹具并跑绿**
+- [x] **Step 4: 写 JSON Schema 与三份跨语言固定夹具并跑绿**
 
 `prepare-request.json` 使用 `requestId: "switch-0001"`、`modelId: "builtin:whitelily-hd"`、`operation: "prepare"`、64 位小写 SHA-256、`worldSessionId: "world-0001"` 和管理目录相对路径 `builtin/whitelily-hd/high.glb`。`ready-state.json` 使用相同请求和世界会话；`committed-state.json` 把 `phase` 改为 `committed` 且 `activeModelId` 为高清内置标识。Schema 设置 `additionalProperties: false`，所有字符串设置最大长度，错误码只接受已声明枚举。
 
@@ -189,7 +190,7 @@ Run: `npx vitest run tests/unit/avatarModelSchemas.test.ts`
 
 Expected: PASS。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```powershell
 git add src/avatar tests/unit/avatarModelSchemas.test.ts subprojects/whitelily-avatar/protocol

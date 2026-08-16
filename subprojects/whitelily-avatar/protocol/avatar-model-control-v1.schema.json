@@ -1,0 +1,191 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://whitelily.local/protocol/avatar-model-control-v1.schema.json",
+  "title": "WhiteLily Avatar Model Control Protocol v1",
+  "oneOf": [
+    { "$ref": "#/$defs/prepareRequest" },
+    { "$ref": "#/$defs/commitRequest" },
+    { "$ref": "#/$defs/cancelRequest" },
+    { "$ref": "#/$defs/controlState" }
+  ],
+  "$defs": {
+    "modelId": {
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^(builtin:whitelily-(hd|classic)|user:[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$"
+    },
+    "requestId": {
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9_-]{1,64}$"
+    },
+    "worldSessionId": {
+      "type": "string",
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9_-]{1,128}$"
+    },
+    "timestamp": {
+      "type": "string",
+      "maxLength": 64,
+      "format": "date-time"
+    },
+    "managedPath": {
+      "type": "string",
+      "maxLength": 512,
+      "pattern": "^(?!/)(?!.*(^|/)\\.\\.(/|$))(?!.*\\\\)(?![A-Za-z][A-Za-z0-9+.-]*:)[A-Za-z0-9._/-]{1,512}$"
+    },
+    "boneName": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "boneMapping": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "head",
+        "neck",
+        "chest",
+        "hips",
+        "leftUpperArm",
+        "leftLowerArm",
+        "leftHand",
+        "rightUpperArm",
+        "rightLowerArm",
+        "rightHand",
+        "leftUpperLeg",
+        "leftLowerLeg",
+        "leftFoot",
+        "rightUpperLeg",
+        "rightLowerLeg",
+        "rightFoot"
+      ],
+      "properties": {
+        "head": { "$ref": "#/$defs/boneName" },
+        "neck": { "$ref": "#/$defs/boneName" },
+        "chest": { "$ref": "#/$defs/boneName" },
+        "hips": { "$ref": "#/$defs/boneName" },
+        "leftUpperArm": { "$ref": "#/$defs/boneName" },
+        "leftLowerArm": { "$ref": "#/$defs/boneName" },
+        "leftHand": { "$ref": "#/$defs/boneName" },
+        "rightUpperArm": { "$ref": "#/$defs/boneName" },
+        "rightLowerArm": { "$ref": "#/$defs/boneName" },
+        "rightHand": { "$ref": "#/$defs/boneName" },
+        "leftUpperLeg": { "$ref": "#/$defs/boneName" },
+        "leftLowerLeg": { "$ref": "#/$defs/boneName" },
+        "leftFoot": { "$ref": "#/$defs/boneName" },
+        "rightUpperLeg": { "$ref": "#/$defs/boneName" },
+        "rightLowerLeg": { "$ref": "#/$defs/boneName" },
+        "rightFoot": { "$ref": "#/$defs/boneName" }
+      }
+    },
+    "candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "modelId",
+        "origin",
+        "format",
+        "resourcePath",
+        "sha256",
+        "boneMapping",
+        "bodyAnimation",
+        "expressions"
+      ],
+      "properties": {
+        "modelId": { "$ref": "#/$defs/modelId" },
+        "origin": { "enum": ["builtin", "imported"] },
+        "format": { "enum": ["builtin-hd", "builtin-classic", "vrm", "glb"] },
+        "resourcePath": { "$ref": "#/$defs/managedPath" },
+        "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "boneMapping": { "$ref": "#/$defs/boneMapping" },
+        "bodyAnimation": { "const": "whitelily-humanoid-v1" },
+        "expressions": { "enum": ["full", "neutral-only"] }
+      }
+    },
+    "prepareRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "requestId",
+        "operation",
+        "modelId",
+        "worldSessionId",
+        "candidate",
+        "issuedAt"
+      ],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "requestId": { "$ref": "#/$defs/requestId" },
+        "operation": { "const": "prepare" },
+        "modelId": { "$ref": "#/$defs/modelId" },
+        "worldSessionId": { "$ref": "#/$defs/worldSessionId" },
+        "candidate": { "$ref": "#/$defs/candidate" },
+        "issuedAt": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "commitRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "requestId",
+        "operation",
+        "modelId",
+        "worldSessionId",
+        "issuedAt"
+      ],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "requestId": { "$ref": "#/$defs/requestId" },
+        "operation": { "const": "commit" },
+        "modelId": { "$ref": "#/$defs/modelId" },
+        "worldSessionId": { "$ref": "#/$defs/worldSessionId" },
+        "issuedAt": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "cancelRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "requestId",
+        "operation",
+        "modelId",
+        "worldSessionId",
+        "issuedAt"
+      ],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "requestId": { "$ref": "#/$defs/requestId" },
+        "operation": { "const": "cancel" },
+        "modelId": { "$ref": "#/$defs/modelId" },
+        "worldSessionId": { "$ref": "#/$defs/worldSessionId" },
+        "issuedAt": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "controlState": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "requestId",
+        "phase",
+        "activeModelId",
+        "worldSessionId",
+        "updatedAt"
+      ],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "requestId": { "$ref": "#/$defs/requestId" },
+        "phase": { "enum": ["preparing", "ready", "committed", "cancelled", "failed"] },
+        "activeModelId": { "$ref": "#/$defs/modelId" },
+        "candidateModelId": { "$ref": "#/$defs/modelId" },
+        "worldSessionId": { "$ref": "#/$defs/worldSessionId" },
+        "errorCode": { "type": "string", "pattern": "^AVATAR_[A-Z0-9_]{1,64}$" },
+        "updatedAt": { "$ref": "#/$defs/timestamp" }
+      }
+    }
+  }
+}
