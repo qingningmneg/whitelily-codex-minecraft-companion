@@ -78,6 +78,7 @@ project(":mod-fabric") {
     )
     add("modImplementation", "net.fabricmc.fabric-api:fabric-api:${property("fabric_api_version")}")
     add("modImplementation", "software.bernie.geckolib:geckolib-fabric-1.21.5:${property("geckolib_version")}")
+    add("implementation", "com.google.code.gson:gson:2.13.1")
     add("testImplementation", platform("org.junit:junit-bom:5.12.2"))
     add("testImplementation", "org.junit.jupiter:junit-jupiter")
     add("testRuntimeOnly", "org.junit.platform:junit-platform-launcher")

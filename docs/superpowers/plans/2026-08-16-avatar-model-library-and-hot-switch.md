@@ -653,7 +653,7 @@ git commit -m "feat: coordinate atomic avatar hot switches"
 - Consumes: Task 1 JSON fixture、`WHITELILY_DATA_ROOT`/`LOCALAPPDATA`、Fabric client tick/world lifecycle。
 - Produces: `AvatarModelController.tick()`、`onRenderBoundary()`、`onVisibleFrameResult()`、`cancelForWorldChange()`。
 
-- [ ] **Step 1: 写跨语言夹具和状态机失败测试**
+- [x] **Step 1: 写跨语言夹具和状态机失败测试**
 
 ```java
 @Test
@@ -677,13 +677,13 @@ void neverCommitsBeforeACompleteVisibleFrame() {
 }
 ```
 
-- [ ] **Step 2: 运行红灯**
+- [x] **Step 2: 运行红灯**
 
 Run: `subprojects\whitelily-avatar\gradlew.bat -p subprojects\whitelily-avatar :mod-fabric:test --tests "io.github.whitelily.avatar.control.*"`
 
 Expected: FAIL，缺少 control 包。
 
-- [ ] **Step 3: 用 Gson 严格解析固定协议**
+- [x] **Step 3: 用 Gson 严格解析固定协议**
 
 ```java
 public record AvatarModelControlRequest(
@@ -718,17 +718,17 @@ public enum AvatarVisibleFrameResult {
 
 在 `mod-fabric` 增加 `implementation("com.google.code.gson:gson:2.13.1")`。codec 先检查文件普通性和 64 KiB 上限，再用 JSON tree 拒绝未知键、空字符串、超长字符串、非小写摘要、路径逃逸和不匹配 schema。模型资源路径必须 canonicalize 后仍位于 `%LOCALAPPDATA%/WhiteLily/models` 或打包内置资源根目录，禁止 symlink/reparse point。
 
-- [ ] **Step 4: 实现非渲染线程读取、渲染线程提交的状态机**
+- [x] **Step 4: 实现非渲染线程读取、渲染线程提交的状态机**
 
 client tick 每 250ms 检查一次 request mtime；`prepare` 将解析/文件读取/骨架准备提交到有界单线程 executor，成功后先执行不可见准备帧再写 `ready`。`commit` 只为同 request、同 world session、同 candidate 的 ready 资源设置 `commitRequested`；`onRenderBoundary()` 原子交换候选和旧活动会话但保留旧资源；`onVisibleFrameResult(COMPLETE)` 后才写 `committed` 并释放旧资源。`FAILED` 立即恢复旧活动引用并写稳定错误；`cancel`、断线、换世界和资源重载取消 future、释放候选并丢弃迟到回调。
 
-- [ ] **Step 5: 跑协议与生命周期测试**
+- [x] **Step 5: 跑协议与生命周期测试**
 
 Run: `subprojects\whitelily-avatar\gradlew.bat -p subprojects\whitelily-avatar :mod-fabric:test --tests "io.github.whitelily.avatar.control.*"`
 
 Expected: PASS。
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```powershell
 git add subprojects/whitelily-avatar/mod-fabric/src/main/java/io/github/whitelily/avatar/control subprojects/whitelily-avatar/mod-fabric/src/test/java/io/github/whitelily/avatar/control subprojects/whitelily-avatar/mod-fabric/src/main/java/io/github/whitelily/avatar/WhiteLilyAvatarClient.java subprojects/whitelily-avatar/build.gradle.kts
