@@ -327,6 +327,7 @@ public final class AvatarGpuResources implements AutoCloseable {
             .withUniform("ProjMat", UniformType.MATRIX4X4)
             .withUniform("AdvancedMaterial", UniformType.FLOAT)
             .withUniform("LowDetail", UniformType.FLOAT)
+            .withUniform("OpaqueTransparency", UniformType.FLOAT)
             .withDepthTestFunction(DepthTestFunction.LEQUAL_DEPTH_TEST)
             .withBlend(BlendFunction.TRANSLUCENT)
             .withDepthWrite(true)
@@ -483,11 +484,11 @@ public final class AvatarGpuResources implements AutoCloseable {
         pass.setUniform("ProjMat", RenderSystem.getProjectionMatrix());
         pass.setUniform("AdvancedMaterial", advancedMaterial(frame));
         pass.setUniform("LowDetail", lowDetailSampling(frame));
+        pass.setUniform("OpaqueTransparency", opaqueTransparency(frame));
         Matrix4f identity = new Matrix4f();
         List<Matrix4f> globalJoints = frame.pose().jointMatrices();
-        for (int primitiveIndex = 0; primitiveIndex < primitives.size(); primitiveIndex++) {
+        for (int primitiveIndex : drawOrder(frame, primitives.size())) {
           PrimitiveAllocation primitive = primitives.get(primitiveIndex);
-          if (!drawPrimitive(frame, primitiveIndex, primitive)) continue;
           List<Matrix4f> joints =
               paletteMatrices(
                   primitive.nodeTransform(), primitive.jointPalette(), globalJoints);
@@ -510,14 +511,6 @@ public final class AvatarGpuResources implements AutoCloseable {
       }
     }
 
-    private static boolean drawPrimitive(
-        SmoothMeshRenderBackend.SmoothMeshFrame frame,
-        int primitiveIndex,
-        PrimitiveAllocation primitive) {
-      return frame.nonessentialTransparencyEnabled()
-          || primitiveIndex == 0
-          || primitive.materialIndex() <= 0;
-    }
 
     @Override
     public void prepareFrame(
@@ -557,6 +550,18 @@ public final class AvatarGpuResources implements AutoCloseable {
     return frame.detailLevel() == io.github.whitelily.avatar.render.quality.AvatarDetailSelector.AvatarDetailLevel.LOW
         ? 1.0f
         : 0.0f;
+  }
+
+  static float opaqueTransparency(SmoothMeshRenderBackend.SmoothMeshFrame frame) {
+    return frame.nonessentialTransparencyEnabled() ? 0.0f : 1.0f;
+  }
+
+  static List<Integer> drawOrder(SmoothMeshRenderBackend.SmoothMeshFrame frame, int primitiveCount) {
+    Objects.requireNonNull(frame, "frame");
+    if (primitiveCount < 0) throw new IllegalArgumentException("primitiveCount must not be negative");
+    List<Integer> order = new ArrayList<>(primitiveCount);
+    for (int primitive = 0; primitive < primitiveCount; primitive++) order.add(primitive);
+    return List.copyOf(order);
   }
 
   private record PrimitiveAllocation(

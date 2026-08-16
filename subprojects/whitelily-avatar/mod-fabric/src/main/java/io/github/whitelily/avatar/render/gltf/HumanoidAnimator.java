@@ -12,6 +12,14 @@ import org.joml.Matrix4f;
 public final class HumanoidAnimator {
   public AvatarPose evaluate(
       AvatarVisualState state, HumanoidSkeleton skeleton, float elapsedSeconds) {
+    return evaluate(state, skeleton, elapsedSeconds, true);
+  }
+
+  public AvatarPose evaluate(
+      AvatarVisualState state,
+      HumanoidSkeleton skeleton,
+      float elapsedSeconds,
+      boolean secondaryDynamicsEnabled) {
     Objects.requireNonNull(state, "state");
     Objects.requireNonNull(skeleton, "skeleton");
     if (!Float.isFinite(elapsedSeconds)) throw new IllegalArgumentException("invalid animation time");
@@ -21,7 +29,7 @@ public final class HumanoidAnimator {
     Map<String, Matrix4f> local = new LinkedHashMap<>();
     for (HumanoidSkeleton.SemanticBone bone : skeleton.semanticBones())
       local.put(bone.semantic(), localJoints.get(bone.jointIndex()));
-    float cycle = (float) Math.sin(elapsedSeconds * 8.0f);
+    float cycle = secondaryDynamicsEnabled ? (float) Math.sin(elapsedSeconds * 8.0f) : 0.0f;
     if (state.moving()) {
       rotateX(local, "leftUpperArm", cycle * 0.55f);
       rotateX(local, "rightUpperArm", -cycle * 0.55f);
@@ -69,16 +77,16 @@ public final class HumanoidAnimator {
     }
     ExpressionWeights expressions =
         skeleton.fullExpressions()
-            ? expressiveWeights(state, elapsedSeconds)
+            ? expressiveWeights(state, elapsedSeconds, secondaryDynamicsEnabled)
             : ExpressionWeights.NEUTRAL;
     return new AvatarPose(
         world, joints, expressions, world.get("leftHand"), world.get("rightHand"));
   }
 
   private static ExpressionWeights expressiveWeights(
-      AvatarVisualState state, float elapsedSeconds) {
+      AvatarVisualState state, float elapsedSeconds, boolean secondaryDynamicsEnabled) {
     Map<String, Float> weights = new LinkedHashMap<>();
-    if (state.speaking()) {
+    if (secondaryDynamicsEnabled && state.speaking()) {
       weights.put("talk", 0.5f + 0.5f * (float) Math.sin(elapsedSeconds * 12.0f));
     }
     if (!"neutral".equals(state.expression())) weights.put(state.expression(), 1.0f);

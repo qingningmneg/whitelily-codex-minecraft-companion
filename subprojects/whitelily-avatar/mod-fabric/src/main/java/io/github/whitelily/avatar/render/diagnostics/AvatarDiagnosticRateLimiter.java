@@ -41,18 +41,20 @@ public final class AvatarDiagnosticRateLimiter {
     Key key = new Key(diagnostic.sessionId(), diagnostic.modelId(), diagnostic.errorCode());
     Window existing = windows.get(key);
     if (existing == null) {
-      windows.put(key, new Window(nowMillis, 0));
+      windows.put(key, new Window(nowMillis, 0, diagnostic));
       return List.of(new Emission(diagnostic, false, 0));
     }
     if (nowMillis - existing.startedAtMillis < WINDOW_MILLIS) {
-      windows.put(key, new Window(existing.startedAtMillis, existing.suppressedCount + 1));
+      windows.put(
+          key,
+          new Window(existing.startedAtMillis, existing.suppressedCount + 1, existing.diagnostic));
       return List.of();
     }
     List<Emission> emissions = new ArrayList<>(2);
     if (existing.suppressedCount > 0) {
       emissions.add(new Emission(diagnostic, true, existing.suppressedCount));
     }
-    windows.put(key, new Window(nowMillis, 0));
+    windows.put(key, new Window(nowMillis, 0, diagnostic));
     emissions.add(new Emission(diagnostic, false, 0));
     return List.copyOf(emissions);
   }
@@ -68,18 +70,18 @@ public final class AvatarDiagnosticRateLimiter {
           Window window = entry.getValue();
           if (nowMillis - window.startedAtMillis < WINDOW_MILLIS) return false;
           if (window.suppressedCount > 0) {
-            Key key = entry.getKey();
+            AvatarRenderDiagnostic original = window.diagnostic;
             emissions.add(
                 new Emission(
                     new AvatarRenderDiagnostic(
-                        "unknown",
-                        "unknown",
-                        key.modelId(),
-                        "unknown",
-                        "unknown",
-                        "unknown",
-                        key.sessionId(),
-                        key.errorCode(),
+                        original.assetVersion(),
+                        original.backend(),
+                        original.modelId(),
+                        original.detailLevel(),
+                        original.armorTheme(),
+                        original.materialTier(),
+                        original.sessionId(),
+                        original.errorCode(),
                         "duplicate diagnostics suppressed"),
                     true,
                     window.suppressedCount));
@@ -91,5 +93,5 @@ public final class AvatarDiagnosticRateLimiter {
 
   private record Key(String sessionId, String modelId, String errorCode) {}
 
-  private record Window(long startedAtMillis, int suppressedCount) {}
+  private record Window(long startedAtMillis, int suppressedCount, AvatarRenderDiagnostic diagnostic) {}
 }

@@ -134,7 +134,7 @@ final class SmoothMeshRenderBackendTest {
   }
 
   @Test
-  void builtinHighModelsPreferTheirValidatedSiblingLowResourceAtLowDetail() throws Exception {
+  void builtinHighModelsDoNotLoadAnUnverifiedSiblingLowResource() throws Exception {
     List<String> loadedPaths = new java.util.ArrayList<>();
     SmoothMeshRenderBackend backend =
         new SmoothMeshRenderBackend(
@@ -147,7 +147,56 @@ final class SmoothMeshRenderBackendTest {
     backend.prepare(descriptor("builtin"));
 
     assertEquals(
-        List.of("builtin/whitelily-hd/high.glb", "builtin/whitelily-hd/low.glb"), loadedPaths);
+        List.of("builtin/whitelily-hd/high.glb"), loadedPaths);
+  }
+
+  @Test
+  void sameStyleLowForcesLowDetailAfterFailuresEvenWhenTheObserverIsNear() throws Exception {
+    FakeDevice device = new FakeDevice();
+    SmoothMeshRenderBackend backend =
+        new SmoothMeshRenderBackend(Path.of("C:/WhiteLily"), descriptor -> decodedMesh(false));
+    PreparedAvatarResources resources = backend.prepare(descriptor("imported"));
+    device.uploadFailure = new AvatarGpuResources.ShaderUnavailableException("first");
+    assertEquals("AVATAR_SHADER_FAILED", backend.renderFrame(resources, state(), new FakeContext(device)).errorCode());
+    device.uploadFailure = new AvatarGpuResources.ShaderUnavailableException("second");
+    assertEquals("AVATAR_SHADER_FAILED", backend.renderFrame(resources, state(), new FakeContext(device)).errorCode());
+    device.uploadFailure = null;
+    FakeContext low = new FakeContext(device);
+
+    assertTrue(backend.renderFrame(resources, state(), low).successful());
+    assertEquals(
+        io.github.whitelily.avatar.render.quality.AvatarDetailSelector.AvatarDetailLevel.LOW,
+        low.frame.detailLevel());
+    assertEquals(1.0f, AvatarGpuResources.lowDetailSampling(low.frame));
+  }
+
+  @Test
+  void disabledSecondaryDynamicsChangesTheProducedAnimatedPose() throws Exception {
+    FakeDevice highDevice = new FakeDevice();
+    SmoothMeshRenderBackend highBackend =
+        new SmoothMeshRenderBackend(Path.of("C:/WhiteLily"), descriptor -> decodedMesh(false));
+    PreparedAvatarResources highResources = highBackend.prepare(descriptor("imported"));
+    FakeContext high = new FakeContext(highDevice);
+    assertTrue(highBackend.renderFrame(highResources, state(7.0f), high).successful());
+
+    FakeDevice fallbackDevice = new FakeDevice();
+    SmoothMeshRenderBackend fallbackBackend =
+        new SmoothMeshRenderBackend(Path.of("C:/WhiteLily"), descriptor -> decodedMesh(false));
+    PreparedAvatarResources fallbackResources = fallbackBackend.prepare(descriptor("imported"));
+    fallbackDevice.uploadFailure = new AvatarGpuResources.ShaderUnavailableException("first");
+    fallbackBackend.renderFrame(fallbackResources, state(7.0f), new FakeContext(fallbackDevice));
+    fallbackDevice.uploadFailure = null;
+    FakeContext fallback = new FakeContext(fallbackDevice);
+    assertTrue(fallbackBackend.renderFrame(fallbackResources, state(7.0f), fallback).successful());
+
+    assertFalse(
+        high.frame
+            .pose()
+            .bone("rightUpperArm")
+            .equals(fallback.frame.pose().bone("rightUpperArm"), 0.0001f));
+    assertEquals(0.0f, AvatarGpuResources.opaqueTransparency(high.frame));
+    assertEquals(1.0f, AvatarGpuResources.opaqueTransparency(fallback.frame));
+    assertEquals(List.of(0, 1), AvatarGpuResources.drawOrder(fallback.frame, 2));
   }
 
   @Test

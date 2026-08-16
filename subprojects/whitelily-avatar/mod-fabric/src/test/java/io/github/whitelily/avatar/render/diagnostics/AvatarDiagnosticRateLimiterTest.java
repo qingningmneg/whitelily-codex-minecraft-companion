@@ -67,6 +67,25 @@ final class AvatarDiagnosticRateLimiterTest {
   }
 
   @Test
+  void flushSummaryKeepsTheOriginalDiagnosticMetadata() {
+    AvatarDiagnosticRateLimiter limiter = new AvatarDiagnosticRateLimiter();
+    AvatarRenderDiagnostic original = diagnostic("AVATAR_ANIMATION_FAILED", "bad helper");
+    limiter.record(original, 0);
+    limiter.record(original, 1);
+
+    AvatarDiagnosticRateLimiter.Emission summary = limiter.flushExpired(30_000).getFirst();
+
+    assertEquals(original.assetVersion(), summary.diagnostic().assetVersion());
+    assertEquals(original.backend(), summary.diagnostic().backend());
+    assertEquals(original.modelId(), summary.diagnostic().modelId());
+    assertEquals(original.detailLevel(), summary.diagnostic().detailLevel());
+    assertEquals(original.armorTheme(), summary.diagnostic().armorTheme());
+    assertEquals(original.materialTier(), summary.diagnostic().materialTier());
+    assertEquals(original.sessionId(), summary.diagnostic().sessionId());
+    assertEquals(original.errorCode(), summary.diagnostic().errorCode());
+  }
+
+  @Test
   void sanitizesQuotedJsonBearerApiKeyAndPathsWithSpacesAtTheCodePointBoundary() {
     AvatarRenderDiagnostic diagnostic =
         diagnostic(

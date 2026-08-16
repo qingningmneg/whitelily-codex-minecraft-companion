@@ -3,6 +3,7 @@
 uniform sampler2D Sampler0;
 uniform float AdvancedMaterial;
 uniform float LowDetail;
+uniform float OpaqueTransparency;
 
 in vec2 texCoord0;
 in vec3 viewNormal;
@@ -20,5 +21,5 @@ void main() {
     float cel = diffuse > 0.68 ? 1.0 : (diffuse > 0.28 ? 0.76 : 0.52);
     float edge = pow(1.0 - max(dot(normalize(viewNormal), normalize(viewDirection)), 0.0), 3.0);
     vec3 boundedHighlight = vec3(0.16, 0.12, 0.2) * min(edge, 0.35) * AdvancedMaterial;
-    fragColor = vec4(base.rgb * cel + boundedHighlight, base.a);
+    fragColor = vec4(base.rgb * cel + boundedHighlight, OpaqueTransparency > 0.5 ? 1.0 : base.a);
 }
