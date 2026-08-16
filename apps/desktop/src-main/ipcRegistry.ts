@@ -39,7 +39,10 @@ import {
   parseOwnerIdentitySnapshot,
   parsePcl2Candidates,
   parseRuntimeSnapshot,
+  isAvatarIpcErrorCode,
   WHITE_LILY_IPC_CHANNELS,
+  type AvatarIpcErrorCode,
+  type AvatarIpcResult,
   type DesktopRendererEvent,
   type OwnerIdentityAuthoritySnapshot,
 } from "../src/desktopApi.js";
@@ -710,12 +713,20 @@ export function registerIpcHandlers(options: IpcRegistryOptions): () => void {
     if (options.avatarModels) {
       options.ipcMain.handle(WHITE_LILY_IPC_CHANNELS.listAvatarModels, async (_event, ...args) => {
         validateNoIpcInput(args);
-        return parseAvatarCatalogSnapshot(await options.avatarModels?.list());
+        try {
+          return avatarIpcSuccess(parseAvatarCatalogSnapshot(await options.avatarModels?.list()));
+        } catch (error) {
+          return avatarIpcFailure(error, "AVATAR_CATALOG_INVALID");
+        }
       });
       registeredChannels.push(WHITE_LILY_IPC_CHANNELS.listAvatarModels);
       options.ipcMain.handle(WHITE_LILY_IPC_CHANNELS.importAvatarModel, async (_event, ...args) => {
         validateNoIpcInput(args);
-        return parseAvatarImportResult(await options.avatarModels?.importFromPicker());
+        try {
+          return avatarIpcSuccess(parseAvatarImportResult(await options.avatarModels?.importFromPicker()));
+        } catch (error) {
+          return avatarIpcFailure(error, "AVATAR_IMPORT_FAILED");
+        }
       });
       registeredChannels.push(WHITE_LILY_IPC_CHANNELS.importAvatarModel);
       options.ipcMain.handle(WHITE_LILY_IPC_CHANNELS.switchAvatarModel, async (_event, ...args) => {
@@ -726,7 +737,13 @@ export function registerIpcHandlers(options: IpcRegistryOptions): () => void {
         } catch {
           throw new Error("invalid avatar model selection");
         }
-        return parseAvatarCatalogSnapshot(await options.avatarModels?.switchTo(modelId));
+        try {
+          return avatarIpcSuccess(
+            parseAvatarCatalogSnapshot(await options.avatarModels?.switchTo(modelId)),
+          );
+        } catch (error) {
+          return avatarIpcFailure(error, "AVATAR_SWITCH_FAILED");
+        }
       });
       registeredChannels.push(WHITE_LILY_IPC_CHANNELS.switchAvatarModel);
       unsubscribeAvatarModels = options.avatarModels.subscribe((snapshot) => {
@@ -781,6 +798,23 @@ export function registerIpcHandlers(options: IpcRegistryOptions): () => void {
     cleanup();
     throw error;
   }
+}
+
+function avatarIpcSuccess<T>(value: T): AvatarIpcResult<T> {
+  return { status: "success", value };
+}
+
+function avatarIpcFailure(error: unknown, fallback: AvatarIpcErrorCode): AvatarIpcResult<never> {
+  let code = fallback;
+  if (error && typeof error === "object") {
+    try {
+      const candidate = Reflect.get(error, "code");
+      if (isAvatarIpcErrorCode(candidate)) code = candidate;
+    } catch {
+      // Error details stay in the main process; the renderer receives only the fallback code.
+    }
+  }
+  return { status: "error", code };
 }
 
 function validateNoIpcInput(args: readonly unknown[]): void {

@@ -367,15 +367,17 @@ describe("IPC registry", () => {
       avatarModels,
     );
 
-    await expect(harness.invoke(WHITE_LILY_IPC_CHANNELS.listAvatarModels)).resolves.toEqual(
-      avatarSnapshot,
-    );
+    await expect(harness.invoke(WHITE_LILY_IPC_CHANNELS.listAvatarModels)).resolves.toEqual({
+      status: "success",
+      value: avatarSnapshot,
+    });
     await expect(harness.invoke(WHITE_LILY_IPC_CHANNELS.importAvatarModel)).resolves.toEqual({
-      status: "cancelled",
+      status: "success",
+      value: { status: "cancelled" },
     });
     await expect(
       harness.invoke(WHITE_LILY_IPC_CHANNELS.switchAvatarModel, "builtin:whitelily-classic"),
-    ).resolves.toEqual(avatarSnapshot);
+    ).resolves.toEqual({ status: "success", value: avatarSnapshot });
     expect(list).toHaveBeenCalledOnce();
     expect(importFromPicker).toHaveBeenCalledOnce();
     expect(switchTo).toHaveBeenCalledWith("builtin:whitelily-classic");
@@ -398,6 +400,82 @@ describe("IPC registry", () => {
     expect(harness.handlers.has(WHITE_LILY_IPC_CHANNELS.listAvatarModels)).toBe(false);
     expect(harness.handlers.has(WHITE_LILY_IPC_CHANNELS.importAvatarModel)).toBe(false);
     expect(harness.handlers.has(WHITE_LILY_IPC_CHANNELS.switchAvatarModel)).toBe(false);
+  });
+
+  it("returns a safe allowlisted avatar failure envelope instead of forwarding main-process errors", async () => {
+    const importFromPicker = vi.fn(async () => {
+      throw Object.assign(new Error(String.raw`failed to import C:\Users\private\avatar.glb`), {
+        code: "AVATAR_GLB_INVALID",
+      });
+    });
+    const avatarModels: AvatarModelsPort = {
+      list: vi.fn(async () => structuredClone(avatarSnapshot)),
+      importFromPicker,
+      switchTo: vi.fn(async () => structuredClone(avatarSnapshot)),
+      subscribe: vi.fn(() => vi.fn()),
+    };
+    const harness = createRegistryHarness(
+      idleSnapshot,
+      undefined,
+      vi.fn(async () => undefined),
+      avatarModels,
+    );
+
+    const result = await harness.invoke(WHITE_LILY_IPC_CHANNELS.importAvatarModel);
+
+    expect(result).toEqual({ status: "error", code: "AVATAR_GLB_INVALID" });
+    expect(JSON.stringify(result)).not.toContain(String.raw`C:\Users\private`);
+  });
+
+  it("replaces unknown avatar failure codes with the operation fallback", async () => {
+    const avatarModels: AvatarModelsPort = {
+      list: vi.fn(async () => structuredClone(avatarSnapshot)),
+      importFromPicker: vi.fn(async () => {
+        throw Object.assign(new Error("private importer detail"), { code: "AVATAR_UNKNOWN_INTERNAL" });
+      }),
+      switchTo: vi.fn(async () => structuredClone(avatarSnapshot)),
+      subscribe: vi.fn(() => vi.fn()),
+    };
+    const harness = createRegistryHarness(
+      idleSnapshot,
+      undefined,
+      vi.fn(async () => undefined),
+      avatarModels,
+    );
+
+    await expect(harness.invoke(WHITE_LILY_IPC_CHANNELS.importAvatarModel)).resolves.toEqual({
+      status: "error",
+      code: "AVATAR_IMPORT_FAILED",
+    });
+  });
+
+  it("does not inspect throwing error properties before returning the safe fallback", async () => {
+    const avatarModels: AvatarModelsPort = {
+      list: vi.fn(async () => structuredClone(avatarSnapshot)),
+      importFromPicker: vi.fn(async () => {
+        throw new Proxy(
+          {},
+          {
+            get() {
+              throw new Error("private error getter");
+            },
+          },
+        );
+      }),
+      switchTo: vi.fn(async () => structuredClone(avatarSnapshot)),
+      subscribe: vi.fn(() => vi.fn()),
+    };
+    const harness = createRegistryHarness(
+      idleSnapshot,
+      undefined,
+      vi.fn(async () => undefined),
+      avatarModels,
+    );
+
+    await expect(harness.invoke(WHITE_LILY_IPC_CHANNELS.importAvatarModel)).resolves.toEqual({
+      status: "error",
+      code: "AVATAR_IMPORT_FAILED",
+    });
   });
 
   it("registers only the fixed renderer invocation channels", () => {

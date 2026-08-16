@@ -37,10 +37,10 @@ export function AvatarModelPage({ api, locale }: AvatarModelPageProps) {
   const importModel = async (): Promise<void> => {
     if (importing) return;
     setImporting(true);
-    setErrorKey(null);
     try {
       const result = await api.importAvatarModel();
       if (result.status === "imported") {
+        setErrorKey(null);
         setCatalog((current) =>
           current && !current.models.some((model) => model.id === result.model.id)
             ? { ...current, models: [...current.models, result.model] }
@@ -132,6 +132,21 @@ function errorMessageKey(error: unknown, operation: "import" | "switch"): Messag
   }
   if (operation === "import" && code === "AVATAR_FORMAT_UNSUPPORTED") {
     return "avatarModels.error.formatUnsupported";
+  }
+  if (operation === "import" && code === "AVATAR_GLB_INVALID") {
+    return "avatarModels.error.invalidFile";
+  }
+  if (operation === "import" && code === "AVATAR_EXTERNAL_RESOURCE") {
+    return "avatarModels.error.externalResource";
+  }
+  if (operation === "import" && code === "AVATAR_REQUIRED_BONE_MISSING") {
+    return "avatarModels.error.requiredBone";
+  }
+  if (operation === "import" && code === "AVATAR_PREVIEW_FAILED") {
+    return "avatarModels.error.preview";
+  }
+  if (operation === "import" && code === "AVATAR_DIGEST_MISMATCH") {
+    return "avatarModels.error.digestMismatch";
   }
   return operation === "import" ? "avatarModels.error.import" : "avatarModels.error.switch";
 }

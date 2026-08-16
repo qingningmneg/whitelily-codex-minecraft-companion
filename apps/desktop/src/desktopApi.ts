@@ -107,6 +107,34 @@ export type WhiteLilyInvokeChannel = Exclude<
   WhiteLilyEventChannel
 >;
 
+export const AVATAR_IPC_ERROR_CODES = [
+  "AVATAR_FORMAT_UNSUPPORTED",
+  "AVATAR_GLB_INVALID",
+  "AVATAR_EXTERNAL_RESOURCE",
+  "AVATAR_REQUIRED_BONE_MISSING",
+  "AVATAR_PREVIEW_FAILED",
+  "AVATAR_DIGEST_MISMATCH",
+  "AVATAR_IMPORT_FAILED",
+  "AVATAR_CATALOG_INVALID",
+  "AVATAR_MODEL_DUPLICATE",
+  "AVATAR_MODEL_FILE_INVALID",
+  "AVATAR_MODEL_NOT_FOUND",
+  "AVATAR_SWITCH_SUPERSEDED",
+  "AVATAR_SWITCH_FAILED",
+  "AVATAR_WORLD_CHANGED",
+  "AVATAR_BRIDGE_DISCONNECTED",
+  "AVATAR_PREFERENCE_CONFLICT",
+] as const;
+
+export type AvatarIpcErrorCode = (typeof AVATAR_IPC_ERROR_CODES)[number];
+export type AvatarIpcResult<T> =
+  | { readonly status: "success"; readonly value: T }
+  | { readonly status: "error"; readonly code: AvatarIpcErrorCode };
+
+export function isAvatarIpcErrorCode(value: unknown): value is AvatarIpcErrorCode {
+  return typeof value === "string" && (AVATAR_IPC_ERROR_CODES as readonly string[]).includes(value);
+}
+
 export interface PreloadTransport {
   invoke(channel: WhiteLilyInvokeChannel, ...args: readonly unknown[]): Promise<unknown>;
   subscribe(channel: WhiteLilyEventChannel, listener: (value: unknown) => void): () => void;
@@ -703,14 +731,16 @@ export function createWhiteLilyApi(transport: PreloadTransport): WhiteLilyAppApi
     },
     listAvatarModels: async (...args: readonly unknown[]) => {
       if (args.length !== 0) throw new Error("invalid avatar list input");
-      return parseAvatarCatalogSnapshot(
+      return parseAvatarIpcResult(
         await transport.invoke(WHITE_LILY_IPC_CHANNELS.listAvatarModels),
+        parseAvatarCatalogSnapshot,
       );
     },
     importAvatarModel: async (...args: readonly unknown[]) => {
       if (args.length !== 0) throw new Error("invalid avatar import input");
-      return parseAvatarImportResult(
+      return parseAvatarIpcResult(
         await transport.invoke(WHITE_LILY_IPC_CHANNELS.importAvatarModel),
+        parseAvatarImportResult,
       );
     },
     switchAvatarModel: async (...args: readonly unknown[]) => {
@@ -721,8 +751,9 @@ export function createWhiteLilyApi(transport: PreloadTransport): WhiteLilyAppApi
       } catch {
         throw new Error("invalid avatar model selection");
       }
-      return parseAvatarCatalogSnapshot(
+      return parseAvatarIpcResult(
         await transport.invoke(WHITE_LILY_IPC_CHANNELS.switchAvatarModel, modelId),
+        parseAvatarCatalogSnapshot,
       );
     },
     subscribeAvatarModels: (...args: readonly unknown[]) => {
@@ -817,6 +848,25 @@ export function parseAvatarImportResult(
     }
   } catch {
     throw new Error("invalid avatar import result");
+  }
+}
+
+function parseAvatarIpcResult<T>(value: unknown, parseValue: (value: unknown) => T): T {
+  try {
+    const success = readExactPlainDataObject(value, ["status", "value"]);
+    if (success.status !== "success") throw new Error("invalid avatar IPC result");
+    return parseValue(success.value);
+  } catch {
+    let failure: Record<string, unknown>;
+    try {
+      failure = readExactPlainDataObject(value, ["status", "code"]);
+    } catch {
+      throw new Error("invalid avatar IPC result");
+    }
+    if (failure.status !== "error" || !isAvatarIpcErrorCode(failure.code)) {
+      throw new Error("invalid avatar IPC result");
+    }
+    throw Object.assign(new Error("avatar operation failed"), { code: failure.code });
   }
 }
 

@@ -80,9 +80,9 @@ describe("Task 5 preload API", () => {
     const subscriptions = new Map<string, (value: unknown) => void>();
     const invoke = vi.fn(async (channel: string) => {
       if (channel === WHITE_LILY_IPC_CHANNELS.importAvatarModel) {
-        return { status: "cancelled" };
+        return { status: "success", value: { status: "cancelled" } };
       }
-      return structuredClone(avatarSnapshot);
+      return { status: "success", value: structuredClone(avatarSnapshot) };
     });
     const api = createWhiteLilyApi({
       invoke,
@@ -120,6 +120,19 @@ describe("Task 5 preload API", () => {
     unsubscribe();
     unsubscribe();
     expect(subscriptions.has(WHITE_LILY_IPC_CHANNELS.avatarModelsEvent)).toBe(false);
+  });
+
+  it("rebuilds only allowlisted avatar error codes from the IPC transport", async () => {
+    const api = createWhiteLilyApi({
+      invoke: vi.fn(async () => ({ status: "error", code: "AVATAR_GLB_INVALID" })),
+      subscribe: vi.fn(),
+    });
+
+    const failure = await api.importAvatarModel().catch((error: unknown) => error);
+
+    expect(failure).toMatchObject({ code: "AVATAR_GLB_INVALID" });
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).not.toContain(String.raw`C:\Users\private\avatar.glb`);
   });
 
   it("drops malformed avatar catalog events at the preload boundary", () => {

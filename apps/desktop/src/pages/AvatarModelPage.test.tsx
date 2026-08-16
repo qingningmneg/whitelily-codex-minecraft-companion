@@ -12,21 +12,45 @@ import { AvatarModelPage } from "./AvatarModelPage.js";
 
 beforeAll(installDesktopStyles);
 afterAll(removeDesktopStyles);
-afterEach(cleanup);
+const originalScrollIntoView = Element.prototype.scrollIntoView;
+afterEach(() => {
+  cleanup();
+  if (originalScrollIntoView) {
+    Element.prototype.scrollIntoView = originalScrollIntoView;
+  } else {
+    delete (Element.prototype as Partial<Element>).scrollIntoView;
+  }
+});
 
 describe("AvatarModelPage", () => {
-  it.each([736, 360])("keeps twelve cards on one horizontal track at %ipx", async (width) => {
-    setContentWidth(width);
+  it("keeps twelve cards in the fixed single-line rail without leaking page overflow", async () => {
     const api = avatarApi(catalogWithTenImports());
-    render(<AvatarModelPage api={api} locale="zh-CN" />);
+    render(
+      <div className="app-shell" data-testid="app-shell">
+        <AvatarModelPage api={api} locale="zh-CN" />
+      </div>,
+    );
 
     const track = await screen.findByTestId("avatar-model-track");
     const viewport = screen.getByTestId("avatar-model-track-viewport");
-    setTrackMetrics(track, width, 2_900);
+    const page = screen.getByRole("main");
+    const shell = screen.getByTestId("app-shell");
+    const cards = screen.getAllByRole("button").filter((button) => button.dataset.avatarModelId);
     expect(track.children).toHaveLength(12);
+    expect(getComputedStyle(document.documentElement).minWidth).toBe("320px");
+    expect(getComputedStyle(document.body).minWidth).toBe("320px");
+    expect(getComputedStyle(shell).overflow).toBe("hidden");
+    expect(getComputedStyle(page).minWidth).toBe("0px");
+    expect(getComputedStyle(page).overflow).toBe("hidden");
+    expect(getComputedStyle(viewport).overflowX).toBe("scroll");
     expect(getComputedStyle(track).flexWrap).toBe("nowrap");
-    expect(track.scrollWidth).toBeGreaterThan(viewport.clientWidth);
-    expect(document.documentElement.scrollWidth).toBe(document.documentElement.clientWidth);
+    expect(getComputedStyle(track).width).toBe("max-content");
+    expect(getComputedStyle(track).height).toBe("430px");
+    expect(getComputedStyle(cards[0]!).flexBasis).toBe("300px");
+    expect(getComputedStyle(cards[1]!).flexBasis).toBe("220px");
+    expect(getComputedStyle(screen.getByAltText("WhiteLily 高清动漫 3D 模型设定图")).height).toBe(
+      "320px",
+    );
   });
 
   it("loads and subscribes once, but a locale-only rerender preserves pending state", async () => {
@@ -57,6 +81,66 @@ describe("AvatarModelPage", () => {
     expect(importAvatarModel).toHaveBeenCalledWith();
     expect(screen.getByTestId("avatar-model-track").children).toHaveLength(12);
     expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("keeps an existing error, catalog, and pending card unchanged when import is cancelled", async () => {
+    let publish!: (snapshot: AvatarModelCatalogSnapshot) => void;
+    const api = avatarApi(catalogWithTenImports(), {
+      importAvatarModel: vi.fn(async () => ({ status: "cancelled" as const })),
+      switchAvatarModel: vi.fn(async () => {
+        throw Object.assign(new Error("switch failed"), { code: "AVATAR_SWITCH_FAILED" });
+      }),
+      subscribeAvatarModels: (listener) => {
+        publish = listener;
+        return () => undefined;
+      },
+    });
+    const user = userEvent.setup();
+    render(<AvatarModelPage api={api} locale="en" />);
+
+    await user.click(await screen.findByRole("button", { name: "Imported 1" }));
+    expect((await screen.findByRole("alert")).textContent).toBe(
+      "The avatar model could not be switched. Try again.",
+    );
+    act(() =>
+      publish({
+        revision: 2,
+        models: catalogWithTenImports(),
+        activeModelId: "builtin:whitelily-hd",
+        pendingModelId: "user:00000000-0000-4000-8000-000000000001",
+      }),
+    );
+    const originalTrack = screen.getByTestId("avatar-model-track");
+
+    await user.click(screen.getByRole("button", { name: "Import model" }));
+
+    expect(screen.getByRole("alert").textContent).toBe(
+      "The avatar model could not be switched. Try again.",
+    );
+    expect(screen.getByTestId("avatar-model-track")).toBe(originalTrack);
+    expect(screen.getByRole("status").textContent).toBe("Switching…");
+  });
+
+  it.each([
+    ["AVATAR_FORMAT_UNSUPPORTED", "This avatar model format is not supported."],
+    ["AVATAR_GLB_INVALID", "The avatar model file is invalid."],
+    ["AVATAR_EXTERNAL_RESOURCE", "The avatar model must not use external resources."],
+    ["AVATAR_REQUIRED_BONE_MISSING", "The avatar model is missing required bones."],
+    ["AVATAR_PREVIEW_FAILED", "The avatar preview could not be created. Try again."],
+    ["AVATAR_DIGEST_MISMATCH", "The avatar model changed while it was being imported. Try again."],
+    ["AVATAR_IMPORT_FAILED", "The avatar model could not be imported. Try again."],
+  ])("shows the localized stable error for %s", async (code, message) => {
+    const api = avatarApi(catalogWithTenImports(), {
+      importAvatarModel: vi.fn(async () => {
+        throw Object.assign(new Error("transport message"), { code });
+      }),
+    });
+    const user = userEvent.setup();
+    render(<AvatarModelPage api={api} locale="en" />);
+
+    await user.click(await screen.findByRole("button", { name: "Import model" }));
+
+    expect((await screen.findByRole("alert")).textContent).toBe(message);
   });
 
   it("keeps the sole confirmed selection when a switch fails", async () => {
@@ -129,16 +213,30 @@ describe("AvatarModelPage", () => {
     expect(unsubscribe).toHaveBeenCalledOnce();
   });
 
-  it("keeps the page track height stable for two and twelve models", async () => {
-    const two = avatarApi(catalogWithTenImports().slice(0, 2));
-    const twelve = avatarApi(catalogWithTenImports());
-    const { unmount } = render(<AvatarModelPage api={two} locale="en" />);
-    const twoViewport = await screen.findByTestId("avatar-model-track-viewport");
-    const twoHeight = getComputedStyle(twoViewport).height;
-    unmount();
-    render(<AvatarModelPage api={twelve} locale="en" />);
-    const twelveViewport = await screen.findByTestId("avatar-model-track-viewport");
-    expect(getComputedStyle(twelveViewport).height).toBe(twoHeight);
+  it("keeps the sidebar collapsed by the 360px media rule", () => {
+    const stylesheet = [...document.styleSheets].find(
+      (candidate) =>
+        candidate.ownerNode instanceof HTMLElement &&
+        candidate.ownerNode.id === "desktop-styles-under-test",
+    );
+    const compactRule = [...(stylesheet?.cssRules ?? [])].find(
+      (rule) => rule instanceof CSSMediaRule && rule.conditionText === "(max-width: 940px)",
+    ) as CSSMediaRule | undefined;
+    const sidebarRule = [...(compactRule?.cssRules ?? [])].find(
+      (rule) => rule instanceof CSSStyleRule && rule.selectorText === ".sidebar",
+    ) as CSSStyleRule | undefined;
+    const narrowRule = [...(stylesheet?.cssRules ?? [])].find(
+      (rule) => rule instanceof CSSMediaRule && rule.conditionText === "(max-width: 680px)",
+    ) as CSSMediaRule | undefined;
+    const hiddenNavigationRule = [...(narrowRule?.cssRules ?? [])].find(
+      (rule) =>
+        rule instanceof CSSStyleRule && rule.selectorText === ".nav-list li:not(:first-child)",
+    ) as CSSStyleRule | undefined;
+
+    expect(compactRule).toBeTruthy();
+    expect(sidebarRule?.style.paddingInline).toBe("0.7rem");
+    expect(narrowRule).toBeTruthy();
+    expect(hiddenNavigationRule?.style.display).toBe("none");
   });
 });
 
@@ -198,20 +296,6 @@ function deferred<T>() {
     resolve = complete;
   });
   return { promise, resolve };
-}
-
-function setContentWidth(width: number): void {
-  Object.defineProperties(document.documentElement, {
-    clientWidth: { configurable: true, value: width },
-    scrollWidth: { configurable: true, value: width },
-  });
-}
-
-function setTrackMetrics(track: HTMLElement, clientWidth: number, scrollWidth: number): void {
-  Object.defineProperties(track, {
-    clientWidth: { configurable: true, value: clientWidth },
-    scrollWidth: { configurable: true, value: scrollWidth },
-  });
 }
 
 function installDesktopStyles(): void {
