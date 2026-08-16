@@ -1,7 +1,8 @@
 import react from "@vitejs/plugin-react";
-import { defineConfig } from "vite";
+import { fileURLToPath } from "node:url";
+import { defineConfig, type UserConfig } from "vite";
 
-export default defineConfig(({ mode }) => {
+export default defineConfig(({ mode }): UserConfig => {
   if (mode === "main") {
     return {
       ssr: {
@@ -32,9 +33,13 @@ export default defineConfig(({ mode }) => {
         outDir: "dist/preload",
         rollupOptions: {
           external: ["electron"],
-          input: "src-main/preload.ts",
+          input: {
+            preload: "src-main/preload.ts",
+            avatarPreviewPreload: "src-preview/avatarPreviewPreload.ts",
+          },
           output: {
-            entryFileNames: "preload.cjs",
+            entryFileNames: (chunk) =>
+              chunk.name === "preload" ? "preload.cjs" : "avatar-preview-preload.cjs",
             format: "cjs",
           },
         },
@@ -53,6 +58,13 @@ export default defineConfig(({ mode }) => {
     build: {
       outDir: "dist-renderer",
       emptyOutDir: true,
+      chunkSizeWarningLimit: 600,
+      rollupOptions: {
+        input: {
+          main: fileURLToPath(new URL("index.html", import.meta.url)),
+          avatarPreview: fileURLToPath(new URL("src-preview/avatarPreview.html", import.meta.url)),
+        },
+      },
     },
   };
 });

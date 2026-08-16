@@ -407,13 +407,13 @@ git commit -m "feat: import managed VRM and GLB avatars"
 - Consumes: Electron `BrowserWindow` 离屏渲染、Three.js `GLTFLoader`、Task 3 已验证的受管理候选。
 - Produces: `AvatarPreviewRenderer.render({modelPath, outputPath, mapping})`、512×512 PNG。
 
-- [ ] **Step 1: 安装唯一新增的预览依赖并记录许可证**
+- [x] **Step 1: 安装唯一新增的预览依赖并记录许可证**
 
 Run: `npm install --save-exact three@0.180.0 --workspace @whitelily/desktop && npm install --save-dev --save-exact @types/three@0.180.0 --workspace @whitelily/desktop`
 
 Expected: `package-lock.json` 固定解析版本，`npm ls three @types/three` 无 peer dependency 错误。
 
-- [ ] **Step 2: 写“预览失败不能提交模型”和确定性相机测试**
+- [x] **Step 2: 写“预览失败不能提交模型”和确定性相机测试**
 
 ```ts
 it("renders a bounded transparent 512px PNG and disposes the hidden window", async () => {
@@ -428,13 +428,13 @@ it("renders a bounded transparent 512px PNG and disposes the hidden window", asy
 });
 ```
 
-- [ ] **Step 3: 运行红灯**
+- [x] **Step 3: 运行红灯**
 
 Run: `npm run test --workspace @whitelily/desktop -- src-main/avatar/avatarPreviewRenderer.test.ts src-preview/avatarPreview.test.ts`
 
 Expected: FAIL，缺少预览入口和渲染器。
 
-- [ ] **Step 4: 实现离屏、无网络、有限时的预览过程**
+- [x] **Step 4: 实现离屏、无网络、有限时的预览过程**
 
 ```ts
 export interface AvatarPreviewResult {
@@ -454,7 +454,7 @@ export class AvatarPreviewRenderer {
 
 主进程建立 `show: false`、`offscreen: true`、`sandbox: true`、`contextIsolation: true`、`nodeIntegration: false` 的临时窗口；`session.webRequest` 拒绝除打包的 `file:` 页面外全部请求。主进程读取已验证 GLB 为有界 `ArrayBuffer` 后经一次性 MessagePort 传入，不向预览页面暴露文件路径。页面用 `GLTFLoader.parse()`、正交相机、透明背景和固定三点灯光，把角色 hips/head 包围盒居中并留 8% 边距；8 秒超时、WebGL context lost、空包围盒或捕获失败统一抛 `AVATAR_PREVIEW_FAILED`。所有 geometry/material/texture、MessagePort 和 BrowserWindow 在 `finally` 释放。
 
-- [ ] **Step 5: 更新 Vite 多入口和打包验证**
+- [x] **Step 5: 更新 Vite 多入口和打包验证**
 
 `vite.config.ts` 的 renderer 构建加入 `index.html` 与 `src-preview/avatarPreview.html` 两个 HTML 入口；`apps/desktop/tsconfig.json` 的 `include` 加入 `src-preview`，确保预览代码也经过 strict typecheck；`preloadBundle.test.ts` 和新的预览测试断言离屏页面不包含 Node 内置模块、远程 URL 或开发服务器硬编码。
 
@@ -466,7 +466,7 @@ Run: `npm run build --workspace @whitelily/desktop`
 
 Expected: PASS，`apps/desktop/dist-renderer/src-preview/avatarPreview.html` 存在。
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```powershell
 git add package.json package-lock.json apps/desktop/package.json apps/desktop/vite.config.ts apps/desktop/tsconfig.json apps/desktop/src-main/main.ts apps/desktop/src-main/avatar/avatarPreviewRenderer.ts apps/desktop/src-main/avatar/avatarPreviewRenderer.test.ts apps/desktop/src-preview
