@@ -15,9 +15,12 @@ public record AvatarRenderDiagnostic(
     String sanitizedReason) {
   private static final int MAX_REASON_CODE_POINTS = 240;
   private static final Pattern USER_WINDOWS_PATH =
-      Pattern.compile("(?i)[a-z]:\\\\(?:users|documents and settings)\\\\[^\\\\\\s]+(?:\\\\[^\\s]*)?");
+      Pattern.compile(
+          "(?i)[a-z]:\\\\(?:users|documents and settings)\\\\[^\\\\]+\\\\.*?(?=\\s+(?:[a-z]:\\\\|/)|[\\p{Cc}]|$)");
   private static final Pattern USER_UNIX_PATH =
-      Pattern.compile("(?i)/(?:users|home)/[^/\\s]+(?:/[^\\s]*)?");
+      Pattern.compile("(?i)/(?:users|home)/[^/]+/.*?(?=\\s+(?:[a-z]:\\\\|/)|[\\p{Cc}]|$)");
+  private static final Pattern JSON_TOKEN =
+      Pattern.compile("(?i)(\"(?:token|api[_-]?key|access[_-]?token|authorization)\")\\s*:\\s*\"[^\"]*\"");
   private static final Pattern TOKEN_VALUE =
       Pattern.compile("(?i)\\b(?:token|api[_-]?key|access[_-]?token|authorization)\\s*[=:]\\s*(?:bearer\\s+)?[^\\s,;]+|\\bbearer\\s+[^\\s,;]+");
 
@@ -34,10 +37,14 @@ public record AvatarRenderDiagnostic(
   }
 
   public static String sanitizeReason(String reason) {
-    String withoutControls = Objects.requireNonNullElse(reason, "unknown").replaceAll("[\\p{Cc}\\p{Cf}]", " ");
-    String withoutPaths = USER_UNIX_PATH.matcher(USER_WINDOWS_PATH.matcher(withoutControls).replaceAll("<user-path>")).replaceAll("<user-path>");
+    String raw = Objects.requireNonNullElse(reason, "unknown");
+    String withoutJsonTokens = JSON_TOKEN.matcher(raw).replaceAll("$1:\"<redacted-token>\"");
+    String withoutPaths =
+        USER_UNIX_PATH
+            .matcher(USER_WINDOWS_PATH.matcher(withoutJsonTokens).replaceAll("<user-path>"))
+            .replaceAll("<user-path>");
     String withoutTokens = TOKEN_VALUE.matcher(withoutPaths).replaceAll("<redacted-token>");
-    String normalized = withoutTokens.replaceAll("\\s+", " ").trim();
+    String normalized = withoutTokens.replaceAll("[\\p{Cc}\\p{Cf}]", "").replaceAll("\\s+", " ").trim();
     if (normalized.isEmpty()) normalized = "unknown";
     if (normalized.codePointCount(0, normalized.length()) <= MAX_REASON_CODE_POINTS) return normalized;
     int end = normalized.offsetByCodePoints(0, MAX_REASON_CODE_POINTS);

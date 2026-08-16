@@ -12,6 +12,7 @@ import io.github.whitelily.avatar.control.AvatarRuntimeDescriptor;
 import io.github.whitelily.avatar.render.backend.AvatarFrameResult;
 import io.github.whitelily.avatar.render.backend.AvatarRenderContext;
 import io.github.whitelily.avatar.render.backend.AvatarRenderBackendRegistry;
+import io.github.whitelily.avatar.render.backend.AvatarRenderException;
 import io.github.whitelily.avatar.render.backend.AvatarVisualState;
 import io.github.whitelily.avatar.render.backend.PreparedAvatarResources;
 import io.github.whitelily.avatar.theme.ArmorTheme;
@@ -109,6 +110,57 @@ final class SmoothMeshRenderBackendTest {
 
     assertFalse(result.successful());
     assertEquals("AVATAR_SHADER_FAILED", result.errorCode());
+  }
+
+  @Test
+  void negotiatedFallbackChangesTheSubmittedFrameMaterialAndLowDetailSampling() throws Exception {
+    FakeDevice device = new FakeDevice();
+    device.uploadFailure = new AvatarGpuResources.ShaderUnavailableException("compile failed");
+    SmoothMeshRenderBackend backend =
+        new SmoothMeshRenderBackend(Path.of("C:/WhiteLily"), descriptor -> decodedMesh(false));
+    PreparedAvatarResources resources = backend.prepare(descriptor("imported"));
+
+    assertEquals(
+        "AVATAR_SHADER_FAILED", backend.renderFrame(resources, state(), new FakeContext(device)).errorCode());
+    device.uploadFailure = null;
+    FakeContext celContext = new FakeContext(device);
+    assertTrue(backend.renderFrame(resources, state(), celContext).successful());
+    assertTrue(celContext.frame.basicCelMaterial());
+    assertEquals(0.0f, AvatarGpuResources.advancedMaterial(celContext.frame));
+
+    FakeContext lowContext = new FakeContext(device);
+    assertTrue(backend.renderFrame(resources, stateAtDistance(20.0f), lowContext).successful());
+    assertEquals(1.0f, AvatarGpuResources.lowDetailSampling(lowContext.frame));
+  }
+
+  @Test
+  void builtinHighModelsPreferTheirValidatedSiblingLowResourceAtLowDetail() throws Exception {
+    List<String> loadedPaths = new java.util.ArrayList<>();
+    SmoothMeshRenderBackend backend =
+        new SmoothMeshRenderBackend(
+            Path.of("C:/WhiteLily"),
+            descriptor -> {
+              loadedPaths.add(descriptor.resourcePath());
+              return decodedMesh(false);
+            });
+
+    backend.prepare(descriptor("builtin"));
+
+    assertEquals(
+        List.of("builtin/whitelily-hd/high.glb", "builtin/whitelily-hd/low.glb"), loadedPaths);
+  }
+
+  @Test
+  void invalidDescriptorUsesTheStableAssetValidationDiagnosticCode() {
+    SmoothMeshRenderBackend backend =
+        new SmoothMeshRenderBackend(Path.of("C:/WhiteLily"), descriptor -> decodedMesh(false));
+    AvatarRuntimeDescriptor invalid =
+        new AvatarRuntimeDescriptor(
+            "user:model", "imported", "obj", "models/model.obj", "a".repeat(64), Map.of(), "other", "full");
+
+    AvatarRenderException error = assertThrows(AvatarRenderException.class, () -> backend.prepare(invalid));
+
+    assertEquals("AVATAR_ASSET_VALIDATION_FAILED", error.code());
   }
 
   @Test
@@ -368,6 +420,33 @@ final class SmoothMeshRenderBackendTest {
         "neutral",
         4,
         new AvatarVisualState.GraphicsCapabilities(true, true, 128));
+  }
+
+  private static AvatarVisualState stateAtDistance(float observerDistance) {
+    AvatarVisualState base = state();
+    return new AvatarVisualState(
+        base.renderSessionEpoch(),
+        base.worldSessionId(),
+        base.x(),
+        base.y(),
+        base.z(),
+        base.bodyYaw(),
+        base.headPitch(),
+        base.minecraftPose(),
+        base.partialTick(),
+        base.animationTick(),
+        base.armorTheme(),
+        base.mainHandItem(),
+        base.offHandItem(),
+        base.moving(),
+        base.swimming(),
+        base.sleeping(),
+        base.hurt(),
+        base.speaking(),
+        base.working(),
+        base.expression(),
+        observerDistance,
+        base.graphics());
   }
 
   private static final class FakeDevice implements AvatarGpuResources.Device {

@@ -150,7 +150,16 @@ public final class AvatarRenderBackendRegistry implements AvatarCandidateRuntime
     try {
       AvatarFrameResult result = candidate.backend.renderFrame(candidate.resources, state, context);
       if (result != null && result.successful()) {
-        transaction.commit();
+        try {
+          transaction.commit();
+        } catch (Exception | LinkageError error) {
+          transaction.restore();
+          AvatarFrameResult deferred =
+              candidate.backend.onDeferredFrameFailure(candidate.resources, state, error);
+          failVisibleCandidate(candidate);
+          return AvatarRenderOutcome.vanilla(
+              deferred == null ? "AVATAR_FRAME_FAILED" : deferred.errorCode());
+        }
         completeVisibleCandidate(candidate);
         return AvatarRenderOutcome.customComplete();
       }

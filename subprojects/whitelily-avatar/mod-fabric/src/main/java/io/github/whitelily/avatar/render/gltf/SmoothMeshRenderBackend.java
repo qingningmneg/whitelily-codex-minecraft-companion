@@ -48,17 +48,25 @@ public final class SmoothMeshRenderBackend implements WhiteLilyAvatarRenderBacke
   public PreparedAvatarResources prepare(AvatarRuntimeDescriptor descriptor)
       throws AvatarRenderException {
     validateDescriptor(descriptor);
-    GlbMeshDecoder.GlbMesh mesh = loader.load(descriptor);
+    GlbMeshDecoder.GlbMesh mesh;
+    try {
+      mesh = loader.load(descriptor);
+    } catch (AvatarRenderException error) {
+      throw new AvatarRenderException("AVATAR_MESH_LOAD_FAILED", "avatar mesh could not be loaded", error);
+    }
     if (!descriptor.modelId().equals(mesh.modelId()) && !mesh.modelId().equals(descriptor.sha256())) {
       throw new AvatarRenderException("AVATAR_MESH_LOAD_FAILED", "avatar mesh identity is invalid");
     }
+    GlbMeshDecoder.GlbMesh lowMesh = optionalBuiltinLow(descriptor);
     negotiations.keySet().removeIf(key -> key.modelId().equals(descriptor.modelId()));
     return new SmoothResources(
         descriptor.modelId(),
         descriptor.origin(),
         descriptor.expressions(),
         mesh,
-        new AvatarGpuResources(mesh));
+        new AvatarGpuResources(mesh),
+        lowMesh,
+        lowMesh == null ? null : new AvatarGpuResources(lowMesh));
   }
 
   @Override
@@ -69,8 +77,16 @@ public final class SmoothMeshRenderBackend implements WhiteLilyAvatarRenderBacke
     if (!(resources instanceof SmoothResources smooth)) {
       return AvatarFrameResult.failed("AVATAR_BACKEND_MISMATCH");
     }
+    emitExpiredDiagnostics();
     Negotiation negotiation = negotiationFor(smooth.modelId(), state);
-    if (smooth.gpuResources().disposed()) {
+    AvatarGpuResources gpuResources =
+        negotiation.detailLevel == AvatarDetailSelector.AvatarDetailLevel.LOW
+                && smooth.lowGpuResources() != null
+            ? smooth.lowGpuResources()
+            : smooth.gpuResources();
+    GlbMeshDecoder.GlbMesh mesh =
+        gpuResources == smooth.lowGpuResources() ? smooth.lowMesh() : smooth.mesh();
+    if (gpuResources.disposed()) {
       return AvatarFrameResult.failed("AVATAR_GPU_RESOURCE_RELEASED");
     }
     if (negotiation.fallback.currentStage()
@@ -79,7 +95,7 @@ public final class SmoothMeshRenderBackend implements WhiteLilyAvatarRenderBacke
       return AvatarFrameResult.failed("AVATAR_FRAME_FALLBACK");
     }
     if (!state.graphics().shaders()
-        || smooth.mesh().primitives().stream()
+        || mesh.primitives().stream()
             .anyMatch(
                 primitive ->
                     primitive.jointPalette().size()
@@ -88,16 +104,21 @@ public final class SmoothMeshRenderBackend implements WhiteLilyAvatarRenderBacke
     }
     try {
       AvatarGpuResources.Allocation allocation =
-          smooth.gpuResources().ensureUploaded(context.avatarGpuDevice());
-      HumanoidAnimator.AvatarPose pose =
-          animator.evaluate(
-              state,
-              smooth.mesh().skeleton(),
-              state.animationTick() / 20.0f);
+          gpuResources.ensureUploaded(context.avatarGpuDevice());
+      HumanoidAnimator.AvatarPose pose;
+      try {
+        pose =
+            animator.evaluate(
+                state,
+                mesh.skeleton(),
+                state.animationTick() / 20.0f);
+      } catch (RuntimeException error) {
+        return fail(state, smooth.modelId(), negotiation, "AVATAR_ANIMATION_FAILED", error.getMessage());
+      }
       SmoothMeshFrame frame =
           new SmoothMeshFrame(
               smooth.modelId(),
-              smooth.gpuResources(),
+              gpuResources,
               allocation,
               pose,
               state,
@@ -125,7 +146,29 @@ public final class SmoothMeshRenderBackend implements WhiteLilyAvatarRenderBacke
 
   @Override
   public void dispose(PreparedAvatarResources resources) {
-    if (resources instanceof SmoothResources smooth) smooth.gpuResources().close();
+    if (resources instanceof SmoothResources smooth) {
+      smooth.gpuResources().close();
+      if (smooth.lowGpuResources() != null) smooth.lowGpuResources().close();
+    }
+  }
+
+  @Override
+  public AvatarFrameResult onDeferredFrameFailure(
+      PreparedAvatarResources resources, AvatarVisualState state, Throwable failure) {
+    if (!(resources instanceof SmoothResources smooth)) {
+      return AvatarFrameResult.failed("AVATAR_FRAME_FAILED");
+    }
+    String code =
+        failure instanceof AvatarGpuResources.ShaderUnavailableException
+            ? "AVATAR_SHADER_FAILED"
+            : "AVATAR_MESH_LOAD_FAILED";
+    return fail(state, smooth.modelId(), negotiationFor(smooth.modelId(), state), code, failure.getMessage());
+  }
+
+  @Override
+  public void close() {
+    emitExpiredDiagnostics();
+    negotiations.clear();
   }
 
   private Negotiation negotiationFor(String modelId, AvatarVisualState state) {
@@ -141,6 +184,28 @@ public final class SmoothMeshRenderBackend implements WhiteLilyAvatarRenderBacke
     negotiation.detailLevel =
         detailSelector.select(negotiation.detailLevel, state.observerDistance(), state.graphics());
     return negotiation;
+  }
+
+  private GlbMeshDecoder.GlbMesh optionalBuiltinLow(AvatarRuntimeDescriptor descriptor) {
+    if (!"builtin".equals(descriptor.origin()) || !descriptor.resourcePath().endsWith("/high.glb")) {
+      return null;
+    }
+    AvatarRuntimeDescriptor lowDescriptor =
+        new AvatarRuntimeDescriptor(
+            descriptor.modelId(),
+            descriptor.origin(),
+            descriptor.format(),
+            descriptor.resourcePath().substring(0, descriptor.resourcePath().length() - "high.glb".length())
+                + "low.glb",
+            descriptor.sha256(),
+            descriptor.boneMapping(),
+            descriptor.bodyAnimation(),
+            descriptor.expressions());
+    try {
+      return loader.load(lowDescriptor);
+    } catch (AvatarRenderException ignored) {
+      return null;
+    }
   }
 
   private AvatarFrameResult fail(
@@ -187,13 +252,20 @@ public final class SmoothMeshRenderBackend implements WhiteLilyAvatarRenderBacke
     }
   }
 
+  private void emitExpiredDiagnostics() {
+    for (AvatarDiagnosticRateLimiter.Emission emission : diagnosticRateLimiter.flushExpired()) {
+      LOGGER.error("{} {}", emission.diagnostic().errorCode(), emission);
+    }
+  }
+
   private void validateDescriptor(AvatarRuntimeDescriptor descriptor) throws AvatarRenderException {
     if (descriptor == null
         || !java.util.Set.of("glb", "vrm", "builtin-hd").contains(descriptor.format())
         || !java.util.Set.of("builtin", "imported").contains(descriptor.origin())
         || !"whitelily-humanoid-v1".equals(descriptor.bodyAnimation())
         || !java.util.Set.of("full", "neutral-only").contains(descriptor.expressions())) {
-      throw new AvatarRenderException("AVATAR_BACKEND_MISMATCH", "invalid smooth avatar descriptor");
+      throw new AvatarRenderException(
+          "AVATAR_ASSET_VALIDATION_FAILED", "invalid smooth avatar descriptor");
     }
   }
 
@@ -253,7 +325,9 @@ public final class SmoothMeshRenderBackend implements WhiteLilyAvatarRenderBacke
       String origin,
       String expressions,
       GlbMeshDecoder.GlbMesh mesh,
-      AvatarGpuResources gpuResources)
+      AvatarGpuResources gpuResources,
+      GlbMeshDecoder.GlbMesh lowMesh,
+      AvatarGpuResources lowGpuResources)
       implements PreparedAvatarResources {}
 
   public record SmoothMeshFrame(

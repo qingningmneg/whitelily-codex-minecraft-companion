@@ -57,6 +57,38 @@ public final class AvatarDiagnosticRateLimiter {
     return List.copyOf(emissions);
   }
 
+  public List<Emission> flushExpired() {
+    return flushExpired(clock.millis());
+  }
+
+  public synchronized List<Emission> flushExpired(long nowMillis) {
+    List<Emission> emissions = new ArrayList<>();
+    windows.entrySet().removeIf(
+        entry -> {
+          Window window = entry.getValue();
+          if (nowMillis - window.startedAtMillis < WINDOW_MILLIS) return false;
+          if (window.suppressedCount > 0) {
+            Key key = entry.getKey();
+            emissions.add(
+                new Emission(
+                    new AvatarRenderDiagnostic(
+                        "unknown",
+                        "unknown",
+                        key.modelId(),
+                        "unknown",
+                        "unknown",
+                        "unknown",
+                        key.sessionId(),
+                        key.errorCode(),
+                        "duplicate diagnostics suppressed"),
+                    true,
+                    window.suppressedCount));
+          }
+          return true;
+        });
+    return List.copyOf(emissions);
+  }
+
   private record Key(String sessionId, String modelId, String errorCode) {}
 
   private record Window(long startedAtMillis, int suppressedCount) {}

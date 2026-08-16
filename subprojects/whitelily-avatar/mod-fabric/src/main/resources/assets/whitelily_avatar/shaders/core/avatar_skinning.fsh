@@ -1,6 +1,8 @@
 #version 150
 
 uniform sampler2D Sampler0;
+uniform float AdvancedMaterial;
+uniform float LowDetail;
 
 in vec2 texCoord0;
 in vec3 viewNormal;
@@ -9,7 +11,7 @@ in vec3 viewDirection;
 out vec4 fragColor;
 
 void main() {
-    vec4 base = texture(Sampler0, texCoord0);
+    vec4 base = LowDetail > 0.5 ? textureLod(Sampler0, texCoord0, 1.0) : texture(Sampler0, texCoord0);
     if (base.a < 0.01) {
         discard;
     }
@@ -17,6 +19,6 @@ void main() {
     float diffuse = max(dot(normalize(viewNormal), lightDirection), 0.0);
     float cel = diffuse > 0.68 ? 1.0 : (diffuse > 0.28 ? 0.76 : 0.52);
     float edge = pow(1.0 - max(dot(normalize(viewNormal), normalize(viewDirection)), 0.0), 3.0);
-    vec3 boundedHighlight = vec3(0.16, 0.12, 0.2) * min(edge, 0.35);
+    vec3 boundedHighlight = vec3(0.16, 0.12, 0.2) * min(edge, 0.35) * AdvancedMaterial;
     fragColor = vec4(base.rgb * cel + boundedHighlight, base.a);
 }

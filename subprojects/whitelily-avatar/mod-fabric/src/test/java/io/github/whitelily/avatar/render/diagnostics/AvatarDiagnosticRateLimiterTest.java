@@ -50,6 +50,38 @@ final class AvatarDiagnosticRateLimiterTest {
     assertTrue(diagnostic.sanitizedReason().codePointCount(0, diagnostic.sanitizedReason().length()) <= 240);
   }
 
+  @Test
+  void flushesExpiredDuplicateSummaryWithoutAnotherFailureAndEvictsQuietWindows() {
+    AvatarDiagnosticRateLimiter limiter = new AvatarDiagnosticRateLimiter();
+    AvatarRenderDiagnostic diagnostic = diagnostic("AVATAR_SHADER_FAILED", "compile failed");
+
+    limiter.record(diagnostic, 0);
+    limiter.record(diagnostic, 1);
+
+    List<AvatarDiagnosticRateLimiter.Emission> emissions = limiter.flushExpired(30_000);
+
+    assertEquals(1, emissions.size());
+    assertTrue(emissions.getFirst().summary());
+    assertEquals(1, emissions.getFirst().suppressedCount());
+    assertTrue(limiter.flushExpired(60_000).isEmpty());
+  }
+
+  @Test
+  void sanitizesQuotedJsonBearerApiKeyAndPathsWithSpacesAtTheCodePointBoundary() {
+    AvatarRenderDiagnostic diagnostic =
+        diagnostic(
+            "AVATAR_SHADER_FAILED",
+            "{\"token\":\"secret-one\",\"apiKey\":\"secret-two\"} Bearer secret-three "
+                + "C:\\Users\\Ada Lovelace\\avatar.glb /home/Ada Lovelace/avatar.glb\u0001"
+                + "🙂".repeat(241));
+
+    assertEquals(
+            "{\"token\":\"<redacted-token>\",\"apiKey\":\"<redacted-token>\"} <redacted-token> "
+            + "<user-path> <user-path>"
+            + "🙂".repeat(143),
+        diagnostic.sanitizedReason());
+  }
+
   private static AvatarRenderDiagnostic diagnostic(String errorCode, String reason) {
     return new AvatarRenderDiagnostic(
         "0.1.0",

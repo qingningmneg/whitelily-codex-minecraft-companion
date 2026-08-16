@@ -16,6 +16,8 @@ final class AvatarDetailSelectorTest {
     assertEquals(LOW, selector.select(HIGH, 18.1f));
     assertEquals(LOW, selector.select(LOW, 14.1f));
     assertEquals(HIGH, selector.select(LOW, 13.9f));
+    assertEquals(HIGH, selector.select(HIGH, 18.0f));
+    assertEquals(LOW, selector.select(LOW, 14.0f));
   }
 
   @Test

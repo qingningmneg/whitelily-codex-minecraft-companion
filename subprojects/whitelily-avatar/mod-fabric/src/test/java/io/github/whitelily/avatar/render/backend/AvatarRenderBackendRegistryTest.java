@@ -64,6 +64,24 @@ final class AvatarRenderBackendRegistryTest {
   }
 
   @Test
+  void deferredCommitFailureRestoresVanillaAndLetsTheActiveBackendAdvanceItsOwnFallback() {
+    FakeBackend backend = new FakeBackend();
+    AvatarRenderBackendRegistry registry =
+        new AvatarRenderBackendRegistry(Map.of("glb", backend), ignored -> {});
+    PreparedCandidate candidate = registry.prepare(descriptor()).toCompletableFuture().join();
+    registry.requestCommit(candidate);
+    FakeContext context = new FakeContext();
+    context.failCommit = true;
+
+    AvatarRenderOutcome outcome = registry.render(snapshot(), context);
+
+    assertFalse(outcome.suppressVanilla());
+    assertEquals("AVATAR_SHADER_FAILED", outcome.errorCode());
+    assertTrue(context.lastTransaction.restored);
+    assertEquals(1, backend.deferredFailureCount);
+  }
+
+  @Test
   void releaseIsIdempotentAndDisposesOnlyTheOwningBackend() {
     FakeBackend backend = new FakeBackend();
     AvatarRenderBackendRegistry registry =
@@ -143,6 +161,7 @@ final class AvatarRenderBackendRegistryTest {
     private AvatarFrameResult nextResult = AvatarFrameResult.complete();
     private int renderCount;
     private int disposeCount;
+    private int deferredFailureCount;
 
     @Override
     public PreparedAvatarResources prepare(AvatarRuntimeDescriptor descriptor) {
@@ -161,6 +180,13 @@ final class AvatarRenderBackendRegistryTest {
     @Override
     public void dispose(PreparedAvatarResources resources) {
       disposeCount++;
+    }
+
+    @Override
+    public AvatarFrameResult onDeferredFrameFailure(
+        PreparedAvatarResources resources, AvatarVisualState state, Throwable failure) {
+      deferredFailureCount++;
+      return AvatarFrameResult.failed("AVATAR_SHADER_FAILED");
     }
   }
 
@@ -198,10 +224,11 @@ final class AvatarRenderBackendRegistryTest {
 
   private static final class FakeContext implements AvatarRenderContext {
     private FakeTransaction lastTransaction;
+    private boolean failCommit;
 
     @Override
     public FrameTransaction beginFrame() {
-      lastTransaction = new FakeTransaction();
+      lastTransaction = new FakeTransaction(failCommit);
       return lastTransaction;
     }
 
@@ -210,11 +237,17 @@ final class AvatarRenderBackendRegistryTest {
   }
 
   private static final class FakeTransaction implements AvatarRenderContext.FrameTransaction {
+    private final boolean failCommit;
     private boolean committed;
     private boolean restored;
 
+    private FakeTransaction(boolean failCommit) {
+      this.failCommit = failCommit;
+    }
+
     @Override
     public void commit() {
+      if (failCommit) throw new IllegalStateException("deferred shader draw failed");
       committed = true;
     }
 

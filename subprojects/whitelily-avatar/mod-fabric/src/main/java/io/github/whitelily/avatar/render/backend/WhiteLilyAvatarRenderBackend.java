@@ -10,6 +10,11 @@ public interface WhiteLilyAvatarRenderBackend extends AutoCloseable {
       AvatarVisualState state,
       AvatarRenderContext context);
 
+  default AvatarFrameResult onDeferredFrameFailure(
+      PreparedAvatarResources resources, AvatarVisualState state, Throwable failure) {
+    return AvatarFrameResult.failed("AVATAR_FRAME_FAILED");
+  }
+
   void dispose(PreparedAvatarResources resources);
 
   @Override
