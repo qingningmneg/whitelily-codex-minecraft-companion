@@ -15,10 +15,12 @@ if SCRIPT_DIRECTORY not in sys.path:
 from avatar_contract import (
     ART_STAGE,
     ASSET_SCHEMA,
+    FRAMES_PER_SECOND,
     REQUIRED_CAMERAS,
     REQUIRED_COLLECTIONS,
     REQUIRED_LIGHTS,
     REQUIRED_SOURCE_DIGESTS,
+    UNIT_SCALE,
 )
 from validate_blender_version import validate_blender_version
 
@@ -86,6 +88,35 @@ def validate_export_profile(profile_path=EXPORT_PROFILE_PATH):
         fail("AVATAR_EXPORT_PROFILE_INVALID")
     if profile != expected:
         fail("AVATAR_EXPORT_PROFILE_INVALID")
+    return profile
+
+
+def validate_reference_images(scene):
+    references = [object_ for object_ in bpy.data.collections["REF"].objects if object_.type == "EMPTY"]
+    if len(references) != len(REQUIRED_SOURCE_DIGESTS) or any(
+        not object_.hide_render for object_ in references
+    ):
+        fail("AVATAR_REFERENCE_INVALID")
+    reference_images = []
+    reference_names = set()
+    for reference in references:
+        image = reference.data
+        if image is None or image.source != "FILE" or image.name not in REQUIRED_SOURCE_DIGESTS:
+            fail("AVATAR_PACKED_SOURCE_INVALID")
+        if image.name in reference_names or image.packed_file is None or image.filepath.startswith("//"):
+            fail("AVATAR_PACKED_SOURCE_INVALID")
+        payload = bytes(image.packed_file.data)
+        if hashlib.sha256(payload).hexdigest() != REQUIRED_SOURCE_DIGESTS[image.name]:
+            fail("AVATAR_PACKED_SOURCE_INVALID")
+        reference_names.add(image.name)
+        reference_images.append(image)
+    if reference_names != set(REQUIRED_SOURCE_DIGESTS):
+        fail("AVATAR_PACKED_SOURCE_INVALID")
+    source_images = [image for image in bpy.data.images if image.source == "FILE"]
+    if len(source_images) != len(reference_images) or {
+        image.as_pointer() for image in source_images
+    } != {image.as_pointer() for image in reference_images}:
+        fail("AVATAR_RESOURCE_UNPACKED")
 
 
 def validate_scene(scene):
@@ -93,6 +124,10 @@ def validate_scene(scene):
         fail("AVATAR_SCHEMA_MISMATCH")
     if scene.get("AVATAR_ART_STAGE") != ART_STAGE:
         fail("AVATAR_ART_STAGE_INVALID")
+    if scene.unit_settings.system != "METRIC" or scene.unit_settings.scale_length != UNIT_SCALE:
+        fail("AVATAR_UNITS_INVALID")
+    if scene.render.fps != FRAMES_PER_SECOND:
+        fail("AVATAR_FRAME_RATE_INVALID")
     # Blender 4.5 reports is_dirty=True for every background invocation,
     # including --factory-startup.  In an interactive session it remains the
     # authoritative unsaved-scene guard; the build always opens a saved file.
@@ -120,33 +155,34 @@ def validate_scene(scene):
             or bpy.data.collections["LIGHTS"] not in object_.users_collection
         ):
             fail("AVATAR_LIGHT_INVALID")
-    references = [object_ for object_ in bpy.data.collections["REF"].objects if object_.type == "EMPTY"]
-    if len(references) != 2 or any(not object_.hide_render for object_ in references):
-        fail("AVATAR_REFERENCE_INVALID")
-    source_images = [image for image in bpy.data.images if image.source == "FILE"]
-    if len(source_images) != 2:
-        fail("AVATAR_RESOURCE_UNPACKED")
-    for image in source_images:
-        if image.packed_file is None or image.filepath.startswith("//"):
-            fail("AVATAR_RESOURCE_UNPACKED")
+    validate_reference_images(scene)
     if bpy.data.libraries or bpy.data.fonts or bpy.data.sounds or bpy.data.movieclips:
         fail("AVATAR_RESOURCE_UNPACKED")
 
 
-def export_bootstrap(output_directory, render_previews):
+def gltf_export_arguments(profile, output_path):
+    if profile["maxWeightsPerVertex"] != 4:
+        fail("AVATAR_EXPORT_PROFILE_INVALID")
+    return {
+        "filepath": output_path,
+        "export_format": profile["container"],
+        "export_yup": profile["upAxis"] == "Y",
+        "export_apply": profile["applyModifiers"],
+        "export_skins": profile["exportSkins"],
+        "export_animations": profile["exportAnimations"],
+        "export_morph": profile["exportMorphTargets"],
+        "export_image_format": "AUTO",
+        "export_draco_mesh_compression_enable": profile["draco"],
+        "export_all_influences": False,
+        "export_force_sampling": True,
+        "export_frame_step": 1,
+    }
+
+
+def export_bootstrap(output_directory, render_previews, profile):
     os.makedirs(output_directory, exist_ok=True)
     bpy.ops.export_scene.gltf(
-        filepath=os.path.join(output_directory, "whitelily-anime-avatar.glb"),
-        export_format="GLB",
-        export_yup=True,
-        export_apply=True,
-        export_skins=True,
-        export_animations=True,
-        export_morph=True,
-        export_image_format="AUTO",
-        export_draco_mesh_compression_enable=False,
-        export_force_sampling=True,
-        export_frame_step=1,
+        **gltf_export_arguments(profile, os.path.join(output_directory, "whitelily-anime-avatar.glb"))
     )
     if not render_previews:
         return
@@ -172,10 +208,10 @@ def main():
     try:
         validate_blender_version()
         validate_sources(arguments.source_root)
-        validate_export_profile()
+        profile = validate_export_profile()
         validate_scene(bpy.context.scene)
         if arguments.output_dir:
-            export_bootstrap(arguments.output_dir, arguments.render_previews)
+            export_bootstrap(arguments.output_dir, arguments.render_previews, profile)
     except AvatarValidationError as error:
         print(error.code, file=sys.stderr)
         raise

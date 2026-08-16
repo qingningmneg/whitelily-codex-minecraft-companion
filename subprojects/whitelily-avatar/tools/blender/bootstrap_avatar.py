@@ -11,7 +11,7 @@ SCRIPT_DIRECTORY = os.path.dirname(os.path.abspath(__file__))
 if SCRIPT_DIRECTORY not in sys.path:
     sys.path.insert(0, SCRIPT_DIRECTORY)
 
-from avatar_contract import ART_STAGE, ASSET_SCHEMA, REQUIRED_CAMERAS, REQUIRED_COLLECTIONS, REQUIRED_LIGHTS, UNIT_SCALE
+from avatar_contract import ART_STAGE, ASSET_SCHEMA, FRAMES_PER_SECOND, REQUIRED_CAMERAS, REQUIRED_COLLECTIONS, REQUIRED_LIGHTS, UNIT_SCALE
 from validate_blender_version import validate_blender_version
 
 
@@ -29,6 +29,9 @@ def reset_scene():
     bpy.ops.object.delete(use_global=False)
     for collection in list(bpy.data.collections):
         bpy.data.collections.remove(collection)
+    for image in list(bpy.data.images):
+        if image.users == 0:
+            bpy.data.images.remove(image)
 
 
 def make_collections(scene):
@@ -107,7 +110,7 @@ def bootstrap(output):
     scene = bpy.context.scene
     scene.unit_settings.system = "METRIC"
     scene.unit_settings.scale_length = UNIT_SCALE
-    scene.render.fps = 30
+    scene.render.fps = FRAMES_PER_SECOND
     scene["whitelily_asset_schema"] = ASSET_SCHEMA
     scene["AVATAR_ART_STAGE"] = ART_STAGE
     collections = make_collections(scene)
