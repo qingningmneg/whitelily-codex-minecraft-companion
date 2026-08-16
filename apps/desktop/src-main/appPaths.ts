@@ -7,6 +7,9 @@ export interface AppPaths {
   dataRoot: string;
   configPath: string;
   logRoot: string;
+  avatarModelRoot: string;
+  avatarModelStagingRoot: string;
+  avatarModelBridgeRoot: string;
 }
 
 function normalizeLocalAppData(localAppData: string): string {
@@ -57,5 +60,8 @@ export function resolveAppPaths(localAppData: string): AppPaths {
     dataRoot,
     configPath: win32.join(dataRoot, "config.toml"),
     logRoot: win32.join(dataRoot, "logs"),
+    avatarModelRoot: win32.join(dataRoot, "models"),
+    avatarModelStagingRoot: win32.join(dataRoot, "models", ".staging"),
+    avatarModelBridgeRoot: win32.join(dataRoot, "bridge", "avatar-model"),
   };
 }

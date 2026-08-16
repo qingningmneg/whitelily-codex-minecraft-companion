@@ -72,6 +72,11 @@ export interface AvatarModelCatalogSnapshot {
   readonly pendingModelId?: AvatarModelId | undefined;
 }
 
+export interface AvatarModelCatalogState {
+  readonly revision: number;
+  readonly models: readonly AvatarModelRecord[];
+}
+
 export interface AvatarRuntimeDescriptor {
   readonly modelId: AvatarModelId;
   readonly origin: AvatarModelOrigin;

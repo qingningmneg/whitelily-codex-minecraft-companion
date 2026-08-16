@@ -536,6 +536,9 @@ export async function runElectronMain(): Promise<void> {
             mkdir(paths.dataRoot, { recursive: true }),
             mkdir(dirname(paths.configPath), { recursive: true }),
             mkdir(paths.logRoot, { recursive: true }),
+            mkdir(paths.avatarModelRoot, { recursive: true }),
+            mkdir(paths.avatarModelStagingRoot, { recursive: true }),
+            mkdir(paths.avatarModelBridgeRoot, { recursive: true }),
           ]);
         },
         setPath: (name, path) => app.setPath(name, path),

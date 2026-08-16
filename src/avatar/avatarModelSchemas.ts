@@ -234,6 +234,10 @@ export function parseAvatarModelRecord(value: unknown): AvatarModelRecord {
   return parseOrThrow(avatarModelRecordSchema, value, "invalid avatar model record");
 }
 
+export function parseAvatarModelId(value: unknown): AvatarModelId {
+  return parseOrThrow(avatarModelIdSchema, value, "invalid avatar model id");
+}
+
 export function parseAvatarRuntimeDescriptor(value: unknown): AvatarRuntimeDescriptor {
   return parseOrThrow(avatarRuntimeDescriptorSchema, value, "invalid avatar runtime descriptor");
 }

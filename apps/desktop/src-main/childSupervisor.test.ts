@@ -3068,6 +3068,19 @@ describe("resolveAppPaths", () => {
       dataRoot: win32.join(String.raw`C:\LocalAppData\owner`, "WhiteLily"),
       configPath: win32.join(String.raw`C:\LocalAppData\owner`, "WhiteLily", "config.toml"),
       logRoot: win32.join(String.raw`C:\LocalAppData\owner`, "WhiteLily", "logs"),
+      avatarModelRoot: win32.join(String.raw`C:\LocalAppData\owner`, "WhiteLily", "models"),
+      avatarModelStagingRoot: win32.join(
+        String.raw`C:\LocalAppData\owner`,
+        "WhiteLily",
+        "models",
+        ".staging",
+      ),
+      avatarModelBridgeRoot: win32.join(
+        String.raw`C:\LocalAppData\owner`,
+        "WhiteLily",
+        "bridge",
+        "avatar-model",
+      ),
     });
   });
 

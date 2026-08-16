@@ -212,7 +212,7 @@ git commit -m "feat: define avatar model control protocol"
 - Consumes: `AppPaths.dataRoot`、`AtomicJsonFile<T>`、Task 1 的模型类型和 schema。
 - Produces: `resolveAvatarModelPaths(dataRoot)`、`AvatarModelCatalog.initialize()`、`list()`、`appendImported()`、`resolveRuntimeDescriptor()`、`AvatarModelPreferences.readActiveModelId()`、`commitActiveModelId()`。
 
-- [ ] **Step 1: 写内置顺序、导入顺序和损坏选择恢复测试**
+- [x] **Step 1: 写内置顺序、导入顺序和损坏选择恢复测试**
 
 ```ts
 it("restores two builtins first and imported records in committed order", async () => {
@@ -235,13 +235,13 @@ it("falls back to builtin HD only when the saved id no longer exists", async () 
 });
 ```
 
-- [ ] **Step 2: 运行红灯**
+- [x] **Step 2: 运行红灯**
 
 Run: `npm run test --workspace @whitelily/desktop -- src-main/avatar/avatarModelCatalog.test.ts src-main/avatar/avatarModelPreferences.test.ts`
 
 Expected: FAIL，缺少目录和偏好类。
 
-- [ ] **Step 3: 实现路径边界和原子目录索引**
+- [x] **Step 3: 实现路径边界和原子目录索引**
 
 ```ts
 export interface AvatarModelPaths {
@@ -265,7 +265,7 @@ export function resolveAvatarModelPaths(dataRoot: string): AvatarModelPaths {
 
 `AvatarModelCatalog` 通过 `AtomicJsonFile` 保存 `{schemaVersion: 1, revision, imported: AvatarModelRecord[]}`；启动时重新合成两个代码内置记录，不允许索引覆盖内置记录。`appendImported()` 在持有进程内互斥锁时复读索引、拒绝重复 ID、追加并原子写入。扫描时忽略 `.staging`，拒绝 reparse point、符号链接、目录逃逸和摘要不一致的自定义条目，并把错误写入结构化诊断而不是让 Electron 启动白屏。
 
-- [ ] **Step 4: 实现只在成功热切换后调用的全局选择提交**
+- [x] **Step 4: 实现只在成功热切换后调用的全局选择提交**
 
 ```ts
 export class AvatarModelPreferences {
@@ -280,7 +280,7 @@ export class AvatarModelPreferences {
 
 偏好文档固定为 schema 1，默认高清内置模型；不得保存数组索引、世界 ID、用户原始路径或 `pendingModelId`。并发修订冲突返回 `AVATAR_PREFERENCE_CONFLICT`，由切换协调器重新读取后决定是否仍需提交。
 
-- [ ] **Step 5: 跑测试和桌面主进程类型检查**
+- [x] **Step 5: 跑测试和桌面主进程类型检查**
 
 Run: `npm run test --workspace @whitelily/desktop -- src-main/avatar/avatarModelCatalog.test.ts src-main/avatar/avatarModelPreferences.test.ts`
 
@@ -290,7 +290,7 @@ Run: `npm run typecheck --workspace @whitelily/desktop`
 
 Expected: PASS。
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```powershell
 git add apps/desktop/src-main/appPaths.ts apps/desktop/src-main/main.ts apps/desktop/src-main/avatar
