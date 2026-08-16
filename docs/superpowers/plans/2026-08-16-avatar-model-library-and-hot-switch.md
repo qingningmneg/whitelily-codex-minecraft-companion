@@ -753,7 +753,7 @@ git commit -m "feat: consume avatar model control mailbox"
 - Consumes: 现有身份、装备、手持物、session health 和 GeckoLib renderer。
 - Produces: `WhiteLilyAvatarRenderBackend.prepare()`、`renderFrame()`、`dispose()`，不可变 `AvatarVisualState`。
 
-- [ ] **Step 1: 写“完整自定义帧成功后才抑制原版人物”失败测试**
+- [x] **Step 1: 写“完整自定义帧成功后才抑制原版人物”失败测试**
 
 ```java
 @Test
@@ -767,13 +767,13 @@ void suppressesVanillaOnlyAfterEveryCustomBatchCommits() {
 }
 ```
 
-- [ ] **Step 2: 运行红灯**
+- [x] **Step 2: 运行红灯**
 
 Run: `subprojects\whitelily-avatar\gradlew.bat -p subprojects\whitelily-avatar :mod-fabric:test --tests "io.github.whitelily.avatar.render.backend.*"`
 
 Expected: FAIL，缺少 backend 接口。
 
-- [ ] **Step 3: 定义只读快照和后端契约**
+- [x] **Step 3: 定义只读快照和后端契约**
 
 ```java
 public interface WhiteLilyAvatarRenderBackend extends AutoCloseable {
@@ -789,21 +789,21 @@ public interface WhiteLilyAvatarRenderBackend extends AutoCloseable {
 
 `AvatarVisualState` 固定包含 render session/world session、位置朝向、Minecraft pose、局部帧时间、`ArmorTheme`、主副手实际物品、移动/游泳/睡觉/受伤、说话/表情/AI 工作语义、观察距离和图形能力；所有字段为值对象，不持有可变玩家实体或行动队列引用。`WhiteLilyRenderRuntime.captureDecision()` 继续做身份审批，再把输入适配为快照。
 
-- [ ] **Step 4: 把当前 GeckoLib 路径封装为显式经典后端**
+- [x] **Step 4: 把当前 GeckoLib 路径封装为显式经典后端**
 
 `ClassicGeckoRenderBackend` 复用 `WhiteLilyGeoRenderer` 和当前持有物层，仅在活动模型 ID 为 `builtin:whitelily-classic` 时工作。`AvatarRenderBackendRegistry` 实现 Task 7 的 `AvatarCandidateRuntime`，把 backend 准备资源封装成 `PreparedCandidate`，并把完整/失败帧映射为 `AvatarVisibleFrameResult` 回报控制器。Registry 不以异常、FPS 或距离自动选择经典后端；高清/自定义失败时只允许当前帧恢复 vanilla player rendering，并上报失败，不写全局选择。
 
-- [ ] **Step 5: 在 mixin 中建立图形状态事务**
+- [x] **Step 5: 在 mixin 中建立图形状态事务**
 
 渲染前复制 PoseStack、记录 blend/depth/cull/shader color；后端返回 `complete` 才设置 captured render 并抑制 vanilla。任何 batch 失败先关闭/丢弃本帧 buffer、恢复 PoseStack 与 RenderSystem 状态，再走 vanilla；不要留下半个人物、纯白材质或损坏缓冲区。
 
-- [ ] **Step 6: 跑现有回归与新契约测试**
+- [x] **Step 6: 跑现有回归与新契约测试**
 
 Run: `subprojects\whitelily-avatar\gradlew.bat -p subprojects\whitelily-avatar :mod-fabric:test --tests "io.github.whitelily.avatar.render.*"`
 
 Expected: PASS，包括已有 `WhiteLilyRenderDecisionTest`、`WhiteLilyHeldItemLayerContractTest` 和 `RendererSessionHealthTest`。
 
-- [ ] **Step 7: 提交**
+- [x] **Step 7: 提交**
 
 ```powershell
 git add subprojects/whitelily-avatar/mod-fabric/src/main/java/io/github/whitelily/avatar/render subprojects/whitelily-avatar/mod-fabric/src/main/java/io/github/whitelily/avatar/mixin subprojects/whitelily-avatar/mod-fabric/src/test/java/io/github/whitelily/avatar/render

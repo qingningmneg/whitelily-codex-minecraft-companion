@@ -65,6 +65,10 @@ public final class WhiteLilyRenderDecision {
     return armorTheme;
   }
 
+  public long renderSessionEpoch() {
+    return capturedSession == null ? 0L : capturedSession.epoch();
+  }
+
   @Override
   public String toString() {
     return "WhiteLilyRenderDecision[identity="

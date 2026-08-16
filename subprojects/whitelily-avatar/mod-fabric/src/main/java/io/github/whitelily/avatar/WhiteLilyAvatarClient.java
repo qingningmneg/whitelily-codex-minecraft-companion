@@ -6,7 +6,10 @@ import io.github.whitelily.avatar.control.AvatarModelController;
 import io.github.whitelily.avatar.control.AvatarModelMailbox;
 import io.github.whitelily.avatar.control.AvatarRuntimeDescriptor;
 import io.github.whitelily.avatar.render.WhiteLilyRenderRuntime;
+import io.github.whitelily.avatar.render.backend.AvatarRenderBackendRegistry;
+import io.github.whitelily.avatar.render.backend.ClassicGeckoRenderBackend;
 import java.nio.file.Path;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CompletableFuture;
@@ -32,6 +35,7 @@ public final class WhiteLilyAvatarClient implements ClientModInitializer {
       new UnavailableCandidateRuntime();
   private static volatile AvatarModelController modelController;
   private static volatile AvatarModelMailbox modelMailbox;
+  private static volatile AvatarRenderBackendRegistry renderBackendRegistry;
   private static volatile ExecutorService controlExecutor;
   private static volatile long nextControlPollNanos;
 
@@ -79,6 +83,10 @@ public final class WhiteLilyAvatarClient implements ClientModInitializer {
     return modelController;
   }
 
+  public static AvatarRenderBackendRegistry renderBackendRegistry() {
+    return renderBackendRegistry;
+  }
+
   public static void installCandidateRuntime(AvatarCandidateRuntime runtime) {
     if (runtime == null) throw new IllegalArgumentException("avatar candidate runtime is required");
     candidateRuntime = runtime;
@@ -116,7 +124,28 @@ public final class WhiteLilyAvatarClient implements ClientModInitializer {
                       }),
               "builtin:whitelily-classic",
               null);
+      AvatarRenderBackendRegistry registry =
+          new AvatarRenderBackendRegistry(
+              Map.of("builtin-classic", new ClassicGeckoRenderBackend()),
+              controller::onVisibleFrameResult);
+      AvatarCandidateRuntime.PreparedCandidate classic =
+          registry
+              .prepare(
+                  new AvatarRuntimeDescriptor(
+                      "builtin:whitelily-classic",
+                      "builtin",
+                      "builtin-classic",
+                      "builtin/whitelily-classic/whitelily.geo.json",
+                      "a".repeat(64),
+                      Map.of(),
+                      "whitelily-humanoid-v1",
+                      "full"))
+              .toCompletableFuture()
+              .join();
+      registry.activateInitial(classic);
+      candidateRuntime = registry;
       modelMailbox = mailbox;
+      renderBackendRegistry = registry;
       controlExecutor = executor;
       modelController = controller;
       Runtime.getRuntime()
@@ -168,6 +197,9 @@ public final class WhiteLilyAvatarClient implements ClientModInitializer {
   }
 
   private static void shutdownControl() {
+    AvatarRenderBackendRegistry registry = renderBackendRegistry;
+    renderBackendRegistry = null;
+    if (registry != null) registry.close();
     ExecutorService executor = controlExecutor;
     controlExecutor = null;
     if (executor != null) executor.shutdownNow();

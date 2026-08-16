@@ -134,6 +134,10 @@ public final class AvatarModelController {
     return confirmedActiveModelId;
   }
 
+  public synchronized String currentWorldSessionId() {
+    return worldSessionId;
+  }
+
   private void prepare(AvatarModelControlRequest request) {
     if (request.candidate() == null || !request.modelId().equals(request.candidate().modelId())) {
       return;

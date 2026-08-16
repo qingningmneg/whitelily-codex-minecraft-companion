@@ -6,6 +6,9 @@ import io.github.whitelily.avatar.render.WhiteLilyCapturedRender;
 import io.github.whitelily.avatar.render.WhiteLilyPlayerRenderStateAccess;
 import io.github.whitelily.avatar.render.WhiteLilyPlayerRendererAccess;
 import io.github.whitelily.avatar.render.WhiteLilyRenderPose;
+import io.github.whitelily.avatar.render.backend.AvatarRenderBackendRegistry;
+import io.github.whitelily.avatar.render.backend.AvatarRenderOutcome;
+import io.github.whitelily.avatar.render.backend.MinecraftAvatarRenderContext;
 import net.minecraft.client.renderer.MultiBufferSource;
 import net.minecraft.client.renderer.entity.LivingEntityRenderer;
 import net.minecraft.client.renderer.entity.state.LivingEntityRenderState;
@@ -40,19 +43,27 @@ public abstract class LivingEntityRendererMixin {
     }
 
     PoseStack customPoseStack = WhiteLilyRenderPose.independentCopy(poseStack);
+    AvatarRenderBackendRegistry registry = WhiteLilyAvatarClient.renderBackendRegistry();
+    if (registry == null) return;
+    AvatarRenderOutcome[] outcome = new AvatarRenderOutcome[1];
     boolean customCompleted =
         WhiteLilyAvatarClient.renderRuntime()
             .runCustom(
                 captured.decision(),
                 () ->
-                    rendererAccess
-                        .whitelily$getGeoRenderer()
-                        .renderCaptured(
-                            captured.renderState(),
-                            customPoseStack,
-                            bufferSource,
-                            packedLight));
-    if (customCompleted) {
+                    outcome[0] =
+                        registry.render(
+                            captured.visualState(),
+                            new MinecraftAvatarRenderContext(
+                                isolatedBufferSource ->
+                                rendererAccess
+                                    .whitelily$getGeoRenderer()
+                                    .renderCaptured(
+                                        captured.renderState(),
+                                        customPoseStack,
+                                        isolatedBufferSource,
+                                        packedLight))));
+    if (customCompleted && outcome[0] != null && outcome[0].suppressVanilla()) {
       callback.cancel();
     }
   }

@@ -62,7 +62,11 @@ public abstract class PlayerRendererMixin
                             player, partialTick, decision));
     if (captured) {
       access.whitelily$setCapturedRender(
-          new WhiteLilyCapturedRender(decision, capturedState[0]));
+          new WhiteLilyCapturedRender(
+              decision,
+              capturedState[0],
+              WhiteLilyAvatarClient.renderRuntime()
+                  .captureVisualState(player, partialTick, decision)));
     }
   }
 
