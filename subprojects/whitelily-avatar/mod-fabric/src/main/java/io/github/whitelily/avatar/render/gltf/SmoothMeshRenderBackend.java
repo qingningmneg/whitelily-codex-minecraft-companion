@@ -7,16 +7,28 @@ import io.github.whitelily.avatar.render.backend.AvatarRenderException;
 import io.github.whitelily.avatar.render.backend.AvatarVisualState;
 import io.github.whitelily.avatar.render.backend.PreparedAvatarResources;
 import io.github.whitelily.avatar.render.backend.WhiteLilyAvatarRenderBackend;
+import io.github.whitelily.avatar.render.diagnostics.AvatarDiagnosticRateLimiter;
+import io.github.whitelily.avatar.render.diagnostics.AvatarRenderDiagnostic;
+import io.github.whitelily.avatar.render.quality.AvatarDetailSelector;
+import io.github.whitelily.avatar.render.quality.AvatarFallbackController;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.util.Objects;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public final class SmoothMeshRenderBackend implements WhiteLilyAvatarRenderBackend {
+  private static final Logger LOGGER = LoggerFactory.getLogger("whitelily_avatar");
   private final Path dataRoot;
   private final MeshLoader loader;
   private final HumanoidAnimator animator = new HumanoidAnimator();
+  private final AvatarDetailSelector detailSelector = new AvatarDetailSelector();
+  private final AvatarDiagnosticRateLimiter diagnosticRateLimiter = new AvatarDiagnosticRateLimiter();
+  private final ConcurrentMap<QualityKey, Negotiation> negotiations = new ConcurrentHashMap<>();
 
   public SmoothMeshRenderBackend(Path dataRoot) {
     this.dataRoot = normalizeRoot(dataRoot);
@@ -40,6 +52,7 @@ public final class SmoothMeshRenderBackend implements WhiteLilyAvatarRenderBacke
     if (!descriptor.modelId().equals(mesh.modelId()) && !mesh.modelId().equals(descriptor.sha256())) {
       throw new AvatarRenderException("AVATAR_MESH_LOAD_FAILED", "avatar mesh identity is invalid");
     }
+    negotiations.keySet().removeIf(key -> key.modelId().equals(descriptor.modelId()));
     return new SmoothResources(
         descriptor.modelId(),
         descriptor.origin(),
@@ -56,8 +69,14 @@ public final class SmoothMeshRenderBackend implements WhiteLilyAvatarRenderBacke
     if (!(resources instanceof SmoothResources smooth)) {
       return AvatarFrameResult.failed("AVATAR_BACKEND_MISMATCH");
     }
+    Negotiation negotiation = negotiationFor(smooth.modelId(), state);
     if (smooth.gpuResources().disposed()) {
       return AvatarFrameResult.failed("AVATAR_GPU_RESOURCE_RELEASED");
+    }
+    if (negotiation.fallback.currentStage()
+        == AvatarFallbackController.FallbackStage.VANILLA_FRAME_ONLY) {
+      diagnose(state, smooth.modelId(), negotiation, "AVATAR_FRAME_FALLBACK", "quality fallback exhausted");
+      return AvatarFrameResult.failed("AVATAR_FRAME_FALLBACK");
     }
     if (!state.graphics().shaders()
         || smooth.mesh().primitives().stream()
@@ -65,7 +84,7 @@ public final class SmoothMeshRenderBackend implements WhiteLilyAvatarRenderBacke
                 primitive ->
                     primitive.jointPalette().size()
                         > state.graphics().maximumJointMatrices())) {
-      return AvatarFrameResult.failed("AVATAR_SHADER_FAILED");
+      return fail(state, smooth.modelId(), negotiation, "AVATAR_SHADER_FAILED", "shader capabilities are unavailable");
     }
     try {
       AvatarGpuResources.Allocation allocation =
@@ -84,24 +103,88 @@ public final class SmoothMeshRenderBackend implements WhiteLilyAvatarRenderBacke
               state,
               state.mainHandItem(),
               state.offHandItem(),
-              "builtin".equals(smooth.origin()));
+              "builtin".equals(smooth.origin()),
+              negotiation.detailLevel,
+              negotiation.fallback.currentStage(),
+              negotiation.fallback.currentStage() == AvatarFallbackController.FallbackStage.BASIC_CEL,
+              negotiation.fallback.currentState().secondaryDynamicsEnabled(),
+              negotiation.fallback.currentState().nonessentialTransparencyEnabled());
       context.prepareSmooth(frame);
       context.renderSmooth(frame);
       return AvatarFrameResult.complete();
     } catch (AvatarGpuResources.ResourceReleasedException error) {
       return AvatarFrameResult.failed("AVATAR_GPU_RESOURCE_RELEASED");
     } catch (AvatarGpuResources.ShaderUnavailableException error) {
-      return AvatarFrameResult.failed("AVATAR_SHADER_FAILED");
+      return fail(state, smooth.modelId(), negotiation, "AVATAR_SHADER_FAILED", error.getMessage());
     } catch (UnsupportedOperationException error) {
-      return AvatarFrameResult.failed("AVATAR_SHADER_FAILED");
+      return fail(state, smooth.modelId(), negotiation, "AVATAR_SHADER_FAILED", error.getMessage());
     } catch (Exception | LinkageError error) {
-      return AvatarFrameResult.failed("AVATAR_MESH_LOAD_FAILED");
+      return fail(state, smooth.modelId(), negotiation, "AVATAR_MESH_LOAD_FAILED", error.getMessage());
     }
   }
 
   @Override
   public void dispose(PreparedAvatarResources resources) {
     if (resources instanceof SmoothResources smooth) smooth.gpuResources().close();
+  }
+
+  private Negotiation negotiationFor(String modelId, AvatarVisualState state) {
+    QualityKey key = new QualityKey(state.worldSessionId(), state.renderSessionEpoch(), modelId);
+    Negotiation negotiation =
+        negotiations.computeIfAbsent(
+            key,
+            ignored -> {
+              AvatarFallbackController fallback = new AvatarFallbackController();
+              fallback.beginNegotiation(state.worldSessionId() + "-" + state.renderSessionEpoch(), modelId);
+              return new Negotiation(fallback, null);
+            });
+    negotiation.detailLevel =
+        detailSelector.select(negotiation.detailLevel, state.observerDistance(), state.graphics());
+    return negotiation;
+  }
+
+  private AvatarFrameResult fail(
+      AvatarVisualState state,
+      String modelId,
+      Negotiation negotiation,
+      String errorCode,
+      String reason) {
+    AvatarFallbackController.FailureType failure =
+        switch (negotiation.fallback.currentStage()) {
+          case FULL_QUALITY -> AvatarFallbackController.FailureType.SECONDARY_DYNAMICS_FAILED;
+          case BASIC_CEL -> AvatarFallbackController.FailureType.ADVANCED_MATERIAL_FAILED;
+          case SAME_STYLE_LOW -> AvatarFallbackController.FailureType.HIGH_MODEL_FAILED;
+          case VANILLA_FRAME_ONLY -> AvatarFallbackController.FailureType.HIGH_MODEL_FAILED;
+        };
+    AvatarFallbackController.FallbackStage stage = negotiation.fallback.record(failure);
+    String resultingCode =
+        stage == AvatarFallbackController.FallbackStage.VANILLA_FRAME_ONLY
+            ? "AVATAR_FRAME_FALLBACK"
+            : errorCode;
+    diagnose(state, modelId, negotiation, resultingCode, reason);
+    return AvatarFrameResult.failed(resultingCode);
+  }
+
+  private void diagnose(
+      AvatarVisualState state,
+      String modelId,
+      Negotiation negotiation,
+      String errorCode,
+      String reason) {
+    AvatarRenderDiagnostic diagnostic =
+        new AvatarRenderDiagnostic(
+            "0.1.0",
+            "smooth-mesh",
+            modelId,
+            negotiation.detailLevel.name(),
+            state.armorTheme().name(),
+            negotiation.fallback.currentStage().name(),
+            state.worldSessionId() + "-" + state.renderSessionEpoch(),
+            errorCode,
+            reason);
+    for (AvatarDiagnosticRateLimiter.Emission emission : diagnosticRateLimiter.record(diagnostic)) {
+      LOGGER.error("{} {}", emission.diagnostic().errorCode(), emission);
+    }
   }
 
   private void validateDescriptor(AvatarRuntimeDescriptor descriptor) throws AvatarRenderException {
@@ -181,7 +264,12 @@ public final class SmoothMeshRenderBackend implements WhiteLilyAvatarRenderBacke
       AvatarVisualState state,
       String mainHandItem,
       String offHandItem,
-      boolean whiteLilyArmorEnabled) {
+      boolean whiteLilyArmorEnabled,
+      AvatarDetailSelector.AvatarDetailLevel detailLevel,
+      AvatarFallbackController.FallbackStage fallbackStage,
+      boolean basicCelMaterial,
+      boolean secondaryDynamicsEnabled,
+      boolean nonessentialTransparencyEnabled) {
     public SmoothMeshFrame {
       Objects.requireNonNull(modelId, "modelId");
       Objects.requireNonNull(resources, "resources");
@@ -190,6 +278,8 @@ public final class SmoothMeshRenderBackend implements WhiteLilyAvatarRenderBacke
       Objects.requireNonNull(state, "state");
       Objects.requireNonNull(mainHandItem, "mainHandItem");
       Objects.requireNonNull(offHandItem, "offHandItem");
+      Objects.requireNonNull(detailLevel, "detailLevel");
+      Objects.requireNonNull(fallbackStage, "fallbackStage");
     }
 
     public org.joml.Matrix4f leftHand() {
@@ -198,6 +288,19 @@ public final class SmoothMeshRenderBackend implements WhiteLilyAvatarRenderBacke
 
     public org.joml.Matrix4f rightHand() {
       return pose.rightHand();
+    }
+  }
+
+  private record QualityKey(String worldSessionId, long renderSessionEpoch, String modelId) {}
+
+  private static final class Negotiation {
+    private final AvatarFallbackController fallback;
+    private volatile AvatarDetailSelector.AvatarDetailLevel detailLevel;
+
+    private Negotiation(
+        AvatarFallbackController fallback, AvatarDetailSelector.AvatarDetailLevel detailLevel) {
+      this.fallback = fallback;
+      this.detailLevel = detailLevel;
     }
   }
 }

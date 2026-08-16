@@ -5,6 +5,10 @@ import io.github.whitelily.avatar.identity.IdentityDecision;
 import io.github.whitelily.avatar.identity.PlayerIdentitySnapshot;
 import io.github.whitelily.avatar.identity.WhiteLilyIdentityMatcher;
 import io.github.whitelily.avatar.render.backend.AvatarVisualState;
+import io.github.whitelily.avatar.render.diagnostics.AvatarDiagnosticRateLimiter;
+import io.github.whitelily.avatar.render.diagnostics.AvatarRenderDiagnostic;
+import io.github.whitelily.avatar.render.quality.AvatarDetailSelector;
+import io.github.whitelily.avatar.render.quality.AvatarFallbackController;
 import io.github.whitelily.avatar.theme.ArmorTheme;
 import io.github.whitelily.avatar.theme.ArmorThemeResolver;
 import io.github.whitelily.avatar.theme.EquipmentThemeInput;
@@ -25,16 +29,25 @@ public final class WhiteLilyRenderRuntime {
 
   private final WhiteLilyRenderSessions sessions = new WhiteLilyRenderSessions();
   private final ArmorThemeResolver themeResolver = new ArmorThemeResolver();
+  private final AvatarDetailSelector detailSelector = new AvatarDetailSelector();
+  private final AvatarFallbackController fallbackController = new AvatarFallbackController();
+  private final AvatarDiagnosticRateLimiter diagnosticRateLimiter = new AvatarDiagnosticRateLimiter();
   private final WhiteLilyRenderCoordinator coordinator =
       new WhiteLilyRenderCoordinator(
-          new RendererSessionHealth(), () -> LOGGER.error(RENDER_FAILURE_CODE));
+            new RendererSessionHealth(), () -> LOGGER.error(RENDER_FAILURE_CODE));
+  private AvatarDetailSelector.AvatarDetailLevel detailLevel;
 
   public RenderSessionId beginSession() {
-    return sessions.beginSession();
+    RenderSessionId session = sessions.beginSession();
+    detailLevel = null;
+    fallbackController.beginNegotiation(
+        "render-" + session.epoch(), confirmedActiveModelId());
+    return session;
   }
 
   public void endSession() {
     sessions.endSession();
+    detailLevel = null;
   }
 
   public WhiteLilyRenderDecision captureDecision(AbstractClientPlayer player) {
@@ -111,5 +124,48 @@ public final class WhiteLilyRenderRuntime {
         "neutral",
         (float) distance,
         new AvatarVisualState.GraphicsCapabilities(true, true, 128));
+  }
+
+  public synchronized AvatarDetailSelector.AvatarDetailLevel selectDetailLevel(
+      AvatarVisualState state) {
+    detailLevel = detailSelector.select(detailLevel, state.observerDistance(), state.graphics());
+    return detailLevel;
+  }
+
+  public synchronized AvatarFallbackController.FallbackState recordFrameFailure(
+      AvatarFallbackController.FailureType failure,
+      String assetVersion,
+      String backend,
+      String modelId,
+      String errorCode,
+      String reason,
+      AvatarVisualState state) {
+    AvatarFallbackController.FallbackStage stage = fallbackController.record(failure);
+    AvatarDetailSelector.AvatarDetailLevel selected = selectDetailLevel(state);
+    AvatarRenderDiagnostic diagnostic =
+        new AvatarRenderDiagnostic(
+            assetVersion,
+            backend,
+            modelId,
+            selected.name(),
+            state.armorTheme().name(),
+            stage.name(),
+            "render-" + state.renderSessionEpoch(),
+            errorCode,
+            reason);
+    for (AvatarDiagnosticRateLimiter.Emission emission : diagnosticRateLimiter.record(diagnostic)) {
+      LOGGER.error("{} {}", emission.diagnostic().errorCode(), emission);
+    }
+    return fallbackController.currentState();
+  }
+
+  public synchronized AvatarFallbackController.FallbackState fallbackState() {
+    return fallbackController.currentState();
+  }
+
+  private static String confirmedActiveModelId() {
+    return WhiteLilyAvatarClient.modelController() == null
+        ? "builtin:whitelily-classic"
+        : WhiteLilyAvatarClient.modelController().confirmedActiveModelId();
   }
 }
