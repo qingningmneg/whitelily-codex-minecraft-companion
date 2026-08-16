@@ -663,6 +663,11 @@ export async function runElectronMain(): Promise<void> {
                       window.webContents.send(WHITE_LILY_IPC_CHANNELS.ownerIdentityEvent, owner);
                     }
                   },
+                  publishAvatarModels: (snapshot) => {
+                    if (!window.isDestroyed()) {
+                      window.webContents.send(WHITE_LILY_IPC_CHANNELS.avatarModelsEvent, snapshot);
+                    }
+                  },
                   externalUrlPolicy,
                   openExternal: (url) => shell.openExternal(url),
                   pcl2Discovery,

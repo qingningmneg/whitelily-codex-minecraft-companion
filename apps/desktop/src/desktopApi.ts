@@ -19,6 +19,13 @@ import {
   type OwnerIdentitySnapshot,
 } from "../../../src/identity/ownerIdentity.js";
 import type { RuntimeEvent, RuntimeSnapshot } from "../../../src/runtime/runtimeEvents.js";
+import {
+  parseAvatarModelCatalogSnapshot as parseSharedAvatarModelCatalogSnapshot,
+  parseAvatarModelId,
+  parseAvatarModelListItem,
+  type AvatarModelCatalogSnapshot,
+  type AvatarModelListItem,
+} from "../../../src/avatar/avatarModelSchemas.js";
 import type { BehaviorModeSettings, CompanionProfile } from "../../../src/profile/profileSchema.js";
 import type { CompanionMode } from "../../../src/domain/types.js";
 import type {
@@ -81,13 +88,19 @@ export const WHITE_LILY_IPC_CHANNELS = {
   setStartupSetting: "whitelily:set-startup-setting",
   readCloseToTraySetting: "whitelily:read-close-to-tray-setting",
   setCloseToTraySetting: "whitelily:set-close-to-tray-setting",
+  listAvatarModels: "whitelily:list-avatar-models",
+  importAvatarModel: "whitelily:import-avatar-model",
+  switchAvatarModel: "whitelily:switch-avatar-model",
   quitApplication: "whitelily:quit-application",
   runtimeEvent: "whitelily:runtime-event",
   ownerIdentityEvent: "whitelily:owner-identity-event",
+  avatarModelsEvent: "whitelily:avatar-models-event",
 } as const;
 
 export type WhiteLilyEventChannel =
-  typeof WHITE_LILY_IPC_CHANNELS.runtimeEvent | typeof WHITE_LILY_IPC_CHANNELS.ownerIdentityEvent;
+  | typeof WHITE_LILY_IPC_CHANNELS.runtimeEvent
+  | typeof WHITE_LILY_IPC_CHANNELS.ownerIdentityEvent
+  | typeof WHITE_LILY_IPC_CHANNELS.avatarModelsEvent;
 
 export type WhiteLilyInvokeChannel = Exclude<
   (typeof WHITE_LILY_IPC_CHANNELS)[keyof typeof WHITE_LILY_IPC_CHANNELS],
@@ -211,6 +224,16 @@ export interface WhiteLilyTask5Api {
   }): Promise<{ revision: number; enabled: boolean }>;
 }
 
+export interface WhiteLilyAvatarApi {
+  listAvatarModels(): Promise<AvatarModelCatalogSnapshot>;
+  importAvatarModel(): Promise<
+    | { readonly status: "cancelled" }
+    | { readonly status: "imported"; readonly model: AvatarModelListItem }
+  >;
+  switchAvatarModel(modelId: string): Promise<AvatarModelCatalogSnapshot>;
+  subscribeAvatarModels(listener: (snapshot: AvatarModelCatalogSnapshot) => void): () => void;
+}
+
 export type RendererMemoryInput = Omit<ScopedMemoryInput, "source" | "worldId">;
 export type RendererMemoryPatch = Omit<ScopedMemoryPatch, "worldId">;
 export interface MemoryMigrationPreviewResult {
@@ -225,7 +248,7 @@ export interface MemoryMigrationMutationResult {
   status: "committed" | "rolled_back";
 }
 
-export type WhiteLilyAppApi = WhiteLilyDesktopApi & WhiteLilyTask5Api;
+export type WhiteLilyAppApi = WhiteLilyDesktopApi & WhiteLilyTask5Api & WhiteLilyAvatarApi;
 
 export type DesktopRendererEvent = RuntimeEvent | ConnectionInvalidatedEvent;
 export type OwnerIdentityAuthoritySnapshot = OwnerIdentitySnapshot & {
@@ -678,6 +701,43 @@ export function createWhiteLilyApi(transport: PreloadTransport): WhiteLilyAppApi
         await transport.invoke(WHITE_LILY_IPC_CHANNELS.setCloseToTraySetting, parsed),
       );
     },
+    listAvatarModels: async (...args: readonly unknown[]) => {
+      if (args.length !== 0) throw new Error("invalid avatar list input");
+      return parseAvatarCatalogSnapshot(
+        await transport.invoke(WHITE_LILY_IPC_CHANNELS.listAvatarModels),
+      );
+    },
+    importAvatarModel: async (...args: readonly unknown[]) => {
+      if (args.length !== 0) throw new Error("invalid avatar import input");
+      return parseAvatarImportResult(
+        await transport.invoke(WHITE_LILY_IPC_CHANNELS.importAvatarModel),
+      );
+    },
+    switchAvatarModel: async (...args: readonly unknown[]) => {
+      if (args.length !== 1) throw new Error("invalid avatar model selection");
+      let modelId: string;
+      try {
+        modelId = parseAvatarModelId(args[0]);
+      } catch {
+        throw new Error("invalid avatar model selection");
+      }
+      return parseAvatarCatalogSnapshot(
+        await transport.invoke(WHITE_LILY_IPC_CHANNELS.switchAvatarModel, modelId),
+      );
+    },
+    subscribeAvatarModels: (...args: readonly unknown[]) => {
+      if (args.length !== 1 || typeof args[0] !== "function") {
+        throw new Error("invalid avatar model listener");
+      }
+      const listener = args[0] as (snapshot: AvatarModelCatalogSnapshot) => void;
+      return transport.subscribe(WHITE_LILY_IPC_CHANNELS.avatarModelsEvent, (value) => {
+        try {
+          listener(parseAvatarCatalogSnapshot(value));
+        } catch {
+          // Malformed avatar catalog events are stopped at the preload boundary.
+        }
+      });
+    },
     subscribeRuntime: (listener: (event: DesktopRendererEvent) => void) =>
       transport.subscribe(WHITE_LILY_IPC_CHANNELS.runtimeEvent, (value) => {
         try {
@@ -687,6 +747,77 @@ export function createWhiteLilyApi(transport: PreloadTransport): WhiteLilyAppApi
         }
       }),
   });
+}
+
+export function parseAvatarCatalogSnapshot(value: unknown): AvatarModelCatalogSnapshot {
+  try {
+    let record: Record<string, unknown>;
+    try {
+      record = readExactPlainDataObject(value, ["revision", "models", "activeModelId"]);
+    } catch {
+      record = readExactPlainDataObject(value, [
+        "revision",
+        "models",
+        "activeModelId",
+        "pendingModelId",
+      ]);
+    }
+    const models = readExactDataArray(record.models, 1_024, "invalid avatar model catalog").map(
+      (model) =>
+        parseAvatarModelListItem(
+          readExactPlainDataObject(model, [
+            "id",
+            "displayName",
+            "origin",
+            "format",
+            "previewDataUrl",
+            "bodyAnimation",
+            "expressions",
+          ]),
+        ),
+    );
+    return parseSharedAvatarModelCatalogSnapshot({
+      revision: record.revision,
+      models,
+      activeModelId: record.activeModelId,
+      ...(Object.hasOwn(record, "pendingModelId") ? { pendingModelId: record.pendingModelId } : {}),
+    });
+  } catch {
+    throw new Error("invalid avatar model catalog");
+  }
+}
+
+export function parseAvatarImportResult(
+  value: unknown,
+):
+  | { readonly status: "cancelled" }
+  | { readonly status: "imported"; readonly model: AvatarModelListItem } {
+  try {
+    try {
+      const cancelled = readExactPlainDataObject(value, ["status"]);
+      if (cancelled.status !== "cancelled") throw new Error("invalid avatar import result");
+      return Object.freeze({ status: "cancelled" });
+    } catch {
+      const imported = readExactPlainDataObject(value, ["status", "model"]);
+      if (imported.status !== "imported") throw new Error("invalid avatar import result");
+      return Object.freeze({
+        status: "imported",
+        model: parseAvatarModelListItem(
+          readExactPlainDataObject(imported.model, [
+            "id",
+            "displayName",
+            "origin",
+            "format",
+            "previewDataUrl",
+            "bodyAnimation",
+            "expressions",
+          ]),
+        ),
+      });
+    }
+  } catch {
+    throw new Error("invalid avatar import result");
+  }
 }
 
 function parseExportResult(value: unknown): { status: "cancelled" | "saved" } {
@@ -1121,7 +1252,7 @@ function readExactDataRecord<const K extends readonly string[]>(
   let descriptors: PropertyDescriptorMap;
   try {
     prototype = Object.getPrototypeOf(value) as object | null;
-    descriptors = Object.getOwnPropertyDescriptors(value);
+    descriptors = Object.getOwnPropertyDescriptors(value) as unknown as PropertyDescriptorMap;
   } catch {
     throw new Error(message);
   }
@@ -1143,6 +1274,40 @@ function readExactDataRecord<const K extends readonly string[]>(
     result[field] = descriptor.value;
   }
   return result as { [P in K[number]]: unknown };
+}
+
+function readExactDataArray(value: unknown, maximum: number, message: string): readonly unknown[] {
+  if (!Array.isArray(value) || value.length > maximum) throw new Error(message);
+  let prototype: object | null;
+  let descriptors: PropertyDescriptorMap;
+  try {
+    prototype = Object.getPrototypeOf(value) as object | null;
+    descriptors = Object.getOwnPropertyDescriptors(value) as unknown as PropertyDescriptorMap;
+  } catch {
+    throw new Error(message);
+  }
+  const expectedKeys = [
+    ...Array.from({ length: value.length }, (_unused, index) => String(index)),
+    "length",
+  ];
+  const keys = Reflect.ownKeys(descriptors);
+  if (
+    prototype !== Array.prototype ||
+    keys.length !== expectedKeys.length ||
+    keys.some((key) => typeof key !== "string" || !expectedKeys.includes(key)) ||
+    descriptors.length?.value !== value.length
+  ) {
+    throw new Error(message);
+  }
+  const result: unknown[] = [];
+  for (let index = 0; index < value.length; index += 1) {
+    const descriptor = descriptors[String(index)];
+    if (!descriptor || !Object.hasOwn(descriptor, "value") || descriptor.enumerable !== true) {
+      throw new Error(message);
+    }
+    result.push(descriptor.value);
+  }
+  return Object.freeze(result);
 }
 
 function isMinecraftComponentState(value: unknown): value is MinecraftComponentState {

@@ -7,6 +7,7 @@ import {
   type AvatarModelControlState,
   type AvatarModelFormat,
   type AvatarModelId,
+  type AvatarModelListItem,
   type AvatarModelOrigin,
   type AvatarModelRecord,
   type AvatarRuntimeDescriptor,
@@ -131,7 +132,7 @@ export const avatarModelRecordSchema = z
     hasCoherentManagedPath({ modelId: id, origin, resourcePath: previewPath }),
   );
 
-const avatarModelListItemSchema = z
+export const avatarModelListItemSchema = z
   .object({
     id: avatarModelIdSchema,
     displayName: displayNameSchema,
@@ -248,6 +249,10 @@ export function parseAvatarModelCatalogSnapshot(value: unknown): AvatarModelCata
     value,
     "invalid avatar model catalog snapshot",
   );
+}
+
+export function parseAvatarModelListItem(value: unknown): AvatarModelListItem {
+  return parseOrThrow(avatarModelListItemSchema, value, "invalid avatar model list item");
 }
 
 export function parseAvatarModelControlRequest(value: unknown): AvatarModelControlRequest {

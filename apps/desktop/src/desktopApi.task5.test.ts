@@ -50,7 +50,96 @@ const ownerSnapshot: OwnerIdentitySnapshot = {
 };
 const ownerAuthoritySnapshot = { ...ownerSnapshot, childGeneration: 7 };
 
+const avatarSnapshot = {
+  revision: 2,
+  models: [
+    {
+      id: "builtin:whitelily-hd",
+      displayName: "WhiteLily 高清动漫",
+      origin: "builtin",
+      format: "builtin-hd",
+      previewDataUrl: "data:image/png;base64,iVBORw0KGgo=",
+      bodyAnimation: "whitelily-humanoid-v1",
+      expressions: "full",
+    },
+    {
+      id: "builtin:whitelily-classic",
+      displayName: "WhiteLily 经典",
+      origin: "builtin",
+      format: "builtin-classic",
+      previewDataUrl: "data:image/png;base64,iVBORw0KGgo=",
+      bodyAnimation: "whitelily-humanoid-v1",
+      expressions: "full",
+    },
+  ],
+  activeModelId: "builtin:whitelily-hd",
+} as const;
+
 describe("Task 5 preload API", () => {
+  it("exposes a path-free avatar model API over dedicated channels", async () => {
+    const subscriptions = new Map<string, (value: unknown) => void>();
+    const invoke = vi.fn(async (channel: string) => {
+      if (channel === WHITE_LILY_IPC_CHANNELS.importAvatarModel) {
+        return { status: "cancelled" };
+      }
+      return structuredClone(avatarSnapshot);
+    });
+    const api = createWhiteLilyApi({
+      invoke,
+      subscribe: (channel, listener) => {
+        subscriptions.set(channel, listener);
+        return () => subscriptions.delete(channel);
+      },
+    } as PreloadTransport);
+
+    await expect(api.listAvatarModels()).resolves.toEqual(avatarSnapshot);
+    await expect(api.importAvatarModel()).resolves.toEqual({ status: "cancelled" });
+    await expect(api.switchAvatarModel("builtin:whitelily-classic")).resolves.toEqual(
+      avatarSnapshot,
+    );
+    expect(invoke.mock.calls).toEqual([
+      [WHITE_LILY_IPC_CHANNELS.listAvatarModels],
+      [WHITE_LILY_IPC_CHANNELS.importAvatarModel],
+      [WHITE_LILY_IPC_CHANNELS.switchAvatarModel, "builtin:whitelily-classic"],
+    ]);
+
+    await expect(
+      (api.importAvatarModel as (...args: unknown[]) => Promise<unknown>)(
+        String.raw`C:\secret.glb`,
+      ),
+    ).rejects.toThrow("invalid avatar import input");
+    await expect(api.switchAvatarModel(String.raw`C:\secret.glb`)).rejects.toThrow(
+      "invalid avatar model selection",
+    );
+    expect(invoke).toHaveBeenCalledTimes(3);
+
+    const listener = vi.fn();
+    const unsubscribe = api.subscribeAvatarModels(listener);
+    subscriptions.get(WHITE_LILY_IPC_CHANNELS.avatarModelsEvent)?.(structuredClone(avatarSnapshot));
+    expect(listener).toHaveBeenCalledWith(avatarSnapshot);
+    unsubscribe();
+    unsubscribe();
+    expect(subscriptions.has(WHITE_LILY_IPC_CHANNELS.avatarModelsEvent)).toBe(false);
+  });
+
+  it("drops malformed avatar catalog events at the preload boundary", () => {
+    let emit: ((value: unknown) => void) | undefined;
+    const api = createWhiteLilyApi({
+      invoke: vi.fn(),
+      subscribe: (_channel, listener) => {
+        emit = listener;
+        return () => undefined;
+      },
+    } as PreloadTransport);
+    const listener = vi.fn();
+    api.subscribeAvatarModels(listener);
+
+    emit?.({ activeModelId: 9 });
+    emit?.({ ...avatarSnapshot, sourcePath: String.raw`C:\secret.glb` });
+
+    expect(listener).not.toHaveBeenCalled();
+  });
+
   it("exposes a frozen zero-argument application quit operation", async () => {
     const invoke = vi.fn(async () => undefined);
     const api = createWhiteLilyApi({ invoke, subscribe: vi.fn() });
@@ -169,6 +258,7 @@ describe("Task 5 preload API", () => {
         mcpListening: true,
         discoveredToolCount: 15,
       },
+      actionQueue: { goal: null, items: [] },
       task: null,
       lastError: null,
     } as const;

@@ -487,7 +487,7 @@ git commit -m "feat: render isolated avatar previews"
 - Consumes: `AvatarModelCatalog`、`AvatarModelImporter`、Task 6 的 `AvatarModelSwitchCoordinator` 端口。
 - Produces: `listAvatarModels()`、`importAvatarModel()`、`switchAvatarModel(modelId)`、`subscribeAvatarModels()`。
 
-- [ ] **Step 1: 写 preload 参数校验、文件选择取消和事件解析失败测试**
+- [x] **Step 1: 写 preload 参数校验、文件选择取消和事件解析失败测试**
 
 ```ts
 it("never accepts a renderer supplied filesystem path", async () => {
@@ -505,13 +505,13 @@ it("drops malformed avatar catalog events at the preload boundary", () => {
 });
 ```
 
-- [ ] **Step 2: 运行红灯**
+- [x] **Step 2: 运行红灯**
 
 Run: `npm run test --workspace @whitelily/desktop -- src/desktopApi.task5.test.ts src-main/ipcRegistry.test.ts src-main/preloadBundle.test.ts`
 
 Expected: FAIL，缺少 avatar IPC channels。
 
-- [ ] **Step 3: 扩展 preload API 而不污染 ChatGPT 模型方法**
+- [x] **Step 3: 扩展 preload API 而不污染 ChatGPT 模型方法**
 
 ```ts
 export interface WhiteLilyAvatarApi {
@@ -527,11 +527,11 @@ export interface WhiteLilyAvatarApi {
 
 新增 channels：`whitelily:list-avatar-models`、`whitelily:import-avatar-model`、`whitelily:switch-avatar-model`、`whitelily:avatar-models-event`。`importAvatarModel()` 在主进程调用 `dialog.showOpenDialog()`，过滤器只显示 `vrm`/`glb`，仅接受一个普通文件；取消返回 `cancelled`。主进程不把受管理绝对路径或原始源路径返回 renderer，列表项只含有界 `previewDataUrl`、能力、状态和稳定错误码。
 
-- [ ] **Step 4: 注册服务并确保清理订阅**
+- [x] **Step 4: 注册服务并确保清理订阅**
 
 `IpcRegistryOptions` 新增 `avatarModels` 端口，明确方法签名为 `list()`、`importFromPicker()`、`switchTo(modelId)`、`subscribe(listener)`。`registerIpcHandlers()` 清理函数必须移除三个 invoke handler 和目录订阅；重复启动/关闭 composition 不得留下监听器。
 
-- [ ] **Step 5: 跑 IPC、preload 和构建测试**
+- [x] **Step 5: 跑 IPC、preload 和构建测试**
 
 Run: `npm run test --workspace @whitelily/desktop -- src/desktopApi.task5.test.ts src-main/ipcRegistry.test.ts src-main/preloadBundle.test.ts`
 
@@ -541,7 +541,7 @@ Run: `npm run typecheck --workspace @whitelily/desktop`
 
 Expected: PASS。
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```powershell
 git add apps/desktop/src/desktopApi.ts apps/desktop/src/desktopApi.task5.test.ts apps/desktop/src-main/ipcRegistry.ts apps/desktop/src-main/ipcRegistry.test.ts apps/desktop/src-main/main.ts apps/desktop/src-main/preloadBundle.test.ts

@@ -45,6 +45,30 @@ const ownerSnapshot: OwnerIdentitySnapshot = {
   presence: "online",
 };
 const ownerAuthoritySnapshot = { ...ownerSnapshot, childGeneration: 7 };
+const avatarSnapshot = {
+  revision: 2,
+  models: [
+    {
+      id: "builtin:whitelily-hd",
+      displayName: "WhiteLily 高清动漫",
+      origin: "builtin",
+      format: "builtin-hd",
+      previewDataUrl: "data:image/png;base64,iVBORw0KGgo=",
+      bodyAnimation: "whitelily-humanoid-v1",
+      expressions: "full",
+    },
+    {
+      id: "builtin:whitelily-classic",
+      displayName: "WhiteLily 经典",
+      origin: "builtin",
+      format: "builtin-classic",
+      previewDataUrl: "data:image/png;base64,iVBORw0KGgo=",
+      bodyAnimation: "whitelily-humanoid-v1",
+      expressions: "full",
+    },
+  ],
+  activeModelId: "builtin:whitelily-hd",
+} as const;
 
 const pcl2Candidates = [
   {
@@ -137,11 +161,13 @@ class LanContainmentChild extends EventEmitter implements ChildProcessPort {
 }
 
 type WorldAuthorityPort = NonNullable<Parameters<typeof registerIpcHandlers>[0]["worldAuthority"]>;
+type AvatarModelsPort = NonNullable<Parameters<typeof registerIpcHandlers>[0]["avatarModels"]>;
 
 function createRegistryHarness(
   snapshot: unknown = idleSnapshot,
   worldAuthority?: WorldAuthorityPort,
   requestApplicationQuit: () => Promise<void> = vi.fn(async () => undefined),
+  avatarModels?: AvatarModelsPort,
 ) {
   const loginExpiresAt = Date.now() + 60_000;
   const handlers = new Map<string, (...args: unknown[]) => unknown>();
@@ -226,6 +252,7 @@ function createRegistryHarness(
   } as IpcSupervisor & { activeChildGeneration(): number };
   const published: DesktopRendererEvent[] = [];
   const publishedOwners: Array<OwnerIdentitySnapshot & { childGeneration: number }> = [];
+  const publishedAvatarModels: unknown[] = [];
   const policy = new ExternalUrlPolicy();
   const openExternal = vi.fn<(url: string) => Promise<unknown>>(async () => undefined);
   const discoverPcl2 = vi.fn(async () => pcl2Candidates);
@@ -265,6 +292,7 @@ function createRegistryHarness(
     supervisor,
     publishRuntime: (event) => published.push(event),
     publishOwnerIdentity: (owner) => publishedOwners.push(owner),
+    publishAvatarModels: (avatarModelsSnapshot) => publishedAvatarModels.push(avatarModelsSnapshot),
     externalUrlPolicy: policy,
     openExternal,
     pcl2Discovery: { discoverPcl2 },
@@ -281,6 +309,7 @@ function createRegistryHarness(
     },
     requestApplicationQuit,
     ...(worldAuthority ? { worldAuthority } : {}),
+    ...(avatarModels ? { avatarModels } : {}),
   });
   const invoke = (channel: string, ...args: unknown[]) => {
     const handler = handlers.get(channel);
@@ -295,6 +324,7 @@ function createRegistryHarness(
     invoke,
     published,
     publishedOwners,
+    publishedAvatarModels,
     removedChannels,
     request,
     runtimeEvent: (event: DesktopEvent["event"], childGeneration = 7) =>
@@ -315,6 +345,61 @@ function createRegistryHarness(
 }
 
 describe("IPC registry", () => {
+  it("registers path-free avatar handlers and removes their subscription on cleanup", async () => {
+    let publish: Parameters<AvatarModelsPort["subscribe"]>[0] | undefined;
+    const unsubscribeAvatarModels = vi.fn();
+    const list = vi.fn(async () => structuredClone(avatarSnapshot));
+    const importFromPicker = vi.fn(async () => ({ status: "cancelled" as const }));
+    const switchTo = vi.fn(async () => structuredClone(avatarSnapshot));
+    const avatarModels: AvatarModelsPort = {
+      list,
+      importFromPicker,
+      switchTo,
+      subscribe: (listener) => {
+        publish = listener;
+        return unsubscribeAvatarModels;
+      },
+    };
+    const harness = createRegistryHarness(
+      idleSnapshot,
+      undefined,
+      vi.fn(async () => undefined),
+      avatarModels,
+    );
+
+    await expect(harness.invoke(WHITE_LILY_IPC_CHANNELS.listAvatarModels)).resolves.toEqual(
+      avatarSnapshot,
+    );
+    await expect(harness.invoke(WHITE_LILY_IPC_CHANNELS.importAvatarModel)).resolves.toEqual({
+      status: "cancelled",
+    });
+    await expect(
+      harness.invoke(WHITE_LILY_IPC_CHANNELS.switchAvatarModel, "builtin:whitelily-classic"),
+    ).resolves.toEqual(avatarSnapshot);
+    expect(list).toHaveBeenCalledOnce();
+    expect(importFromPicker).toHaveBeenCalledOnce();
+    expect(switchTo).toHaveBeenCalledWith("builtin:whitelily-classic");
+
+    await expect(
+      harness.invoke(WHITE_LILY_IPC_CHANNELS.importAvatarModel, String.raw`C:\secret.glb`),
+    ).rejects.toThrow("invalid IPC input");
+    await expect(
+      harness.invoke(WHITE_LILY_IPC_CHANNELS.switchAvatarModel, String.raw`C:\secret.glb`),
+    ).rejects.toThrow("invalid avatar model selection");
+    expect(importFromPicker).toHaveBeenCalledOnce();
+    expect(switchTo).toHaveBeenCalledOnce();
+
+    publish?.(structuredClone(avatarSnapshot));
+    expect(harness.publishedAvatarModels).toEqual([avatarSnapshot]);
+
+    harness.cleanup();
+    harness.cleanup();
+    expect(unsubscribeAvatarModels).toHaveBeenCalledOnce();
+    expect(harness.handlers.has(WHITE_LILY_IPC_CHANNELS.listAvatarModels)).toBe(false);
+    expect(harness.handlers.has(WHITE_LILY_IPC_CHANNELS.importAvatarModel)).toBe(false);
+    expect(harness.handlers.has(WHITE_LILY_IPC_CHANNELS.switchAvatarModel)).toBe(false);
+  });
+
   it("registers only the fixed renderer invocation channels", () => {
     const { handlers } = createRegistryHarness();
 
@@ -1680,12 +1765,16 @@ describe("typed preload API", () => {
         "emergencyStop",
         "readOwnerIdentity",
         "updateOwnerIdentity",
+        "subscribeAvatarModels",
         "subscribeOwnerIdentity",
         "subscribeRuntime",
+        "switchAvatarModel",
         "getAccount",
         "startChatGptLogin",
         "cancelChatGptLogin",
         "commitMemoryMigration",
+        "importAvatarModel",
+        "listAvatarModels",
         "listModels",
         "migrateModelPreference",
         "selectModel",

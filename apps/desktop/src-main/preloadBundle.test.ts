@@ -62,12 +62,16 @@ it("runs the built preload with only sandbox-approved module access", async () =
         detectLanCandidates: expect.any(Function),
         getMinecraftComponentStatus: expect.any(Function),
         installMinecraftComponents: expect.any(Function),
+        importAvatarModel: expect.any(Function),
+        listAvatarModels: expect.any(Function),
         quitApplication: expect.any(Function),
         removeMinecraftComponents: expect.any(Function),
         readOwnerIdentity: expect.any(Function),
         updateOwnerIdentity: expect.any(Function),
         subscribeOwnerIdentity: expect.any(Function),
+        subscribeAvatarModels: expect.any(Function),
         subscribeRuntime: expect.any(Function),
+        switchAvatarModel: expect.any(Function),
       }),
     );
 

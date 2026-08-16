@@ -8,6 +8,11 @@ import {
   type DesktopEvent,
 } from "../../../src/desktop/desktopProtocol.js";
 import type { RuntimeSnapshot } from "../../../src/runtime/runtimeEvents.js";
+import { parseAvatarModelId } from "../../../src/avatar/avatarModelSchemas.js";
+import type {
+  AvatarModelCatalogSnapshot,
+  AvatarModelListItem,
+} from "../../../src/avatar/avatarModelTypes.js";
 import {
   parseMinecraftJavaUsername,
   type OwnerIdentitySnapshot,
@@ -25,6 +30,8 @@ import type {
 } from "./discovery/lanDetector.js";
 import {
   parseConfirmedLanSession,
+  parseAvatarCatalogSnapshot,
+  parseAvatarImportResult,
   parseDesktopRendererEvent,
   parseLanCandidates,
   parseMinecraftComponentStatus,
@@ -64,6 +71,7 @@ export interface IpcRegistryOptions {
   supervisor: IpcSupervisor;
   publishRuntime: (event: DesktopRendererEvent) => void;
   publishOwnerIdentity: (owner: OwnerIdentityAuthoritySnapshot) => void;
+  publishAvatarModels?: (snapshot: AvatarModelCatalogSnapshot) => void;
   externalUrlPolicy: ExternalUrlPolicy;
   openExternal(url: string): Promise<unknown>;
   pcl2Discovery: {
@@ -94,6 +102,15 @@ export interface IpcRegistryOptions {
     ): Promise<{ revision: number; enabled: boolean }>;
   };
   requestApplicationQuit?: () => Promise<void>;
+  avatarModels?: {
+    list(): Promise<AvatarModelCatalogSnapshot>;
+    importFromPicker(): Promise<
+      | { readonly status: "cancelled" }
+      | { readonly status: "imported"; readonly model: AvatarModelListItem }
+    >;
+    switchTo(modelId: string): Promise<AvatarModelCatalogSnapshot>;
+    subscribe(listener: (snapshot: AvatarModelCatalogSnapshot) => void): () => void;
+  };
   exportSerialized?(serialized: string): Promise<{ status: "cancelled" | "saved" }>;
   exportDiagnostic?(
     exportId: string,
@@ -131,6 +148,7 @@ export function registerIpcHandlers(options: IpcRegistryOptions): () => void {
   >;
   const registeredChannels: string[] = [];
   let unsubscribe = (): void => undefined;
+  let unsubscribeAvatarModels = (): void => undefined;
   const inFlightOpens = new Map<string, LoginOpenOperation>();
   let activeLogin: LoginOpenOperation | undefined;
   let loginGeneration = 0;
@@ -259,6 +277,7 @@ export function registerIpcHandlers(options: IpcRegistryOptions): () => void {
     if (cleaned) return;
     cleaned = true;
     unsubscribe();
+    unsubscribeAvatarModels();
     stopLanMonitor();
     invalidateActiveLogin();
     inFlightOpens.clear();
@@ -688,6 +707,36 @@ export function registerIpcHandlers(options: IpcRegistryOptions): () => void {
       },
     );
     registeredChannels.push(WHITE_LILY_IPC_CHANNELS.setCloseToTraySetting);
+    if (options.avatarModels) {
+      options.ipcMain.handle(WHITE_LILY_IPC_CHANNELS.listAvatarModels, async (_event, ...args) => {
+        validateNoIpcInput(args);
+        return parseAvatarCatalogSnapshot(await options.avatarModels?.list());
+      });
+      registeredChannels.push(WHITE_LILY_IPC_CHANNELS.listAvatarModels);
+      options.ipcMain.handle(WHITE_LILY_IPC_CHANNELS.importAvatarModel, async (_event, ...args) => {
+        validateNoIpcInput(args);
+        return parseAvatarImportResult(await options.avatarModels?.importFromPicker());
+      });
+      registeredChannels.push(WHITE_LILY_IPC_CHANNELS.importAvatarModel);
+      options.ipcMain.handle(WHITE_LILY_IPC_CHANNELS.switchAvatarModel, async (_event, ...args) => {
+        if (args.length !== 1) throw new Error("invalid avatar model selection");
+        let modelId: string;
+        try {
+          modelId = parseAvatarModelId(args[0]);
+        } catch {
+          throw new Error("invalid avatar model selection");
+        }
+        return parseAvatarCatalogSnapshot(await options.avatarModels?.switchTo(modelId));
+      });
+      registeredChannels.push(WHITE_LILY_IPC_CHANNELS.switchAvatarModel);
+      unsubscribeAvatarModels = options.avatarModels.subscribe((snapshot) => {
+        try {
+          options.publishAvatarModels?.(parseAvatarCatalogSnapshot(snapshot));
+        } catch {
+          // Invalid avatar catalog events remain private to the main process.
+        }
+      });
+    }
     unsubscribe = options.supervisor.subscribe((value, context) => {
       let event: DesktopEvent["event"];
       try {
