@@ -312,7 +312,7 @@ git commit -m "feat: add managed avatar model catalog"
 - Consumes: Task 1 模型 schema、Task 2 目录与目录追加接口、Node `crypto`/`fs/promises`。
 - Produces: `parseGlbContainer(bytes)`、`mapAvatarBones(document)`、`AvatarModelImporter.importFile(sourcePath, displayName)`、`AvatarImportError`。
 
-- [ ] **Step 1: 写格式、资源与骨骼安全失败测试**
+- [x] **Step 1: 写格式、资源与骨骼安全失败测试**
 
 ```ts
 it.each([
@@ -328,13 +328,13 @@ it.each([
 });
 ```
 
-- [ ] **Step 2: 运行红灯**
+- [x] **Step 2: 运行红灯**
 
 Run: `npm run test --workspace @whitelily/desktop -- src-main/avatar/glbContainer.test.ts src-main/avatar/avatarBoneMapper.test.ts src-main/avatar/avatarModelImporter.test.ts`
 
 Expected: FAIL，缺少 GLB 解析器和导入器。
 
-- [ ] **Step 3: 实现有界 GLB 容器与 glTF 结构校验**
+- [x] **Step 3: 实现有界 GLB 容器与 glTF 结构校验**
 
 ```ts
 export interface ParsedGlbContainer {
@@ -349,7 +349,7 @@ export function parseGlbContainer(bytes: Uint8Array): ParsedGlbContainer;
 
 固定限制：源文件最多 128 MiB、JSON chunk 最多 8 MiB、节点最多 4096、关节最多 256、材质最多 128、纹理最多 128、图元最多 2048。校验 GLB magic/version/总长度/chunk 对齐、唯一 JSON 与 BIN chunk、bufferView/accessor 范围、索引类型、蒙皮 inverse bind matrix、图片 MIME、材质纹理索引和动画 sampler。只允许无 URI 的单一 BIN buffer及嵌入 bufferView 的图片；任何 `http:`、`https:`、`file:`、`data:`、相对或绝对 URI 都返回 `AVATAR_EXTERNAL_RESOURCE`。
 
-- [ ] **Step 4: 实现 VRM 和普通 GLB 的确定性身体骨骼映射**
+- [x] **Step 4: 实现 VRM 和普通 GLB 的确定性身体骨骼映射**
 
 ```ts
 export function mapAvatarBones(input: ParsedGlbContainer): {
@@ -360,7 +360,7 @@ export function mapAvatarBones(input: ParsedGlbContainer): {
 
 VRM 1.0 读取 `VRMC_vrm.humanoid.humanBones`，VRM 0.x 读取 `VRM.humanoid.humanBones`。普通 GLB 对规范化节点名按固定优先级映射：精确 `hips/pelvis`、`spine/chest`、`neck`、`head`、左右 `upperarm/lowerarm/hand/upperleg/lowerleg/foot`，再验证祖先层级和静止姿势左右方向；每个语义只能映射一次。缺少任何 `AvatarBoneMapping` 必填项失败；缺少表情扩展或 morph target 时返回 `neutral-only`。
 
-- [ ] **Step 5: 实现暂存、摘要、预览前置和无半成品提交**
+- [x] **Step 5: 实现暂存、摘要、预览前置和无半成品提交**
 
 ```ts
 export class AvatarModelImporter {
@@ -373,7 +373,7 @@ export class AvatarModelImporter {
 
 导入器先用随机 ID 建立 `.staging/<id>/`，通过已打开文件句柄完成有界读取与 SHA-256，写入规范文件名 `model.vrm` 或 `model.glb`，再调用 Task 4 的 `AvatarPreviewRenderer.render()`。只有模型、`preview.png` 和 `record.json` 全部落盘并复核摘要后，才把暂存目录原子重命名为 `models/<id>/`，最后调用 `catalog.appendImported()`；目录追加失败必须只删除本次新目录。显示名移除控制字符并截断到 80 Unicode 字符；ID 使用 `user:<lowercase-uuid>`。
 
-- [ ] **Step 6: 覆盖成功、损坏、缺表情和事务清理并跑绿**
+- [x] **Step 6: 覆盖成功、损坏、缺表情和事务清理并跑绿**
 
 增加测试：VRM 0.x、VRM 1.0、自包含 GLB 成功；`neutral-only` 成功；坏 accessor 越界、重复骨骼、预览失败、重命名失败、目录追加失败；用户删除原文件后受管理副本仍能读取；每种失败均不改变活动模型、偏好或目录顺序。
 
@@ -381,7 +381,7 @@ Run: `npm run test --workspace @whitelily/desktop -- src-main/avatar/glbContaine
 
 Expected: PASS。
 
-- [ ] **Step 7: 提交**
+- [x] **Step 7: 提交**
 
 ```powershell
 git add apps/desktop/src-main/avatar/glbContainer.ts apps/desktop/src-main/avatar/glbContainer.test.ts apps/desktop/src-main/avatar/avatarBoneMapper.ts apps/desktop/src-main/avatar/avatarBoneMapper.test.ts apps/desktop/src-main/avatar/avatarModelImporter.ts apps/desktop/src-main/avatar/avatarModelImporter.test.ts apps/desktop/src-main/avatar/__fixtures__
