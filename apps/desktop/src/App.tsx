@@ -12,6 +12,7 @@ import { HomePage } from "./pages/HomePage";
 import { DiagnosticsPage } from "./pages/DiagnosticsPage";
 import { MemoryPage } from "./pages/MemoryPage";
 import { ModelPage } from "./pages/ModelPage";
+import { AvatarModelPage } from "./pages/AvatarModelPage";
 import {
   OnboardingPage,
   persistOnboardingLocale,
@@ -211,6 +212,8 @@ function App({ api }: AppProps) {
         <WorldSafetyPage api={task5Api} locale={locale} ownerIdentity={ownerIdentity} />
       ) : route === "model" ? (
         <ModelPage api={desktopApi} locale={locale} />
+      ) : route === "avatarModels" ? (
+        <AvatarModelPage api={task5Api} locale={locale} />
       ) : route === "diagnostics" ? (
         <DiagnosticsPage api={task5Api} locale={locale} />
       ) : (

@@ -136,6 +136,33 @@ function createAppApi(
       revision: expectedRevision + 1,
       enabled,
     })),
+    listAvatarModels: vi.fn(async () => ({
+      revision: 1,
+      models: [
+        {
+          id: "builtin:whitelily-hd",
+          displayName: "WhiteLily 高清动漫 3D 模型设定图",
+          origin: "builtin" as const,
+          format: "builtin-hd" as const,
+          previewDataUrl: "data:image/png;base64,AA==",
+          bodyAnimation: "whitelily-humanoid-v1" as const,
+          expressions: "full" as const,
+        },
+        {
+          id: "builtin:whitelily-classic",
+          displayName: "WhiteLily Classic",
+          origin: "builtin" as const,
+          format: "builtin-classic" as const,
+          previewDataUrl: "data:image/png;base64,AA==",
+          bodyAnimation: "whitelily-humanoid-v1" as const,
+          expressions: "full" as const,
+        },
+      ],
+      activeModelId: "builtin:whitelily-hd",
+    })),
+    importAvatarModel: vi.fn(async () => ({ status: "cancelled" as const })),
+    switchAvatarModel: vi.fn(),
+    subscribeAvatarModels: vi.fn(() => vi.fn()),
     readWorldProfile: vi.fn(async () => ({
       schemaVersion: 1 as const,
       revision: 0,
@@ -183,6 +210,23 @@ describe("Task 5 application routing", () => {
     render(<App api={harness.api} />);
 
     expect(screen.getAllByRole("button", { name: "Quit WhiteLily" })).toHaveLength(1);
+  });
+
+  it("keeps avatar models separate from AI model settings and routes to the avatar library", async () => {
+    persistOnboardingLocale("en");
+    const harness = createAppApi();
+    render(<App api={harness.api} />);
+    const user = userEvent.setup();
+
+    await screen.findByRole("heading", { name: "Runtime overview" });
+    await user.click(screen.getByRole("link", { name: "Models & appearance" }));
+
+    expect(await screen.findByRole("heading", { name: "Models & appearance" })).toBeTruthy();
+    expect(screen.getByRole("link", { name: "AI model" }).getAttribute("aria-current")).toBeNull();
+    expect(screen.getByRole("link", { name: "Models & appearance" }).getAttribute("aria-current")).toBe(
+      "page",
+    );
+    await waitFor(() => expect(harness.api.listAvatarModels).toHaveBeenCalledOnce());
   });
 
   it("keeps one accessible application exit control across onboarding and main routes", async () => {

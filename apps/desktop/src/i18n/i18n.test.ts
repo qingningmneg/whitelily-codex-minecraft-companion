@@ -60,4 +60,13 @@ describe("desktop message catalogs", () => {
       expect(value).not.toContain("\ufffd");
     }
   });
+
+  it("keeps AI model settings separate from avatar model appearance copy", () => {
+    expect(zhCN["nav.models"]).toBe("AI 模型");
+    expect(zhCN["nav.avatarModels"]).toBe("模型与外观");
+    expect(zhCN["model.title"]).toBe("AI 模型设置");
+    expect(en["nav.models"]).toBe("AI model");
+    expect(en["nav.avatarModels"]).toBe("Models & appearance");
+    expect(en["model.title"]).toBe("AI model settings");
+  });
 });

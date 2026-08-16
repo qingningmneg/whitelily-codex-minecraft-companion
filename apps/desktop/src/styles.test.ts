@@ -87,6 +87,18 @@ describe("desktop style safety invariants", () => {
       expect(forcedColors).toContain(systemColor);
     }
   });
+
+  it("keeps the avatar model library as a visible single-line horizontal rail", () => {
+    const viewport = css.match(/\.avatar-model-track-viewport\s*\{([^}]+)\}/su)?.[1];
+    const track = css.match(/\.avatar-model-track\s*\{([^}]+)\}/su)?.[1];
+    const card = css.match(/\.avatar-model-card\s*\{([^}]+)\}/su)?.[1];
+
+    expect(viewport).toMatch(/overflow-x:\s*scroll/u);
+    expect(viewport).toMatch(/scrollbar-gutter:\s*stable/u);
+    expect(track).toMatch(/flex-wrap:\s*nowrap/u);
+    expect(track).toMatch(/width:\s*max-content/u);
+    expect(card).toMatch(/flex:\s*0\s+0\s+220px/u);
+  });
 });
 
 function readRootTokens(source: string): Map<string, string> {

@@ -10,7 +10,14 @@ interface SidebarProps {
 }
 
 export type AppRoute =
-  "home" | "persona" | "memory" | "worldSafety" | "model" | "diagnostics" | "settings";
+  | "home"
+  | "persona"
+  | "memory"
+  | "worldSafety"
+  | "model"
+  | "avatarModels"
+  | "diagnostics"
+  | "settings";
 
 const navigationItems: readonly {
   key: MessageKey;
@@ -22,6 +29,7 @@ const navigationItems: readonly {
   { key: "nav.memories", route: "memory" },
   { key: "nav.worldSafety", route: "worldSafety" },
   { key: "nav.models", route: "model" },
+  { key: "nav.avatarModels", route: "avatarModels" },
   { key: "nav.diagnostics", route: "diagnostics" },
   { key: "nav.settings", route: "settings" },
 ];
