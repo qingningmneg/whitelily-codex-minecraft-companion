@@ -31,7 +31,9 @@
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "avatar:test": "subprojects\\whitelily-avatar\\gradlew.bat -p subprojects\\whitelily-avatar :mod-fabric:test",
-    "avatar:check": "node subprojects/whitelily-avatar/tools/validate-assets.mjs && subprojects\\whitelily-avatar\\gradlew.bat -p subprojects\\whitelily-avatar :mod-fabric:check"
+    "avatar:check": "node subprojects/whitelily-avatar/tools/validate-assets.mjs && subprojects\\whitelily-avatar\\gradlew.bat -p subprojects\\whitelily-avatar :mod-fabric:check",
+    "avatar:anime:build": "node subprojects/whitelily-avatar/tools/build-anime-avatar.mjs --export --render-previews",
+    "avatar:anime:check": "node subprojects/whitelily-avatar/tools/build-anime-avatar.mjs --verify"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.29.0",

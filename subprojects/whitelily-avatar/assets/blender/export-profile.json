@@ -1,0 +1,15 @@
+{
+  "format": "glTF 2.0",
+  "container": "GLB",
+  "upAxis": "Y",
+  "units": "meters",
+  "applyModifiers": true,
+  "exportSkins": true,
+  "exportAnimations": true,
+  "exportMorphTargets": true,
+  "images": "embedded",
+  "draco": false,
+  "externalUris": false,
+  "maxWeightsPerVertex": 4,
+  "sampleRateFps": 30
+}

@@ -1,0 +1,25 @@
+"""Stable contract for the reproducible WhiteLily Blender source scene."""
+
+BLENDER_VERSION = (4, 5, 3)
+UNIT_SCALE = 1.0
+CHARACTER_HEIGHT_METERS = 1.80
+HIGH_TRIANGLE_RANGE = (45_000, 85_000)
+LOW_TRIANGLE_RANGE = (14_000, 28_000)
+MAX_JOINTS = 128
+MAX_WEIGHTS_PER_VERTEX = 4
+TEXTURE_SIZE = 2048
+THEMES = ("base", "leather", "iron", "gold", "diamond", "netherite")
+
+REQUIRED_COLLECTIONS = (
+    "REF", "BODY_HIGH", "BODY_LOW", "OUTFIT_BASE", "ARMOR", "RIG", "CAMERAS", "LIGHTS"
+)
+REQUIRED_CAMERAS = (
+    "CAM_FRONT", "CAM_BACK", "CAM_LEFT", "CAM_RIGHT", "CAM_TOP", "CAM_BOTTOM"
+)
+REQUIRED_LIGHTS = ("LIGHT_KEY", "LIGHT_FILL", "LIGHT_RIM")
+REQUIRED_SOURCE_DIGESTS = {
+    "whitelily-turnaround.png": "572e52d22255c9d36328c48a114dfe30f89988b676122b7025a16af062935cd6",
+    "whitelily-armor-themes.png": "8bfa790fbfac1c5e5816765fac5d4466fdb856b9c3fa407c725b9c29270d5a46",
+}
+ASSET_SCHEMA = 3
+ART_STAGE = "bootstrap"
