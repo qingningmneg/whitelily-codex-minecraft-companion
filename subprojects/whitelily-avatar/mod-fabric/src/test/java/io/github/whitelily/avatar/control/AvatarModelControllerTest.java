@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.github.whitelily.avatar.WhiteLilyAvatarClient;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -11,6 +12,10 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 
 final class AvatarModelControllerTest {
@@ -34,6 +39,22 @@ final class AvatarModelControllerTest {
 
     harness.controller.onVisibleFrameResult(AvatarVisibleFrameResult.COMPLETE);
 
+    assertEquals(FIRST, harness.controller.confirmedActiveModelId());
+    assertEquals(AvatarModelPhase.COMMITTED, harness.lastState().phase());
+  }
+
+  @Test
+  void productionRenderBoundaryMakesAReadyCommitVisibleAndCommitted() {
+    Harness harness = new Harness();
+    harness.controller.accept(prepare("switch-0001", FIRST));
+    harness.runtime.completePrepared(FIRST);
+    harness.controller.tick();
+    harness.controller.accept(commit("switch-0001", FIRST));
+
+    WhiteLilyAvatarClient.onRenderBoundary(harness.controller);
+    harness.controller.onVisibleFrameResult(AvatarVisibleFrameResult.COMPLETE);
+
+    assertEquals(List.of(FIRST), harness.runtime.commitRequests);
     assertEquals(FIRST, harness.controller.confirmedActiveModelId());
     assertEquals(AvatarModelPhase.COMMITTED, harness.lastState().phase());
   }
@@ -112,6 +133,48 @@ final class AvatarModelControllerTest {
     assertEquals(2, states.size());
     assertEquals(AvatarModelPhase.READY, states.get(1).phase());
     assertEquals("world-0001", states.get(1).worldSessionId());
+  }
+
+  @Test
+  void slowRuntimePrepareDoesNotHoldTheControllerMonitor() throws Exception {
+    CountDownLatch entered = new CountDownLatch(1);
+    CountDownLatch release = new CountDownLatch(1);
+    AvatarCandidateRuntime runtime =
+        new AvatarCandidateRuntime() {
+          @Override
+          public CompletionStage<PreparedCandidate> prepare(AvatarRuntimeDescriptor descriptor) {
+            entered.countDown();
+            try {
+              release.await();
+            } catch (InterruptedException ignored) {
+              Thread.currentThread().interrupt();
+            }
+            return CompletableFuture.completedFuture(new Candidate(descriptor.modelId()));
+          }
+
+          @Override
+          public void requestCommit(PreparedCandidate candidate) {}
+
+          @Override
+          public void cancel(PreparedCandidate candidate) {}
+
+          @Override
+          public void release(PreparedCandidate candidate) {}
+        };
+    AvatarModelController controller =
+        new AvatarModelController(runtime, ignored -> {}, CLASSIC, "world-0001");
+    ExecutorService executor = Executors.newFixedThreadPool(2);
+    try {
+      executor.submit(() -> controller.accept(prepare("switch-0001", FIRST)));
+      assertTrue(entered.await(2, TimeUnit.SECONDS));
+
+      assertTrue(
+          executor.submit(() -> controller.cancelForWorldChange()).get(500, TimeUnit.MILLISECONDS)
+              == null);
+    } finally {
+      release.countDown();
+      executor.shutdownNow();
+    }
   }
 
   private static AvatarModelControlRequest prepare(String requestId, String modelId) {

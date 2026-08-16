@@ -32,6 +32,7 @@ public abstract class LivingEntityRendererMixin {
       MultiBufferSource bufferSource,
       int packedLight,
       CallbackInfo callback) {
+    WhiteLilyAvatarClient.onRenderBoundary(WhiteLilyAvatarClient.modelController());
     if (!((Object) this instanceof WhiteLilyPlayerRendererAccess rendererAccess)
         || !(renderState instanceof WhiteLilyPlayerRenderStateAccess stateAccess)) {
       return;
@@ -62,7 +63,10 @@ public abstract class LivingEntityRendererMixin {
                                         captured.renderState(),
                                         customPoseStack,
                                         isolatedBufferSource,
-                                        packedLight))));
+                                        packedLight),
+                                customPoseStack,
+                                captured.renderState(),
+                                packedLight)));
     if (customCompleted && outcome[0] != null && outcome[0].suppressVanilla()) {
       callback.cancel();
     }

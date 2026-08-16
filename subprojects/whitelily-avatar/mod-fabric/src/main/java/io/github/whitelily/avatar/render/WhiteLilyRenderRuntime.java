@@ -98,6 +98,7 @@ public final class WhiteLilyRenderRuntime {
         player.getXRot(),
         player.getPose().name().toLowerCase(Locale.ROOT),
         partialTick,
+        player.tickCount + partialTick,
         decision.armorTheme(),
         mainHand,
         offHand,

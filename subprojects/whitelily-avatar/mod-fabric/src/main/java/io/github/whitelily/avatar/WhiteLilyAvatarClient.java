@@ -8,6 +8,7 @@ import io.github.whitelily.avatar.control.AvatarRuntimeDescriptor;
 import io.github.whitelily.avatar.render.WhiteLilyRenderRuntime;
 import io.github.whitelily.avatar.render.backend.AvatarRenderBackendRegistry;
 import io.github.whitelily.avatar.render.backend.ClassicGeckoRenderBackend;
+import io.github.whitelily.avatar.render.gltf.SmoothMeshRenderBackend;
 import java.nio.file.Path;
 import java.util.Map;
 import java.util.Optional;
@@ -87,6 +88,10 @@ public final class WhiteLilyAvatarClient implements ClientModInitializer {
     return renderBackendRegistry;
   }
 
+  public static void onRenderBoundary(AvatarModelController controller) {
+    if (controller != null) controller.onRenderBoundary();
+  }
+
   public static void installCandidateRuntime(AvatarCandidateRuntime runtime) {
     if (runtime == null) throw new IllegalArgumentException("avatar candidate runtime is required");
     candidateRuntime = runtime;
@@ -126,7 +131,7 @@ public final class WhiteLilyAvatarClient implements ClientModInitializer {
               null);
       AvatarRenderBackendRegistry registry =
           new AvatarRenderBackendRegistry(
-              Map.of("builtin-classic", new ClassicGeckoRenderBackend()),
+              smoothBackends(dataRoot.get()),
               controller::onVisibleFrameResult);
       AvatarCandidateRuntime.PreparedCandidate classic =
           registry
@@ -194,6 +199,16 @@ public final class WhiteLilyAvatarClient implements ClientModInitializer {
     String localAppData = System.getenv("LOCALAPPDATA");
     if (localAppData == null || localAppData.isBlank()) return Optional.empty();
     return Optional.of(Path.of(localAppData).toAbsolutePath().normalize().resolve("WhiteLily"));
+  }
+
+  private static Map<String, io.github.whitelily.avatar.render.backend.WhiteLilyAvatarRenderBackend>
+      smoothBackends(Path root) {
+    SmoothMeshRenderBackend smooth = new SmoothMeshRenderBackend(root.resolve("models"));
+    return Map.of(
+        "builtin-classic", new ClassicGeckoRenderBackend(),
+        "builtin-hd", smooth,
+        "glb", smooth,
+        "vrm", smooth);
   }
 
   private static void shutdownControl() {

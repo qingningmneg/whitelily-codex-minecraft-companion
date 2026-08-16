@@ -10,6 +10,12 @@ import io.github.whitelily.avatar.control.AvatarVisibleFrameResult;
 import io.github.whitelily.avatar.theme.ArmorTheme;
 import java.util.ArrayDeque;
 import java.util.Map;
+import java.util.concurrent.CompletionStage;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 
 final class AvatarRenderBackendRegistryTest {
@@ -70,6 +76,31 @@ final class AvatarRenderBackendRegistryTest {
     assertEquals(1, backend.disposeCount);
   }
 
+  @Test
+  void prepareReturnsAsynchronouslyAndCancelledLateDecodeIsDisposed() throws Exception {
+    BlockingBackend backend = new BlockingBackend();
+    AvatarRenderBackendRegistry registry =
+        new AvatarRenderBackendRegistry(Map.of("glb", backend), ignored -> {});
+    ExecutorService caller = Executors.newSingleThreadExecutor();
+    try {
+      Future<CompletionStage<PreparedCandidate>> invocation =
+          caller.submit(() -> registry.prepare(descriptor()));
+      assertTrue(backend.started.await(2, TimeUnit.SECONDS));
+
+      CompletionStage<PreparedCandidate> stage = invocation.get(500, TimeUnit.MILLISECONDS);
+      assertTrue(stage.toCompletableFuture().cancel(true));
+      backend.release.countDown();
+
+      assertTrue(backend.disposed.await(2, TimeUnit.SECONDS));
+      assertEquals(1, backend.disposeCount);
+      assertTrue(stage.toCompletableFuture().isCancelled());
+    } finally {
+      backend.release.countDown();
+      caller.shutdownNow();
+      registry.close();
+    }
+  }
+
   private static AvatarRuntimeDescriptor descriptor() {
     return new AvatarRuntimeDescriptor(
         "user:00000000-0000-4000-8000-000000000001",
@@ -92,6 +123,7 @@ final class AvatarRenderBackendRegistryTest {
         0.0f,
         0.0f,
         "standing",
+        0.5f,
         0.5f,
         ArmorTheme.BASE,
         "minecraft:air",
@@ -129,6 +161,38 @@ final class AvatarRenderBackendRegistryTest {
     @Override
     public void dispose(PreparedAvatarResources resources) {
       disposeCount++;
+    }
+  }
+
+  private static final class BlockingBackend implements WhiteLilyAvatarRenderBackend {
+    private final CountDownLatch started = new CountDownLatch(1);
+    private final CountDownLatch release = new CountDownLatch(1);
+    private final CountDownLatch disposed = new CountDownLatch(1);
+    private int disposeCount;
+
+    @Override
+    public PreparedAvatarResources prepare(AvatarRuntimeDescriptor descriptor) {
+      started.countDown();
+      try {
+        release.await();
+      } catch (InterruptedException ignored) {
+        Thread.currentThread().interrupt();
+      }
+      return descriptor::modelId;
+    }
+
+    @Override
+    public AvatarFrameResult renderFrame(
+        PreparedAvatarResources resources,
+        AvatarVisualState state,
+        AvatarRenderContext context) {
+      return AvatarFrameResult.complete();
+    }
+
+    @Override
+    public void dispose(PreparedAvatarResources resources) {
+      disposeCount++;
+      disposed.countDown();
     }
   }
 

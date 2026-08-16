@@ -50,19 +50,23 @@ public final class AvatarModelController {
     this.clock = Objects.requireNonNull(clock, "clock");
   }
 
-  public synchronized void accept(AvatarModelControlRequest request) {
+  public void accept(AvatarModelControlRequest request) {
     Objects.requireNonNull(request, "request");
-    if (!worldAvailable || request.schemaVersion() != 1) return;
-    if (worldSessionId == null) {
-      if (request.operation() != AvatarModelOperation.PREPARE) return;
-      worldSessionId = request.worldSessionId();
+    PreparationLaunch launch = null;
+    synchronized (this) {
+      if (!worldAvailable || request.schemaVersion() != 1) return;
+      if (worldSessionId == null) {
+        if (request.operation() != AvatarModelOperation.PREPARE) return;
+        worldSessionId = request.worldSessionId();
+      }
+      if (!worldSessionId.equals(request.worldSessionId())) return;
+      switch (request.operation()) {
+        case PREPARE -> launch = beginPreparation(request);
+        case COMMIT -> requestCommit(request);
+        case CANCEL -> cancel(request);
+      }
     }
-    if (!worldSessionId.equals(request.worldSessionId())) return;
-    switch (request.operation()) {
-      case PREPARE -> prepare(request);
-      case COMMIT -> requestCommit(request);
-      case CANCEL -> cancel(request);
-    }
+    if (launch != null) startPreparation(launch);
   }
 
   public void tick() {
@@ -138,26 +142,43 @@ public final class AvatarModelController {
     return worldSessionId;
   }
 
-  private void prepare(AvatarModelControlRequest request) {
+  private PreparationLaunch beginPreparation(AvatarModelControlRequest request) {
     if (request.candidate() == null || !request.modelId().equals(request.candidate().modelId())) {
-      return;
+      return null;
     }
     if (pendingRequest != null) discardPending();
     pendingRequest = request;
     long capturedGeneration = ++generation;
     publish(AvatarModelPhase.PREPARING, request, null);
+    return new PreparationLaunch(capturedGeneration, request);
+  }
+
+  private void startPreparation(PreparationLaunch launch) {
     final CompletionStage<PreparedCandidate> stage;
     try {
-      stage = runtime.prepare(request.candidate());
-      preparation = stage.toCompletableFuture();
+      stage = runtime.prepare(launch.request().candidate());
     } catch (RuntimeException error) {
-      publish(AvatarModelPhase.FAILED, request, "AVATAR_PREPARE_FAILED");
-      pendingRequest = null;
+      synchronized (this) {
+        if (launch.generation() == generation && pendingRequest == launch.request()) {
+          publish(AvatarModelPhase.FAILED, launch.request(), "AVATAR_PREPARE_FAILED");
+          pendingRequest = null;
+        }
+      }
       return;
+    }
+    CompletableFuture<PreparedCandidate> future = stage.toCompletableFuture();
+    boolean current;
+    synchronized (this) {
+      current = launch.generation() == generation && pendingRequest == launch.request();
+      if (current) preparation = future;
     }
     stage.whenComplete(
         (candidate, failure) ->
-            completions.add(() -> completePreparation(capturedGeneration, request, candidate, failure)));
+            completions.add(
+                () ->
+                    completePreparation(
+                        launch.generation(), launch.request(), candidate, failure)));
+    if (!current) future.cancel(true);
   }
 
   private synchronized void completePreparation(
@@ -240,4 +261,7 @@ public final class AvatarModelController {
             errorCode,
             Instant.now(clock)));
   }
+
+  private record PreparationLaunch(
+      long generation, AvatarModelControlRequest request) {}
 }

@@ -13,6 +13,7 @@ public record AvatarVisualState(
     float headPitch,
     String minecraftPose,
     float partialTick,
+    float animationTick,
     ArmorTheme armorTheme,
     String mainHandItem,
     String offHandItem,
@@ -42,6 +43,8 @@ public record AvatarVisualState(
         || !Float.isFinite(partialTick)
         || partialTick < 0.0f
         || partialTick > 1.0f
+        || !Float.isFinite(animationTick)
+        || animationTick < 0.0f
         || !Float.isFinite(observerDistance)
         || observerDistance < 0.0f) {
       throw new IllegalArgumentException("invalid avatar visual state");

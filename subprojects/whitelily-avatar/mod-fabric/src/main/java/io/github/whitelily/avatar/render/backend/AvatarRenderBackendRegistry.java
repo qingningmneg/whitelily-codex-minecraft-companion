@@ -9,12 +9,23 @@ import java.util.Set;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Future;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 
 public final class AvatarRenderBackendRegistry implements AvatarCandidateRuntime, AutoCloseable {
   private final Map<String, WhiteLilyAvatarRenderBackend> backends;
   private final Consumer<AvatarVisibleFrameResult> visibleFrameListener;
+  private final ExecutorService prepareExecutor;
+  private final Map<CompletableFuture<PreparedCandidate>, Future<?>> preparations =
+      new ConcurrentHashMap<>();
+  private final AtomicBoolean closed = new AtomicBoolean();
   private RegistryCandidate active;
   private RegistryCandidate previous;
   private RegistryCandidate awaitingVisible;
@@ -24,6 +35,19 @@ public final class AvatarRenderBackendRegistry implements AvatarCandidateRuntime
       Consumer<AvatarVisibleFrameResult> visibleFrameListener) {
     this.backends = Map.copyOf(backends);
     this.visibleFrameListener = Objects.requireNonNull(visibleFrameListener, "visibleFrameListener");
+    this.prepareExecutor =
+        new ThreadPoolExecutor(
+            1,
+            1,
+            0L,
+            TimeUnit.MILLISECONDS,
+            new ArrayBlockingQueue<>(16),
+            runnable -> {
+              Thread thread = new Thread(runnable, "whitelily-avatar-decode");
+              thread.setDaemon(true);
+              return thread;
+            },
+            new ThreadPoolExecutor.AbortPolicy());
   }
 
   @Override
@@ -33,17 +57,41 @@ public final class AvatarRenderBackendRegistry implements AvatarCandidateRuntime
       return CompletableFuture.failedFuture(
           new IllegalArgumentException("no avatar backend accepts this format"));
     }
+    if (closed.get()) {
+      return CompletableFuture.failedFuture(new IllegalStateException("avatar registry is closed"));
+    }
+    CompletableFuture<PreparedCandidate> result = new CompletableFuture<>();
+    final Future<?> task;
     try {
-      PreparedAvatarResources resources = backend.prepare(descriptor);
-      if (resources == null || !descriptor.modelId().equals(resources.modelId())) {
-        throw new AvatarRenderException(
-            "AVATAR_PREPARE_FAILED", "avatar backend returned invalid prepared resources");
-      }
-      return CompletableFuture.completedFuture(
-          new RegistryCandidate(descriptor.modelId(), backend, resources));
-    } catch (AvatarRenderException | RuntimeException error) {
+      task =
+          prepareExecutor.submit(
+              () -> {
+                RegistryCandidate candidate = null;
+                try {
+                  PreparedAvatarResources resources = backend.prepare(descriptor);
+                  if (resources == null || !descriptor.modelId().equals(resources.modelId())) {
+                    throw new AvatarRenderException(
+                        "AVATAR_PREPARE_FAILED",
+                        "avatar backend returned invalid prepared resources");
+                  }
+                  candidate = new RegistryCandidate(descriptor.modelId(), backend, resources);
+                  if (!result.complete(candidate)) dispose(candidate);
+                } catch (AvatarRenderException | RuntimeException error) {
+                  result.completeExceptionally(error);
+                } finally {
+                  preparations.remove(result);
+                }
+              });
+    } catch (RejectedExecutionException error) {
       return CompletableFuture.failedFuture(error);
     }
+    preparations.put(result, task);
+    if (result.isDone()) preparations.remove(result, task);
+    result.whenComplete(
+        (ignored, failure) -> {
+          if (result.isCancelled()) task.cancel(true);
+        });
+    return result;
   }
 
   @Override
@@ -119,6 +167,14 @@ public final class AvatarRenderBackendRegistry implements AvatarCandidateRuntime
 
   @Override
   public void close() {
+    if (!closed.compareAndSet(false, true)) return;
+    for (Map.Entry<CompletableFuture<PreparedCandidate>, Future<?>> preparation :
+        preparations.entrySet()) {
+      preparation.getKey().cancel(true);
+      preparation.getValue().cancel(true);
+    }
+    preparations.clear();
+    prepareExecutor.shutdownNow();
     Set<RegistryCandidate> candidates = new HashSet<>();
     synchronized (this) {
       if (active != null) candidates.add(active);
