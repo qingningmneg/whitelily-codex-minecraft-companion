@@ -574,6 +574,37 @@ final class GlbDocumentReaderTest {
   }
 
   @Test
+  void acceptsOnlyExplicitBooleanMetadataForNonessentialTransparentMaterials() throws Exception {
+    byte[] accepted =
+        mutate(
+            fixture(16, false, false),
+            json -> {
+              json.add(
+                  "materials",
+                  new Gson()
+                      .toJsonTree(
+                          List.of(
+                              Map.of(
+                                  "alphaMode",
+                                  "BLEND",
+                                  "extras",
+                                  Map.of("whitelilyNonessentialTransparency", true)))));
+              json.getAsJsonArray("meshes")
+                  .get(0)
+                  .getAsJsonObject()
+                  .getAsJsonArray("primitives")
+                  .get(0)
+                  .getAsJsonObject()
+                  .addProperty("material", 0);
+            });
+
+    GlbMeshDecoder.GlbMesh mesh =
+        new GlbDocumentReader().read(write("marked-material.glb", accepted), sha256(accepted), boneMapping(), false);
+
+    assertTrue(mesh.primitives().getFirst().nonessentialTransparency());
+  }
+
+  @Test
   void fullExpressionDescriptorRejectsUnimplementedMorphTargets() throws Exception {
     byte[] bytes =
         mutate(

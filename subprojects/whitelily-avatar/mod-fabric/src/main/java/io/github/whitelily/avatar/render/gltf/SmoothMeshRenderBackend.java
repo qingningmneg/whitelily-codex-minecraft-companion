@@ -120,7 +120,7 @@ public final class SmoothMeshRenderBackend implements WhiteLilyAvatarRenderBacke
               "builtin".equals(smooth.origin()),
               negotiation.detailLevel,
               negotiation.fallback.currentStage(),
-              negotiation.fallback.currentStage() == AvatarFallbackController.FallbackStage.BASIC_CEL,
+              negotiation.fallback.currentStage() != AvatarFallbackController.FallbackStage.FULL_QUALITY,
               negotiation.fallback.currentState().secondaryDynamicsEnabled(),
               negotiation.fallback.currentState().nonessentialTransparencyEnabled());
       context.prepareSmooth(frame);

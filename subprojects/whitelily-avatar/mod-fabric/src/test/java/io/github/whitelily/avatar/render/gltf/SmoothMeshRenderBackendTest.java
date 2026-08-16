@@ -168,6 +168,7 @@ final class SmoothMeshRenderBackendTest {
         io.github.whitelily.avatar.render.quality.AvatarDetailSelector.AvatarDetailLevel.LOW,
         low.frame.detailLevel());
     assertEquals(1.0f, AvatarGpuResources.lowDetailSampling(low.frame));
+    assertEquals(0.0f, AvatarGpuResources.advancedMaterial(low.frame));
   }
 
   @Test
@@ -196,6 +197,8 @@ final class SmoothMeshRenderBackendTest {
             .equals(fallback.frame.pose().bone("rightUpperArm"), 0.0001f));
     assertEquals(0.0f, AvatarGpuResources.opaqueTransparency(high.frame));
     assertEquals(1.0f, AvatarGpuResources.opaqueTransparency(fallback.frame));
+    assertEquals(1.0f, AvatarGpuResources.opaqueTransparency(fallback.frame, true));
+    assertEquals(0.0f, AvatarGpuResources.opaqueTransparency(fallback.frame, false));
     assertEquals(List.of(0, 1), AvatarGpuResources.drawOrder(fallback.frame, 2));
   }
 

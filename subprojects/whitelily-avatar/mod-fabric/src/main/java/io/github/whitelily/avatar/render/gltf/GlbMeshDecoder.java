@@ -62,7 +62,7 @@ public final class GlbMeshDecoder {
       HumanoidSkeleton skeleton =
           decodeSkeleton(nodes, skin, boneMapping, false);
       List<GlbImage> images = decodeImages(json, views, binary);
-      List<Integer> materialImages = decodeMaterialImages(json, images.size());
+      List<MaterialInfo> materials = decodeMaterials(json, images.size());
       DecodedMeshes decoded =
           decodePrimitives(
               json,
@@ -70,7 +70,7 @@ public final class GlbMeshDecoder {
               views,
               binary,
               skin.joints().size(),
-              materialImages,
+              materials,
               fullExpressions);
       List<GlbPrimitive> primitives =
           instantiateActiveScene(json, nodes, decoded.meshes(), skins.size());
@@ -570,7 +570,7 @@ public final class GlbMeshDecoder {
     return List.copyOf(images);
   }
 
-  private static List<Integer> decodeMaterialImages(JsonObject json, int imageCount)
+  private static List<MaterialInfo> decodeMaterials(JsonObject json, int imageCount)
       throws AvatarRenderException {
     JsonArray samplers = optionalArray(json, "samplers", MAX_TEXTURES);
     for (JsonElement value : samplers) object(value, "sampler");
@@ -583,11 +583,14 @@ public final class GlbMeshDecoder {
       if (texture.has("sampler")) integer(texture, "sampler", 0, samplers.size() - 1);
     }
     JsonArray materials = optionalArray(json, "materials", MAX_MATERIALS);
-    List<Integer> materialImages = new ArrayList<>(materials.size());
+    List<MaterialInfo> materialInfos = new ArrayList<>(materials.size());
     for (JsonElement value : materials) {
       GlbDocumentReader.cancellationCheckpoint();
       JsonObject material = object(value, "material");
-      if (!"OPAQUE".equals(optionalString(material, "alphaMode", "OPAQUE"))
+      String alphaMode = optionalString(material, "alphaMode", "OPAQUE");
+      boolean nonessentialTransparency = nonessentialTransparency(material, alphaMode);
+      if (!("OPAQUE".equals(alphaMode)
+              || ("BLEND".equals(alphaMode) && nonessentialTransparency))
           || optionalBoolean(material, "doubleSided", false)
           || material.has("normalTexture")
           || material.has("occlusionTexture")
@@ -603,9 +606,23 @@ public final class GlbMeshDecoder {
           imageIndex = textureImages.get(integer(texture, "index", 0, textures.size() - 1));
         }
       }
-      materialImages.add(imageIndex);
+      materialInfos.add(new MaterialInfo(imageIndex, nonessentialTransparency));
     }
-    return List.copyOf(materialImages);
+    return List.copyOf(materialInfos);
+  }
+
+  private static boolean nonessentialTransparency(JsonObject material, String alphaMode)
+      throws AvatarRenderException {
+    if (!material.has("extras")) return false;
+    JsonObject extras = object(material.get("extras"), "material extras");
+    if (!extras.has("whitelilyNonessentialTransparency")) return false;
+    if (!"BLEND".equals(alphaMode)
+        || extras.size() != 1
+        || !extras.get("whitelilyNonessentialTransparency").isJsonPrimitive()
+        || !extras.get("whitelilyNonessentialTransparency").getAsJsonPrimitive().isBoolean()) {
+      invalid("avatar nonessential transparency metadata is invalid");
+    }
+    return extras.get("whitelilyNonessentialTransparency").getAsBoolean();
   }
 
   private static DecodedMeshes decodePrimitives(
@@ -614,7 +631,7 @@ public final class GlbMeshDecoder {
       List<BufferView> views,
       ByteBuffer binary,
       int jointCount,
-      List<Integer> materialImages,
+      List<MaterialInfo> materials,
       boolean fullExpressions)
       throws AvatarRenderException {
     JsonArray meshes = optionalArray(json, "meshes", MAX_NODES);
@@ -673,10 +690,10 @@ public final class GlbMeshDecoder {
           invalid("avatar index accessor is invalid");
         }
         IndexBuffer indexBuffer = cache.indices(indexAccessor, views, binary, vertices);
-        int baseColorImage =
+        MaterialInfo material =
             primitive.has("material")
-                ? materialImages.get(integer(primitive, "material", 0, materialImages.size() - 1))
-                : -1;
+                ? materials.get(integer(primitive, "material", 0, materials.size() - 1))
+                : MaterialInfo.NONE;
         Object geometryKey =
             geometryKeys.computeIfAbsent(
                 new GeometrySignature(
@@ -693,7 +710,8 @@ public final class GlbMeshDecoder {
                 vertices,
                 indexAccessor.count(),
                 indexBuffer.componentType(),
-                baseColorImage,
+                material.imageIndex(),
+                material.nonessentialTransparency(),
                 new Matrix4f(),
                 jointBuffer.palette(),
                 geometryKey));
@@ -1246,6 +1264,10 @@ public final class GlbMeshDecoder {
       Accessor weights,
       Accessor indices) {}
 
+  private record MaterialInfo(int imageIndex, boolean nonessentialTransparency) {
+    private static final MaterialInfo NONE = new MaterialInfo(-1, false);
+  }
+
   public static final class GlbPrimitive {
     private final ByteBuffer positions;
     private final ByteBuffer normals;
@@ -1257,6 +1279,7 @@ public final class GlbMeshDecoder {
     private final int indexCount;
     private final int indexComponentType;
     private final int materialIndex;
+    private final boolean nonessentialTransparency;
     private final Matrix4f nodeTransform;
     private final List<Integer> jointPalette;
     private final Object geometryKey;
@@ -1283,6 +1306,7 @@ public final class GlbMeshDecoder {
           indexCount,
           indexComponentType,
           materialIndex,
+          false,
           new Matrix4f(),
           inferPalette(joints),
           new Object());
@@ -1312,6 +1336,38 @@ public final class GlbMeshDecoder {
           indexCount,
           indexComponentType,
           materialIndex,
+          false,
+          nodeTransform,
+          jointPalette,
+          new Object());
+    }
+
+    public GlbPrimitive(
+        ByteBuffer positions,
+        ByteBuffer normals,
+        ByteBuffer texCoords,
+        ByteBuffer joints,
+        ByteBuffer weights,
+        ByteBuffer indices,
+        int vertexCount,
+        int indexCount,
+        int indexComponentType,
+        int materialIndex,
+        boolean nonessentialTransparency,
+        Matrix4f nodeTransform,
+        List<Integer> jointPalette) {
+      this(
+          positions,
+          normals,
+          texCoords,
+          joints,
+          weights,
+          indices,
+          vertexCount,
+          indexCount,
+          indexComponentType,
+          materialIndex,
+          nonessentialTransparency,
           nodeTransform,
           jointPalette,
           new Object());
@@ -1328,6 +1384,7 @@ public final class GlbMeshDecoder {
         int indexCount,
         int indexComponentType,
         int materialIndex,
+        boolean nonessentialTransparency,
         Matrix4f nodeTransform,
         List<Integer> jointPalette,
         Object geometryKey) {
@@ -1341,6 +1398,7 @@ public final class GlbMeshDecoder {
       this.indexCount = indexCount;
       this.indexComponentType = indexComponentType;
       this.materialIndex = materialIndex;
+      this.nonessentialTransparency = nonessentialTransparency;
       this.nodeTransform = new Matrix4f(Objects.requireNonNull(nodeTransform, "nodeTransform"));
       this.jointPalette = List.copyOf(jointPalette);
       this.geometryKey = geometryKey;
@@ -1394,6 +1452,10 @@ public final class GlbMeshDecoder {
       return materialIndex;
     }
 
+    public boolean nonessentialTransparency() {
+      return nonessentialTransparency;
+    }
+
     public Matrix4f nodeTransform() {
       return new Matrix4f(nodeTransform);
     }
@@ -1418,6 +1480,7 @@ public final class GlbMeshDecoder {
           indexCount,
           indexComponentType,
           materialIndex,
+          nonessentialTransparency,
           transform,
           jointPalette,
           geometryKey);

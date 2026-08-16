@@ -409,6 +409,7 @@ public final class AvatarGpuResources implements AutoCloseable {
                       ? VertexFormat.IndexType.SHORT
                       : VertexFormat.IndexType.INT,
                   primitive.materialIndex(),
+                  primitive.nonessentialTransparency(),
                   primitive.nodeTransform(),
                   primitive.jointPalette()));
         }
@@ -484,11 +485,12 @@ public final class AvatarGpuResources implements AutoCloseable {
         pass.setUniform("ProjMat", RenderSystem.getProjectionMatrix());
         pass.setUniform("AdvancedMaterial", advancedMaterial(frame));
         pass.setUniform("LowDetail", lowDetailSampling(frame));
-        pass.setUniform("OpaqueTransparency", opaqueTransparency(frame));
         Matrix4f identity = new Matrix4f();
         List<Matrix4f> globalJoints = frame.pose().jointMatrices();
         for (int primitiveIndex : drawOrder(frame, primitives.size())) {
           PrimitiveAllocation primitive = primitives.get(primitiveIndex);
+          pass.setUniform(
+              "OpaqueTransparency", opaqueTransparency(frame, primitive.nonessentialTransparency()));
           List<Matrix4f> joints =
               paletteMatrices(
                   primitive.nodeTransform(), primitive.jointPalette(), globalJoints);
@@ -556,6 +558,11 @@ public final class AvatarGpuResources implements AutoCloseable {
     return frame.nonessentialTransparencyEnabled() ? 0.0f : 1.0f;
   }
 
+  static float opaqueTransparency(
+      SmoothMeshRenderBackend.SmoothMeshFrame frame, boolean nonessentialTransparency) {
+    return !frame.nonessentialTransparencyEnabled() && nonessentialTransparency ? 1.0f : 0.0f;
+  }
+
   static List<Integer> drawOrder(SmoothMeshRenderBackend.SmoothMeshFrame frame, int primitiveCount) {
     Objects.requireNonNull(frame, "frame");
     if (primitiveCount < 0) throw new IllegalArgumentException("primitiveCount must not be negative");
@@ -569,6 +576,7 @@ public final class AvatarGpuResources implements AutoCloseable {
       int indexCount,
       VertexFormat.IndexType indexType,
       int materialIndex,
+      boolean nonessentialTransparency,
       Matrix4f nodeTransform,
       List<Integer> jointPalette) {
     private PrimitiveAllocation {
