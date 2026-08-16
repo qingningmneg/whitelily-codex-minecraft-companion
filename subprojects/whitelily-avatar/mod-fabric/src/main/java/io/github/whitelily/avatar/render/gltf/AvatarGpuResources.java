@@ -15,6 +15,7 @@ import com.mojang.blaze3d.systems.RenderPass;
 import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.blaze3d.vertex.VertexFormat;
 import com.mojang.blaze3d.vertex.VertexFormatElement;
+import io.github.whitelily.avatar.mixin.RenderTargetAccessor;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -26,6 +27,7 @@ import java.util.Objects;
 import java.util.OptionalDouble;
 import java.util.OptionalInt;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Supplier;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.texture.DynamicTexture;
 import net.minecraft.resources.ResourceLocation;
@@ -101,9 +103,12 @@ public final class AvatarGpuResources implements AutoCloseable {
   }
 
   public static void renderMinecraft(
-      SmoothMeshRenderBackend.SmoothMeshFrame frame, Matrix4f modelMatrix) {
+      SmoothMeshRenderBackend.SmoothMeshFrame frame,
+      Matrix4f modelMatrix,
+      Runnable heldItemDraw) {
     Objects.requireNonNull(frame, "frame");
     Objects.requireNonNull(modelMatrix, "modelMatrix");
+    Objects.requireNonNull(heldItemDraw, "heldItemDraw");
     if (!(frame.allocation() instanceof MinecraftAllocation allocation)) {
       throw new IllegalArgumentException("avatar allocation belongs to another GPU device");
     }
@@ -115,14 +120,128 @@ public final class AvatarGpuResources implements AutoCloseable {
             main.height,
             main.getDepthTexture() != null);
     try {
-      main.blitAndBlendToTexture(staged.getColorTexture());
-      if (main.getDepthTexture() != null) staged.copyDepthFrom(main);
-      allocation.render(frame, modelMatrix, staged);
-      staged.blitAndBlendToTexture(main.getColorTexture());
-      if (main.getDepthTexture() != null) main.copyDepthFrom(staged);
+      commitDiscardable(
+          new MinecraftDrawTransaction(main, staged),
+          () -> allocation.render(frame, modelMatrix, main),
+          heldItemDraw);
     } finally {
       staged.destroyBuffers();
     }
+  }
+
+  private static final class MinecraftDrawTransaction implements DrawTransaction {
+    private final RenderTarget main;
+    private final TextureTarget staged;
+    private final com.mojang.blaze3d.textures.GpuTexture originalColor;
+    private final com.mojang.blaze3d.textures.GpuTexture originalDepth;
+    private boolean swapped;
+
+    private MinecraftDrawTransaction(RenderTarget main, TextureTarget staged) {
+      this.main = main;
+      this.staged = staged;
+      this.originalColor = main.getColorTexture();
+      this.originalDepth = main.getDepthTexture();
+    }
+
+    @Override
+    public void begin() {
+      main.blitAndBlendToTexture(staged.getColorTexture());
+      if (originalDepth != null) staged.copyDepthFrom(main);
+      RenderTargetAccessor accessor = (RenderTargetAccessor) main;
+      accessor.whitelily$setColorTexture(staged.getColorTexture());
+      accessor.whitelily$setDepthTexture(staged.getDepthTexture());
+      swapped = true;
+    }
+
+    @Override
+    public void rollback() {
+      restoreMainTextures();
+    }
+
+    @Override
+    public void compose() {
+      restoreMainTextures();
+      staged.blitAndBlendToTexture(originalColor);
+      if (originalDepth != null) main.copyDepthFrom(staged);
+    }
+
+    private void restoreMainTextures() {
+      if (!swapped) return;
+      RenderTargetAccessor accessor = (RenderTargetAccessor) main;
+      accessor.whitelily$setColorTexture(originalColor);
+      accessor.whitelily$setDepthTexture(originalDepth);
+      swapped = false;
+    }
+  }
+
+  static List<Matrix4f> paletteMatrices(
+      GlbMeshDecoder.GlbPrimitive primitive, HumanoidAnimator.AvatarPose pose) {
+    Objects.requireNonNull(primitive, "primitive");
+    Objects.requireNonNull(pose, "pose");
+    return paletteMatrices(
+        primitive.nodeTransform(), primitive.jointPalette(), pose.jointMatrices());
+  }
+
+  private static List<Matrix4f> paletteMatrices(
+      Matrix4f nodeTransform,
+      List<Integer> jointPalette,
+      List<Matrix4f> global) {
+    Matrix4f inverseMesh = new Matrix4f(nodeTransform).invert();
+    List<Matrix4f> local = new ArrayList<>(jointPalette.size());
+    for (int joint : jointPalette) {
+      if (joint < 0 || joint >= global.size()) {
+        throw new IllegalArgumentException("avatar draw palette is invalid");
+      }
+      local.add(new Matrix4f(inverseMesh).mul(global.get(joint)));
+    }
+    return List.copyOf(local);
+  }
+
+  interface DrawTransaction {
+    void begin();
+
+    void rollback();
+
+    void compose();
+  }
+
+  static void commitDiscardable(
+      DrawTransaction transaction, Runnable meshDraw, Runnable itemDraw) {
+    Objects.requireNonNull(transaction, "transaction");
+    try {
+      transaction.begin();
+      Objects.requireNonNull(meshDraw, "meshDraw").run();
+      Objects.requireNonNull(itemDraw, "itemDraw").run();
+      transaction.compose();
+    } catch (Throwable failure) {
+      try {
+        transaction.rollback();
+      } catch (Throwable cleanupFailure) {
+        if (cleanupFailure != failure) failure.addSuppressed(cleanupFailure);
+      }
+      throwUnchecked(failure);
+    }
+  }
+
+  static <T> T createAfterAllocated(
+      AutoCloseable alreadyAllocated, Supplier<T> nextAllocation) {
+    Objects.requireNonNull(alreadyAllocated, "alreadyAllocated");
+    Objects.requireNonNull(nextAllocation, "nextAllocation");
+    try {
+      return nextAllocation.get();
+    } catch (Throwable failure) {
+      try {
+        alreadyAllocated.close();
+      } catch (Throwable cleanupFailure) {
+        if (cleanupFailure != failure) failure.addSuppressed(cleanupFailure);
+      }
+      return throwUnchecked(failure);
+    }
+  }
+
+  @SuppressWarnings("unchecked")
+  private static <T, E extends Throwable> T throwUnchecked(Throwable failure) throws E {
+    throw (E) failure;
   }
 
   public synchronized void prepareFrame(SmoothMeshRenderBackend.SmoothMeshFrame frame) {
@@ -168,7 +287,7 @@ public final class AvatarGpuResources implements AutoCloseable {
     for (AutoCloseable resource : resources) {
       try {
         if (resource != null) resource.close();
-      } catch (Exception | LinkageError error) {
+      } catch (Throwable error) {
         RuntimeException next =
             error instanceof RuntimeException runtime
                 ? runtime
@@ -266,18 +385,15 @@ public final class AvatarGpuResources implements AutoCloseable {
                     BufferType.VERTICES,
                     BufferUsage.STATIC_WRITE,
                     interleave(primitive));
-            GpuBuffer indices;
-            try {
-              indices =
-                  device.createBuffer(
-                      () -> "WhiteLily avatar indices " + allocationIndex,
-                      BufferType.INDICES,
-                      BufferUsage.STATIC_WRITE,
-                      primitive.indices());
-            } catch (RuntimeException error) {
-              vertices.close();
-              throw error;
-            }
+            GpuBuffer indices =
+                createAfterAllocated(
+                    vertices,
+                    () ->
+                        device.createBuffer(
+                            () -> "WhiteLily avatar indices " + allocationIndex,
+                            BufferType.INDICES,
+                            BufferUsage.STATIC_WRITE,
+                            primitive.indices()));
             geometry = new GeometryAllocation(vertices, indices);
             geometryByKey.put(primitive.geometryKey(), geometry);
             geometries.add(geometry);
@@ -347,7 +463,6 @@ public final class AvatarGpuResources implements AutoCloseable {
         RenderTarget target) {
       if (closed.get()) throw new ResourceReleasedException();
       RenderSystem.assertOnRenderThread();
-      List<Matrix4f> joints = frame.pose().jointMatrices();
       RenderPass pass =
           target.getDepthTexture() == null
               ? RenderSystem.getDevice()
@@ -365,15 +480,17 @@ public final class AvatarGpuResources implements AutoCloseable {
         pass.setUniform("ViewMat", RenderSystem.getModelViewMatrix());
         pass.setUniform("ProjMat", RenderSystem.getProjectionMatrix());
         Matrix4f identity = new Matrix4f();
+        List<Matrix4f> globalJoints = frame.pose().jointMatrices();
         for (PrimitiveAllocation primitive : primitives) {
+          List<Matrix4f> joints =
+              paletteMatrices(
+                  primitive.nodeTransform(), primitive.jointPalette(), globalJoints);
           pass.setUniform(
               "ModelMat", new Matrix4f(modelMatrix).mul(primitive.nodeTransform()));
           for (int joint = 0; joint < MAX_SHADER_JOINTS; joint++) {
             pass.setUniform(
                 "JointMatrices[" + joint + "]",
-                joint < primitive.jointPalette().size()
-                    ? joints.get(primitive.jointPalette().get(joint))
-                    : identity);
+                joint < joints.size() ? joints.get(joint) : identity);
           }
           DynamicTexture texture =
               primitive.materialIndex() >= 0 && primitive.materialIndex() < textures.size()

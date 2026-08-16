@@ -87,6 +87,7 @@ public final class GlbDocumentReader {
   }
 
   private static Document parse(byte[] bytes, String digest) throws AvatarRenderException {
+    cancellationCheckpoint();
     ByteBuffer container = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN);
     if (container.getInt() != GLB_MAGIC
         || container.getInt() != 2
@@ -96,6 +97,7 @@ public final class GlbDocumentReader {
     byte[] jsonBytes = null;
     byte[] binaryBytes = null;
     while (container.hasRemaining()) {
+      cancellationCheckpoint();
       if (container.remaining() < 8) {
         throw failure("AVATAR_GLB_INVALID", "avatar GLB chunk header is truncated");
       }
@@ -161,6 +163,7 @@ public final class GlbDocumentReader {
       }
       ByteBuffer output = ByteBuffer.allocate(Math.toIntExact(before.size()));
       while (output.hasRemaining()) {
+        cancellationCheckpoint();
         if (channel.read(output) < 0) {
           throw failure("AVATAR_GLB_INVALID", "avatar GLB changed while being read");
         }
@@ -184,6 +187,7 @@ public final class GlbDocumentReader {
       int depth = 0;
       int tokens = 0;
       while (reader.peek() != JsonToken.END_DOCUMENT) {
+        if ((tokens & 0x3ff) == 0) cancellationCheckpoint();
         if (++tokens > MAX_JSON_TOKENS) {
           throw failure("AVATAR_GLB_INVALID", "avatar JSON structure is too complex");
         }
@@ -240,6 +244,12 @@ public final class GlbDocumentReader {
 
   static AvatarRenderException failure(String code, String message, Throwable cause) {
     return new AvatarRenderException(code, message, cause);
+  }
+
+  static void cancellationCheckpoint() throws AvatarRenderException {
+    if (Thread.currentThread().isInterrupted()) {
+      throw failure("AVATAR_PREPARE_CANCELLED", "avatar preparation was cancelled");
+    }
   }
 
   record Document(JsonObject json, ByteBuffer binary, String digest) {

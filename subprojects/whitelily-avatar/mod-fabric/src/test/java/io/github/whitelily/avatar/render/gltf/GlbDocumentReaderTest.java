@@ -152,6 +152,23 @@ final class GlbDocumentReaderTest {
   }
 
   @Test
+  void expectedDigestRejectsSameSizeDifferentChannelBytes() throws Exception {
+    byte[] expected = resourceFixture();
+    byte[] replaced = expected.clone();
+    replaced[replaced.length - 1] ^= 1;
+
+    assertCode(
+        "AVATAR_DIGEST_MISMATCH",
+        () ->
+            new GlbDocumentReader()
+                .read(
+                    write("same-size-replacement.glb", replaced),
+                    sha256(expected),
+                    boneMapping(),
+                    false));
+  }
+
+  @Test
   void productionBackendResolvesDescriptorsFromTheRealModelsRoot() throws Exception {
     Path dataRoot = temporaryDirectory.resolve("WhiteLily");
     Path model =
@@ -371,6 +388,76 @@ final class GlbDocumentReaderTest {
   }
 
   @Test
+  void rejectsActiveSceneInstanceAmplificationBeforeAllocatingWrappers() throws Exception {
+    byte[] amplified =
+        mutate(
+            fixture(16, false, false),
+            json -> {
+              JsonObject primitive =
+                  json.getAsJsonArray("meshes")
+                      .get(0)
+                      .getAsJsonObject()
+                      .getAsJsonArray("primitives")
+                      .get(0)
+                      .getAsJsonObject();
+              JsonArray primitives = new JsonArray();
+              for (int index = 0; index < 256; index++) primitives.add(primitive.deepCopy());
+              json.getAsJsonArray("meshes")
+                  .get(0)
+                  .getAsJsonObject()
+                  .add("primitives", primitives);
+              JsonArray nodes = json.getAsJsonArray("nodes");
+              List<Integer> roots = new ArrayList<>();
+              for (int index = 0; index < 100; index++) {
+                JsonObject instance = new JsonObject();
+                instance.addProperty("mesh", 0);
+                instance.addProperty("skin", 0);
+                nodes.add(instance);
+                roots.add(nodes.size() - 1);
+              }
+              json.getAsJsonArray("scenes")
+                  .get(0)
+                  .getAsJsonObject()
+                  .add("nodes", new Gson().toJsonTree(roots));
+            });
+
+    assertCode(
+        "AVATAR_GLB_INVALID",
+        () ->
+            new GlbDocumentReader()
+                .read(
+                    write("instance-amplification.glb", amplified),
+                    sha256(amplified),
+                    boneMapping(),
+                    false));
+  }
+
+  @Test
+  void zeroWeightJointFillersDoNotConsumeTheDrawPalette() throws Exception {
+    ByteBuffer joints =
+        ByteBuffer.allocateDirect(128 * 4 * Short.BYTES).order(ByteOrder.LITTLE_ENDIAN);
+    ByteBuffer weights =
+        ByteBuffer.allocateDirect(128 * 4 * Float.BYTES).order(ByteOrder.LITTLE_ENDIAN);
+    for (int vertex = 0; vertex < 128; vertex++) {
+      joints.putShort((short) vertex);
+      joints.putShort((short) (128 + vertex));
+      joints.putShort((short) 255);
+      joints.putShort((short) 200);
+      weights.putFloat(1.0f).putFloat(0.0f).putFloat(0.0f).putFloat(0.0f);
+    }
+    joints.flip();
+    weights.flip();
+
+    GlbMeshDecoder.PaletteRemap remap =
+        GlbMeshDecoder.remapJointPalette(joints, weights, 256);
+
+    assertEquals(128, remap.palette().size());
+    assertEquals(127, remap.palette().getLast());
+    ByteBuffer remapped = remap.joints().order(ByteOrder.LITTLE_ENDIAN);
+    assertEquals(0, Short.toUnsignedInt(remapped.getShort(Short.BYTES)));
+  }
+
+  @Test
   void rejectsOversizedPngDimensionsBeforeNativeImageDecode() throws Exception {
     ByteBuffer png = ByteBuffer.allocate(24).order(ByteOrder.BIG_ENDIAN);
     png.putLong(0x89504e470d0a1a0aL).putInt(13).putInt(0x49484452);
@@ -434,6 +521,39 @@ final class GlbDocumentReaderTest {
   }
 
   @Test
+  void rejectsRotationAnimationWhoseOutputIsNotVec4() throws Exception {
+    byte[] bytes =
+        mutate(
+            fixture(16, false, false),
+            json -> {
+              JsonArray accessors = json.getAsJsonArray("accessors");
+              accessors.add(new Gson().toJsonTree(accessor(0, 5126, 3, "SCALAR")));
+              json.add(
+                  "animations",
+                  new Gson()
+                      .toJsonTree(
+                          List.of(
+                              Map.of(
+                                  "samplers",
+                                  List.of(
+                                      Map.of(
+                                          "input", 7,
+                                          "output", 0,
+                                          "interpolation", "LINEAR")),
+                                  "channels",
+                                  List.of(
+                                      Map.of(
+                                          "sampler", 0,
+                                          "target", Map.of("node", 0, "path", "rotation")))))));
+            });
+    assertCode(
+        "AVATAR_GLB_INVALID",
+        () ->
+            new GlbDocumentReader()
+                .read(write("animation-output.glb", bytes), sha256(bytes), boneMapping(), false));
+  }
+
+  @Test
   void rejectsUnsupportedAdvancedMaterialModes() throws Exception {
     byte[] bytes =
         mutate(
@@ -485,6 +605,31 @@ final class GlbDocumentReaderTest {
             .read(write("neutral-only.glb", bytes), sha256(bytes), boneMapping(), true);
 
     assertTrue(!mesh.skeleton().fullExpressions());
+  }
+
+  @Test
+  void neutralOnlyMorphTargetStillValidatesAccessorReferences() throws Exception {
+    byte[] bytes =
+        mutate(
+            fixture(16, false, false),
+            json -> {
+              JsonObject target = new JsonObject();
+              target.addProperty("POSITION", 999);
+              JsonArray targets = new JsonArray();
+              targets.add(target);
+              json.getAsJsonArray("meshes")
+                  .get(0)
+                  .getAsJsonObject()
+                  .getAsJsonArray("primitives")
+                  .get(0)
+                  .getAsJsonObject()
+                  .add("targets", targets);
+            });
+    assertCode(
+        "AVATAR_GLB_INVALID",
+        () ->
+            new GlbDocumentReader()
+                .read(write("neutral-morph.glb", bytes), sha256(bytes), boneMapping(), false));
   }
 
   @Test

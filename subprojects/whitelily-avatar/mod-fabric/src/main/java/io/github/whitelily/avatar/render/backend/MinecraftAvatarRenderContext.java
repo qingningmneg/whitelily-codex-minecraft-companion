@@ -10,6 +10,7 @@ import io.github.whitelily.avatar.render.gltf.SmoothMeshRenderBackend;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
+import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.MultiBufferSource;
 
 public final class MinecraftAvatarRenderContext implements AvatarRenderContext {
@@ -57,9 +58,11 @@ public final class MinecraftAvatarRenderContext implements AvatarRenderContext {
               pendingSmoothFrame != null && pendingSmoothModelMatrix != null
                   ? () ->
                       AvatarGpuResources.renderMinecraft(
-                          pendingSmoothFrame, pendingSmoothModelMatrix)
-                  : () -> {};
-          commitPreparedDraws(smoothDraw, frameSource::endBatch);
+                          pendingSmoothFrame,
+                          pendingSmoothModelMatrix,
+                          frameSource::endBatch)
+                  : frameSource::endBatch;
+          smoothDraw.run();
           submitted = true;
         } finally {
           closeBuffer(!submitted, shaderColor);
@@ -101,11 +104,20 @@ public final class MinecraftAvatarRenderContext implements AvatarRenderContext {
           Axis.YP.rotationDegrees(180.0f - frame.state().bodyYaw()));
       pendingSmoothFrame = frame;
       pendingSmoothModelMatrix = new org.joml.Matrix4f(smoothPoseStack.last().pose());
+      var mainTarget = Minecraft.getInstance().getMainRenderTarget();
+      MultiBufferSource stagedOnly =
+          renderType -> {
+            if (renderType.getRenderTarget() != mainTarget) {
+              throw new UnsupportedOperationException(
+                  "smooth held item render type escapes the staged target");
+            }
+            return frameSource.getBuffer(renderType);
+          };
       smoothRenderState.renderSmoothHeldItems(
           smoothPoseStack,
           frame.leftHand(),
           frame.rightHand(),
-          frameSource,
+          stagedOnly,
           packedLight);
     } finally {
       smoothPoseStack.popPose();

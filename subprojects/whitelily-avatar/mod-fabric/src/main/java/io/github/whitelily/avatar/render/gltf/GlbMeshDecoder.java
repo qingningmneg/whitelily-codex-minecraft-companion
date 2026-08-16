@@ -24,6 +24,7 @@ public final class GlbMeshDecoder {
   private static final int MAX_NODES = 4_096;
   private static final int MAX_JOINTS = 256;
   private static final int MAX_PRIMITIVES = 2_048;
+  private static final int MAX_ACTIVE_DRAWS = 16_384;
   private static final int MAX_MATERIALS = 128;
   private static final int MAX_TEXTURES = 128;
   private static final int MAX_ACCESSORS = 65_536;
@@ -54,7 +55,7 @@ public final class GlbMeshDecoder {
       List<BufferView> views = decodeViews(json, declaredBytes);
       List<Accessor> accessors = decodeAccessors(json, views);
       List<Node> nodes = decodeNodes(json);
-      validateAnimations(json, accessors, nodes.size());
+      validateAnimations(json, accessors, nodes);
       List<Skin> skins = decodeSkins(json, accessors, nodes, views, binary);
       if (skins.size() != 1) invalid("avatar glTF must contain one humanoid skin");
       Skin skin = skins.getFirst();
@@ -89,6 +90,7 @@ public final class GlbMeshDecoder {
     JsonArray values = optionalArray(json, "bufferViews", MAX_ACCESSORS);
     List<BufferView> views = new ArrayList<>(values.size());
     for (JsonElement value : values) {
+      GlbDocumentReader.cancellationCheckpoint();
       JsonObject view = object(value, "bufferView");
       if (integer(view, "buffer", 0, 0) != 0) invalid("avatar bufferView buffer is invalid");
       int offset = optionalInteger(view, "byteOffset", 0, 0, bufferLength);
@@ -112,6 +114,7 @@ public final class GlbMeshDecoder {
     JsonArray values = optionalArray(json, "accessors", MAX_ACCESSORS);
     List<Accessor> accessors = new ArrayList<>(values.size());
     for (JsonElement value : values) {
+      GlbDocumentReader.cancellationCheckpoint();
       JsonObject accessor = object(value, "accessor");
       if (accessor.has("sparse")) invalid("sparse avatar accessors are unsupported");
       int viewIndex = integer(accessor, "bufferView", 0, views.size() - 1);
@@ -151,6 +154,7 @@ public final class GlbMeshDecoder {
     JsonArray values = optionalArray(json, "nodes", MAX_NODES);
     List<MutableNode> mutable = new ArrayList<>(values.size());
     for (JsonElement value : values) {
+      GlbDocumentReader.cancellationCheckpoint();
       JsonObject node = object(value, "node");
       String name = optionalString(node, "name", "");
       if (name.codePointCount(0, name.length()) > 256 || hasControls(name)) {
@@ -165,6 +169,7 @@ public final class GlbMeshDecoder {
       mutable.add(new MutableNode(name, children, localTransform(node), mesh, skin, -1));
     }
     for (int parent = 0; parent < mutable.size(); parent++) {
+      cancellationCheckpoint(parent);
       for (int child : mutable.get(parent).children()) {
         if (child == parent || child < 0 || child >= mutable.size() || mutable.get(child).parent() >= 0) {
           invalid("avatar node hierarchy is invalid");
@@ -173,6 +178,7 @@ public final class GlbMeshDecoder {
       }
     }
     for (int start = 0; start < mutable.size(); start++) {
+      cancellationCheckpoint(start);
       Set<Integer> visited = new HashSet<>();
       int current = start;
       while (current >= 0) {
@@ -220,6 +226,7 @@ public final class GlbMeshDecoder {
     JsonArray values = optionalArray(json, "skins", MAX_NODES);
     List<Skin> skins = new ArrayList<>(values.size());
     for (JsonElement value : values) {
+      GlbDocumentReader.cancellationCheckpoint();
       JsonObject skin = object(value, "skin");
       List<Integer> joints = integerList(skin, "joints", nodes.size(), MAX_JOINTS);
       if (joints.isEmpty() || new HashSet<>(joints).size() != joints.size()) {
@@ -236,6 +243,7 @@ public final class GlbMeshDecoder {
           invalid("avatar inverse bind matrices accessor is invalid");
         }
         for (int index = 0; index < joints.size(); index++) {
+          cancellationCheckpoint(index);
           float[] values16 = readFloatElement(accessor, index, views, binary);
           inverseBind.add(new Matrix4f().set(values16));
         }
@@ -263,10 +271,12 @@ public final class GlbMeshDecoder {
     }
     Map<String, List<Integer>> nodesByName = new HashMap<>();
     for (int index = 0; index < nodes.size(); index++) {
+      cancellationCheckpoint(index);
       nodesByName.computeIfAbsent(nodes.get(index).name(), ignored -> new ArrayList<>()).add(index);
     }
     Map<String, Integer> indices = new LinkedHashMap<>();
     for (String semantic : HumanoidSkeleton.REQUIRED_SEMANTICS) {
+      GlbDocumentReader.cancellationCheckpoint();
       String nodeName = mapping.get(semantic);
       List<Integer> matches = nodesByName.getOrDefault(nodeName, List.of());
       if (nodeName == null || nodeName.isBlank() || matches.size() != 1) {
@@ -308,6 +318,7 @@ public final class GlbMeshDecoder {
     }
     List<HumanoidSkeleton.JointBinding> jointBindings = new ArrayList<>(skin.joints().size());
     for (int jointPositionIndex = 0; jointPositionIndex < skin.joints().size(); jointPositionIndex++) {
+      cancellationCheckpoint(jointPositionIndex);
       int nodeIndex = skin.joints().get(jointPositionIndex);
       int parentNode = nodes.get(nodeIndex).parent();
       while (parentNode >= 0 && !jointPosition.containsKey(parentNode)) {
@@ -361,9 +372,10 @@ public final class GlbMeshDecoder {
     return false;
   }
 
-  private static List<Matrix4f> worldTransforms(List<Node> nodes) {
+  private static List<Matrix4f> worldTransforms(List<Node> nodes) throws AvatarRenderException {
     Matrix4f[] world = new Matrix4f[nodes.size()];
     for (int start = 0; start < nodes.size(); start++) {
+      cancellationCheckpoint(start);
       if (world[start] != null) continue;
       ArrayDeque<Integer> chain = new ArrayDeque<>();
       int current = start;
@@ -390,11 +402,13 @@ public final class GlbMeshDecoder {
   }
 
   private static void validateAnimations(
-      JsonObject json, List<Accessor> accessors, int nodeCount) throws AvatarRenderException {
+      JsonObject json, List<Accessor> accessors, List<Node> nodes) throws AvatarRenderException {
     JsonArray animations = optionalArray(json, "animations", 128);
     for (JsonElement value : animations) {
+      GlbDocumentReader.cancellationCheckpoint();
       JsonObject animation = object(value, "animation");
       JsonArray samplers = array(animation, "samplers", 1024);
+      List<AnimationSampler> decodedSamplers = new ArrayList<>(samplers.size());
       for (JsonElement samplerValue : samplers) {
         JsonObject sampler = object(samplerValue, "animation sampler");
         int input = integer(sampler, "input", 0, accessors.size() - 1);
@@ -405,19 +419,56 @@ public final class GlbMeshDecoder {
             || !Set.of("LINEAR", "STEP").contains(optionalString(sampler, "interpolation", "LINEAR"))) {
           invalid("avatar animation sampler is unsupported");
         }
+        decodedSamplers.add(new AnimationSampler(accessors.get(input), accessors.get(output)));
       }
       JsonArray channels = array(animation, "channels", 4096);
       for (JsonElement channelValue : channels) {
         JsonObject channel = object(channelValue, "animation channel");
-        integer(channel, "sampler", 0, samplers.size() - 1);
+        AnimationSampler sampler =
+            decodedSamplers.get(integer(channel, "sampler", 0, samplers.size() - 1));
         JsonObject target = object(channel, "target");
-        integer(target, "node", 0, nodeCount - 1);
-        if (!Set.of("translation", "rotation", "scale", "weights")
-            .contains(string(target, "path"))) {
+        int nodeIndex = integer(target, "node", 0, nodes.size() - 1);
+        String path = string(target, "path");
+        if (!Set.of("translation", "rotation", "scale", "weights").contains(path)) {
           invalid("avatar animation target path is invalid");
+        }
+        String outputType = switch (path) {
+          case "translation", "scale" -> "VEC3";
+          case "rotation" -> "VEC4";
+          case "weights" -> "SCALAR";
+          default -> throw new IllegalStateException("validated animation path");
+        };
+        long expectedOutputCount = sampler.input().count();
+        if ("weights".equals(path)) {
+          expectedOutputCount *= morphTargetCount(json, nodes.get(nodeIndex));
+        }
+        if (!outputType.equals(sampler.output().type())
+            || sampler.output().count() != expectedOutputCount) {
+          invalid("avatar animation output accessor is invalid");
         }
       }
     }
+  }
+
+  private static int morphTargetCount(JsonObject json, Node node)
+      throws AvatarRenderException {
+    JsonArray meshes = optionalArray(json, "meshes", MAX_NODES);
+    if (node.mesh() < 0 || node.mesh() >= meshes.size()) {
+      invalid("avatar animation weights target is not a mesh node");
+    }
+    JsonArray primitives =
+        array(object(meshes.get(node.mesh()), "mesh"), "primitives", MAX_PRIMITIVES);
+    int count = -1;
+    for (JsonElement value : primitives) {
+      JsonArray targets =
+          optionalArray(object(value, "primitive"), "targets", 128);
+      if (targets.isEmpty() || (count >= 0 && count != targets.size())) {
+        invalid("avatar animation morph target count is invalid");
+      }
+      count = targets.size();
+    }
+    if (count < 1) invalid("avatar animation weights target has no morph targets");
+    return count;
   }
 
   private static ImageDimensions imageDimensions(ByteBuffer encoded, String mimeType)
@@ -438,6 +489,7 @@ public final class GlbMeshDecoder {
     }
     int offset = 2;
     while (offset + 9 < bytes.limit()) {
+      GlbDocumentReader.cancellationCheckpoint();
       if (Byte.toUnsignedInt(bytes.get(offset)) != 0xff) invalid("avatar JPEG marker is invalid");
       int marker = Byte.toUnsignedInt(bytes.get(offset + 1));
       if (marker == 0xc0 || marker == 0xc1 || marker == 0xc2) {
@@ -466,13 +518,18 @@ public final class GlbMeshDecoder {
     for (int index = roots.size() - 1; index >= 0; index--) pending.push(roots.get(index));
     List<GlbPrimitive> instances = new ArrayList<>();
     while (!pending.isEmpty()) {
+      GlbDocumentReader.cancellationCheckpoint();
       int nodeIndex = pending.pop();
       if (visited[nodeIndex]) invalid("avatar active scene references a node more than once");
       visited[nodeIndex] = true;
       Node node = nodes.get(nodeIndex);
       if (node.mesh() >= 0) {
         if (node.skin() != 0) invalid("avatar active mesh uses an unsupported skin");
-        for (GlbPrimitive primitive : meshes.get(node.mesh())) {
+        List<GlbPrimitive> definitions = meshes.get(node.mesh());
+        if (definitions.size() > MAX_ACTIVE_DRAWS - instances.size()) {
+          invalid("avatar active scene has too many draw instances");
+        }
+        for (GlbPrimitive primitive : definitions) {
           instances.add(primitive.withNodeTransform(world.get(nodeIndex)));
         }
       }
@@ -489,6 +546,7 @@ public final class GlbMeshDecoder {
     List<GlbImage> images = new ArrayList<>(values.size());
     long totalPixels = 0;
     for (JsonElement value : values) {
+      GlbDocumentReader.cancellationCheckpoint();
       JsonObject image = object(value, "image");
       int viewIndex = integer(image, "bufferView", 0, views.size() - 1);
       String mimeType = string(image, "mimeType");
@@ -519,6 +577,7 @@ public final class GlbMeshDecoder {
     JsonArray textures = optionalArray(json, "textures", MAX_TEXTURES);
     List<Integer> textureImages = new ArrayList<>(textures.size());
     for (JsonElement value : textures) {
+      GlbDocumentReader.cancellationCheckpoint();
       JsonObject texture = object(value, "texture");
       textureImages.add(integer(texture, "source", 0, imageCount - 1));
       if (texture.has("sampler")) integer(texture, "sampler", 0, samplers.size() - 1);
@@ -526,6 +585,7 @@ public final class GlbMeshDecoder {
     JsonArray materials = optionalArray(json, "materials", MAX_MATERIALS);
     List<Integer> materialImages = new ArrayList<>(materials.size());
     for (JsonElement value : materials) {
+      GlbDocumentReader.cancellationCheckpoint();
       JsonObject material = object(value, "material");
       if (!"OPAQUE".equals(optionalString(material, "alphaMode", "OPAQUE"))
           || optionalBoolean(material, "doubleSided", false)
@@ -563,18 +623,15 @@ public final class GlbMeshDecoder {
     DecodeCache cache = new DecodeCache();
     Map<GeometrySignature, Object> geometryKeys = new HashMap<>();
     for (JsonElement meshValue : meshes) {
+      GlbDocumentReader.cancellationCheckpoint();
       JsonObject mesh = object(meshValue, "mesh");
       JsonArray primitives = array(mesh, "primitives", MAX_PRIMITIVES);
       if (primitives.isEmpty()) invalid("avatar mesh contains no primitives");
       List<GlbPrimitive> decoded = new ArrayList<>();
       for (JsonElement primitiveValue : primitives) {
+        GlbDocumentReader.cancellationCheckpoint();
         if (++primitiveCount > MAX_PRIMITIVES) invalid("avatar has too many primitives");
         JsonObject primitive = object(primitiveValue, "primitive");
-        if (primitive.has("targets")) {
-          JsonArray targets = array(primitive, "targets", 128);
-          for (JsonElement target : targets) object(target, "morph target");
-          if (fullExpressions) invalid("avatar morph expressions are unsupported");
-        }
         if (optionalInteger(primitive, "mode", 4, 0, 6) != 4) {
           invalid("avatar mesh primitive is not TRIANGLES");
         }
@@ -603,11 +660,13 @@ public final class GlbMeshDecoder {
             || weights.count() != vertices) {
           invalid("avatar mesh vertex attributes have different counts");
         }
+        validateMorphTargets(primitive, accessors, vertices, fullExpressions);
         ByteBuffer positionBytes = cache.floats(positions, views, binary);
         ByteBuffer normalBytes = cache.floats(normals, views, binary);
         ByteBuffer texCoordBytes = cache.floats(texCoords, views, binary);
-        JointBuffer jointBuffer = cache.joints(joints, views, binary, jointCount);
         ByteBuffer weightBytes = cache.weights(weights, views, binary);
+        JointBuffer jointBuffer =
+            cache.joints(joints, weights, weightBytes, views, binary, jointCount);
         Accessor indexAccessor = accessors.get(integer(primitive, "indices", 0, accessors.size() - 1));
         if (!"SCALAR".equals(indexAccessor.type())
             || !Set.of(5121, 5123, 5125).contains(indexAccessor.componentType())) {
@@ -644,6 +703,30 @@ public final class GlbMeshDecoder {
     return new DecodedMeshes(List.copyOf(decodedMeshes), cache.decodedBytes());
   }
 
+  private static void validateMorphTargets(
+      JsonObject primitive, List<Accessor> accessors, int vertexCount, boolean fullExpressions)
+      throws AvatarRenderException {
+    if (!primitive.has("targets")) return;
+    JsonArray targets = array(primitive, "targets", 128);
+    for (JsonElement value : targets) {
+      JsonObject target = object(value, "morph target");
+      for (String attribute : target.keySet()) {
+        if (!Set.of("POSITION", "NORMAL", "TANGENT").contains(attribute)) {
+          invalid("avatar morph target attribute is unsupported");
+        }
+        Accessor accessor =
+            accessors.get(integer(target, attribute, 0, accessors.size() - 1));
+        if (!"VEC3".equals(accessor.type())
+            || accessor.componentType() != 5126
+            || accessor.normalized()
+            || accessor.count() != vertexCount) {
+          invalid("avatar morph target accessor is invalid");
+        }
+      }
+    }
+    if (fullExpressions) invalid("avatar morph expressions are unsupported");
+  }
+
   private static Accessor attribute(
       JsonObject attributes,
       String name,
@@ -667,6 +750,7 @@ public final class GlbMeshDecoder {
         ByteBuffer.allocateDirect(accessor.count() * accessor.components() * Float.BYTES)
             .order(ByteOrder.LITTLE_ENDIAN);
     for (int index = 0; index < accessor.count(); index++) {
+      cancellationCheckpoint(index);
       float[] values = readFloatElement(accessor, index, views, binary);
       for (float value : values) {
         if (!Float.isFinite(value)) invalid("avatar mesh contains a non-finite value");
@@ -676,7 +760,7 @@ public final class GlbMeshDecoder {
     return readOnly(output.flip());
   }
 
-  private static JointBuffer canonicalJoints(
+  private static ByteBuffer canonicalGlobalJoints(
       Accessor accessor,
       List<BufferView> views,
       ByteBuffer binary,
@@ -684,24 +768,58 @@ public final class GlbMeshDecoder {
       throws AvatarRenderException {
     ByteBuffer output =
         ByteBuffer.allocateDirect(accessor.count() * 4 * Short.BYTES).order(ByteOrder.LITTLE_ENDIAN);
-    Map<Integer, Integer> palette = new LinkedHashMap<>();
     for (int index = 0; index < accessor.count(); index++) {
+      cancellationCheckpoint(index);
       int base = elementOffset(accessor, index, views);
       for (int component = 0; component < 4; component++) {
         int joint = readUnsigned(binary, base + component * accessor.componentBytes(), accessor.componentType());
         if (joint >= jointCount) invalid("avatar mesh joint index is out of bounds");
-        Integer local = palette.get(joint);
-        if (local == null) {
-          if (palette.size() >= AvatarGpuResources.MAX_SHADER_JOINTS) {
-            invalid("avatar primitive uses too many active joints");
-          }
-          local = palette.size();
-          palette.put(joint, local);
-        }
-        output.putShort(local.shortValue());
+        output.putShort((short) joint);
       }
     }
-    return new JointBuffer(readOnly(output.flip()), List.copyOf(palette.keySet()));
+    return readOnly(output.flip());
+  }
+
+  static PaletteRemap remapJointPalette(
+      ByteBuffer globalJoints, ByteBuffer weights, int jointCount)
+      throws AvatarRenderException {
+    ByteBuffer sourceJoints = globalJoints.duplicate().order(ByteOrder.LITTLE_ENDIAN);
+    ByteBuffer sourceWeights = weights.duplicate().order(ByteOrder.LITTLE_ENDIAN);
+    if (jointCount < 1
+        || sourceJoints.remaining() % (4 * Short.BYTES) != 0
+        || sourceWeights.remaining() != sourceJoints.remaining() * 2) {
+      invalid("avatar joint palette input is invalid");
+    }
+    int vertices = sourceJoints.remaining() / (4 * Short.BYTES);
+    ByteBuffer output =
+        ByteBuffer.allocateDirect(sourceJoints.remaining()).order(ByteOrder.LITTLE_ENDIAN);
+    Map<Integer, Integer> palette = new LinkedHashMap<>();
+    for (int vertex = 0; vertex < vertices; vertex++) {
+      cancellationCheckpoint(vertex);
+      int jointOffset = sourceJoints.position() + vertex * 4 * Short.BYTES;
+      int weightOffset = sourceWeights.position() + vertex * 4 * Float.BYTES;
+      for (int component = 0; component < 4; component++) {
+        int joint =
+            Short.toUnsignedInt(sourceJoints.getShort(jointOffset + component * Short.BYTES));
+        if (joint >= jointCount) invalid("avatar mesh joint index is out of bounds");
+        float weight = sourceWeights.getFloat(weightOffset + component * Float.BYTES);
+        int local = 0;
+        if (weight > 0.0f) {
+          Integer mapped = palette.get(joint);
+          if (mapped == null) {
+            if (palette.size() >= AvatarGpuResources.MAX_SHADER_JOINTS) {
+              invalid("avatar primitive uses too many active joints");
+            }
+            mapped = palette.size();
+            palette.put(joint, mapped);
+          }
+          local = mapped;
+        }
+        output.putShort((short) local);
+      }
+    }
+    if (palette.isEmpty()) invalid("avatar primitive has no active joints");
+    return new PaletteRemap(readOnly(output.flip()), List.copyOf(palette.keySet()));
   }
 
   private static ByteBuffer canonicalWeights(
@@ -709,6 +827,7 @@ public final class GlbMeshDecoder {
     ByteBuffer output =
         ByteBuffer.allocateDirect(accessor.count() * 4 * Float.BYTES).order(ByteOrder.LITTLE_ENDIAN);
     for (int index = 0; index < accessor.count(); index++) {
+      cancellationCheckpoint(index);
       float[] weights = readFloatElement(accessor, index, views, binary);
       float total = 0;
       for (float weight : weights) {
@@ -731,6 +850,7 @@ public final class GlbMeshDecoder {
         ByteBuffer.allocateDirect(accessor.count() * (outputType == 5123 ? 2 : 4))
             .order(ByteOrder.LITTLE_ENDIAN);
     for (int index = 0; index < accessor.count(); index++) {
+      cancellationCheckpoint(index);
       int value =
           readUnsigned(binary, elementOffset(accessor, index, views), accessor.componentType());
       if (value < 0 || value >= vertexCount) invalid("avatar mesh index is out of bounds");
@@ -800,6 +920,7 @@ public final class GlbMeshDecoder {
   private static void validateMeshNodes(List<Node> nodes, int meshCount, int skinCount)
       throws AvatarRenderException {
     for (Node node : nodes) {
+      GlbDocumentReader.cancellationCheckpoint();
       if (node.mesh() >= 0 && node.skin() < 0) invalid("avatar mesh node is not skinned");
       if (node.mesh() >= meshCount) invalid("avatar node mesh is out of bounds");
       if (node.skin() >= skinCount) invalid("avatar node skin is out of bounds");
@@ -921,6 +1042,7 @@ public final class GlbMeshDecoder {
     JsonArray values = optionalArray(object, key, maximum);
     List<Integer> decoded = new ArrayList<>(values.size());
     for (JsonElement value : values) {
+      GlbDocumentReader.cancellationCheckpoint();
       JsonObject holder = new JsonObject();
       holder.add("value", value);
       decoded.add(integer(holder, "value", 0, bound - 1));
@@ -976,6 +1098,8 @@ public final class GlbMeshDecoder {
       boolean normalized,
       int stride) {}
 
+  private record AnimationSampler(Accessor input, Accessor output) {}
+
   private record MutableNode(
       String name, List<Integer> children, Matrix4f local, int mesh, int skin, int parent) {
     private MutableNode withParent(int nextParent) {
@@ -1012,13 +1136,26 @@ public final class GlbMeshDecoder {
 
   private record JointBuffer(ByteBuffer bytes, List<Integer> palette) {}
 
+  record PaletteRemap(ByteBuffer joints, List<Integer> palette) {
+    PaletteRemap {
+      joints = readOnly(joints);
+      palette = List.copyOf(palette);
+    }
+
+    @Override
+    public ByteBuffer joints() {
+      return joints.asReadOnlyBuffer().order(ByteOrder.LITTLE_ENDIAN);
+    }
+  }
+
   private record ImageDimensions(int width, int height) {}
 
   private record DecodedMeshes(List<List<GlbPrimitive>> meshes, long decodedBytes) {}
 
   private static final class DecodeCache {
     private final Map<Accessor, ByteBuffer> floats = new HashMap<>();
-    private final Map<Accessor, JointBuffer> joints = new HashMap<>();
+    private final Map<Accessor, ByteBuffer> globalJoints = new HashMap<>();
+    private final Map<JointWeightKey, JointBuffer> joints = new HashMap<>();
     private final Map<Accessor, ByteBuffer> weights = new HashMap<>();
     private final Map<IndexKey, IndexBuffer> indices = new HashMap<>();
     private long decodedBytes;
@@ -1035,13 +1172,26 @@ public final class GlbMeshDecoder {
     }
 
     private JointBuffer joints(
-        Accessor accessor, List<BufferView> views, ByteBuffer binary, int jointCount)
+        Accessor accessor,
+        Accessor weightAccessor,
+        ByteBuffer decodedWeights,
+        List<BufferView> views,
+        ByteBuffer binary,
+        int jointCount)
         throws AvatarRenderException {
-      JointBuffer cached = joints.get(accessor);
+      JointWeightKey key = new JointWeightKey(accessor, weightAccessor);
+      JointBuffer cached = joints.get(key);
       if (cached != null) return cached;
+      ByteBuffer decodedGlobal = globalJoints.get(accessor);
+      if (decodedGlobal == null) {
+        reserve((long) accessor.count() * 4 * Short.BYTES);
+        decodedGlobal = canonicalGlobalJoints(accessor, views, binary, jointCount);
+        globalJoints.put(accessor, decodedGlobal);
+      }
       reserve((long) accessor.count() * 4 * Short.BYTES);
-      JointBuffer decoded = canonicalJoints(accessor, views, binary, jointCount);
-      joints.put(accessor, decoded);
+      PaletteRemap remap = remapJointPalette(decodedGlobal, decodedWeights, jointCount);
+      JointBuffer decoded = new JointBuffer(remap.joints(), remap.palette());
+      joints.put(key, decoded);
       return decoded;
     }
 
@@ -1081,6 +1231,12 @@ public final class GlbMeshDecoder {
   }
 
   private record IndexKey(Accessor accessor, int outputType) {}
+
+  private record JointWeightKey(Accessor joints, Accessor weights) {}
+
+  private static void cancellationCheckpoint(int index) throws AvatarRenderException {
+    if ((index & 0x3ff) == 0) GlbDocumentReader.cancellationCheckpoint();
+  }
 
   private record GeometrySignature(
       Accessor positions,

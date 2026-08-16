@@ -3,6 +3,7 @@ package io.github.whitelily.avatar.render.gltf;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -10,6 +11,7 @@ import com.mojang.blaze3d.pipeline.RenderPipeline;
 import io.github.whitelily.avatar.control.AvatarRuntimeDescriptor;
 import io.github.whitelily.avatar.render.backend.AvatarFrameResult;
 import io.github.whitelily.avatar.render.backend.AvatarRenderContext;
+import io.github.whitelily.avatar.render.backend.AvatarRenderBackendRegistry;
 import io.github.whitelily.avatar.render.backend.AvatarVisualState;
 import io.github.whitelily.avatar.render.backend.PreparedAvatarResources;
 import io.github.whitelily.avatar.theme.ArmorTheme;
@@ -17,6 +19,9 @@ import java.nio.ByteBuffer;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import net.minecraft.client.renderer.RenderPipelines;
 import org.joml.Matrix4f;
 import org.junit.jupiter.api.Test;
@@ -154,6 +159,122 @@ final class SmoothMeshRenderBackendTest {
 
     assertEquals(List.of(1, 1, 1), List.of(closed[0], closed[1], closed[2]));
     assertEquals(1, failure.getSuppressed().length);
+  }
+
+  @Test
+  void meshNodeTransformIsRemovedFromJointPaletteBeforeModelTransform() {
+    GlbMeshDecoder.GlbMesh mesh = decodedMesh(false);
+    GlbMeshDecoder.GlbPrimitive source = mesh.primitives().getFirst();
+    GlbMeshDecoder.GlbPrimitive transformed =
+        new GlbMeshDecoder.GlbPrimitive(
+            source.positions(),
+            source.normals(),
+            source.texCoords(),
+            source.joints(),
+            source.weights(),
+            source.indices(),
+            source.vertexCount(),
+            source.indexCount(),
+            source.indexComponentType(),
+            source.materialIndex(),
+            new Matrix4f().translation(2.0f, 0.0f, 0.0f),
+            source.jointPalette());
+    HumanoidAnimator.AvatarPose pose =
+        new HumanoidAnimator().evaluate(state(), mesh.skeleton(), 0.0f);
+
+    Matrix4f palette = AvatarGpuResources.paletteMatrices(transformed, pose).getFirst();
+
+    assertEquals(-2.0f, palette.m30(), 0.0001f);
+  }
+
+  @Test
+  void heldItemFailureRollsBackTheDiscardableTargetBeforeMainComposition() {
+    String[] main = {"original"};
+    String[] staged = {null};
+    AvatarGpuResources.DrawTransaction transaction =
+        new AvatarGpuResources.DrawTransaction() {
+          @Override
+          public void begin() {
+            staged[0] = main[0];
+          }
+
+          @Override
+          public void rollback() {
+            staged[0] = null;
+          }
+
+          @Override
+          public void compose() {
+            main[0] = staged[0];
+          }
+        };
+
+    assertThrows(
+        IllegalStateException.class,
+        () ->
+            AvatarGpuResources.commitDiscardable(
+                transaction,
+                () -> staged[0] = "mesh",
+                () -> {
+                  staged[0] = "held-item";
+                  throw new IllegalStateException("item upload failed");
+                }));
+
+    assertEquals("original", main[0]);
+    assertEquals(null, staged[0]);
+  }
+
+  @Test
+  void indexAllocationErrorClosesTheUnregisteredVertexBufferAndRethrowsOriginal() {
+    int[] closed = {0};
+    AutoCloseable vertices = () -> closed[0]++;
+    LinkageError marker = new LinkageError("index device linkage failed");
+
+    LinkageError thrown =
+        assertThrows(
+            LinkageError.class,
+            () ->
+                AvatarGpuResources.createAfterAllocated(
+                    vertices,
+                    () -> {
+                      throw marker;
+                    }));
+
+    assertSame(marker, thrown);
+    assertEquals(1, closed[0]);
+  }
+
+  @Test
+  void cancelledDecodeYieldsTheBoundedWorkerToTheNextPrepare() throws Exception {
+    AtomicInteger calls = new AtomicInteger();
+    CountDownLatch firstStarted = new CountDownLatch(1);
+    SmoothMeshRenderBackend backend =
+        new SmoothMeshRenderBackend(
+            Path.of("C:/WhiteLily"),
+            descriptor -> {
+              if (calls.getAndIncrement() == 0) {
+                firstStarted.countDown();
+                while (true) GlbDocumentReader.cancellationCheckpoint();
+              }
+              return decodedMesh(false);
+            });
+    AvatarRenderBackendRegistry registry =
+        new AvatarRenderBackendRegistry(Map.of("glb", backend), ignored -> {});
+    try {
+      var first = registry.prepare(descriptor("imported")).toCompletableFuture();
+      assertTrue(firstStarted.await(2, TimeUnit.SECONDS));
+      assertTrue(first.cancel(true));
+
+      var second =
+          registry
+              .prepare(descriptor("imported"))
+              .toCompletableFuture()
+              .get(2, TimeUnit.SECONDS);
+
+      assertNotNull(second);
+    } finally {
+      registry.close();
+    }
   }
 
   private static AvatarRuntimeDescriptor descriptor(String origin) {
