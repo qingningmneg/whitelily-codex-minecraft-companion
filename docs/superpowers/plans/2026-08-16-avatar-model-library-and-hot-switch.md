@@ -561,7 +561,7 @@ git commit -m "feat: expose avatar model desktop API"
 - Consumes: Task 1 控制协议、Task 2 目录/偏好、原子 JSON 文件、Minecraft presence/world session。
 - Produces: `AvatarModelMailbox.publish()`、`waitForState()`、`AvatarModelSwitchCoordinator.switchTo()`、`cancelPending()`、`reconcilePersistedSelection()`。
 
-- [ ] **Step 1: 写准备、候选抢占、首帧提交和失败回滚测试**
+- [x] **Step 1: 写准备、候选抢占、首帧提交和失败回滚测试**
 
 ```ts
 it("persists only after the matching visible-frame committed state", async () => {
@@ -586,13 +586,13 @@ it("cancels an uncommitted candidate when a newer choice arrives", async () => {
 });
 ```
 
-- [ ] **Step 2: 运行红灯**
+- [x] **Step 2: 运行红灯**
 
 Run: `npm run test --workspace @whitelily/desktop -- src-main/avatar/avatarModelMailbox.test.ts src-main/avatar/avatarModelSwitchCoordinator.test.ts`
 
 Expected: FAIL，缺少邮箱和切换协调器。
 
-- [ ] **Step 3: 实现安全邮箱**
+- [x] **Step 3: 实现安全邮箱**
 
 ```ts
 export interface AvatarModelMailbox {
@@ -608,7 +608,7 @@ export interface AvatarModelMailbox {
 
 请求写入 `request.json`，Fabric 状态写入 `state.json`，双方均使用同目录临时文件、flush、原子 rename。读者复核普通文件、大小不超过 64 KiB、schema、`requestId`、`worldSessionId` 和单调 `updatedAt`。等待采用 `fs.watch` 加 250ms 轮询兜底，不使用忙循环；prepare 超时 15 秒、commit 超时 5 秒。旧 request/state、未知字段、世界会话不匹配和 symlink/reparse point 一律忽略并记录稳定错误码。
 
-- [ ] **Step 4: 实现最新候选获胜的串行切换**
+- [x] **Step 4: 实现最新候选获胜的串行切换**
 
 ```ts
 export class AvatarModelSwitchCoordinator {
@@ -620,7 +620,7 @@ export class AvatarModelSwitchCoordinator {
 
 协调器在读取候选记录后复核资源摘要和 `AVATAR_VALID`；保留旧活动 ID；发布 prepare，等待 ready；若未被抢占则发布 commit，等待 committed；仅在 committed 的 `activeModelId`、`requestId`、`worldSessionId` 全匹配时写偏好并更新单一活动卡片。任何失败先发布 cancel（如果仍有活动世界）、清理 pending 状态并返回带稳定码错误，绝不改旧偏好。断桥、换世界、资源重载和 Electron 关闭都调用 `cancelPending()`；重新连接只对持久化 ID 执行全新协商。
 
-- [ ] **Step 5: 覆盖所有中断边界并跑绿**
+- [x] **Step 5: 覆盖所有中断边界并跑绿**
 
 增加测试：摘要漂移、ready 之后换世界、commit 之后状态来自旧 session、bridge 断开、超时、failed 状态、偏好修订冲突、已活动模型幂等选择、桌面重启重新协商、同一错误不会重复发布目录事件。
 
@@ -628,7 +628,7 @@ Run: `npm run test --workspace @whitelily/desktop -- src-main/avatar/avatarModel
 
 Expected: PASS。
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```powershell
 git add apps/desktop/src-main/avatar/avatarModelMailbox.ts apps/desktop/src-main/avatar/avatarModelMailbox.test.ts apps/desktop/src-main/avatar/avatarModelSwitchCoordinator.ts apps/desktop/src-main/avatar/avatarModelSwitchCoordinator.test.ts apps/desktop/src-main/main.ts
