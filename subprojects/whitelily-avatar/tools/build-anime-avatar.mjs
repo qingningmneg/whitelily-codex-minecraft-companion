@@ -10,6 +10,20 @@ const blenderTools = path.join(toolDirectory, "blender");
 const sourceRoot = path.join(avatarRoot, "assets", "source");
 const blendFile = path.join(avatarRoot, "assets", "blender", "whitelily-anime-avatar.blend");
 const generatedDirectory = path.join(avatarRoot, "build", "anime-avatar");
+const repositoryRoot = path.resolve(avatarRoot, "..", "..");
+
+export function bodyHighValidationArguments(root = repositoryRoot) {
+  const rootAvatar = path.join(root, "subprojects", "whitelily-avatar");
+  return [
+    "--background",
+    "--python-exit-code", "12",
+    path.join(rootAvatar, "assets", "blender", "whitelily-anime-avatar.blend"),
+    "--python", path.join(rootAvatar, "tools", "blender", "validate_silhouette.py"),
+    "--",
+    "--baseline", path.join(rootAvatar, "assets", "measurements", "base-silhouette.json"),
+    "--output-dir", path.join(rootAvatar, "assets", "review", "body-high"),
+  ];
+}
 
 function buildError(code) {
   return new Error(code);
@@ -41,10 +55,14 @@ export async function buildAnimeAvatar({
   blenderPath,
   outputDirectory,
   renderPreviews = false,
+  stage = "bootstrap",
   verifyOnly = false,
 } = {}) {
   if (blenderVersion !== undefined && blenderVersion !== REQUIRED_BLENDER_VERSION) {
     throw buildError("BLENDER_VERSION_MISMATCH");
+  }
+  if (!new Set(["bootstrap", "body-high"]).has(stage)) {
+    throw buildError("AVATAR_ART_STAGE_INVALID");
   }
   if (verifyOnly) return { version: REQUIRED_BLENDER_VERSION };
   const executable = blenderPath ?? process.env.WHITELILY_BLENDER_PATH ?? process.env.BLENDER_PATH ?? "blender";
@@ -58,7 +76,12 @@ export async function buildAnimeAvatar({
     blendFile,
     "--python", path.join(blenderTools, "validate_avatar.py"),
     "--", "--source-root", sourceRoot,
+    "--stage", stage,
   ]);
+  if (stage === "body-high") {
+    await run(executable, bodyHighValidationArguments());
+    return { version: REQUIRED_BLENDER_VERSION, executable, stage };
+  }
   if (outputDirectory) {
     await run(executable, [
       "--background",
@@ -101,14 +124,17 @@ async function publishBootstrapMarker() {
 }
 
 async function main() {
-  const arguments_ = new Set(process.argv.slice(2));
+  const rawArguments = process.argv.slice(2);
+  const arguments_ = new Set(rawArguments);
   const verify = arguments_.has("--verify");
   const exportRequested = arguments_.has("--export");
   const previewsRequested = arguments_.has("--render-previews");
+  const stageIndex = rawArguments.indexOf("--stage");
+  const stage = stageIndex === -1 ? "bootstrap" : rawArguments[stageIndex + 1];
   if (!verify && !exportRequested && !previewsRequested) throw buildError("AVATAR_BUILD_ARGUMENTS_INVALID");
-  if (exportRequested || previewsRequested) await publishBootstrapMarker();
-  else await buildAnimeAvatar();
-  console.log("AVATAR_ART_STAGE=bootstrap");
+  if ((exportRequested || previewsRequested) && stage === "bootstrap") await publishBootstrapMarker();
+  else await buildAnimeAvatar({ stage });
+  console.log(`AVATAR_ART_STAGE=${stage}`);
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {

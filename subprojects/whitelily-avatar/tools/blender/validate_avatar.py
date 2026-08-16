@@ -119,10 +119,10 @@ def validate_reference_images(scene):
         fail("AVATAR_RESOURCE_UNPACKED")
 
 
-def validate_scene(scene):
+def validate_scene(scene, expected_art_stage=ART_STAGE):
     if scene.get("whitelily_asset_schema") != ASSET_SCHEMA:
         fail("AVATAR_SCHEMA_MISMATCH")
-    if scene.get("AVATAR_ART_STAGE") != ART_STAGE:
+    if scene.get("AVATAR_ART_STAGE") != expected_art_stage:
         fail("AVATAR_ART_STAGE_INVALID")
     if scene.unit_settings.system != "METRIC" or scene.unit_settings.scale_length != UNIT_SCALE:
         fail("AVATAR_UNITS_INVALID")
@@ -204,12 +204,13 @@ def main():
     parser.add_argument("--source-root", default=SOURCE_DIRECTORY)
     parser.add_argument("--output-dir")
     parser.add_argument("--render-previews", action="store_true")
+    parser.add_argument("--stage", choices=("bootstrap", "body-high"), default=ART_STAGE)
     arguments = parser.parse_args(blender_arguments())
     try:
         validate_blender_version()
         validate_sources(arguments.source_root)
         profile = validate_export_profile()
-        validate_scene(bpy.context.scene)
+        validate_scene(bpy.context.scene, expected_art_stage=arguments.stage)
         if arguments.output_dir:
             export_bootstrap(arguments.output_dir, arguments.render_previews, profile)
     except AvatarValidationError as error:

@@ -43,6 +43,13 @@ class AvatarContractTest(unittest.TestCase):
             with self.assertRaisesRegex(AvatarValidationError, "AVATAR_FRAME_RATE_INVALID"):
                 validate_scene(scene)
 
+    def test_scene_accepts_an_explicit_body_high_art_stage(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            bootstrap(os.path.join(temporary_directory, "avatar.blend"))
+            scene = bpy.context.scene
+            scene["AVATAR_ART_STAGE"] = "body-high"
+            validate_scene(scene, expected_art_stage="body-high")
+
     def test_references_require_the_approved_packed_image_payloads(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             bootstrap(os.path.join(temporary_directory, "avatar.blend"))
