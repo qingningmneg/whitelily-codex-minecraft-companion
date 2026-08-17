@@ -90,6 +90,26 @@ def object_bounds(name):
     return world_bounds((object_,))
 
 
+def landmark_world_position(object_name, group_name):
+    object_ = bpy.data.objects.get(object_name)
+    if object_ is None or object_.type != "MESH":
+        fail("AVATAR_BODY_HIGH_LANDMARK_MISSING")
+    group = object_.vertex_groups.get(group_name)
+    if group is None:
+        fail("AVATAR_BODY_HIGH_LANDMARK_MISSING")
+    points = [
+        object_.matrix_world @ vertex.co
+        for vertex in object_.data.vertices
+        if any(
+            membership.group == group.index and membership.weight > 0.5
+            for membership in vertex.groups
+        )
+    ]
+    if not points:
+        fail("AVATAR_BODY_HIGH_LANDMARK_MISSING")
+    return sum(points, Vector()) / len(points)
+
+
 def evaluated_triangle_count(objects):
     depsgraph = bpy.context.evaluated_depsgraph_get()
     total = 0
@@ -118,13 +138,15 @@ def validate_body_high_structure(scene):
     height = body_bounds[2][1] - body_bounds[2][0]
     if abs(height - CHARACTER_HEIGHT_METERS) > 0.01:
         fail("AVATAR_BODY_HIGH_HEIGHT_INVALID")
-    face_bounds = object_bounds("Face")
-    head_height = face_bounds[2][1] - face_bounds[2][0]
+    head_top = landmark_world_position("Hair", "HeadTopLandmark")
+    chin = landmark_world_position("Face", "ChinLandmark")
+    head_height = head_top.z - chin.z
     head_ratio = height / head_height
     if not 6.3 <= head_ratio <= 6.8:
         fail("AVATAR_BODY_HIGH_HEAD_RATIO_INVALID")
-    dress_bounds = object_bounds("DressBase")
-    shoulder_width = dress_bounds[0][1] - dress_bounds[0][0]
+    shoulder_l = landmark_world_position("Body", "ShoulderLandmarkL")
+    shoulder_r = landmark_world_position("Body", "ShoulderLandmarkR")
+    shoulder_width = abs(shoulder_l.x - shoulder_r.x)
     if not 0.34 <= shoulder_width <= 0.40:
         fail("AVATAR_BODY_HIGH_SHOULDER_WIDTH_INVALID")
     lily_petals = [object_ for object_ in body_meshes if object_.name.startswith("LilyPetal")]
@@ -169,10 +191,13 @@ def configure_render(scene):
     scene.render.image_settings.color_mode = "RGBA"
     scene.render.film_transparent = True
     scene.render.use_file_extension = True
+    scene.view_settings.view_transform = "AgX"
     scene.view_settings.look = "AgX - Medium High Contrast"
-    bpy.data.objects["LIGHT_KEY"].data.energy = 900.0
-    bpy.data.objects["LIGHT_FILL"].data.energy = 800.0
-    bpy.data.objects["LIGHT_RIM"].data.energy = 650.0
+    scene.view_settings.exposure = -0.75
+    scene.view_settings.gamma = 1.0
+    bpy.data.objects["LIGHT_KEY"].data.energy = 460.0
+    bpy.data.objects["LIGHT_FILL"].data.energy = 210.0
+    bpy.data.objects["LIGHT_RIM"].data.energy = 300.0
     for camera_name in CAMERA_VIEWS.values():
         camera = bpy.data.objects.get(camera_name)
         if camera is None or camera.type != "CAMERA" or camera.data.type != "ORTHO":
@@ -250,16 +275,15 @@ def bounds_center(bounds):
 
 def keypoint_world_positions():
     body = world_bounds(collection_meshes("BODY_HIGH"))
-    face = object_bounds("Face")
     dress = object_bounds("DressBase")
     inner_skirt = object_bounds("SkirtInner")
     foot_l = object_bounds("FootL")
     foot_r = object_bounds("FootR")
     points = {
-        "headTop": Vector((0.0, 0.0, body[2][1])),
-        "chin": Vector((0.0, face[1][0], face[2][0])),
-        "shoulderL": Vector((dress[0][1], 0.0, dress[2][1] - 0.04)),
-        "shoulderR": Vector((dress[0][0], 0.0, dress[2][1] - 0.04)),
+        "headTop": landmark_world_position("Hair", "HeadTopLandmark"),
+        "chin": landmark_world_position("Face", "ChinLandmark"),
+        "shoulderL": landmark_world_position("Body", "ShoulderLandmarkL"),
+        "shoulderR": landmark_world_position("Body", "ShoulderLandmarkR"),
         "waist": Vector((0.0, 0.0, dress[2][0] + 0.03)),
         "skirtHem": Vector((0.0, inner_skirt[1][0], inner_skirt[2][0])),
         "sleeveCuffL": bpy.data.objects["SleeveCuffL"].matrix_world.translation,
@@ -330,28 +354,46 @@ def create_contact_sheet(input_paths, output_path):
 
 
 def render_clay_reviews(scene, output_directory):
-    clay = render_material("BodyHighClayReview", (0.82, 0.84, 0.80), emission=False)
-    clay_mid = render_material("BodyHighClayMid", (0.58, 0.61, 0.56), emission=False)
-    clay_dark = render_material("BodyHighClayDark", (0.19, 0.22, 0.18), emission=False)
-    clay_light = render_material("BodyHighClayLight", (0.94, 0.95, 0.91), emission=False)
+    clay = render_material("BodyHighClayReview", (0.68, 0.70, 0.66), emission=False)
+    clay_mid = render_material("BodyHighClayMid", (0.28, 0.33, 0.26), emission=False)
+    clay_lid = render_material("BodyHighClayLid", (0.22, 0.25, 0.21), emission=False)
+    clay_dark = render_material("BodyHighClayDark", (0.055, 0.070, 0.050), emission=False)
+    clay_light = render_material("BodyHighClayLight", (0.84, 0.85, 0.81), emission=False)
+    clay_lock = render_material("BodyHighClayHairLock", (0.61, 0.64, 0.60), emission=False)
+    clay_face = render_material("BodyHighClayFace", (0.76, 0.74, 0.70), emission=False)
     for object_ in collection_meshes("BODY_HIGH", "OUTFIT_BASE"):
         object_.data.materials.clear()
         object_.data.materials.append(clay)
-    for prefix in ("Iris", "Eyelid", "LowerEyelid", "Mouth"):
+    for prefix in ("Iris", "Mouth"):
         for object_ in bpy.data.objects:
             if object_.type == "MESH" and object_.name.startswith(prefix):
                 object_.data.materials.clear()
                 object_.data.materials.append(clay_mid)
+    for prefix in ("Eyelid", "LowerEyelid"):
+        for object_ in bpy.data.objects:
+            if object_.type == "MESH" and object_.name.startswith(prefix):
+                object_.data.materials.clear()
+                object_.data.materials.append(clay_lid)
     for prefix in ("Pupil",):
         for object_ in bpy.data.objects:
             if object_.type == "MESH" and object_.name.startswith(prefix):
                 object_.data.materials.clear()
                 object_.data.materials.append(clay_dark)
-    for prefix in ("Face", "Nose", "EyeWhite", "EyeHighlight", "Eyes"):
+    for prefix in ("Face", "Nose"):
+        for object_ in bpy.data.objects:
+            if object_.type == "MESH" and object_.name.startswith(prefix):
+                object_.data.materials.clear()
+                object_.data.materials.append(clay_face)
+    for prefix in ("EyeWhite", "EyeHighlight", "Eyes"):
         for object_ in bpy.data.objects:
             if object_.type == "MESH" and object_.name.startswith(prefix):
                 object_.data.materials.clear()
                 object_.data.materials.append(clay_light)
+    for prefix in ("Hair",):
+        for object_ in bpy.data.objects:
+            if object_.type == "MESH" and object_.name.startswith(prefix):
+                object_.data.materials.clear()
+                object_.data.materials.append(clay_lock)
     paths = []
     for view_name in REVIEW_VIEWS:
         filepath = os.path.join(output_directory, view_name + ".png")

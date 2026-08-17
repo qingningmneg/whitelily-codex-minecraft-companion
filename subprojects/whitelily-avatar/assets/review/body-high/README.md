@@ -1,6 +1,15 @@
 # Body-high clay review
 
-Generated from the controlled Blender 4.5.3 source with:
+Fix Round 1 was generated from the controlled Blender 4.5.3 source whose
+SHA-256 is `82A8DB0389F82543891157A0590A508C48B8678F53355CC0DE9FF8FC64158CF4`.
+The approved replacement baseline and all fixed-camera review images were
+rebuilt together with:
+
+```powershell
+& $env:WHITELILY_BLENDER_PATH --background --python-exit-code 12 subprojects/whitelily-avatar/assets/blender/whitelily-anime-avatar.blend --python subprojects/whitelily-avatar/tools/blender/validate_silhouette.py -- --baseline subprojects/whitelily-avatar/assets/measurements/base-silhouette.json --output-dir subprojects/whitelily-avatar/assets/review/body-high --write-baseline
+```
+
+The ordinary no-write verification command is:
 
 ```powershell
 $env:WHITELILY_BLENDER_PATH = 'C:\Users\Admin\.cache\whitelily-tools\blender-4.5.3\blender-4.5.3-windows-x64\blender.exe'
