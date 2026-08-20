@@ -1,7 +1,7 @@
 # Body-high clay review
 
-Fix Round 3 was generated from the controller-approved Blender 4.5.3 source whose
-SHA-256 is `6E2F86ECE36070BF0235D210FB1322A63BBD32BB7CE215E33F6E43CE8FD3AA4A`.
+Fix Round 4 was generated from the controller-approved Blender 4.5.3 source whose
+SHA-256 is `0CE243FBF6C3ED946E1341DB1803486C4E5749CC1BC9819AE16EE3764F79C593`.
 The approved replacement baseline and all fixed-camera review images were
 rebuilt together with:
 
@@ -18,6 +18,6 @@ npm run avatar:anime:check -- --stage body-high
 
 `front.png`, `back.png`, `left.png`, and `right.png` are fixed-camera monochrome clay reviews. `contact-sheet.png` combines those four views. `masks/` contains the six 1024×1024 alpha silhouettes used by `base-silhouette.json`; top and bottom masks are retained for future drift checks even though they are not part of the four-view clay sheet.
 
-The evaluated `BODY_HIGH + OUTFIT_BASE` total for this promoted source is 83,060 triangles.
+The evaluated `BODY_HIGH + OUTFIT_BASE` total for this promoted source is 81,044 triangles.
 
 The body-high stage is an art review source, not a rigged, textured, armored, or publishable runtime avatar.
