@@ -244,6 +244,68 @@ class RigContractTest(unittest.TestCase):
         )
         self.assertEqual(maximum, [0])
 
+    def test_deep_stride_outer_skirt_retains_waist_attachment_and_downward_hang(self):
+        rig = bpy.data.objects["RIG_WhiteLily"]
+        skirt = bpy.data.objects["SkirtOuter"]
+        group = skirt.vertex_groups.get("secondary.skirt.outer.L")
+        self.assertIsNotNone(group)
+
+        owned_indices = [
+            vertex.index
+            for vertex in skirt.data.vertices
+            if any(
+                membership.group == group.index and membership.weight >= 0.5
+                for membership in vertex.groups
+            )
+        ]
+        self.assertGreater(len(owned_indices), 0)
+
+        rig.animation_data.action = None
+        bpy.context.scene.frame_set(1)
+        bpy.context.view_layer.update()
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+        rest_points = rig_validator.evaluated_world_points(skirt, depsgraph)
+        minimum_z = min(rest_points[index].z for index in owned_indices)
+        maximum_z = max(rest_points[index].z for index in owned_indices)
+        panel_height = maximum_z - minimum_z
+        band_height = panel_height * 0.15
+        seam_indices = [
+            index
+            for index in owned_indices
+            if rest_points[index].z >= maximum_z - band_height
+        ]
+        hem_indices = [
+            index
+            for index in owned_indices
+            if rest_points[index].z <= minimum_z + band_height
+        ]
+
+        def centroid(points, indices):
+            return sum((points[index] for index in indices), Vector()) / len(indices)
+
+        rest_seam = centroid(rest_points, seam_indices)
+        rig.animation_data.action = bpy.data.actions["POSE_PREVIEW.deep-stride"]
+        bpy.context.scene.frame_set(31)
+        bpy.context.view_layer.update()
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+        posed_points = rig_validator.evaluated_world_points(skirt, depsgraph)
+        posed_seam = centroid(posed_points, seam_indices)
+        posed_hem = centroid(posed_points, hem_indices)
+        posed_axis = posed_hem - posed_seam
+        downward_fraction = (posed_seam.z - posed_hem.z) / posed_axis.length
+        seam_displacement = (posed_seam - rest_seam).length
+
+        self.assertGreaterEqual(
+            downward_fraction,
+            0.55,
+            f"outer skirt hangs too horizontally: downward fraction {downward_fraction:.3f}",
+        )
+        self.assertLessEqual(
+            seam_displacement,
+            panel_height * 0.12,
+            f"outer skirt waist detached by {seam_displacement:.3f} m",
+        )
+
     def test_deep_stride_stays_within_rest_derived_leg_skirt_contact_gates(self):
         rig = bpy.data.objects["RIG_WhiteLily"]
         pairs = tuple(
