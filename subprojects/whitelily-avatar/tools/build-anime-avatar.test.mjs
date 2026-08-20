@@ -43,3 +43,41 @@ test("rig stage uses the public contract and reproducible review directory", () 
     "--render-previews",
   ]);
 });
+
+test("rig stage executes body-high precheck before the rig validator", async () => {
+  const calls = [];
+  const runCommand = async (command, arguments_) => {
+    calls.push([command, arguments_]);
+    return arguments_[0] === "--version" ? "Blender 4.5.3\n" : "";
+  };
+
+  await buildAnimeAvatar({
+    blenderPath: "fake-blender",
+    runCommand,
+    stage: "rig",
+  });
+
+  assert.equal(calls.length, 3);
+  assert.deepEqual(calls[0], ["fake-blender", ["--version"]]);
+  assert.match(calls[1][1].join(" "), /validate_avatar\.py .*--stage body-high/);
+  assert.match(calls[2][1].join(" "), /validate_rig\.py .*--render-previews/);
+});
+
+test("rig stage stops before rig validation when body-high precheck fails", async () => {
+  const calls = [];
+  const runCommand = async (command, arguments_) => {
+    calls.push([command, arguments_]);
+    if (arguments_[0] === "--version") return "Blender 4.5.3\n";
+    throw new Error("AVATAR_BODY_HIGH_PRECHECK_FAILED");
+  };
+
+  await assert.rejects(
+    buildAnimeAvatar({
+      blenderPath: "fake-blender",
+      runCommand,
+      stage: "rig",
+    }),
+    /AVATAR_BODY_HIGH_PRECHECK_FAILED/,
+  );
+  assert.equal(calls.length, 2);
+});

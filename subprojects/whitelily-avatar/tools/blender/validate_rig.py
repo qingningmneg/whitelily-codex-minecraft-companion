@@ -10,7 +10,8 @@ import shutil
 import sys
 
 import bpy
-from mathutils import Vector
+from mathutils import Matrix, Vector
+from mathutils.bvhtree import BVHTree
 
 
 SCRIPT_DIRECTORY = os.path.dirname(os.path.abspath(__file__))
@@ -102,6 +103,33 @@ def visible_meshes():
             if object_.type == "MESH":
                 objects[object_.as_pointer()] = object_
     return tuple(objects.values())
+
+
+def validate_scene_wide_visible_mesh_coverage(scene, contract):
+    covered = {object_.as_pointer() for object_ in visible_meshes()}
+    allowed = contract.get("visibleMeshCoverage", {}).get("allowed", [])
+    allowed_reasons = {
+        entry.get("object"): entry.get("reason")
+        for entry in allowed
+        if isinstance(entry, dict)
+    }
+    if any(not name or not reason for name, reason in allowed_reasons.items()):
+        fail("AVATAR_RIG_VISIBLE_MESH_ALLOWLIST_INVALID")
+    visible = [
+        object_
+        for object_ in scene.objects
+        if object_.type == "MESH"
+        and not object_.hide_render
+        and any(not collection.hide_render for collection in object_.users_collection)
+    ]
+    uncovered = [
+        object_.name
+        for object_ in visible
+        if object_.as_pointer() not in covered and object_.name not in allowed_reasons
+    ]
+    if uncovered:
+        fail("AVATAR_RIG_VISIBLE_MESH_UNCOVERED")
+    return len(visible)
 
 
 def validate_armature(contract):
@@ -199,7 +227,104 @@ def palm_center(object_name):
     )
 
 
-def validate_attachments(contract, rig):
+def evaluated_surface(object_, depsgraph):
+    evaluated = object_.evaluated_get(depsgraph)
+    mesh = evaluated.to_mesh(preserve_all_data_layers=False, depsgraph=depsgraph)
+    try:
+        vertices = [evaluated.matrix_world @ vertex.co for vertex in mesh.vertices]
+        polygons = [tuple(polygon.vertices) for polygon in mesh.polygons]
+        if not vertices or not polygons:
+            fail("AVATAR_RIG_CLIPPING_SURFACE_INVALID")
+        center = sum(vertices, Vector()) / len(vertices)
+        return BVHTree.FromPolygons(vertices, polygons, all_triangles=False), center
+    finally:
+        evaluated.to_mesh_clear()
+
+
+def evaluated_bvh(object_, depsgraph):
+    return evaluated_surface(object_, depsgraph)[0]
+
+
+def oriented_proxy_box(rig, pose_bone, proxy):
+    center = Vector(proxy["center"])
+    half = Vector(proxy["halfExtents"])
+    vertices = [
+        rig.matrix_world
+        @ (pose_bone.matrix @ (center + Vector((x * half.x, y * half.y, z * half.z))))
+        for x, y, z in (
+            (-1, -1, -1),
+            (1, -1, -1),
+            (1, 1, -1),
+            (-1, 1, -1),
+            (-1, -1, 1),
+            (1, -1, 1),
+            (1, 1, 1),
+            (-1, 1, 1),
+        )
+    ]
+    faces = (
+        (0, 1, 2, 3),
+        (4, 7, 6, 5),
+        (0, 4, 5, 1),
+        (1, 5, 6, 2),
+        (2, 6, 7, 3),
+        (4, 0, 3, 7),
+    )
+    world_center = rig.matrix_world @ (pose_bone.matrix @ center)
+    return vertices, faces, world_center
+
+
+def point_is_inside_surface(tree, point, tolerance=1e-6):
+    nearest = tree.find_nearest(point)
+    if nearest[0] is None:
+        fail("AVATAR_RIG_ITEM_PROXY_SURFACE_INVALID")
+    surface_point, normal, _, distance = nearest
+    return distance > tolerance and (point - surface_point).dot(normal) < -tolerance
+
+
+def validate_attachment_proxy_surfaces(
+    scene,
+    contract,
+    rig,
+    proxies=None,
+    attachment_names=("heldItemL", "heldItemR"),
+):
+    proxies = tuple(contract["itemProxies"] if proxies is None else proxies)
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    checks = []
+    for held_name in attachment_names:
+        hand_name = "HandL" if held_name == "heldItemL" else "HandR"
+        hand = bpy.data.objects.get(hand_name)
+        if hand is None:
+            fail("AVATAR_RIG_HAND_MISSING")
+        hand_tree = evaluated_bvh(hand, depsgraph)
+        pose_bone = rig.pose.bones[held_name]
+        minimum_clearance = contract["attachments"][held_name].get(
+            "minimumEvaluatedSurfaceClearanceMeters", 0.001
+        )
+        for proxy in proxies:
+            vertices, faces, center = oriented_proxy_box(rig, pose_bone, proxy)
+            proxy_tree = BVHTree.FromPolygons(vertices, faces, all_triangles=False)
+            samples = vertices + [center]
+            if proxy_tree.overlap(hand_tree) or any(
+                point_is_inside_surface(hand_tree, point) for point in samples
+            ):
+                fail("AVATAR_RIG_ITEM_PROXY_HAND_INTERSECTION")
+            distances = [hand_tree.find_nearest(point)[3] for point in samples]
+            clearance = min(distances)
+            if clearance < minimum_clearance:
+                fail("AVATAR_RIG_ITEM_PROXY_HAND_CLEARANCE_INVALID")
+            checks.append(
+                {
+                    "attachment": held_name,
+                    "proxy": proxy["id"],
+                    "minimumSurfaceClearanceMeters": round(clearance, 6),
+                }
+            )
+    return checks
+
+
+def validate_attachments(scene, contract, rig):
     specifications = {bone["name"]: bone for bone in contract["bones"]}
     axes = {}
     for suffix, held_name, hand_name in (
@@ -260,7 +385,85 @@ def validate_attachments(contract, rig):
     runtime_attachments = contract.get("runtimeManifest", {}).get("attachmentBones", {})
     if runtime_attachments.get("leftHeldItem") != "heldItemL" or runtime_attachments.get("rightHeldItem") != "heldItemR":
         fail("AVATAR_RIG_RUNTIME_ATTACHMENT_INVALID")
+    validate_attachment_proxy_surfaces(scene, contract, rig)
     return checks
+
+
+def maximum_consecutive_clipping_frames(scene, object_pairs, frames):
+    resolved_pairs = []
+    for first_name, second_name in object_pairs:
+        first = bpy.data.objects.get(first_name)
+        second = bpy.data.objects.get(second_name)
+        if first is None or second is None or first.type != "MESH" or second.type != "MESH":
+            fail("AVATAR_RIG_CLIPPING_PAIR_INVALID")
+        resolved_pairs.append((first, second))
+
+    consecutive = [0] * len(resolved_pairs)
+    maximum = [0] * len(resolved_pairs)
+    original_frame = scene.frame_current
+    try:
+        for frame in frames:
+            scene.frame_set(frame)
+            bpy.context.view_layer.update()
+            depsgraph = bpy.context.evaluated_depsgraph_get()
+            surfaces = {}
+            for index, (first, second) in enumerate(resolved_pairs):
+                for object_ in (first, second):
+                    if object_.as_pointer() not in surfaces:
+                        surfaces[object_.as_pointer()] = evaluated_surface(
+                            object_, depsgraph
+                        )
+                first_tree, first_center = surfaces[first.as_pointer()]
+                second_tree, second_center = surfaces[second.as_pointer()]
+                intersects = (
+                    bool(first_tree.overlap(second_tree))
+                    or point_is_inside_surface(second_tree, first_center)
+                    or point_is_inside_surface(first_tree, second_center)
+                )
+                consecutive[index] = consecutive[index] + 1 if intersects else 0
+                maximum[index] = max(maximum[index], consecutive[index])
+    finally:
+        scene.frame_set(original_frame)
+        bpy.context.view_layer.update()
+    return maximum
+
+
+def validate_pose_clipping(contract, rig, scene):
+    limit = contract["limits"]["maximumPersistentClippingFrames"]
+    results = []
+    rig.animation_data_create()
+    for check in contract.get("poseClippingChecks", []):
+        pose_id = check.get("pose")
+        pairs = check.get("pairs")
+        action = bpy.data.actions.get(f"POSE_PREVIEW.{pose_id}")
+        if action is None or not isinstance(pairs, list) or not pairs:
+            fail("AVATAR_RIG_CLIPPING_CHECK_INVALID")
+        if any(
+            not isinstance(pair, list)
+            or len(pair) != 2
+            or not all(isinstance(name, str) and name for name in pair)
+            for pair in pairs
+        ):
+            fail("AVATAR_RIG_CLIPPING_CHECK_INVALID")
+        rig.animation_data.action = action
+        start, end = (int(value) for value in action.frame_range)
+        maxima = maximum_consecutive_clipping_frames(
+            scene, pairs, range(start, end + 1)
+        )
+        if any(maximum > limit for maximum in maxima):
+            fail("AVATAR_RIG_PERSISTENT_CLIPPING")
+        results.extend(
+            {
+                "pose": pose_id,
+                "objects": pair,
+                "maximumConsecutiveFrames": maximum,
+            }
+            for pair, maximum in zip(pairs, maxima)
+        )
+    rig.animation_data.action = None
+    scene.frame_set(1)
+    bpy.context.view_layer.update()
+    return results
 
 
 def evaluated_world_points(object_, depsgraph):
@@ -296,6 +499,13 @@ def validate_pose_actions(contract, rig, scene):
         for rotation in pose["rotations"].values():
             if rotation.get("axis") not in {"X", "Y", "Z"} or abs(rotation.get("degrees", 999.0)) > 90.0:
                 fail("AVATAR_RIG_POSE_LIMIT_INVALID")
+        for location in pose.get("locations", {}).values():
+            if (
+                not isinstance(location, list)
+                or len(location) != 3
+                or any(not math.isfinite(value) or abs(value) > 0.5 for value in location)
+            ):
+                fail("AVATAR_RIG_POSE_LIMIT_INVALID")
 
     tracked_names = (
         "ArmL", "ArmR", "HandL", "HandR", "ThighL", "ThighR",
@@ -313,12 +523,15 @@ def validate_pose_actions(contract, rig, scene):
     for pose in contract["poses"]:
         action = bpy.data.actions[f"POSE_PREVIEW.{pose['id']}"]
         rig.animation_data.action = action
-        scene.frame_set(1)
+        scene.frame_set(31)
         bpy.context.view_layer.update()
         for bone_name, rotation in pose["rotations"].items():
             axis = {"X": 0, "Y": 1, "Z": 2}[rotation["axis"]]
             actual_degrees = math.degrees(rig.pose.bones[bone_name].rotation_euler[axis])
             if abs(actual_degrees - rotation["degrees"]) > 1e-3:
+                fail("AVATAR_RIG_POSE_ACTION_INVALID")
+        for bone_name, location in pose.get("locations", {}).items():
+            if (rig.pose.bones[bone_name].location - Vector(location)).length > 1e-5:
                 fail("AVATAR_RIG_POSE_ACTION_INVALID")
         depsgraph = bpy.context.evaluated_depsgraph_get()
         all_points = []
@@ -377,21 +590,25 @@ def validate_rig(scene, contract_path=DEFAULT_CONTRACT_PATH):
         fail("AVATAR_RIG_BODY_HIGH_SOURCE_INVALID")
     if contract["limits"].get("maximumPersistentClippingFrames") != 15:
         fail("AVATAR_RIG_CLIPPING_LIMIT_INVALID")
+    scene_visible_mesh_count = validate_scene_wide_visible_mesh_coverage(scene, contract)
     rig = validate_armature(contract)
     metrics = validate_skinning(contract, rig)
     metrics.update(
         {
             "boneCount": len(rig.data.bones),
-            "heldItemProxyChecks": validate_attachments(contract, rig),
+            "heldItemProxyChecks": validate_attachments(scene, contract, rig),
             "correctiveShapeKeyCount": validate_correctives(rig),
+            "sceneVisibleMeshCount": scene_visible_mesh_count,
         }
     )
     pose_bounds, maximum_extent = validate_pose_actions(contract, rig, scene)
+    clipping_checks = validate_pose_clipping(contract, rig, scene)
     metrics.update(
         {
             "posePreviewCount": len(pose_bounds),
             "poseBounds": pose_bounds,
             "maximumPoseExtentMeters": round(maximum_extent, 6),
+            "poseClippingChecks": clipping_checks,
             "triangleCount": evaluated_triangle_count(),
         }
     )
@@ -412,10 +629,98 @@ def configure_render(scene):
     scene.world.color = (0.025, 0.03, 0.04)
 
 
-def render_bounds():
+def create_review_box(name, half_extents, material, collection):
+    x, y, z = half_extents
+    vertices = (
+        (-x, -y, -z),
+        (x, -y, -z),
+        (x, y, -z),
+        (-x, y, -z),
+        (-x, -y, z),
+        (x, -y, z),
+        (x, y, z),
+        (-x, y, z),
+    )
+    faces = (
+        (0, 3, 2, 1),
+        (4, 5, 6, 7),
+        (0, 1, 5, 4),
+        (1, 2, 6, 5),
+        (2, 3, 7, 6),
+        (3, 0, 4, 7),
+    )
+    mesh = bpy.data.meshes.new(name + "Mesh")
+    mesh.from_pydata(vertices, [], faces)
+    mesh.materials.append(material)
+    object_ = bpy.data.objects.new(name, mesh)
+    object_.hide_render = True
+    object_["AVATAR_REVIEW_PROXY"] = "pickaxe"
+    collection.objects.link(object_)
+    return object_
+
+
+def ensure_pickaxe_proxy():
+    shaft = bpy.data.objects.get("ReviewPickaxeShaft")
+    head = bpy.data.objects.get("ReviewPickaxeHead")
+    if shaft is not None and head is not None:
+        return shaft, head
+    collection = bpy.data.collections.get("REVIEW_PROXIES")
+    if collection is None:
+        collection = bpy.data.collections.new("REVIEW_PROXIES")
+        bpy.context.scene.collection.children.link(collection)
+    wood = bpy.data.materials.get("ReviewProxyPickaxeWood") or bpy.data.materials.new(
+        "ReviewProxyPickaxeWood"
+    )
+    wood.diffuse_color = (0.20, 0.085, 0.035, 1.0)
+    metal = bpy.data.materials.get("ReviewProxyPickaxeMetal") or bpy.data.materials.new(
+        "ReviewProxyPickaxeMetal"
+    )
+    metal.diffuse_color = (0.16, 0.22, 0.28, 1.0)
+    shaft = shaft or create_review_box(
+        "ReviewPickaxeShaft", (0.018, 0.36, 0.018), wood, collection
+    )
+    head = head or create_review_box(
+        "ReviewPickaxeHead", (0.16, 0.04, 0.04), metal, collection
+    )
+    head.parent = shaft
+    head.location = (0.0, 0.30, 0.0)
+    head.rotation_euler = (0.0, 0.0, 0.0)
+    return shaft, head
+
+
+def position_pickaxe_proxy(rig, shaft=None, head=None):
+    if shaft is None or head is None:
+        shaft, head = ensure_pickaxe_proxy()
+    grips = [
+        rig.matrix_world @ rig.pose.bones[name].matrix.translation
+        for name in ("heldItemL", "heldItemR")
+    ]
+    direction = grips[1] - grips[0]
+    if direction.length < 0.08:
+        fail("AVATAR_RIG_PICKAXE_GRIP_INVALID")
+    direction.normalize()
+    center = (grips[0] + grips[1]) * 0.5
+    rotation = direction.to_track_quat("Y", "X").to_matrix().to_4x4()
+    shaft.matrix_world = Matrix.Translation(center) @ rotation
+    shaft.hide_render = False
+    head.hide_render = False
+    bpy.context.view_layer.update()
+    return shaft, head
+
+
+def hide_pickaxe_proxy():
+    for name in ("ReviewPickaxeShaft", "ReviewPickaxeHead"):
+        object_ = bpy.data.objects.get(name)
+        if object_ is not None:
+            object_.hide_render = True
+
+
+def render_bounds(extra_objects=()):
     depsgraph = bpy.context.evaluated_depsgraph_get()
     points = []
     for object_ in visible_meshes():
+        points.extend(evaluated_world_points(object_, depsgraph))
+    for object_ in extra_objects:
         points.extend(evaluated_world_points(object_, depsgraph))
     return point_bounds(points)
 
@@ -427,10 +732,38 @@ def fit_camera(camera, bounds, view):
         camera.location = (center.x, bounds[1][0] - 4.0, center.z)
         camera.rotation_euler = (math.pi * 0.5, 0.0, 0.0)
         camera.data.ortho_scale = max(dimensions[0], dimensions[2]) * 1.15
+    elif (
+        (rig := bpy.data.objects.get("RIG_WhiteLily")) is not None
+        and rig.animation_data is not None
+        and rig.animation_data.action is not None
+        and rig.animation_data.action.name == "POSE_PREVIEW.side-sleep"
+    ):
+        hips = rig.matrix_world @ rig.pose.bones["hips"].matrix.translation
+        head = rig.matrix_world @ rig.pose.bones["head"].matrix.translation
+        body_axis = (head - hips).normalized()
+        view_direction = body_axis.cross(Vector((0.0, 0.0, 1.0)))
+        if view_direction.length < 1e-5:
+            view_direction = Vector((-1.0, 0.0, 0.0))
+        view_direction.normalize()
+        camera.location = center - view_direction * 4.0
+        camera.rotation_euler = view_direction.to_track_quat("-Z", "Y").to_euler()
+        right = camera.rotation_euler.to_matrix() @ Vector((1.0, 0.0, 0.0))
+        up = camera.rotation_euler.to_matrix() @ Vector((0.0, 1.0, 0.0))
+        corners = [
+            Vector((x, y, z)) - center
+            for x in bounds[0]
+            for y in bounds[1]
+            for z in bounds[2]
+        ]
+        camera.data.ortho_scale = 2.0 * max(
+            max(abs(point.dot(right)) for point in corners),
+            max(abs(point.dot(up)) for point in corners),
+        ) * 1.03
     else:
         camera.location = (bounds[0][1] + 4.0, center.y, center.z)
         camera.rotation_euler = (math.pi * 0.5, 0.0, math.pi * 0.5)
         camera.data.ortho_scale = max(dimensions[1], dimensions[2]) * 1.15
+    bpy.context.view_layer.update()
 
 
 def render_view(scene, camera, filepath):
@@ -523,14 +856,19 @@ def render_pose_previews(scene, contract, output_directory):
     heat_material = create_weight_material({bone["name"] for bone in contract["bones"]})
     outputs = []
     for pose in contract["poses"]:
+        hide_pickaxe_proxy()
         rig.animation_data.action = bpy.data.actions[f"POSE_PREVIEW.{pose['id']}"]
-        scene.frame_set(1)
+        scene.frame_set(31)
         bpy.context.view_layer.update()
         for object_ in visible_meshes():
             object_.data.materials.clear()
             for material in original_materials[object_.as_pointer()]:
                 object_.data.materials.append(material)
-        bounds = render_bounds()
+        extra_objects = ()
+        if pose["id"] == "bent-elbow-pickaxe":
+            extra_objects = position_pickaxe_proxy(rig)
+            validate_scene_wide_visible_mesh_coverage(scene, contract)
+        bounds = render_bounds(extra_objects)
         pose_panel_directory = os.path.join(panel_directory, pose["id"])
         os.makedirs(pose_panel_directory, exist_ok=True)
         front_path = os.path.join(pose_panel_directory, "front.png")
@@ -549,6 +887,7 @@ def render_pose_previews(scene, contract, output_directory):
         create_contact_sheet((front_path, side_path, weights_path), output_path)
         outputs.append(output_path)
     rig.animation_data.action = None
+    hide_pickaxe_proxy()
     scene.frame_set(1)
     return outputs
 

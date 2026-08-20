@@ -77,6 +77,7 @@ export async function buildAnimeAvatar({
   blenderPath,
   outputDirectory,
   renderPreviews = false,
+  runCommand = run,
   stage = "bootstrap",
   verifyOnly = false,
 } = {}) {
@@ -89,7 +90,7 @@ export async function buildAnimeAvatar({
   if (verifyOnly) return { version: REQUIRED_BLENDER_VERSION };
   const executable =
     blenderPath ?? process.env.WHITELILY_BLENDER_PATH ?? process.env.BLENDER_PATH ?? "blender";
-  const versionOutput = await run(executable, ["--version"]);
+  const versionOutput = await runCommand(executable, ["--version"]);
   if (
     !new RegExp(`^Blender ${REQUIRED_BLENDER_VERSION.replaceAll(".", "\\.")}(?:\\s|$)`, "m").test(
       versionOutput,
@@ -97,7 +98,7 @@ export async function buildAnimeAvatar({
   ) {
     throw buildError("BLENDER_VERSION_MISMATCH");
   }
-  await run(executable, [
+  await runCommand(executable, [
     "--background",
     "--python-exit-code",
     "12",
@@ -111,15 +112,15 @@ export async function buildAnimeAvatar({
     stage === "rig" ? "body-high" : stage,
   ]);
   if (stage === "body-high") {
-    await run(executable, bodyHighValidationArguments());
+    await runCommand(executable, bodyHighValidationArguments());
     return { version: REQUIRED_BLENDER_VERSION, executable, stage };
   }
   if (stage === "rig") {
-    await run(executable, rigValidationArguments());
+    await runCommand(executable, rigValidationArguments());
     return { version: REQUIRED_BLENDER_VERSION, executable, stage };
   }
   if (outputDirectory) {
-    await run(executable, [
+    await runCommand(executable, [
       "--background",
       "--python-exit-code",
       "12",

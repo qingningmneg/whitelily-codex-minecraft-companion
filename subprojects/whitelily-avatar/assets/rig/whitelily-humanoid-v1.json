@@ -15,6 +15,12 @@
     "maximumPersistentClippingFrames": 15,
     "sampleRateFps": 30
   },
+  "visibleMeshCoverage": {
+    "allowed": [
+      { "object": "ReviewPickaxeShaft", "reason": "Neutral review-only proxy positioned through both evaluated held-item grips." },
+      { "object": "ReviewPickaxeHead", "reason": "Neutral review-only proxy head paired with the formal pickaxe shaft." }
+    ]
+  },
   "semanticBones": [
     "hips",
     "spine",
@@ -108,19 +114,23 @@
     }
   },
   "itemProxies": [
-    { "id": "sword", "center": [0.0, 0.15, 0.0], "halfExtents": [0.025, 0.13, 0.025], "longAxis": "+Y" },
-    { "id": "pickaxe", "center": [0.0, 0.14, 0.0], "halfExtents": [0.16, 0.12, 0.03], "longAxis": "+Y" },
-    { "id": "fishingRod", "center": [0.0, 0.17, 0.0], "halfExtents": [0.018, 0.15, 0.018], "longAxis": "+Y" },
-    { "id": "bread", "center": [0.0, 0.10, 0.0], "halfExtents": [0.06, 0.07, 0.035], "longAxis": "+Y" }
+    { "id": "sword", "center": [0.0, 0.205, 0.0], "halfExtents": [0.025, 0.13, 0.025], "longAxis": "+Y" },
+    { "id": "pickaxe", "center": [0.0, 0.195, 0.0], "halfExtents": [0.16, 0.12, 0.03], "longAxis": "+Y" },
+    { "id": "fishingRod", "center": [0.0, 0.225, 0.0], "halfExtents": [0.018, 0.15, 0.018], "longAxis": "+Y" },
+    { "id": "bread", "center": [0.0, 0.145, 0.0], "halfExtents": [0.06, 0.07, 0.035], "longAxis": "+Y" }
   ],
   "poses": [
     { "id": "t-pose", "rotations": { "leftUpperArm": { "axis": "Z", "degrees": -82.0 }, "rightUpperArm": { "axis": "Z", "degrees": 82.0 } } },
     { "id": "a-pose", "rotations": { "leftUpperArm": { "axis": "Z", "degrees": -43.0 }, "rightUpperArm": { "axis": "Z", "degrees": 43.0 } } },
     { "id": "arms-forward", "rotations": { "leftUpperArm": { "axis": "X", "degrees": -82.0 }, "rightUpperArm": { "axis": "X", "degrees": -82.0 } } },
-    { "id": "bent-elbow-pickaxe", "rotations": { "leftUpperArm": { "axis": "X", "degrees": -45.0 }, "rightUpperArm": { "axis": "X", "degrees": -70.0 }, "leftLowerArm": { "axis": "Z", "degrees": 70.0 }, "rightLowerArm": { "axis": "Z", "degrees": -82.0 } } },
-    { "id": "deep-stride", "rotations": { "leftUpperLeg": { "axis": "X", "degrees": -48.0 }, "rightUpperLeg": { "axis": "X", "degrees": 42.0 }, "leftLowerLeg": { "axis": "X", "degrees": 58.0 }, "leftUpperArm": { "axis": "X", "degrees": 32.0 }, "rightUpperArm": { "axis": "X", "degrees": -32.0 } } },
+    { "id": "bent-elbow-pickaxe", "rotations": { "leftShoulder": { "axis": "Z", "degrees": -6.0 }, "rightShoulder": { "axis": "Z", "degrees": 6.0 }, "leftUpperArm": { "axis": "X", "degrees": -45.0 }, "rightUpperArm": { "axis": "X", "degrees": -70.0 }, "leftLowerArm": { "axis": "Z", "degrees": 70.0 }, "rightLowerArm": { "axis": "Z", "degrees": -82.0 } } },
+    { "id": "deep-stride", "rotations": { "leftUpperLeg": { "axis": "X", "degrees": -48.0 }, "rightUpperLeg": { "axis": "X", "degrees": 42.0 }, "leftLowerLeg": { "axis": "X", "degrees": 40.0 }, "leftUpperArm": { "axis": "X", "degrees": 32.0 }, "rightUpperArm": { "axis": "X", "degrees": -32.0 }, "secondary.skirt.inner.L": { "axis": "X", "degrees": 20.0 }, "secondary.skirt.inner.R": { "axis": "X", "degrees": -20.0 }, "secondary.skirt.outer.L": { "axis": "X", "degrees": 80.0 }, "secondary.skirt.outer.R": { "axis": "X", "degrees": 40.0 } }, "locations": { "secondary.skirt.outer.L": [0.0, 0.0, 0.15] } },
     { "id": "swimming-stretch", "rotations": { "leftUpperArm": { "axis": "X", "degrees": -88.0 }, "rightUpperArm": { "axis": "X", "degrees": -88.0 }, "leftUpperLeg": { "axis": "X", "degrees": 14.0 }, "rightUpperLeg": { "axis": "X", "degrees": 14.0 } } },
     { "id": "side-sleep", "rotations": { "hips": { "axis": "Z", "degrees": 88.0 }, "leftUpperArm": { "axis": "Z", "degrees": -38.0 }, "rightUpperArm": { "axis": "Z", "degrees": 38.0 }, "leftUpperLeg": { "axis": "X", "degrees": -24.0 }, "rightUpperLeg": { "axis": "X", "degrees": 20.0 }, "leftLowerLeg": { "axis": "X", "degrees": 34.0 } } }
+  ],
+  "poseClippingChecks": [
+    { "pose": "bent-elbow-pickaxe", "pairs": [["SleeveL", "SleeveR"]] },
+    { "pose": "deep-stride", "pairs": [["ThighL", "SkirtOuter"], ["ShinL", "SkirtInner"], ["ShinL", "SkirtOuter"], ["ShinR", "SkirtInner"], ["ShinR", "SkirtOuter"]] }
   ],
   "runtimeManifest": {
     "bodyAnimation": "whitelily-humanoid-v1",
