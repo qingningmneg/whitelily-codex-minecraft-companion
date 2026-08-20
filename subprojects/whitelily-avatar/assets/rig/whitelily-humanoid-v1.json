@@ -1,0 +1,134 @@
+{
+  "schemaVersion": 1,
+  "id": "whitelily-humanoid-v1",
+  "armature": "RIG_WhiteLily",
+  "coordinateSystem": {
+    "handedness": "right",
+    "upAxis": "+Z",
+    "forwardAxis": "-Y",
+    "units": "meters"
+  },
+  "limits": {
+    "maximumJoints": 128,
+    "maximumWeightsPerVertex": 4,
+    "weightSumTolerance": 0.0001,
+    "maximumPersistentClippingFrames": 15,
+    "sampleRateFps": 30
+  },
+  "semanticBones": [
+    "hips",
+    "spine",
+    "chest",
+    "upperChest",
+    "neck",
+    "head",
+    "leftShoulder",
+    "leftUpperArm",
+    "leftLowerArm",
+    "leftHand",
+    "leftUpperLeg",
+    "leftLowerLeg",
+    "leftFoot",
+    "leftToes",
+    "rightShoulder",
+    "rightUpperArm",
+    "rightLowerArm",
+    "rightHand",
+    "rightUpperLeg",
+    "rightLowerLeg",
+    "rightFoot",
+    "rightToes"
+  ],
+  "bones": [
+    { "name": "hips", "parent": null, "role": "semantic", "deform": true, "head": [0.0, 0.0, 0.97], "tail": [0.0, 0.0, 1.08] },
+    { "name": "spine", "parent": "hips", "role": "semantic", "deform": true, "head": [0.0, 0.0, 1.02], "tail": [0.0, 0.0, 1.22] },
+    { "name": "chest", "parent": "spine", "role": "semantic", "deform": true, "head": [0.0, 0.0, 1.20], "tail": [0.0, 0.0, 1.43] },
+    { "name": "upperChest", "parent": "chest", "role": "semantic", "deform": true, "head": [0.0, 0.0, 1.34], "tail": [0.0, 0.0, 1.48] },
+    { "name": "neck", "parent": "chest", "role": "semantic", "deform": true, "head": [0.0, 0.0, 1.43], "tail": [0.0, 0.0, 1.54] },
+    { "name": "head", "parent": "neck", "role": "semantic", "deform": true, "head": [0.0, 0.0, 1.53], "tail": [0.0, 0.0, 1.76] },
+
+    { "name": "leftShoulder", "parent": "upperChest", "role": "semantic", "deform": true, "head": [0.0, 0.0, 1.43], "tail": [0.18, -0.015, 1.43] },
+    { "name": "leftUpperArm", "parent": "leftShoulder", "role": "semantic", "deform": true, "head": [0.18, -0.015, 1.43], "tail": [0.215, -0.035, 1.19] },
+    { "name": "leftLowerArm", "parent": "leftUpperArm", "role": "semantic", "deform": true, "head": [0.215, -0.035, 1.19], "tail": [0.242, -0.055, 0.98] },
+    { "name": "leftHand", "parent": "leftLowerArm", "role": "semantic", "deform": true, "head": [0.242, -0.055, 0.98], "tail": [0.246, -0.061, 0.89] },
+    { "name": "leftUpperLeg", "parent": "hips", "role": "semantic", "deform": true, "head": [0.075, 0.0, 0.98], "tail": [0.075, -0.005, 0.64] },
+    { "name": "leftLowerLeg", "parent": "leftUpperLeg", "role": "semantic", "deform": true, "head": [0.075, -0.005, 0.64], "tail": [0.075, -0.005, 0.18] },
+    { "name": "leftFoot", "parent": "leftLowerLeg", "role": "semantic", "deform": true, "head": [0.075, -0.005, 0.18], "tail": [0.075, -0.135, 0.08] },
+    { "name": "leftToes", "parent": "leftFoot", "role": "semantic", "deform": true, "head": [0.075, -0.135, 0.08], "tail": [0.075, -0.20, 0.055] },
+
+    { "name": "rightShoulder", "parent": "upperChest", "role": "semantic", "deform": true, "head": [0.0, 0.0, 1.43], "tail": [-0.18, -0.015, 1.43] },
+    { "name": "rightUpperArm", "parent": "rightShoulder", "role": "semantic", "deform": true, "head": [-0.18, -0.015, 1.43], "tail": [-0.215, -0.035, 1.19] },
+    { "name": "rightLowerArm", "parent": "rightUpperArm", "role": "semantic", "deform": true, "head": [-0.215, -0.035, 1.19], "tail": [-0.242, -0.055, 0.98] },
+    { "name": "rightHand", "parent": "rightLowerArm", "role": "semantic", "deform": true, "head": [-0.242, -0.055, 0.98], "tail": [-0.246, -0.061, 0.89] },
+    { "name": "rightUpperLeg", "parent": "hips", "role": "semantic", "deform": true, "head": [-0.075, 0.0, 0.98], "tail": [-0.075, -0.005, 0.64] },
+    { "name": "rightLowerLeg", "parent": "rightUpperLeg", "role": "semantic", "deform": true, "head": [-0.075, -0.005, 0.64], "tail": [-0.075, -0.005, 0.18] },
+    { "name": "rightFoot", "parent": "rightLowerLeg", "role": "semantic", "deform": true, "head": [-0.075, -0.005, 0.18], "tail": [-0.075, -0.135, 0.08] },
+    { "name": "rightToes", "parent": "rightFoot", "role": "semantic", "deform": true, "head": [-0.075, -0.135, 0.08], "tail": [-0.075, -0.20, 0.055] },
+
+    { "name": "jaw", "parent": "head", "role": "face", "deform": true, "head": [0.0, -0.08, 1.60], "tail": [0.0, -0.10, 1.52] },
+    { "name": "eyeL", "parent": "head", "role": "face", "deform": true, "head": [0.05, -0.09, 1.64], "tail": [0.05, -0.15, 1.64] },
+    { "name": "eyeR", "parent": "head", "role": "face", "deform": true, "head": [-0.05, -0.09, 1.64], "tail": [-0.05, -0.15, 1.64] },
+    { "name": "eyelidL", "parent": "eyeL", "role": "face", "deform": true, "head": [0.05, -0.105, 1.645], "tail": [0.05, -0.145, 1.645] },
+    { "name": "eyelidR", "parent": "eyeR", "role": "face", "deform": true, "head": [-0.05, -0.105, 1.645], "tail": [-0.05, -0.145, 1.645] },
+
+    { "name": "secondary.hair.back.01", "parent": "head", "role": "secondary", "deform": true, "head": [0.0, 0.12, 1.70], "tail": [0.0, 0.18, 1.40] },
+    { "name": "secondary.hair.back.02", "parent": "secondary.hair.back.01", "role": "secondary", "deform": true, "head": [0.0, 0.18, 1.40], "tail": [0.0, 0.22, 1.10] },
+    { "name": "secondary.hair.back.03", "parent": "secondary.hair.back.02", "role": "secondary", "deform": true, "head": [0.0, 0.22, 1.10], "tail": [0.0, 0.24, 0.80] },
+    { "name": "secondary.hair.left.01", "parent": "head", "role": "secondary", "deform": true, "head": [0.12, 0.06, 1.68], "tail": [0.15, 0.08, 1.40] },
+    { "name": "secondary.hair.left.02", "parent": "secondary.hair.left.01", "role": "secondary", "deform": true, "head": [0.15, 0.08, 1.40], "tail": [0.16, 0.10, 1.12] },
+    { "name": "secondary.hair.left.03", "parent": "secondary.hair.left.02", "role": "secondary", "deform": true, "head": [0.16, 0.10, 1.12], "tail": [0.17, 0.12, 0.86] },
+    { "name": "secondary.hair.right.01", "parent": "head", "role": "secondary", "deform": true, "head": [-0.12, 0.06, 1.68], "tail": [-0.15, 0.08, 1.40] },
+    { "name": "secondary.hair.right.02", "parent": "secondary.hair.right.01", "role": "secondary", "deform": true, "head": [-0.15, 0.08, 1.40], "tail": [-0.16, 0.10, 1.12] },
+    { "name": "secondary.hair.right.03", "parent": "secondary.hair.right.02", "role": "secondary", "deform": true, "head": [-0.16, 0.10, 1.12], "tail": [-0.17, 0.12, 0.86] },
+
+    { "name": "secondary.sleeveL.upper", "parent": "leftUpperArm", "role": "secondary", "deform": true, "head": [0.18, -0.015, 1.43], "tail": [0.215, -0.035, 1.19] },
+    { "name": "secondary.sleeveL.lower", "parent": "leftLowerArm", "role": "secondary", "deform": true, "head": [0.215, -0.035, 1.19], "tail": [0.242, -0.055, 0.98] },
+    { "name": "secondary.sleeveR.upper", "parent": "rightUpperArm", "role": "secondary", "deform": true, "head": [-0.18, -0.015, 1.43], "tail": [-0.215, -0.035, 1.19] },
+    { "name": "secondary.sleeveR.lower", "parent": "rightLowerArm", "role": "secondary", "deform": true, "head": [-0.215, -0.035, 1.19], "tail": [-0.242, -0.055, 0.98] },
+    { "name": "secondary.skirt.inner.L", "parent": "hips", "role": "secondary", "deform": true, "head": [0.07, 0.0, 1.00], "tail": [0.16, 0.02, 0.30] },
+    { "name": "secondary.skirt.inner.R", "parent": "hips", "role": "secondary", "deform": true, "head": [-0.07, 0.0, 1.00], "tail": [-0.16, 0.02, 0.30] },
+    { "name": "secondary.skirt.outer.L", "parent": "hips", "role": "secondary", "deform": true, "head": [0.08, -0.01, 1.01], "tail": [0.22, -0.02, 0.31] },
+    { "name": "secondary.skirt.outer.R", "parent": "hips", "role": "secondary", "deform": true, "head": [-0.08, -0.01, 1.01], "tail": [-0.22, -0.02, 0.31] },
+    { "name": "secondary.ribbon", "parent": "hips", "role": "secondary", "deform": true, "head": [0.0, 0.35, 1.03], "tail": [0.0, 0.35, 0.74] },
+    { "name": "secondary.lily", "parent": "head", "role": "secondary", "deform": true, "head": [-0.15, -0.10, 1.64], "tail": [-0.15, -0.10, 1.73] },
+    { "name": "attachment.back", "parent": "upperChest", "role": "attachment", "deform": false, "head": [0.0, 0.14, 1.34], "tail": [0.0, 0.22, 1.34] },
+    { "name": "heldItemL", "parent": "leftHand", "role": "attachment", "deform": false, "head": [0.24585, -0.06095, 0.93985], "tail": [0.25410, -0.06759, 0.86056], "rollAxisWorld": [0.0, 1.0, 0.0] },
+    { "name": "heldItemR", "parent": "rightHand", "role": "attachment", "deform": false, "head": [-0.24585, -0.06095, 0.93985], "tail": [-0.25410, -0.06759, 0.86056], "rollAxisWorld": [0.0, 1.0, 0.0] }
+  ],
+  "attachments": {
+    "heldItemL": {
+      "origin": "palmCenter",
+      "localAxes": { "+Y": "forearmTowardFingers", "+Z": "handBack" },
+      "palmClearanceMeters": 0.015
+    },
+    "heldItemR": {
+      "origin": "palmCenter",
+      "localAxes": { "+Y": "forearmTowardFingers", "+Z": "handBack" },
+      "palmClearanceMeters": 0.015
+    }
+  },
+  "itemProxies": [
+    { "id": "sword", "center": [0.0, 0.15, 0.0], "halfExtents": [0.025, 0.13, 0.025], "longAxis": "+Y" },
+    { "id": "pickaxe", "center": [0.0, 0.14, 0.0], "halfExtents": [0.16, 0.12, 0.03], "longAxis": "+Y" },
+    { "id": "fishingRod", "center": [0.0, 0.17, 0.0], "halfExtents": [0.018, 0.15, 0.018], "longAxis": "+Y" },
+    { "id": "bread", "center": [0.0, 0.10, 0.0], "halfExtents": [0.06, 0.07, 0.035], "longAxis": "+Y" }
+  ],
+  "poses": [
+    { "id": "t-pose", "rotations": { "leftUpperArm": { "axis": "Z", "degrees": -82.0 }, "rightUpperArm": { "axis": "Z", "degrees": 82.0 } } },
+    { "id": "a-pose", "rotations": { "leftUpperArm": { "axis": "Z", "degrees": -43.0 }, "rightUpperArm": { "axis": "Z", "degrees": 43.0 } } },
+    { "id": "arms-forward", "rotations": { "leftUpperArm": { "axis": "X", "degrees": -82.0 }, "rightUpperArm": { "axis": "X", "degrees": -82.0 } } },
+    { "id": "bent-elbow-pickaxe", "rotations": { "leftUpperArm": { "axis": "X", "degrees": -45.0 }, "rightUpperArm": { "axis": "X", "degrees": -70.0 }, "leftLowerArm": { "axis": "Z", "degrees": 70.0 }, "rightLowerArm": { "axis": "Z", "degrees": -82.0 } } },
+    { "id": "deep-stride", "rotations": { "leftUpperLeg": { "axis": "X", "degrees": -48.0 }, "rightUpperLeg": { "axis": "X", "degrees": 42.0 }, "leftLowerLeg": { "axis": "X", "degrees": 58.0 }, "leftUpperArm": { "axis": "X", "degrees": 32.0 }, "rightUpperArm": { "axis": "X", "degrees": -32.0 } } },
+    { "id": "swimming-stretch", "rotations": { "leftUpperArm": { "axis": "X", "degrees": -88.0 }, "rightUpperArm": { "axis": "X", "degrees": -88.0 }, "leftUpperLeg": { "axis": "X", "degrees": 14.0 }, "rightUpperLeg": { "axis": "X", "degrees": 14.0 } } },
+    { "id": "side-sleep", "rotations": { "hips": { "axis": "Z", "degrees": 88.0 }, "leftUpperArm": { "axis": "Z", "degrees": -38.0 }, "rightUpperArm": { "axis": "Z", "degrees": 38.0 }, "leftUpperLeg": { "axis": "X", "degrees": -24.0 }, "rightUpperLeg": { "axis": "X", "degrees": 20.0 }, "leftLowerLeg": { "axis": "X", "degrees": 34.0 } } }
+  ],
+  "runtimeManifest": {
+    "bodyAnimation": "whitelily-humanoid-v1",
+    "armature": "RIG_WhiteLily",
+    "attachmentBones": {
+      "leftHeldItem": "heldItemL",
+      "rightHeldItem": "heldItemR",
+      "backEquipment": "attachment.back"
+    }
+  }
+}
