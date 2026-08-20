@@ -28,6 +28,10 @@ from validate_blender_version import validate_blender_version
 ASSET_DIRECTORY = os.path.dirname(os.path.dirname(SCRIPT_DIRECTORY))
 SOURCE_DIRECTORY = os.path.join(ASSET_DIRECTORY, "assets", "source")
 EXPORT_PROFILE_PATH = os.path.join(ASSET_DIRECTORY, "assets", "blender", "export-profile.json")
+PACKED_MATERIAL_IMAGES = {
+    "whitelily-base-albedo.png",
+    "whitelily-base-control.png",
+}
 
 
 class AvatarValidationError(RuntimeError):
@@ -112,10 +116,16 @@ def validate_reference_images(scene):
         reference_images.append(image)
     if reference_names != set(REQUIRED_SOURCE_DIGESTS):
         fail("AVATAR_PACKED_SOURCE_INVALID")
-    source_images = [image for image in bpy.data.images if image.source == "FILE"]
-    if len(source_images) != len(reference_images) or {
-        image.as_pointer() for image in source_images
-    } != {image.as_pointer() for image in reference_images}:
+    file_images = [image for image in bpy.data.images if image.source == "FILE"]
+    material_images = [image for image in file_images if image.name in PACKED_MATERIAL_IMAGES]
+    if any(image.packed_file is None for image in material_images):
+        fail("AVATAR_RESOURCE_UNPACKED")
+    if set(image.name for image in material_images) not in (set(), PACKED_MATERIAL_IMAGES):
+        fail("AVATAR_RESOURCE_UNPACKED")
+    approved_images = {image.as_pointer() for image in reference_images + material_images}
+    if len(file_images) != len(approved_images) or {
+        image.as_pointer() for image in file_images
+    } != approved_images:
         fail("AVATAR_RESOURCE_UNPACKED")
 
 

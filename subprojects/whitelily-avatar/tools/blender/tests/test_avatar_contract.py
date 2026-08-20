@@ -59,6 +59,29 @@ class AvatarContractTest(unittest.TestCase):
             with self.assertRaisesRegex(AvatarValidationError, "AVATAR_PACKED_SOURCE_INVALID"):
                 validate_reference_images(bpy.context.scene)
 
+    def test_packed_material_atlases_do_not_invalidate_approved_reference_images(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            for material in list(bpy.data.materials):
+                bpy.data.materials.remove(material, do_unlink=True)
+            for image in list(bpy.data.images):
+                bpy.data.images.remove(image, do_unlink=True)
+            bootstrap(os.path.join(temporary_directory, "avatar.blend"))
+            for atlas_name in (
+                "whitelily-base-albedo.png",
+                "whitelily-base-control.png",
+            ):
+                atlas_path = os.path.join(temporary_directory, atlas_name)
+                generated = bpy.data.images.new(
+                    f"temporary-{atlas_name}", width=1, height=1, alpha=True
+                )
+                generated.filepath_raw = atlas_path
+                generated.file_format = "PNG"
+                generated.save()
+                bpy.data.images.remove(generated)
+                atlas = bpy.data.images.load(atlas_path, check_existing=False)
+                atlas.pack()
+            validate_reference_images(bpy.context.scene)
+
     def test_gltf_export_arguments_pin_four_vertex_influences(self):
         profile = {
             "format": "glTF 2.0",

@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   bodyHighValidationArguments,
   buildAnimeAvatar,
+  materialsValidationArguments,
   rigValidationArguments,
 } from "./build-anime-avatar.mjs";
 
@@ -80,4 +81,39 @@ test("rig stage stops before rig validation when body-high precheck fails", asyn
     /AVATAR_BODY_HIGH_PRECHECK_FAILED/,
   );
   assert.equal(calls.length, 2);
+});
+
+test("materials stage uses the formal blend and reproducible comparison directory", () => {
+  assert.deepEqual(materialsValidationArguments("C:\\repo"), [
+    "--background",
+    "--python-exit-code",
+    "12",
+    "C:\\repo\\subprojects\\whitelily-avatar\\assets\\blender\\whitelily-anime-avatar.blend",
+    "--python",
+    "C:\\repo\\subprojects\\whitelily-avatar\\tools\\blender\\bake_cel_materials.py",
+    "--",
+    "--validate",
+    "--output-dir",
+    "C:\\repo\\subprojects\\whitelily-avatar\\assets\\review\\materials",
+    "--render-comparisons",
+  ]);
+});
+
+test("materials stage executes body-high precheck before material comparisons", async () => {
+  const calls = [];
+  const runCommand = async (command, arguments_) => {
+    calls.push([command, arguments_]);
+    return arguments_[0] === "--version" ? "Blender 4.5.3\n" : "";
+  };
+
+  await buildAnimeAvatar({
+    blenderPath: "fake-blender",
+    runCommand,
+    stage: "materials",
+  });
+
+  assert.equal(calls.length, 3);
+  assert.deepEqual(calls[0], ["fake-blender", ["--version"]]);
+  assert.match(calls[1][1].join(" "), /validate_avatar\.py .*--stage body-high/);
+  assert.match(calls[2][1].join(" "), /bake_cel_materials\.py .*--validate .*--render-comparisons/);
 });

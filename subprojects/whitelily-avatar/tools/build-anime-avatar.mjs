@@ -47,6 +47,23 @@ export function rigValidationArguments(root = repositoryRoot) {
   ];
 }
 
+export function materialsValidationArguments(root = repositoryRoot) {
+  const rootAvatar = path.join(root, "subprojects", "whitelily-avatar");
+  return [
+    "--background",
+    "--python-exit-code",
+    "12",
+    path.join(rootAvatar, "assets", "blender", "whitelily-anime-avatar.blend"),
+    "--python",
+    path.join(rootAvatar, "tools", "blender", "bake_cel_materials.py"),
+    "--",
+    "--validate",
+    "--output-dir",
+    path.join(rootAvatar, "assets", "review", "materials"),
+    "--render-comparisons",
+  ];
+}
+
 function buildError(code) {
   return new Error(code);
 }
@@ -84,7 +101,7 @@ export async function buildAnimeAvatar({
   if (blenderVersion !== undefined && blenderVersion !== REQUIRED_BLENDER_VERSION) {
     throw buildError("BLENDER_VERSION_MISMATCH");
   }
-  if (!new Set(["bootstrap", "body-high", "rig"]).has(stage)) {
+  if (!new Set(["bootstrap", "body-high", "rig", "materials"]).has(stage)) {
     throw buildError("AVATAR_ART_STAGE_INVALID");
   }
   if (verifyOnly) return { version: REQUIRED_BLENDER_VERSION };
@@ -109,7 +126,7 @@ export async function buildAnimeAvatar({
     "--source-root",
     sourceRoot,
     "--stage",
-    stage === "rig" ? "body-high" : stage,
+    new Set(["rig", "materials"]).has(stage) ? "body-high" : stage,
   ]);
   if (stage === "body-high") {
     await runCommand(executable, bodyHighValidationArguments());
@@ -117,6 +134,10 @@ export async function buildAnimeAvatar({
   }
   if (stage === "rig") {
     await runCommand(executable, rigValidationArguments());
+    return { version: REQUIRED_BLENDER_VERSION, executable, stage };
+  }
+  if (stage === "materials") {
+    await runCommand(executable, materialsValidationArguments());
     return { version: REQUIRED_BLENDER_VERSION, executable, stage };
   }
   if (outputDirectory) {
