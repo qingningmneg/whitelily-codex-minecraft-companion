@@ -41,6 +41,27 @@ PHYSICAL_SUBPIECES = (
     "LilyStamen04", "LilyStamen05", "LilyStamen06",
 )
 SHELL_OBJECTS = ("SleeveL", "SleeveR", "SkirtInner", "SkirtOuter")
+PRIMARY_VISIBLE_STRUCTURAL_MESHES = {
+    "Body": 1,
+    "Face": 1,
+    "Hair": 1,
+    "HairBack": 1,
+    "DressBase": 1,
+    "ArmL": 1,
+    "ArmR": 1,
+    "HandL": 1,
+    "HandR": 1,
+    "ThighL": 1,
+    "ThighR": 1,
+    "ShinL": 1,
+    "ShinR": 1,
+    "FootL": 1,
+    "FootR": 1,
+    "ShoeSoleL": 1,
+    "ShoeSoleR": 1,
+    "BootL": 1,
+    "BootR": 1,
+}
 
 
 def collection_meshes(*collection_names):
@@ -123,6 +144,74 @@ def manifold_volume_and_thickness(object_):
         return manifold, volume, volume / area if area else 0.0
     finally:
         bm.free()
+
+
+def evaluated_mesh_integrity(object_):
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    evaluated = object_.evaluated_get(depsgraph)
+    mesh = evaluated.to_mesh(preserve_all_data_layers=False, depsgraph=depsgraph)
+    try:
+        vertices = [object_.matrix_world @ vertex.co for vertex in mesh.vertices]
+        adjacency = defaultdict(set)
+        edge_directions = defaultdict(list)
+        degenerate_faces = 0
+        for polygon in mesh.polygons:
+            indices = tuple(polygon.vertices)
+            if len(indices) < 3:
+                degenerate_faces += 1
+                continue
+            origin = vertices[indices[0]]
+            doubled_area = Vector()
+            for offset in range(1, len(indices) - 1):
+                doubled_area += (vertices[indices[offset]] - origin).cross(
+                    vertices[indices[offset + 1]] - origin
+                )
+            if doubled_area.length <= 2e-12:
+                degenerate_faces += 1
+            for index, first in enumerate(indices):
+                second = indices[(index + 1) % len(indices)]
+                adjacency[first].add(second)
+                adjacency[second].add(first)
+                key = tuple(sorted((first, second)))
+                edge_directions[key].append(1 if (first, second) == key else -1)
+
+        remaining = set(range(len(vertices)))
+        components = 0
+        while remaining:
+            components += 1
+            queue = [remaining.pop()]
+            while queue:
+                current = queue.pop()
+                for neighbor in adjacency[current]:
+                    if neighbor in remaining:
+                        remaining.remove(neighbor)
+                        queue.append(neighbor)
+
+        nonmanifold_edges = sum(len(directions) != 2 for directions in edge_directions.values())
+        inconsistent_edges = sum(
+            len(directions) == 2 and sum(directions) != 0
+            for directions in edge_directions.values()
+        )
+        bm = bmesh.new()
+        bm.from_mesh(mesh)
+        bm.transform(object_.matrix_world)
+        try:
+            signed_volume = bm.calc_volume(signed=True)
+        finally:
+            bm.free()
+        dimensions = object_.dimensions
+        bounding_volume = max(0.0, dimensions.x * dimensions.y * dimensions.z)
+        minimum_volume = max(1e-12, bounding_volume * 1e-6)
+        return {
+            "components": components,
+            "nonmanifoldEdges": nonmanifold_edges,
+            "inconsistentEdges": inconsistent_edges,
+            "degenerateFaces": degenerate_faces,
+            "signedVolume": signed_volume,
+            "minimumVolume": minimum_volume,
+        }
+    finally:
+        evaluated.to_mesh_clear()
 
 
 def group_forms_closed_loop(object_name, group_name, minimum_vertices=12):
@@ -394,6 +483,19 @@ class BodyHighContractTest(unittest.TestCase):
                 object_name,
             )
 
+    def test_every_primary_visible_mesh_is_a_closed_outward_non_degenerate_solid(self):
+        for object_name, expected_components in PRIMARY_VISIBLE_STRUCTURAL_MESHES.items():
+            object_ = bpy.data.objects.get(object_name)
+            self.assertIsNotNone(object_, object_name)
+            self.assertEqual(object_.type, "MESH", object_name)
+            integrity = evaluated_mesh_integrity(object_)
+            with self.subTest(object_name=object_name, integrity=integrity):
+                self.assertEqual(integrity["components"], expected_components)
+                self.assertEqual(integrity["nonmanifoldEdges"], 0)
+                self.assertEqual(integrity["inconsistentEdges"], 0)
+                self.assertEqual(integrity["degenerateFaces"], 0)
+                self.assertGreater(integrity["signedVolume"], integrity["minimumVolume"])
+
     def test_hair_strands_are_tapered_connected_and_layered(self):
         strand_names = tuple(f"HairStrand{index:02d}" for index in range(1, 9))
         tip_heights = set()
@@ -411,8 +513,8 @@ class BodyHighContractTest(unittest.TestCase):
         self.assertTrue(group_forms_closed_loop("EyelidR", "BlinkLoop"))
         self.assertTrue(group_forms_closed_loop("Mouth", "MouthLoop"))
         for side in ("L", "R"):
-            self.assertTrue(group_forms_closed_loop("UpperArm" + side, "ShoulderLoop", 16))
-            self.assertTrue(group_forms_closed_loop("UpperArm" + side, "ElbowLoop", 16))
+            self.assertTrue(group_forms_closed_loop("Arm" + side, "ShoulderLoop", 16))
+            self.assertTrue(group_forms_closed_loop("Arm" + side, "ElbowLoop", 16))
 
     def test_outfit_and_decorations_are_named_manifold_physical_structures(self):
         for object_name in PHYSICAL_SUBPIECES + SHELL_OBJECTS:
@@ -446,6 +548,8 @@ class BodyHighContractTest(unittest.TestCase):
         self.assertEqual(bvh_overlap("SkirtInner", "SkirtOuter"), [])
         self.assertEqual(bvh_overlap("SleeveL", "HandL"), [])
         self.assertEqual(bvh_overlap("SleeveR", "HandR"), [])
+        self.assertEqual(bvh_overlap("FootL", "FootR"), [])
+        self.assertEqual(bvh_overlap("ShoeSoleL", "ShoeSoleR"), [])
 
 
 if __name__ == "__main__":
