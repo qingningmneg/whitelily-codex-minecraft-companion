@@ -6,6 +6,8 @@ import type { CompanionProfile } from "../../../src/profile/profileSchema.js";
 import type { MinecraftComponentStatus } from "../src-main/minecraftComponents.js";
 import {
   createWhiteLilyApi,
+  parseAvatarCatalogSnapshot,
+  parseAvatarImportResult,
   WHITE_LILY_IPC_CHANNELS,
   type PreloadTransport,
 } from "./desktopApi.js";
@@ -54,28 +56,34 @@ const avatarSnapshot = {
   revision: 2,
   models: [
     {
-      id: "builtin:whitelily-hd",
-      displayName: "WhiteLily 高清动漫",
+      id: "builtin:whitelily",
+      displayName: "WhiteLily",
       origin: "builtin",
-      format: "builtin-hd",
+      worldRenderer: "minecraft-skin",
+      armModel: "slim",
       previewDataUrl: "data:image/png;base64,iVBORw0KGgo=",
-      bodyAnimation: "whitelily-humanoid-v1",
-      expressions: "full",
+      portraitDataUrl: "data:image/png;base64,iVBORw0KGgo=",
     },
     {
-      id: "builtin:whitelily-classic",
-      displayName: "WhiteLily 经典",
-      origin: "builtin",
-      format: "builtin-classic",
+      id: "user:00000000-0000-4000-8000-000000000001",
+      displayName: "Imported skin",
+      origin: "imported",
+      worldRenderer: "minecraft-skin",
+      armModel: "wide",
       previewDataUrl: "data:image/png;base64,iVBORw0KGgo=",
-      bodyAnimation: "whitelily-humanoid-v1",
-      expressions: "full",
     },
   ],
-  activeModelId: "builtin:whitelily-hd",
+  activeModelId: "builtin:whitelily",
 } as const;
 
 describe("Task 5 preload API", () => {
+  it("parses current Minecraft skin list items for catalog and import results", () => {
+    expect(parseAvatarCatalogSnapshot(avatarSnapshot)).toEqual(avatarSnapshot);
+    expect(
+      parseAvatarImportResult({ status: "imported", model: avatarSnapshot.models[1] }),
+    ).toEqual({ status: "imported", model: avatarSnapshot.models[1] });
+  });
+
   it("exposes a path-free avatar model API over dedicated channels", async () => {
     const subscriptions = new Map<string, (value: unknown) => void>();
     const invoke = vi.fn(async (channel: string) => {
@@ -94,13 +102,13 @@ describe("Task 5 preload API", () => {
 
     await expect(api.listAvatarModels()).resolves.toEqual(avatarSnapshot);
     await expect(api.importAvatarModel()).resolves.toEqual({ status: "cancelled" });
-    await expect(api.switchAvatarModel("builtin:whitelily-classic")).resolves.toEqual(
-      avatarSnapshot,
-    );
+    await expect(
+      api.switchAvatarModel("user:00000000-0000-4000-8000-000000000001"),
+    ).resolves.toEqual(avatarSnapshot);
     expect(invoke.mock.calls).toEqual([
       [WHITE_LILY_IPC_CHANNELS.listAvatarModels],
       [WHITE_LILY_IPC_CHANNELS.importAvatarModel],
-      [WHITE_LILY_IPC_CHANNELS.switchAvatarModel, "builtin:whitelily-classic"],
+      [WHITE_LILY_IPC_CHANNELS.switchAvatarModel, "user:00000000-0000-4000-8000-000000000001"],
     ]);
 
     await expect(

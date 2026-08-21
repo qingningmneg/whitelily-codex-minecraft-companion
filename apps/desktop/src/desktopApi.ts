@@ -20,11 +20,11 @@ import {
 } from "../../../src/identity/ownerIdentity.js";
 import type { RuntimeEvent, RuntimeSnapshot } from "../../../src/runtime/runtimeEvents.js";
 import {
+  parseAvatarAppearanceListItem,
   parseAvatarModelCatalogSnapshot as parseSharedAvatarModelCatalogSnapshot,
   parseAvatarModelId,
-  parseAvatarModelListItem,
+  type AvatarAppearanceListItem,
   type AvatarModelCatalogSnapshot,
-  type AvatarModelListItem,
 } from "../../../src/avatar/avatarModelSchemas.js";
 import type { BehaviorModeSettings, CompanionProfile } from "../../../src/profile/profileSchema.js";
 import type { CompanionMode } from "../../../src/domain/types.js";
@@ -258,7 +258,7 @@ export interface WhiteLilyAvatarApi {
   listAvatarModels(): Promise<AvatarModelCatalogSnapshot>;
   importAvatarModel(): Promise<
     | { readonly status: "cancelled" }
-    | { readonly status: "imported"; readonly model: AvatarModelListItem }
+    | { readonly status: "imported"; readonly model: AvatarAppearanceListItem }
   >;
   switchAvatarModel(modelId: string): Promise<AvatarModelCatalogSnapshot>;
   subscribeAvatarModels(listener: (snapshot: AvatarModelCatalogSnapshot) => void): () => void;
@@ -796,18 +796,7 @@ export function parseAvatarCatalogSnapshot(value: unknown): AvatarModelCatalogSn
       ]);
     }
     const models = readExactDataArray(record.models, 1_024, "invalid avatar model catalog").map(
-      (model) =>
-        parseAvatarModelListItem(
-          readExactPlainDataObject(model, [
-            "id",
-            "displayName",
-            "origin",
-            "format",
-            "previewDataUrl",
-            "bodyAnimation",
-            "expressions",
-          ]),
-        ),
+      (model) => parseAvatarAppearanceListItem(readAvatarAppearanceListItem(model)),
     );
     return parseSharedAvatarModelCatalogSnapshot({
       revision: record.revision,
@@ -824,7 +813,7 @@ export function parseAvatarImportResult(
   value: unknown,
 ):
   | { readonly status: "cancelled" }
-  | { readonly status: "imported"; readonly model: AvatarModelListItem } {
+  | { readonly status: "imported"; readonly model: AvatarAppearanceListItem } {
   try {
     try {
       const cancelled = readExactPlainDataObject(value, ["status"]);
@@ -835,21 +824,34 @@ export function parseAvatarImportResult(
       if (imported.status !== "imported") throw new Error("invalid avatar import result");
       return Object.freeze({
         status: "imported",
-        model: parseAvatarModelListItem(
-          readExactPlainDataObject(imported.model, [
-            "id",
-            "displayName",
-            "origin",
-            "format",
-            "previewDataUrl",
-            "bodyAnimation",
-            "expressions",
-          ]),
-        ),
+        model: parseAvatarAppearanceListItem(readAvatarAppearanceListItem(imported.model)),
       });
     }
   } catch {
     throw new Error("invalid avatar import result");
+  }
+}
+
+function readAvatarAppearanceListItem(value: unknown): Record<string, unknown> {
+  try {
+    return readExactPlainDataObject(value, [
+      "id",
+      "displayName",
+      "origin",
+      "worldRenderer",
+      "armModel",
+      "previewDataUrl",
+    ]);
+  } catch {
+    return readExactPlainDataObject(value, [
+      "id",
+      "displayName",
+      "origin",
+      "worldRenderer",
+      "armModel",
+      "previewDataUrl",
+      "portraitDataUrl",
+    ]);
   }
 }
 
