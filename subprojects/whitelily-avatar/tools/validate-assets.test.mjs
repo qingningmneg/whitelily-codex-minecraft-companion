@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { copyFile, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { copyFile, lstat, mkdtemp, mkdir, open, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { validateAvatarAssets } from "./validate-assets.mjs";
+import { readBoundedFile, readStableFile, validateAvatarAssets } from "./validate-assets.mjs";
 
 const ASSET_ROOT = fileURLToPath(new URL("../assets/", import.meta.url));
 const RESOURCE_ROOT = fileURLToPath(
@@ -93,6 +93,15 @@ test("classifies retained Blender, Gecko, and entity files as research assets", 
   );
 });
 
+test("rejects a schema-v2 manifest that omits the native renderer declaration", async () => {
+  await rejectsFixture(
+    async ({ manifest }) => {
+      delete manifest.worldRenderer;
+    },
+    /native slim skin renderer/i,
+  );
+});
+
 test("rejects duplicate source declarations", async () => {
   await rejectsFixture(
     async ({ manifest }) => {
@@ -135,4 +144,43 @@ test("rejects runtime hash tampering, traversal paths, and unknown resource file
     },
     /undeclared runtime asset/i,
   );
+});
+
+test("rejects an over-limit PNG read before parsing it", async () => {
+  const root = await mkdtemp(join(tmpdir(), "whitelily-bounded-read-"));
+  const file = join(root, "oversized.png");
+  try {
+    await writeFile(file, Buffer.alloc(1024 * 1024 + 1));
+    await assert.rejects(
+      readBoundedFile(() => open(file, "r"), 1024 * 1024, "oversized PNG"),
+      /asset exceeds maximum size/i,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("rejects an asset whose metadata changes while it is being read", async () => {
+  const root = await mkdtemp(join(tmpdir(), "whitelily-stable-read-"));
+  const file = join(root, "changing.png");
+  let calls = 0;
+  try {
+    await writeFile(file, Buffer.from("before"));
+    await assert.rejects(
+      readStableFile(
+        {
+          lstatFile: async () => {
+            if (calls++ === 1) await writeFile(file, Buffer.from("after-changed"));
+            return lstat(file, { bigint: true });
+          },
+          openFile: () => open(file, "r"),
+        },
+        64,
+        "changing PNG",
+      ),
+      /asset changed during read/i,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });

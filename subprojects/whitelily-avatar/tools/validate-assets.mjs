@@ -862,7 +862,7 @@ async function validateNativeSkinAssets(assetRoot, resourceRoot, namespaceRoot, 
   };
 }
 
-export async function validateAvatarAssets(root) {
+export async function validateLegacyAvatarAssets(root) {
   const assetRoot = asAssetRoot(root);
   const subprojectRoot = path.dirname(assetRoot);
   const resourceRoot = path.join(subprojectRoot, "mod-fabric", "src", "main", "resources");
@@ -876,13 +876,6 @@ export async function validateAvatarAssets(root) {
   const manifest = jsonAsset(manifestBytes, "manifest is not valid JSON");
   if (!isPlainObject(manifest) || manifest.schemaVersion !== 2) {
     throw failure("unsupported manifest schema");
-  }
-
-  // Schema-v2 manifests without a renderer are historical migration inputs.  Native manifests
-  // always take the skin-only path above; the retained branch below remains callable only to
-  // validate those archived inputs while their research records are migrated.
-  if (manifest.worldRenderer !== undefined) {
-    return validateNativeSkinAssets(assetRoot, resourceRoot, namespaceRoot, allFiles, manifest);
   }
 
   requireExactThemes(manifest.themes);
@@ -1238,6 +1231,24 @@ export async function validateAvatarAssets(root) {
     unreferencedTextureCount: 0,
     maxTextureDimension: Math.max(entityTextureSize.width, entityTextureSize.height, 64),
   };
+}
+
+export async function validateAvatarAssets(root) {
+  const assetRoot = asAssetRoot(root);
+  const subprojectRoot = path.dirname(assetRoot);
+  const resourceRoot = path.join(subprojectRoot, "mod-fabric", "src", "main", "resources");
+  const namespaceRoot = path.join(resourceRoot, "assets", "whitelily_avatar");
+  const allFiles = await walk(assetRoot);
+  const manifestBytes = await regularFile(
+    path.join(assetRoot, "manifest.json"),
+    "missing manifest",
+    MAX_MANIFEST_BYTES,
+  );
+  const manifest = jsonAsset(manifestBytes, "manifest is not valid JSON");
+  if (!isPlainObject(manifest) || manifest.schemaVersion !== 2) {
+    throw failure("unsupported manifest schema");
+  }
+  return validateNativeSkinAssets(assetRoot, resourceRoot, namespaceRoot, allFiles, manifest);
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
