@@ -25,14 +25,14 @@ final class WhiteLilyRenderDecisionTest {
   }
 
   @Test
-  void onlyFullIdentityUsesTheCustomRenderer() {
+  void onlyFullIdentityUsesTheNativeSkin() {
     WhiteLilyRenderSessions sessions = new WhiteLilyRenderSessions();
     RenderSessionId session = sessions.beginSession();
 
     assertTrue(
         WhiteLilyRenderDecision.capture(
                 IdentityDecision.FULL, ArmorTheme.BASE, session, session)
-            .usesCustomRenderer());
+            .usesNativeSkin());
     assertTrue(
         WhiteLilyRenderDecision.capture(
                 IdentityDecision.FULL, ArmorTheme.BASE, session, session)
@@ -40,7 +40,7 @@ final class WhiteLilyRenderDecisionTest {
   }
 
   @Test
-  void matchedCustomRenderHidesVanillaArmorAndKeepsHeldItems() {
+  void matchedNativeSkinPreservesVanillaArmorAndHeldItems() {
     WhiteLilyRenderSessions sessions = new WhiteLilyRenderSessions();
     RenderSessionId session = sessions.beginSession();
 
@@ -48,8 +48,9 @@ final class WhiteLilyRenderDecisionTest {
         WhiteLilyRenderDecision.capture(
             IdentityDecision.FULL, ArmorTheme.NETHERITE, session, session);
 
-    assertTrue(decision.hidesVanillaArmor());
-    assertTrue(decision.rendersHeldItem());
+    assertTrue(decision.usesNativeSkin());
+    assertFalse(decision.hidesVanillaArmor());
+    assertFalse(decision.rendersHeldItem());
   }
 
   @Test

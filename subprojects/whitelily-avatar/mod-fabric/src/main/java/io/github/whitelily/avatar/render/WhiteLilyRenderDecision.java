@@ -8,17 +8,17 @@ public final class WhiteLilyRenderDecision {
   private final IdentityDecision identity;
   private final ArmorTheme armorTheme;
   private final RenderSessionId capturedSession;
-  private final boolean customRenderer;
+  private final boolean nativeSkin;
 
   private WhiteLilyRenderDecision(
       IdentityDecision identity,
       ArmorTheme armorTheme,
       RenderSessionId capturedSession,
-      boolean customRenderer) {
+      boolean nativeSkin) {
     this.identity = identity;
     this.armorTheme = armorTheme;
     this.capturedSession = capturedSession;
-    this.customRenderer = customRenderer;
+    this.nativeSkin = nativeSkin;
   }
 
   public static WhiteLilyRenderDecision vanilla() {
@@ -42,23 +42,27 @@ public final class WhiteLilyRenderDecision {
   }
 
   public boolean usesCustomRenderer() {
-    return customRenderer;
+    return usesNativeSkin();
+  }
+
+  public boolean usesNativeSkin() {
+    return nativeSkin;
   }
 
   public boolean canRenderCustomIn(RenderSessionId currentSession) {
-    return customRenderer && Objects.equals(capturedSession, currentSession);
+    return nativeSkin && Objects.equals(capturedSession, currentSession);
   }
 
   public boolean expressionCapable() {
-    return customRenderer && identity == IdentityDecision.FULL;
+    return nativeSkin && identity == IdentityDecision.FULL;
   }
 
   public boolean hidesVanillaArmor() {
-    return customRenderer;
+    return false;
   }
 
   public boolean rendersHeldItem() {
-    return customRenderer;
+    return false;
   }
 
   public ArmorTheme armorTheme() {
@@ -75,8 +79,8 @@ public final class WhiteLilyRenderDecision {
         + identity
         + ", armorTheme="
         + armorTheme
-        + ", customRenderer="
-        + customRenderer
+        + ", nativeSkin="
+        + nativeSkin
         + ", session=<redacted>]";
   }
 }
