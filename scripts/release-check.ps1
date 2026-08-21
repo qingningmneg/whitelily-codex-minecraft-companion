@@ -31,7 +31,7 @@ function Read-ReleaseText {
   }
   if ($bytes -contains 0) {
     $extension = [IO.Path]::GetExtension($DisplayPath).ToLowerInvariant()
-    if ($extension -in @(".png", ".jpg", ".jpeg", ".gif", ".ico", ".jar", ".zip", ".woff", ".woff2")) { return $null }
+    if ($extension -in @(".png", ".jpg", ".jpeg", ".gif", ".ico", ".jar", ".zip", ".woff", ".woff2", ".blend", ".glb")) { return $null }
     throw "Unreadable or ambiguous NUL-containing tracked file: $DisplayPath"
   }
   return [Text.UTF8Encoding]::new($false, $true).GetString($bytes)

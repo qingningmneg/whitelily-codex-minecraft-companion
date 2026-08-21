@@ -404,7 +404,7 @@ describe("IPC registry", () => {
 
   it("returns a safe allowlisted avatar failure envelope instead of forwarding main-process errors", async () => {
     const importFromPicker = vi.fn(async () => {
-      throw Object.assign(new Error(String.raw`failed to import C:\Users\private\avatar.glb`), {
+      throw Object.assign(new Error(String.raw`failed to import C:\Users\Other\avatar.glb`), {
         code: "AVATAR_GLB_INVALID",
       });
     });
@@ -424,7 +424,7 @@ describe("IPC registry", () => {
     const result = await harness.invoke(WHITE_LILY_IPC_CHANNELS.importAvatarModel);
 
     expect(result).toEqual({ status: "error", code: "AVATAR_GLB_INVALID" });
-    expect(JSON.stringify(result)).not.toContain(String.raw`C:\Users\private`);
+    expect(JSON.stringify(result)).not.toContain(String.raw`C:\Users\Other`);
   });
 
   it("replaces unknown avatar failure codes with the operation fallback", async () => {
