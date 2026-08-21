@@ -27,23 +27,12 @@ val fabricApiDistribution = configurations.create("fabricApiDistribution") {
   isCanBeResolved = true
   isTransitive = false
 }
-val geckoLibDistribution = configurations.create("geckoLibDistribution") {
-  isCanBeConsumed = false
-  isCanBeResolved = true
-  isTransitive = false
-}
-
 repositories {
   maven("https://maven.fabricmc.net/")
-  maven("https://dl.cloudsmith.io/public/geckolib3/geckolib/maven/")
 }
 
 dependencies {
   add(fabricApiDistribution.name, "net.fabricmc.fabric-api:fabric-api:${property("fabric_api_version")}")
-  add(
-    geckoLibDistribution.name,
-    "software.bernie.geckolib:geckolib-fabric-1.21.5:${property("geckolib_version")}",
-  )
 }
 
 project(":mod-fabric") {
@@ -77,11 +66,15 @@ project(":mod-fabric") {
       project(mapOf("path" to ":bridge-fabric", "configuration" to "namedElements")),
     )
     add("modImplementation", "net.fabricmc.fabric-api:fabric-api:${property("fabric_api_version")}")
-    add("modImplementation", "software.bernie.geckolib:geckolib-fabric-1.21.5:${property("geckolib_version")}")
+    add("modCompileOnly", "software.bernie.geckolib:geckolib-fabric-1.21.5:${property("geckolib_version")}")
     add("implementation", "com.google.code.gson:gson:2.13.1")
     add("testImplementation", platform("org.junit:junit-bom:5.12.2"))
     add("testImplementation", "org.junit.jupiter:junit-jupiter")
     add("testRuntimeOnly", "org.junit.platform:junit-platform-launcher")
+  }
+
+  configurations.named("testRuntimeClasspath") {
+    extendsFrom(configurations.named("modCompileOnly").get())
   }
 
   tasks.withType<Test>().configureEach {
@@ -90,6 +83,9 @@ project(":mod-fabric") {
 
   tasks.named<ProcessResources>("processResources") {
     inputs.property("version", modVersion)
+    exclude("assets/whitelily_avatar/shaders/**")
+    exclude("assets/whitelily_avatar/geckolib/**")
+    exclude("assets/whitelily_avatar/textures/entity/**")
     filesMatching("fabric.mod.json") {
       expand(mapOf("version" to modVersion))
     }
@@ -240,25 +236,21 @@ val minecraftVersion = property("minecraft_version").toString()
 val componentVersion = property("mod_version").toString()
 val bridgeVersion = property("bridge_version").toString()
 val fabricApiVersion = property("fabric_api_version").toString()
-val geckoLibVersion = property("geckolib_version").toString()
 val bridgeOutputName = "whitelily-bridge-fabric-$minecraftVersion-$bridgeVersion.jar"
 val avatarOutputName = "whitelily-avatar-fabric-$minecraftVersion-$componentVersion.jar"
 val fabricApiOutputName = "fabric-api-$fabricApiVersion.jar"
-val geckoLibOutputName = "geckolib-fabric-1.21.5-$geckoLibVersion.jar"
 val manifestName = "minecraft-components-manifest.json"
 val licenseOutputNames =
   listOf(
     "WhiteLily-LICENSE.txt",
     "WhiteLily-NOTICE.txt",
     "Fabric-API-LICENSE.txt",
-    "GeckoLib-LICENSE.txt",
   )
 val stagedOutputNames =
   listOf(
     bridgeOutputName,
     avatarOutputName,
     fabricApiOutputName,
-    geckoLibOutputName,
     *licenseOutputNames.toTypedArray(),
     manifestName,
   )
@@ -287,14 +279,8 @@ val stageMinecraftComponents = tasks.register("stageMinecraftComponents") {
   inputs.property("minecraftVersion", minecraftVersion)
   inputs.property("componentVersion", componentVersion)
   inputs.property("fabricApiCoordinate", "net.fabricmc.fabric-api:fabric-api:$fabricApiVersion")
-  inputs.property(
-    "geckoLibCoordinate",
-    "software.bernie.geckolib:geckolib-fabric-1.21.5:$geckoLibVersion",
-  )
   inputs.property("fabricApiExpectedBytes", project.property("fabric_api_distribution_bytes"))
   inputs.property("fabricApiExpectedSha256", project.property("fabric_api_distribution_sha256"))
-  inputs.property("geckoLibExpectedBytes", project.property("geckolib_distribution_bytes"))
-  inputs.property("geckoLibExpectedSha256", project.property("geckolib_distribution_sha256"))
   for (
     pin in
       listOf(
@@ -308,8 +294,6 @@ val stageMinecraftComponents = tasks.register("stageMinecraftComponents") {
         "whitelily_notice_sha256",
         "fabric_api_license_bytes",
         "fabric_api_license_sha256",
-        "geckolib_license_bytes",
-        "geckolib_license_sha256",
         "component_manifest_bytes",
         "component_manifest_sha256",
       )
@@ -319,11 +303,10 @@ val stageMinecraftComponents = tasks.register("stageMinecraftComponents") {
   inputs.property("artifactOutputNames", stagedOutputNames)
   inputs.property(
     "artifactAuthorities",
-    listOf("bridge:whitelily_bridge", "avatar:whitelily_avatar", "avatar:fabric-api", "avatar:geckolib"),
+    listOf("bridge:whitelily_bridge", "avatar:whitelily_avatar", "avatar:fabric-api"),
   )
   inputs.property("fabricApiLicenseEntry", "LICENSE-fabric-api")
-  inputs.property("geckoLibLicenseEntry", "LICENSE_GeckoLib 5")
-  inputs.files(fabricApiDistribution, geckoLibDistribution)
+  inputs.files(fabricApiDistribution)
     .withPathSensitivity(PathSensitivity.NAME_ONLY)
   inputs.files(bridgeJar, avatarJar).withPathSensitivity(PathSensitivity.RELATIVE)
   inputs.files(file("../../LICENSE"), file("../../NOTICE"), stagingTransactionScript)
@@ -365,15 +348,6 @@ val stageMinecraftComponents = tasks.register("stageMinecraftComponents") {
           project.property("fabric_api_distribution_bytes").toString().toLong(),
           project.property("fabric_api_distribution_sha256").toString(),
         ),
-        StagedArtifact(
-          "avatar",
-          geckoLibOutputName,
-          geckoLibDistribution.singleFile,
-          "geckolib",
-          geckoLibVersion,
-          project.property("geckolib_distribution_bytes").toString().toLong(),
-          project.property("geckolib_distribution_sha256").toString(),
-        ),
       )
     val preparedArtifacts =
       artifacts.map { artifact ->
@@ -407,10 +381,6 @@ val stageMinecraftComponents = tasks.register("stageMinecraftComponents") {
           "Fabric-API-LICENSE.txt",
           exactZipEntry(preparedArtifacts[2].bytes, "LICENSE-fabric-api"),
         ),
-        StagedLicense(
-          "GeckoLib-LICENSE.txt",
-          exactZipEntry(preparedArtifacts[3].bytes, "LICENSE_GeckoLib 5"),
-        ),
       )
     val reviewedLicensePins =
       mapOf(
@@ -420,8 +390,6 @@ val stageMinecraftComponents = tasks.register("stageMinecraftComponents") {
           Pair("whitelily_notice_bytes", "whitelily_notice_sha256"),
         "Fabric-API-LICENSE.txt" to
           Pair("fabric_api_license_bytes", "fabric_api_license_sha256"),
-        "GeckoLib-LICENSE.txt" to
-          Pair("geckolib_license_bytes", "geckolib_license_sha256"),
       )
     for (license in licenses) {
       val pins = checkNotNull(reviewedLicensePins[license.fileName])
@@ -470,9 +438,9 @@ val stageMinecraftComponents = tasks.register("stageMinecraftComponents") {
     check(
       manifestBytes.size.toLong() ==
         project.property("component_manifest_bytes").toString().toLong(),
-    ) { "Reviewed component manifest byte count changed" }
+    ) { "Reviewed component manifest byte count changed: ${manifestBytes.size}" }
     check(sha256(manifestBytes) == project.property("component_manifest_sha256").toString()) {
-      "Reviewed component manifest hash changed"
+      "Reviewed component manifest hash changed: ${sha256(manifestBytes)}"
     }
     val fileRequests =
       preparedArtifacts.map { prepared ->
@@ -497,20 +465,43 @@ val stageMinecraftComponents = tasks.register("stageMinecraftComponents") {
               ",\"sha256\":" + jsonString(sha256(bytes)) + "}"
           },
         )
-    val previousFileRequests =
+    val currentFileRequests =
+      preparedArtifacts.map { prepared ->
+        "{\"name\":" + jsonString(prepared.artifact.fileName) +
+          ",\"bytes\":" + prepared.bytes.size +
+          ",\"sha256\":" + jsonString(prepared.sha256) + "}"
+      } +
+        licenses.map { license ->
+          "{\"name\":" + jsonString(license.fileName) +
+            ",\"bytes\":" + license.bytes.size +
+            ",\"sha256\":" + jsonString(sha256(license.bytes)) + "}"
+        } +
+        listOf(
+          "{\"name\":" + jsonString(manifestName) +
+            ",\"bytes\":" + manifestBytes.size +
+            ",\"sha256\":" + jsonString(sha256(manifestBytes)) + "}",
+        )
+    val legacyFileRequests =
       listOf(
         Triple("fabric-api-0.128.2+1.21.5.jar", 2_248_994, "a82fd00827206e911936ed1e0ceaec6eb55d061ca5d3c5d63c7f0031426d29ae"),
         Triple("Fabric-API-LICENSE.txt", 11_357, "b40930bbcf80744c86c46a12bc9da056641d722716c378f5659b9e555ef833e1"),
         Triple("geckolib-fabric-1.21.5-5.1.0.jar", 670_425, "885ef4b03cd438c7d2ec9f59bb492f3af6ba2b73aa0493afc4f80801b5a9126c"),
         Triple("GeckoLib-LICENSE.txt", 1_065, "5f2943625776c6126cd252652f4c57d2fb187d339a20fa065a2b7c619165a52f"),
-        Triple("minecraft-components-manifest.json", 1_784, "bcd528825f95d8062865bc77d1979d9a07907b92337cfccae46c9140f453cff1"),
+        Triple("minecraft-components-manifest.json", 1_984, "9f6d60d8e8f23543689d5e61e9aa6656271daf8cf4b8028bdfebb305a12eaab0"),
         Triple("whitelily-avatar-fabric-1.21.5-0.1.0.jar", 55_627, "fff00f66e4beab2eff1e51f253608b198f43aa0a12443fbe07f7f3fd48278872"),
-        Triple("whitelily-bridge-fabric-1.21.5-0.1.1.jar", 52_087, "8a6e00d47a28799798ffa5d561156ea7ceb0f697a0beb2cc7c55b34f6f81b514"),
+        Triple("whitelily-bridge-fabric-1.21.5-0.1.2.jar", 53_984, "ac5bfab545b723b2346aeb017b3a6ea3186a6cbced370e16097f3836b128746d"),
         Triple("WhiteLily-LICENSE.txt", 11_123, "226d0e41f61309952c27fcc11a5140c4e735115f702ff0484ff0c25cfbbeee16"),
         Triple("WhiteLily-NOTICE.txt", 697, "6323cb4b742d322d61ee47279d71d0f0de496568cf1f2f793fea104a58ab0dde"),
       ).map { (name, bytes, hash) ->
         "{\"name\":" + jsonString(name) + ",\"bytes\":" + bytes +
           ",\"sha256\":" + jsonString(hash) + "}"
+      }
+    val existingNames = stagingDirectory.listFiles()?.map { it.name }?.toSet().orEmpty()
+    val previousFileRequests =
+      if (existingNames.contains("geckolib-fabric-1.21.5-5.1.0.jar")) {
+        legacyFileRequests
+      } else {
+        currentFileRequests
       }
     val request =
       "{\"destination\":" + jsonString(stagingDirectory.absolutePath) +

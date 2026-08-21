@@ -549,7 +549,7 @@ namespace WhiteLily.Packaging
         $MaximumOutputBytes
     )
     [byte[]]$expected = [System.Text.UTF8Encoding]::new($false).GetBytes(
-        "{`"status`":`"ok`",`"files`":9}`n"
+        "{`"status`":`"ok`",`"files`":7}`n"
     )
     if (
         $result.ExitCode -ne 0 -or
@@ -561,7 +561,7 @@ namespace WhiteLily.Packaging
     ) {
         throw 'invalid verifier protocol'
     }
-    Write-Output '{"status":"ok","files":9}'
+    Write-Output '{"status":"ok","files":7}'
 } catch {
     [Console]::Error.WriteLine('MINECRAFT_COMPONENT_VERIFIER_FAILED')
     exit 1

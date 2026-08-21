@@ -36,7 +36,6 @@ const PRIOR_BRIDGE_FILE = "whitelily-bridge-fabric-1.21.5-0.1.1.jar";
 const LEGACY_BRIDGE_FILE = "whitelily-bridge-fabric-1.21.5-0.1.0.jar";
 const AVATAR_FILE = "whitelily-avatar-fabric-1.21.5-0.1.0.jar";
 const FABRIC_API_FILE = "fabric-api-0.128.2+1.21.5.jar";
-const GECKOLIB_FILE = "geckolib-fabric-1.21.5-5.1.0.jar";
 const FABRIC_LOADER_FILE = "fabric-loader-0.16.14.jar";
 
 interface Fixture {
@@ -51,7 +50,6 @@ interface Fixture {
   readonly legacyBridge: Buffer;
   readonly avatar: Buffer;
   readonly fabricApi: Buffer;
-  readonly geckoLib: Buffer;
   readonly loader: Buffer;
   readonly loaderPath: string;
   readonly manifest: MinecraftComponentResourceManifest;
@@ -99,7 +97,6 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
   const legacyBridge = jar("whitelily_bridge", "0.1.0");
   const avatar = jar("whitelily_avatar", "0.1.0");
   const fabricApi = jar("fabric-api", "0.128.2+1.21.5");
-  const geckoLib = jar("geckolib", "5.1.0");
   const loaderVersion = options.loaderVersion ?? "0.16.14";
   const loader = options.loaderBytes ?? jar(options.loaderId ?? "fabricloader", loaderVersion);
   const loaderDirectory = join(root, "libraries");
@@ -112,7 +109,6 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
   await writeFile(join(resources, BRIDGE_FILE), bridge);
   await writeFile(join(resources, AVATAR_FILE), avatar);
   await writeFile(join(resources, FABRIC_API_FILE), fabricApi);
-  await writeFile(join(resources, GECKOLIB_FILE), geckoLib);
   const baseManifest: MinecraftComponentResourceManifest = {
     schemaVersion: 1,
     minecraftVersion: "1.21.5",
@@ -159,15 +155,6 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
         version: "0.128.2+1.21.5",
         prior: [],
       },
-      {
-        component: "avatar",
-        fileName: GECKOLIB_FILE,
-        bytes: geckoLib.byteLength,
-        sha256: sha256(geckoLib),
-        modId: "geckolib",
-        version: "5.1.0",
-        prior: [],
-      },
     ],
   };
   const manifest = options.manifestPatch?.(baseManifest) ?? baseManifest;
@@ -182,7 +169,6 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
     legacyBridge,
     avatar,
     fabricApi,
-    geckoLib,
     loader,
     loaderPath,
     manifest,
@@ -404,7 +390,6 @@ describe("Minecraft component manager", () => {
     const priorPath = await installFixtureFile(fixture, PRIOR_BRIDGE_FILE, fixture.priorBridge);
     await installFixtureFile(fixture, AVATAR_FILE, fixture.avatar);
     await installFixtureFile(fixture, FABRIC_API_FILE, fixture.fabricApi);
-    await installFixtureFile(fixture, GECKOLIB_FILE, fixture.geckoLib);
     try {
       const installation = fixture.manager.install(fixture.candidateId, ["bridge"]);
 
@@ -458,7 +443,6 @@ describe("Minecraft component manager", () => {
       await installFixtureFile(fixture, BRIDGE_FILE, fixture.bridge);
       await installFixtureFile(fixture, AVATAR_FILE, fixture.avatar);
       await installFixtureFile(fixture, FABRIC_API_FILE, fixture.fabricApi);
-      await installFixtureFile(fixture, GECKOLIB_FILE, fixture.geckoLib);
 
       await expect(fixture.manager.remove(fixture.candidateId, ["avatar"])).resolves.toMatchObject({
         state: "bridge_not_active",
@@ -470,9 +454,6 @@ describe("Minecraft component manager", () => {
         code: "ENOENT",
       });
       await expect(lstat(join(fixture.mods, FABRIC_API_FILE))).rejects.toMatchObject({
-        code: "ENOENT",
-      });
-      await expect(lstat(join(fixture.mods, GECKOLIB_FILE))).rejects.toMatchObject({
         code: "ENOENT",
       });
       await expect(fixture.manager.remove(fixture.candidateId, ["avatar"])).resolves.toMatchObject({
@@ -531,7 +512,6 @@ describe("Minecraft component manager", () => {
         AFTER_PROCESS_START,
       );
       await installFixtureFile(fixture, FABRIC_API_FILE, fixture.fabricApi);
-      await installFixtureFile(fixture, GECKOLIB_FILE, fixture.geckoLib);
       await writePresence(fixture);
 
       await expect(fixture.manager.status(fixture.candidateId)).resolves.toMatchObject({
@@ -562,7 +542,7 @@ describe("Minecraft component manager", () => {
       await expect(readFile(join(bridgeOnly.mods, BRIDGE_FILE))).resolves.toEqual(
         bridgeOnly.bridge,
       );
-      for (const fileName of [AVATAR_FILE, FABRIC_API_FILE, GECKOLIB_FILE]) {
+      for (const fileName of [AVATAR_FILE, FABRIC_API_FILE]) {
         await expect(lstat(join(bridgeOnly.mods, fileName))).rejects.toMatchObject({
           code: "ENOENT",
         });
@@ -574,9 +554,6 @@ describe("Minecraft component manager", () => {
       );
       await expect(readFile(join(avatarOnly.mods, FABRIC_API_FILE))).resolves.toEqual(
         avatarOnly.fabricApi,
-      );
-      await expect(readFile(join(avatarOnly.mods, GECKOLIB_FILE))).resolves.toEqual(
-        avatarOnly.geckoLib,
       );
       await expect(readFile(join(avatarOnly.mods, BRIDGE_FILE))).resolves.toEqual(
         avatarOnly.bridge,
@@ -592,7 +569,7 @@ describe("Minecraft component manager", () => {
     try {
       await fixture.manager.install(fixture.candidateId, ["avatar"]);
       await fixture.manager.remove(fixture.candidateId, ["bridge"]);
-      for (const fileName of [BRIDGE_FILE, AVATAR_FILE, FABRIC_API_FILE, GECKOLIB_FILE]) {
+      for (const fileName of [BRIDGE_FILE, AVATAR_FILE, FABRIC_API_FILE]) {
         await expect(lstat(join(fixture.mods, fileName))).rejects.toMatchObject({
           code: "ENOENT",
         });
@@ -602,22 +579,20 @@ describe("Minecraft component manager", () => {
     }
   });
 
-  it("preserves the complete stack when Bridge removal preflight finds a dependency conflict", async () => {
+  it("preserves an unmanaged same-name legacy Gecko jar while removing the reviewed stack", async () => {
     const fixture = await createFixture({ stubWorldBindingAuthority: true });
     const foreign = Buffer.from("foreign geckolib collision");
+    const legacyGeckoFile = "geckolib-fabric-1.21.5-5.1.0.jar";
     try {
       await installFixtureFile(fixture, BRIDGE_FILE, fixture.bridge);
       await installFixtureFile(fixture, AVATAR_FILE, fixture.avatar);
       await installFixtureFile(fixture, FABRIC_API_FILE, fixture.fabricApi);
-      await writeFile(join(fixture.mods, GECKOLIB_FILE), foreign);
+      await writeFile(join(fixture.mods, legacyGeckoFile), foreign);
 
       await expect(fixture.manager.remove(fixture.candidateId, ["bridge"])).resolves.toMatchObject({
-        state: "bridge_file_conflict",
+        state: "bridge_not_installed",
       });
-      expect(await readFile(join(fixture.mods, BRIDGE_FILE))).toEqual(fixture.bridge);
-      expect(await readFile(join(fixture.mods, AVATAR_FILE))).toEqual(fixture.avatar);
-      expect(await readFile(join(fixture.mods, FABRIC_API_FILE))).toEqual(fixture.fabricApi);
-      expect(await readFile(join(fixture.mods, GECKOLIB_FILE))).toEqual(foreign);
+      expect(await readFile(join(fixture.mods, legacyGeckoFile))).toEqual(foreign);
     } finally {
       await fixture.cleanup();
     }
@@ -642,19 +617,13 @@ describe("Minecraft component manager", () => {
       stubWorldBindingAuthority: true,
       manifestPatch: (manifest) => ({
         ...manifest,
-        artifacts: [
-          manifest.artifacts[0]!,
-          manifest.artifacts[2]!,
-          manifest.artifacts[3]!,
-          manifest.artifacts[1]!,
-        ],
+        artifacts: [manifest.artifacts[0]!, manifest.artifacts[2]!, manifest.artifacts[1]!],
       }),
     });
     try {
       await installFixtureFile(fixture, BRIDGE_FILE, fixture.bridge);
       await installFixtureFile(fixture, AVATAR_FILE, fixture.avatar);
       await installFixtureFile(fixture, FABRIC_API_FILE, fixture.fabricApi);
-      await installFixtureFile(fixture, GECKOLIB_FILE, fixture.geckoLib);
 
       await expect(fixture.manager.remove(fixture.candidateId, ["bridge"])).rejects.toThrow(
         "MINECRAFT_COMPONENT_OPERATION_FAILED",
@@ -662,7 +631,6 @@ describe("Minecraft component manager", () => {
       expect(await readFile(join(fixture.mods, BRIDGE_FILE))).toEqual(fixture.bridge);
       expect(await readFile(join(fixture.mods, AVATAR_FILE))).toEqual(fixture.avatar);
       expect(await readFile(join(fixture.mods, FABRIC_API_FILE))).toEqual(fixture.fabricApi);
-      expect(await readFile(join(fixture.mods, GECKOLIB_FILE))).toEqual(fixture.geckoLib);
     } finally {
       await fixture.cleanup();
       vi.doUnmock("node:fs/promises");
@@ -677,7 +645,7 @@ describe("Minecraft component manager", () => {
       return {
         ...actual,
         link: async (source: string, destination: string) => {
-          if (destination.endsWith(GECKOLIB_FILE)) throw new Error("forced dependency failure");
+          if (destination.endsWith(AVATAR_FILE)) throw new Error("forced Avatar failure");
           return actual.link(source, destination);
         },
       };
@@ -694,9 +662,6 @@ describe("Minecraft component manager", () => {
       );
       expect(await readFile(join(fixture.mods, BRIDGE_FILE))).toEqual(fixture.bridge);
       expect(await readFile(join(fixture.mods, FABRIC_API_FILE))).toEqual(fixture.fabricApi);
-      await expect(lstat(join(fixture.mods, GECKOLIB_FILE))).rejects.toMatchObject({
-        code: "ENOENT",
-      });
       await expect(lstat(join(fixture.mods, AVATAR_FILE))).rejects.toMatchObject({
         code: "ENOENT",
       });
@@ -761,7 +726,7 @@ describe("Minecraft component manager", () => {
     }
   });
 
-  it("rejects an Avatar manifest missing exact Fabric API or GeckoLib versions", async () => {
+  it("rejects an Avatar manifest missing or changing the exact Fabric API version", async () => {
     const fixture = await createFixture();
     const complete = fixture.manifest.artifacts;
     const create = (artifacts: MinecraftComponentResourceManifest["artifacts"]) =>
@@ -904,7 +869,6 @@ describe("Minecraft component manager", () => {
           await writeFile(join(current.resources, BRIDGE_FILE), current.bridge);
           await writeFile(join(current.resources, AVATAR_FILE), current.avatar);
           await writeFile(join(current.resources, FABRIC_API_FILE), current.fabricApi);
-          await writeFile(join(current.resources, GECKOLIB_FILE), current.geckoLib);
         }
       },
     });

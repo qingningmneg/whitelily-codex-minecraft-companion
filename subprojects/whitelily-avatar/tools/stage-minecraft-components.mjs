@@ -263,7 +263,9 @@ function cleanupJournalDocument(
 }
 
 function normalizeSnapshotFiles(value) {
-  if (!Array.isArray(value) || value.length !== 9) throw new Error(FAILURE);
+  if (!Array.isArray(value) || value.length < 1 || value.length > 32) {
+    throw new Error(FAILURE);
+  }
   const names = value.map((file) => file?.name);
   if (
     names.some((name) => !validName(name)) ||
@@ -327,9 +329,6 @@ function normalizeCleanupJournal(value, base, transactionId) {
   const candidateDirectory = normalizedIdentity(value.candidateDirectory);
   const previousFiles = normalizeSnapshotFiles(value.previousFiles);
   const candidateFiles = normalizeSnapshotFiles(value.candidateFiles);
-  if (previousFiles.names.some((name, index) => name !== candidateFiles.names[index])) {
-    throw new Error(FAILURE);
-  }
   const document = {
     schema: CLEANUP_SCHEMA,
     transactionId,
@@ -730,7 +729,8 @@ export async function stageComponentPack(destinationInput, specification, hooks 
     if (
       !specification ||
       !Array.isArray(specification.files) ||
-      specification.files.length !== 9 ||
+      specification.files.length < 1 ||
+      specification.files.length > 32 ||
       !validName(base) ||
       !/^[a-z0-9-]{1,64}$/.test(transactionId)
     ) {
@@ -755,7 +755,8 @@ export async function stageComponentPack(destinationInput, specification, hooks 
     const previousDescriptors = specification.previousFiles ?? specification.files;
     const previousNames = previousDescriptors.map((file) => file.name).sort();
     if (
-      previousDescriptors.length !== 9 ||
+      previousDescriptors.length < 1 ||
+      previousDescriptors.length > 32 ||
       new Set(previousNames).size !== previousNames.length ||
       previousNames.some((name) => !validName(name)) ||
       previousDescriptors.some(

@@ -160,7 +160,7 @@ final class ComponentPackPolicy {
   }
 
   static void inspectPack(LinkedHashMap<Path, ExpectedMod> components) throws IOException {
-    if (components.size() != 4) {
+    if (components.size() != 3) {
       throw invalid();
     }
     Set<String> allModIds = new HashSet<>();
@@ -256,9 +256,7 @@ final class ComponentPackPolicy {
       for (String name : entries.keySet()) {
         if (!entries.get(name).directory()
             && name.startsWith(AVATAR_RESOURCE_PREFIX)
-            && (name.contains("/geckolib/models/")
-                || name.contains("/textures/entity/")
-                || name.contains("/textures/skin/"))) {
+            && name.contains("/textures/skin/")) {
           actualAvatarResources.add(name);
         }
       }

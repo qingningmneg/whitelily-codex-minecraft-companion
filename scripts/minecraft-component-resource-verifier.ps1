@@ -110,7 +110,7 @@ function Assert-ReviewedMinecraftComponentResources {
         [Parameter(Mandatory = $true)][object[]]$ReviewedFiles
     )
 
-    if ($ReviewedFiles.Count -ne 9) { throw 'installed Minecraft component policy is invalid' }
+    if ($ReviewedFiles.Count -ne 7) { throw 'installed Minecraft component policy is invalid' }
     $reviewedByName = [Collections.Generic.Dictionary[string, object]]::new(
         [StringComparer]::OrdinalIgnoreCase
     )
@@ -162,9 +162,9 @@ function Assert-ReviewedMinecraftComponentResources {
             Where-Object { ([string]$_).StartsWith($componentPrefix, [StringComparison]::Ordinal) }
     )
     if (
-        $sourceFiles.Count -ne 9 -or
-        $resources.Count -ne 9 -or
-        $required.Count -ne 9 -or
+        $sourceFiles.Count -ne 7 -or
+        $resources.Count -ne 7 -or
+        $required.Count -ne 7 -or
         $executables.Count -ne 0 -or
         $scripts.Count -ne 0
     ) {
@@ -224,7 +224,7 @@ function Assert-ReviewedMinecraftComponentResources {
         throw 'installed Minecraft component root is not an ordinary directory'
     }
     $actual = @(Get-ChildItem -LiteralPath $componentRoot -Force)
-    if ($actual.Count -ne 9) { throw 'installed Minecraft component file set is not exact' }
+    if ($actual.Count -ne 7) { throw 'installed Minecraft component file set is not exact' }
     foreach ($entry in $actual) {
         $reviewed = $null
         if (
@@ -242,5 +242,5 @@ function Assert-ReviewedMinecraftComponentResources {
             throw 'installed Minecraft component file mismatch'
         }
     }
-    return 9
+    return 7
 }

@@ -255,7 +255,7 @@ public static class FakeWindowsSandbox {
                     "\",\"baselineInstallerSha256\":\"" + baselineHash +
                     "\",\"controllerObservedBaselineInstallerSha256\":\"" + baselineHash +
                     "\",\"installedVersion\":\"" + expectedVersion +
-                    "\",\"managedWorkspaceResources\":3,\"minecraftComponentResources\":9,\"componentPreferencesFresh\":true,\"componentPreferencesUpgradePreserved\":true,\"componentPreferencesKeepPreserved\":true,\"success\":true,\"stages\":" + stages + ",\"error\":null}\n"
+                    "\",\"managedWorkspaceResources\":3,\"minecraftComponentResources\":7,\"componentPreferencesFresh\":true,\"componentPreferencesUpgradePreserved\":true,\"componentPreferencesKeepPreserved\":true,\"success\":true,\"stages\":" + stages + ",\"error\":null}\n"
                 : "{\"schemaVersion\":2,\"controllerSid\":\"S-1-5-18\",\"candidateSid\":\"S-1-5-21-1-2-3-1001\",\"candidateReportWriteDenied\":true,\"installerSha256\":\"" + hash +
                     "\",\"controllerObservedInstallerSha256\":\"" + hash +
                     "\",\"expectedVersion\":\"" + expectedVersion +
@@ -420,8 +420,6 @@ async function createInstalledComponentFixture(): Promise<{
   const paths = [
     "fabric-api-0.128.2+1.21.5.jar",
     "Fabric-API-LICENSE.txt",
-    "geckolib-fabric-1.21.5-5.1.0.jar",
-    "GeckoLib-LICENSE.txt",
     "minecraft-components-manifest.json",
     "whitelily-avatar-fabric-1.21.5-0.1.0.jar",
     "whitelily-bridge-fabric-1.21.5-0.1.2.jar",
@@ -517,8 +515,6 @@ async function createInstallerFixture(
   const componentPaths = [
     "minecraft-components/fabric-api-0.128.2+1.21.5.jar",
     "minecraft-components/Fabric-API-LICENSE.txt",
-    "minecraft-components/geckolib-fabric-1.21.5-5.1.0.jar",
-    "minecraft-components/GeckoLib-LICENSE.txt",
     "minecraft-components/minecraft-components-manifest.json",
     "minecraft-components/whitelily-avatar-fabric-1.21.5-0.1.0.jar",
     "minecraft-components/whitelily-bridge-fabric-1.21.5-0.1.2.jar",
@@ -1435,7 +1431,7 @@ describe("WhiteLily installer inspection", () => {
 
     expect(source).toContain("$sourceManifest.paths.minecraftComponents");
     expect(source).toContain("INSTALLER_MINECRAFT_COMPONENT_RESOURCES_INVALID");
-    expect(source).toMatch(/\$minecraftComponentResources\.Count\s+-ne\s+9/u);
+    expect(source).toMatch(/\$minecraftComponentResources\.Count\s+-ne\s+7/u);
     expect(source).toContain("minecraftComponentResourcesVerified");
     expect(source).toMatch(/executableFiles[\s\S]*?minecraftComponentPrefix/iu);
     expect(source).toMatch(/scriptFiles[\s\S]*?minecraftComponentPrefix/iu);
@@ -1483,7 +1479,7 @@ describe("WhiteLily isolated installer lifecycle", () => {
     const baseline = await createInstalledComponentFixture();
     const baselineResult = runInstalledComponentVerifier(baseline);
     expect(baselineResult.status, `${baselineResult.stdout}\n${baselineResult.stderr}`).toBe(0);
-    expect(baselineResult.stdout).toBe("9");
+    expect(baselineResult.stdout).toBe("7");
 
     const coordinated = await createInstalledComponentFixture();
     const replacement = Buffer.from("coordinated installed replacement", "utf8");
@@ -1539,7 +1535,7 @@ describe("WhiteLily isolated installer lifecycle", () => {
     expect(source).toContain('{"schemaVersion":1,"bridgeEnabled":true,"avatarEnabled":true}');
     expect(source).toContain('{"schemaVersion":1,"bridgeEnabled":false,"avatarEnabled":false}');
     expect(source.match(/Assert-ExactComponentPreferences/gu)).toHaveLength(5);
-    expect(source).toMatch(/\[int\]\$report\.minecraftComponentResources\s+-ne\s+9/u);
+    expect(source).toMatch(/\[int\]\$report\.minecraftComponentResources\s+-ne\s+7/u);
     expect(source).toMatch(/\$report\.componentPreferencesFresh\s+-ne\s+\$true/u);
     expect(source).toMatch(/\$report\.componentPreferencesUpgradePreserved\s+-ne\s+\$true/u);
     expect(source).toMatch(/\$report\.componentPreferencesKeepPreserved\s+-ne\s+\$true/u);

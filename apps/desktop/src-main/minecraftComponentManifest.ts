@@ -40,7 +40,7 @@ export function validateMinecraftComponentManifest(
     value.schemaVersion !== 1 ||
     value.minecraftVersion !== "1.21.5" ||
     !Array.isArray(value.artifacts) ||
-    value.artifacts.length !== 4 ||
+    value.artifacts.length !== 3 ||
     value.artifacts.length > MAX_ARTIFACTS
   ) {
     throw new Error("invalid");
@@ -86,7 +86,6 @@ export function validateMinecraftComponentManifest(
   const bridge = artifacts.find(({ modId }) => modId === "whitelily_bridge");
   const avatar = artifacts.find(({ modId }) => modId === "whitelily_avatar");
   const fabricApi = artifacts.find(({ modId }) => modId === "fabric-api");
-  const geckoLib = artifacts.find(({ modId }) => modId === "geckolib");
   if (
     bridgeArtifacts.length !== 1 ||
     bridge?.component !== "bridge" ||
@@ -99,7 +98,7 @@ export function validateMinecraftComponentManifest(
     bridge.prior[1]?.modId !== "whitelily_bridge" ||
     bridge.prior[1]?.version !== "0.1.0" ||
     !/^whitelily-bridge-fabric-1\.21\.5-[A-Za-z0-9.+_-]+\.jar$/u.test(bridge.fileName) ||
-    avatarArtifacts.length !== 3 ||
+    avatarArtifacts.length !== 2 ||
     avatar?.component !== "avatar" ||
     avatar.version !== "0.1.0" ||
     !/^whitelily-avatar-fabric-1\.21\.5-[A-Za-z0-9.+_-]+\.jar$/u.test(avatar.fileName) ||
@@ -107,10 +106,6 @@ export function validateMinecraftComponentManifest(
     fabricApi.version !== "0.128.2+1.21.5" ||
     fabricApi.fileName !== "fabric-api-0.128.2+1.21.5.jar" ||
     fabricApi.prior.length !== 0 ||
-    geckoLib?.component !== "avatar" ||
-    geckoLib.version !== "5.1.0" ||
-    geckoLib.fileName !== "geckolib-fabric-1.21.5-5.1.0.jar" ||
-    geckoLib.prior.length !== 0 ||
     new Set(artifacts.map(({ modId }) => modId)).size !== artifacts.length
   ) {
     throw new Error("invalid");

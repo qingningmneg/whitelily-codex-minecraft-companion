@@ -1869,7 +1869,7 @@ try {
         $report.candidateReportWriteDenied -ne $true -or
         -not [StringComparer]::Ordinal.Equals([string]$report.installedVersion, $version) -or
         [int]$report.managedWorkspaceResources -ne 3 -or
-        [int]$report.minecraftComponentResources -ne 9 -or
+        [int]$report.minecraftComponentResources -ne 7 -or
         $report.componentPreferencesFresh -ne $true -or
         $report.componentPreferencesUpgradePreserved -ne $true -or
         $report.componentPreferencesKeepPreserved -ne $true -or

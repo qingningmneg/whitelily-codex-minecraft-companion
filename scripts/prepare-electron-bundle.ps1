@@ -133,8 +133,8 @@ function Assert-ExactMinecraftComponentPack {
         $sourceManifest.allowlist.exactFiles |
             Where-Object { $null -ne $_.target -and ([string]$_.target).StartsWith($componentTargetPrefix, [StringComparison]::Ordinal) }
     )
-    if ($componentEntries.Count -ne 9) {
-        throw 'reviewed Minecraft component pack must declare exactly nine files'
+    if ($componentEntries.Count -ne 7) {
+        throw 'reviewed Minecraft component pack must declare exactly seven files'
     }
 
     $componentRoot = Join-Path $repositoryRoot 'build/minecraft-components'
@@ -182,7 +182,7 @@ if (
     $componentVerificationOutput.Count -ne 1 -or
     -not [StringComparer]::Ordinal.Equals(
         [string]$componentVerificationOutput[0],
-        '{"status":"ok","files":9}'
+        '{"status":"ok","files":7}'
     )
 ) {
     throw 'Minecraft component pack verification failed'

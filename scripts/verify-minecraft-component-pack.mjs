@@ -6,7 +6,7 @@ import { pathToFileURL } from "node:url";
 
 const COMPONENT_ROOT = "minecraft-components";
 const COMPONENT_PREFIX = `${COMPONENT_ROOT}/`;
-const EXPECTED_FILE_COUNT = 9;
+const EXPECTED_FILE_COUNT = 7;
 const MAX_POLICY_BYTES = 8_192;
 const MAX_RUNTIME_MANIFEST_BYTES = 131_072;
 const MAX_JSON_DEPTH = 32;

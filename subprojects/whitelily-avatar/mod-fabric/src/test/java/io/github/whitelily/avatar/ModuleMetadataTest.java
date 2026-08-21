@@ -1,6 +1,7 @@
 package io.github.whitelily.avatar;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -15,7 +16,7 @@ final class ModuleMetadataTest {
     assertTrue(json.contains("\"minecraft\": \"=1.21.5\""));
     assertTrue(json.contains("\"fabricloader\": \">=0.16.14\""));
     assertTrue(json.contains("\"whitelily_bridge\": \">=0.1.0\""));
-    assertTrue(json.contains("\"geckolib\": \"=5.1.0\""));
+    assertFalse(json.contains("\"geckolib\""));
   }
 
   @Test

@@ -12,7 +12,6 @@
     "minecraft": "=1.21.5",
     "fabricloader": ">=0.16.14",
     "whitelily_bridge": ">=0.1.0",
-    "fabric-api": ">=0.128.2+1.21.5",
-    "geckolib": "=5.1.0"
+    "fabric-api": ">=0.128.2+1.21.5"
   }
 }

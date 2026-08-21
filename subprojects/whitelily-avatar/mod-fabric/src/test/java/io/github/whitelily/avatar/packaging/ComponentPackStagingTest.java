@@ -24,11 +24,9 @@ final class ComponentPackStagingTest {
   private static final List<String> EXACT_FILES =
       List.of(
           "Fabric-API-LICENSE.txt",
-          "GeckoLib-LICENSE.txt",
           "WhiteLily-LICENSE.txt",
           "WhiteLily-NOTICE.txt",
           "fabric-api-0.128.2+1.21.5.jar",
-          "geckolib-fabric-1.21.5-5.1.0.jar",
           "minecraft-components-manifest.json",
           "whitelily-avatar-fabric-1.21.5-0.1.0.jar",
           "whitelily-bridge-fabric-1.21.5-0.1.2.jar");
@@ -55,16 +53,14 @@ final class ComponentPackStagingTest {
 
     assertEquals(1, manifest.get("schemaVersion").getAsInt());
     assertEquals("1.21.5", manifest.get("minecraftVersion").getAsString());
-    assertEquals(4, manifest.getAsJsonArray("artifacts").size());
-    assertEquals(4, manifest.getAsJsonArray("licenses").size());
+    assertEquals(3, manifest.getAsJsonArray("artifacts").size());
+    assertEquals(3, manifest.getAsJsonArray("licenses").size());
     assertArtifact(
         manifest, 0, "bridge", "whitelily-bridge-fabric-1.21.5-0.1.2.jar", "whitelily_bridge", "0.1.2");
     assertArtifact(
         manifest, 1, "avatar", "whitelily-avatar-fabric-1.21.5-0.1.0.jar", "whitelily_avatar", "0.1.0");
     assertArtifact(
         manifest, 2, "avatar", "fabric-api-0.128.2+1.21.5.jar", "fabric-api", "0.128.2+1.21.5");
-    assertArtifact(
-        manifest, 3, "avatar", "geckolib-fabric-1.21.5-5.1.0.jar", "geckolib", "5.1.0");
     for (var element : manifest.getAsJsonArray("licenses")) {
       assertEquals(Set.of("fileName", "bytes", "sha256"), element.getAsJsonObject().keySet());
     }
@@ -92,10 +88,6 @@ final class ComponentPackStagingTest {
         ComponentPackPolicy.readRequiredEntry(
             STAGING.resolve("fabric-api-0.128.2+1.21.5.jar"), "LICENSE-fabric-api"),
         Files.readAllBytes(STAGING.resolve("Fabric-API-LICENSE.txt")));
-    assertArrayEquals(
-        ComponentPackPolicy.readRequiredEntry(
-            STAGING.resolve("geckolib-fabric-1.21.5-5.1.0.jar"), "LICENSE_GeckoLib 5"),
-        Files.readAllBytes(STAGING.resolve("GeckoLib-LICENSE.txt")));
   }
 
   private static String canonicalManifest(JsonObject manifest) {

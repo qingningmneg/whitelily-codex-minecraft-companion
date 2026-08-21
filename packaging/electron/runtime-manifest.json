@@ -149,8 +149,8 @@
       {
         "source": "NOTICE",
         "target": "licenses/WhiteLily-NOTICE.txt",
-        "bytes": 697,
-        "sha256": "6323cb4b742d322d61ee47279d71d0f0de496568cf1f2f793fea104a58ab0dde"
+        "bytes": 795,
+        "sha256": "bc5ab24ff5624664bc3ef3d5b850ac3c820dddf3b2f15a4125b355f1c65a2c2a"
       },
       {
         "source": "build/minecraft-components/fabric-api-0.128.2+1.21.5.jar",
@@ -165,28 +165,16 @@
         "sha256": "b40930bbcf80744c86c46a12bc9da056641d722716c378f5659b9e555ef833e1"
       },
       {
-        "source": "build/minecraft-components/geckolib-fabric-1.21.5-5.1.0.jar",
-        "target": "minecraft-components/geckolib-fabric-1.21.5-5.1.0.jar",
-        "bytes": 670425,
-        "sha256": "885ef4b03cd438c7d2ec9f59bb492f3af6ba2b73aa0493afc4f80801b5a9126c"
-      },
-      {
-        "source": "build/minecraft-components/GeckoLib-LICENSE.txt",
-        "target": "minecraft-components/GeckoLib-LICENSE.txt",
-        "bytes": 1065,
-        "sha256": "5f2943625776c6126cd252652f4c57d2fb187d339a20fa065a2b7c619165a52f"
-      },
-      {
         "source": "build/minecraft-components/minecraft-components-manifest.json",
         "target": "minecraft-components/minecraft-components-manifest.json",
-        "bytes": 1984,
-        "sha256": "9f6d60d8e8f23543689d5e61e9aa6656271daf8cf4b8028bdfebb305a12eaab0"
+        "bytes": 1624,
+        "sha256": "ab184d3351b274e5af387ba5c20dd3f989571048c318ba5ae66cb810374f50b3"
       },
       {
         "source": "build/minecraft-components/whitelily-avatar-fabric-1.21.5-0.1.0.jar",
         "target": "minecraft-components/whitelily-avatar-fabric-1.21.5-0.1.0.jar",
-        "bytes": 55627,
-        "sha256": "fff00f66e4beab2eff1e51f253608b198f43aa0a12443fbe07f7f3fd48278872"
+        "bytes": 239985,
+        "sha256": "1fdba2b89281d7dbfb96d8e2ab3637caf95b20452831377f46e5285d37531351"
       },
       {
         "source": "build/minecraft-components/whitelily-bridge-fabric-1.21.5-0.1.2.jar",
@@ -203,8 +191,8 @@
       {
         "source": "build/minecraft-components/WhiteLily-NOTICE.txt",
         "target": "minecraft-components/WhiteLily-NOTICE.txt",
-        "bytes": 697,
-        "sha256": "6323cb4b742d322d61ee47279d71d0f0de496568cf1f2f793fea104a58ab0dde"
+        "bytes": 795,
+        "sha256": "bc5ab24ff5624664bc3ef3d5b850ac3c820dddf3b2f15a4125b355f1c65a2c2a"
       }
     ],
     "generatedFiles": [
@@ -230,8 +218,6 @@
       "licenses/OpenAI-Codex-NOTICE.txt",
       "minecraft-components/fabric-api-0.128.2+1.21.5.jar",
       "minecraft-components/Fabric-API-LICENSE.txt",
-      "minecraft-components/geckolib-fabric-1.21.5-5.1.0.jar",
-      "minecraft-components/GeckoLib-LICENSE.txt",
       "minecraft-components/minecraft-components-manifest.json",
       "minecraft-components/whitelily-avatar-fabric-1.21.5-0.1.0.jar",
       "minecraft-components/whitelily-bridge-fabric-1.21.5-0.1.2.jar",

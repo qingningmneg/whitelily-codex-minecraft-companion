@@ -304,7 +304,7 @@ async function verifyReviewedMinecraftComponents(
     !hasExactKeys(policy, ["schemaVersion", "files"]) ||
     policy.schemaVersion !== 1 ||
     !Array.isArray(policy.files) ||
-    policy.files.length !== 9
+    policy.files.length !== 7
   ) {
     throw new Error("WhiteLily reviewed Minecraft component policy is invalid");
   }
@@ -351,9 +351,9 @@ async function verifyReviewedMinecraftComponents(
     (entry) => typeof entry === "string" && entry.startsWith(prefix),
   );
   if (
-    sourceEntries.length !== 9 ||
-    resourceEntries.length !== 9 ||
-    requiredEntries.length !== 9 ||
+    sourceEntries.length !== 7 ||
+    resourceEntries.length !== 7 ||
+    requiredEntries.length !== 7 ||
     executableEntries.length !== 0 ||
     scriptEntries.length !== 0
   ) {
@@ -417,7 +417,7 @@ async function verifyReviewedMinecraftComponents(
     compareOrdinal(left.name, right.name),
   );
   if (
-    actual.length !== 9 ||
+    actual.length !== 7 ||
     actual.some(
       (entry) => !entry.isFile() || policyByKey.get(entry.name.toLowerCase())?.name !== entry.name,
     )

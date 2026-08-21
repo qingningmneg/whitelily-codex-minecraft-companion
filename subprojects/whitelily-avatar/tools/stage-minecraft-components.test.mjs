@@ -22,15 +22,14 @@ import { stageComponentPack } from "./stage-minecraft-components.mjs";
 
 const names = [
   "Fabric-API-LICENSE.txt",
-  "GeckoLib-LICENSE.txt",
   "WhiteLily-LICENSE.txt",
   "WhiteLily-NOTICE.txt",
   "fabric-api-0.128.2+1.21.5.jar",
-  "geckolib-fabric-1.21.5-5.1.0.jar",
   "minecraft-components-manifest.json",
   "whitelily-avatar-fabric-1.21.5-0.1.0.jar",
   "whitelily-bridge-fabric-1.21.5-0.1.1.jar",
 ];
+const legacyGeckoNames = [...names, "GeckoLib-LICENSE.txt", "geckolib-fabric-1.21.5-5.1.0.jar"];
 
 function sha256(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
@@ -40,11 +39,11 @@ function content(label, name) {
   return Buffer.from(`${label}:${name}\n`, "utf8");
 }
 
-async function spec(root, label) {
+async function spec(root, label, selectedNames = names) {
   const sources = join(root, `sources-${label}`);
   await mkdir(sources);
   const files = [];
-  for (const name of names) {
+  for (const name of selectedNames) {
     const bytes = content(label, name);
     const source = join(sources, name);
     await writeFile(source, bytes, { flag: "wx" });
@@ -178,7 +177,7 @@ async function crashAt(destination, replacement, crashBoundary) {
   assert.equal(exitCode, 73);
 }
 
-test("publishes one exact nine-file pack without transaction residue", async (t) => {
+test("publishes one exact seven-file pack without transaction residue", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "whitelily-stage-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const destination = join(root, "minecraft-components");
@@ -186,6 +185,59 @@ test("publishes one exact nine-file pack without transaction residue", async (t)
   const result = await stageComponentPack(destination, await spec(root, "new"));
 
   assert.deepEqual(result, { state: "published", cleanupPending: false });
+  assert.deepEqual((await readdir(destination)).sort(), names);
+  await assertNoTransactionResidue(root);
+});
+
+test("removes the exact reviewed legacy Gecko files during a pack upgrade", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "whitelily-stage-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const destination = join(root, "minecraft-components");
+  const legacy = await spec(root, "legacy-gecko", legacyGeckoNames);
+  await stageComponentPack(destination, legacy);
+  const replacement = await spec(root, "native-skin");
+  replacement.previousFiles = reviewedFiles(legacy);
+
+  await stageComponentPack(destination, replacement);
+
+  assert.deepEqual((await readdir(destination)).sort(), names);
+  await assertNoTransactionResidue(root);
+});
+
+test("preserves a foreign same-name Gecko collision and rejects the upgrade", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "whitelily-stage-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const destination = join(root, "minecraft-components");
+  const legacy = await spec(root, "legacy-gecko-foreign", legacyGeckoNames);
+  await stageComponentPack(destination, legacy);
+  const geckoPath = join(destination, "geckolib-fabric-1.21.5-5.1.0.jar");
+  const foreign = Buffer.from("foreign same-name Gecko jar", "utf8");
+  await writeFile(geckoPath, foreign);
+  const replacement = await spec(root, "native-skin-foreign");
+  replacement.previousFiles = reviewedFiles(legacy);
+
+  await assert.rejects(stageComponentPack(destination, replacement), /component staging failed/);
+
+  assert.deepEqual(await readFile(geckoPath), foreign);
+  await assertNoTransactionResidue(root);
+});
+
+test("recovers a crashed exact legacy Gecko cleanup before the next reviewed run", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "whitelily-stage-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const destination = join(root, "minecraft-components");
+  const legacy = await spec(root, "legacy-gecko-crash", legacyGeckoNames);
+  await stageComponentPack(destination, legacy);
+  const replacement = await spec(root, "native-skin-crash");
+  replacement.previousFiles = reviewedFiles(legacy);
+  await crashAt(destination, replacement, "afterPublishCandidate");
+
+  const recovered = await stageComponentPack(
+    destination,
+    await replacementSpec(root, "native-skin-recovered", reviewedFiles(replacement)),
+  );
+
+  assert.deepEqual(recovered, { state: "published", cleanupPending: false });
   assert.deepEqual((await readdir(destination)).sort(), names);
   await assertNoTransactionResidue(root);
 });

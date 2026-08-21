@@ -194,28 +194,16 @@ const minecraftComponentFiles = [
     sha256: "b40930bbcf80744c86c46a12bc9da056641d722716c378f5659b9e555ef833e1",
   },
   {
-    source: "build/minecraft-components/geckolib-fabric-1.21.5-5.1.0.jar",
-    target: "minecraft-components/geckolib-fabric-1.21.5-5.1.0.jar",
-    bytes: 670_425,
-    sha256: "885ef4b03cd438c7d2ec9f59bb492f3af6ba2b73aa0493afc4f80801b5a9126c",
-  },
-  {
-    source: "build/minecraft-components/GeckoLib-LICENSE.txt",
-    target: "minecraft-components/GeckoLib-LICENSE.txt",
-    bytes: 1_065,
-    sha256: "5f2943625776c6126cd252652f4c57d2fb187d339a20fa065a2b7c619165a52f",
-  },
-  {
     source: "build/minecraft-components/minecraft-components-manifest.json",
     target: "minecraft-components/minecraft-components-manifest.json",
-    bytes: 1_984,
-    sha256: "9f6d60d8e8f23543689d5e61e9aa6656271daf8cf4b8028bdfebb305a12eaab0",
+    bytes: 1_624,
+    sha256: "ab184d3351b274e5af387ba5c20dd3f989571048c318ba5ae66cb810374f50b3",
   },
   {
     source: "build/minecraft-components/whitelily-avatar-fabric-1.21.5-0.1.0.jar",
     target: "minecraft-components/whitelily-avatar-fabric-1.21.5-0.1.0.jar",
-    bytes: 55_627,
-    sha256: "fff00f66e4beab2eff1e51f253608b198f43aa0a12443fbe07f7f3fd48278872",
+    bytes: 239_985,
+    sha256: "1fdba2b89281d7dbfb96d8e2ab3637caf95b20452831377f46e5285d37531351",
   },
   {
     source: "build/minecraft-components/whitelily-bridge-fabric-1.21.5-0.1.2.jar",
@@ -232,8 +220,8 @@ const minecraftComponentFiles = [
   {
     source: "build/minecraft-components/WhiteLily-NOTICE.txt",
     target: "minecraft-components/WhiteLily-NOTICE.txt",
-    bytes: 697,
-    sha256: "6323cb4b742d322d61ee47279d71d0f0de496568cf1f2f793fea104a58ab0dde",
+    bytes: 795,
+    sha256: "bc5ab24ff5624664bc3ef3d5b850ac3c820dddf3b2f15a4125b355f1c65a2c2a",
   },
 ] as const;
 
@@ -336,12 +324,12 @@ import { writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 const mode = basename(process.argv[3]);
 const marker = join(dirname(process.argv[3]), "descendant.pid");
-if (mode === "success") process.stdout.write('{"status":"ok","files":9}\\n');
+if (mode === "success") process.stdout.write('{"status":"ok","files":7}\\n');
 else if (mode === "nonzero") process.exitCode = 7;
 else if (mode === "stderr") process.stderr.write("unreviewed stderr");
 else if (mode === "oversize-stdout") process.stdout.write("x".repeat(10000));
 else if (mode === "oversize-stderr") process.stderr.write("x".repeat(10000));
-else if (mode === "extra-line") process.stdout.write('{"status":"ok","files":9}\\nextra\\n');
+else if (mode === "extra-line") process.stdout.write('{"status":"ok","files":7}\\nextra\\n');
 else if (mode === "malformed") process.stdout.write('{"status":"ok"}\\n');
 else if (mode === "hang") {
   const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore", windowsHide: true });
@@ -356,7 +344,7 @@ else if (mode === "parent-exits-first") {
   });
   writeFileSync(marker, String(child.pid));
   child.unref();
-  process.stdout.write('{"status":"ok","files":9}\\n');
+  process.stdout.write('{"status":"ok","files":7}\\n');
 }
 `,
   );
@@ -404,7 +392,7 @@ param([string]$Helper, [string]$Node, [string]$Verifier, [string]$Root)
 $output = @(
     & $Helper -NodeExecutable $Node -VerifierPath $Verifier -RepositoryRoot $Root -ManifestPath (Join-Path $Root 'success') -TimeoutMilliseconds 1500 -MaximumOutputBytes 256
 )
-if ($output.Count -ne 1 -or $output[0] -cne '{"status":"ok","files":9}') {
+if ($output.Count -ne 1 -or $output[0] -cne '{"status":"ok","files":7}') {
     exit 9
 }
 `,
@@ -1617,7 +1605,7 @@ describe("deterministic Electron resources", () => {
     ).toEqual([]);
   });
 
-  it("prepares exactly the reviewed nine-file Minecraft component pack", async () => {
+  it("prepares exactly the reviewed seven-file Minecraft component pack", async () => {
     const manifest = await readManifest(bundleManifestPath);
     expect(await filesUnder(join(bundleRoot, manifest.paths.minecraftComponents))).toEqual(
       minecraftComponentFiles

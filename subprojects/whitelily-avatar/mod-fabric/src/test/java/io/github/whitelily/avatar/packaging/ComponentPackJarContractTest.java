@@ -32,18 +32,8 @@ final class ComponentPackJarContractTest {
       STAGING.resolve("whitelily-avatar-fabric-1.21.5-0.1.0.jar");
   private static final Path FABRIC_API =
       STAGING.resolve("fabric-api-0.128.2+1.21.5.jar");
-  private static final Path GECKOLIB =
-      STAGING.resolve("geckolib-fabric-1.21.5-5.1.0.jar");
-
   private static final Set<String> AVATAR_THEME_RESOURCES =
       Set.of(
-          "assets/whitelily_avatar/geckolib/models/whitelily.geo.json",
-          "assets/whitelily_avatar/textures/entity/base.png",
-          "assets/whitelily_avatar/textures/entity/leather.png",
-          "assets/whitelily_avatar/textures/entity/iron.png",
-          "assets/whitelily_avatar/textures/entity/gold.png",
-          "assets/whitelily_avatar/textures/entity/diamond.png",
-          "assets/whitelily_avatar/textures/entity/netherite.png",
           "assets/whitelily_avatar/textures/skin/base.png",
           "assets/whitelily_avatar/textures/skin/leather.png",
           "assets/whitelily_avatar/textures/skin/iron.png",
@@ -62,6 +52,17 @@ final class ComponentPackJarContractTest {
   void bridgeAuthorityRemainsInItsOwnJarInsteadOfBeingCopiedIntoAvatar() throws Exception {
     assertFalse(hasEntryPrefix(AVATAR, "io/github/whitelily/bridge/"));
     assertFalse(hasEntryPrefix(BRIDGE, "io/github/whitelily/avatar/"));
+  }
+
+  @Test
+  void avatarJarDoesNotPublishCustomSkinningShaders() throws Exception {
+    assertFalse(hasEntryPrefix(AVATAR, "assets/whitelily_avatar/shaders/"));
+  }
+
+  @Test
+  void avatarJarDoesNotPublishLegacyGeckoOrEntityResources() throws Exception {
+    assertFalse(hasEntryPrefix(AVATAR, "assets/whitelily_avatar/geckolib/"));
+    assertFalse(hasEntryPrefix(AVATAR, "assets/whitelily_avatar/textures/entity/"));
   }
 
   @Test
@@ -90,7 +91,7 @@ final class ComponentPackJarContractTest {
             AVATAR,
             null,
             UnaryOperator.identity(),
-            "assets/whitelily_avatar/textures/entity/gold.png",
+            "assets/whitelily_avatar/textures/skin/gold.png",
             Map.of());
 
     assertThrows(
@@ -102,7 +103,7 @@ final class ComponentPackJarContractTest {
   void executableOrNativePayloadIsRejectedAtAnyJarBoundary() throws Exception {
     Path mutated =
         rewrite(
-            GECKOLIB,
+            FABRIC_API,
             null,
             UnaryOperator.identity(),
             null,
@@ -110,7 +111,7 @@ final class ComponentPackJarContractTest {
 
     assertThrows(
         IOException.class,
-        () -> ComponentPackPolicy.inspectComponent(mutated, geckoExpectation("geckolib")));
+        () -> ComponentPackPolicy.inspectComponent(mutated, fabricApiExpectation("fabric-api")));
   }
 
   @Test
@@ -130,16 +131,16 @@ final class ComponentPackJarContractTest {
 
   @Test
   void duplicateModIdAcrossTopLevelArtifactsIsRejected() throws Exception {
-    Path mutatedGecko =
+    Path mutatedFabricApi =
         rewrite(
-            GECKOLIB,
+            FABRIC_API,
             "fabric.mod.json",
-            bytes -> replaceRequired(bytes, "\"id\": \"geckolib\"", "\"id\": \"fabric-api\""),
+            bytes -> replaceRequired(bytes, "\"id\": \"fabric-api\"", "\"id\": \"whitelily_avatar\""),
             null,
             Map.of());
     LinkedHashMap<Path, ComponentPackPolicy.ExpectedMod> duplicatePack = exactPack();
-    duplicatePack.remove(GECKOLIB);
-    duplicatePack.put(mutatedGecko, geckoExpectation("fabric-api"));
+    duplicatePack.remove(FABRIC_API);
+    duplicatePack.put(mutatedFabricApi, fabricApiExpectation("whitelily_avatar"));
 
     assertThrows(IOException.class, () -> ComponentPackPolicy.inspectPack(duplicatePack));
   }
@@ -157,20 +158,7 @@ final class ComponentPackJarContractTest {
             "LICENSE",
             false));
     pack.put(AVATAR, avatarExpectation());
-    pack.put(
-        FABRIC_API,
-        new ComponentPackPolicy.ExpectedMod(
-            "fabric-api",
-            "0.128.2+1.21.5",
-            "*",
-            Map.of(
-                "fabricloader", ">=0.16.10",
-                "java", ">=21",
-                "minecraft", ">=1.21.5- <1.21.6-"),
-            Set.of(),
-            "LICENSE-fabric-api",
-            true));
-    pack.put(GECKOLIB, geckoExpectation("geckolib"));
+    pack.put(FABRIC_API, fabricApiExpectation("fabric-api"));
     return pack;
   }
 
@@ -183,26 +171,24 @@ final class ComponentPackJarContractTest {
             "minecraft", "=1.21.5",
             "fabricloader", ">=0.16.14",
             "whitelily_bridge", ">=0.1.0",
-            "fabric-api", ">=0.128.2+1.21.5",
-            "geckolib", "=5.1.0"),
+            "fabric-api", ">=0.128.2+1.21.5"),
         AVATAR_THEME_RESOURCES,
         "LICENSE",
         false);
   }
 
-  private static ComponentPackPolicy.ExpectedMod geckoExpectation(String id) {
+  private static ComponentPackPolicy.ExpectedMod fabricApiExpectation(String id) {
     return new ComponentPackPolicy.ExpectedMod(
         id,
-        "5.1.0",
+        "0.128.2+1.21.5",
         "*",
         Map.of(
-            "fabricloader", ">=0.16",
-            "fabric-api", ">=0.119.5+1.21.5",
-            "java", ">=17",
-            "minecraft", ">=1.21.5"),
+            "fabricloader", ">=0.16.10",
+            "java", ">=21",
+            "minecraft", ">=1.21.5- <1.21.6-"),
         Set.of(),
-        "LICENSE_GeckoLib 5",
-        false);
+        "LICENSE-fabric-api",
+        true);
   }
 
   private Path rewrite(

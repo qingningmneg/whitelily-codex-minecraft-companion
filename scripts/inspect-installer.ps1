@@ -453,9 +453,9 @@ try {
     [Array]::Sort($requiredMinecraftComponentFiles, [StringComparer]::Ordinal)
     [Array]::Sort($runtimeMinecraftComponentFiles, [StringComparer]::Ordinal)
     if (
-        $minecraftComponentResources.Count -ne 9 -or
-        $sourceMinecraftComponentFiles.Count -ne 9 -or
-        $requiredMinecraftComponentFiles.Count -ne 9 -or
+        $minecraftComponentResources.Count -ne 7 -or
+        $sourceMinecraftComponentFiles.Count -ne 7 -or
+        $requiredMinecraftComponentFiles.Count -ne 7 -or
         $componentExecutableFiles.Count -ne 0 -or
         $componentScriptFiles.Count -ne 0 -or
         -not [System.Linq.Enumerable]::SequenceEqual(
