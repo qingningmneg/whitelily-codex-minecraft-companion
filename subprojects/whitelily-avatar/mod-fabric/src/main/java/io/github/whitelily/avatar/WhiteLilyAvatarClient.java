@@ -27,10 +27,12 @@ import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
 
 public final class WhiteLilyAvatarClient implements ClientModInitializer {
   public static final String COMPONENT_VERSION = "0.1.0";
-  public static final String NATIVE_SKIN_FAILURE_CODE = "WL_AVATAR_SKIN_001";
+  public static final String NATIVE_SKIN_FAILURE_CODE = NativeSkinFailureDiagnostics.CODE;
 
   private static final WhiteLilyRenderRuntime RENDER_RUNTIME =
       new WhiteLilyRenderRuntime();
+  private static final NativeSkinFailureDiagnostics NATIVE_SKIN_FAILURE_DIAGNOSTICS =
+      new NativeSkinFailureDiagnostics(System.err::println);
   private static final long CONTROL_POLL_NANOS = 250_000_000L;
   private static final AtomicBoolean CONTROL_POLL_IN_FLIGHT = new AtomicBoolean();
   private static volatile AvatarCandidateRuntime candidateRuntime =
@@ -94,11 +96,7 @@ public final class WhiteLilyAvatarClient implements ClientModInitializer {
   }
 
   public static void reportNativeSkinFailure(RuntimeException error) {
-    try {
-      System.err.println(NATIVE_SKIN_FAILURE_CODE);
-    } catch (RuntimeException ignored) {
-      // Rendering must keep the entering vanilla state even if diagnostics are unavailable.
-    }
+    NATIVE_SKIN_FAILURE_DIAGNOSTICS.report(error);
   }
 
   public static void installCandidateRuntime(AvatarCandidateRuntime runtime) {
