@@ -359,7 +359,7 @@ export class AvatarModelSwitchCoordinator {
       state.worldSessionId !== request.worldSessionId ||
       state.phase !== recovery.terminalPhase ||
       state.activeModelId !== recovery.expectedActiveModelId ||
-      (state.candidateModelId !== undefined && state.candidateModelId !== request.modelId)
+      state.candidateModelId !== request.modelId
     ) {
       throw new AvatarModelSwitchError(
         "AVATAR_SWITCH_RECOVERY_PENDING",

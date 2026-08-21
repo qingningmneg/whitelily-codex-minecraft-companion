@@ -327,6 +327,54 @@ describe("AvatarModelSwitchCoordinator", () => {
       ),
     ).toBe(false);
   });
+
+  it.each([
+    {
+      label: "missing candidate model",
+      acknowledgement: { candidateModelId: undefined },
+    },
+    {
+      label: "foreign candidate model",
+      acknowledgement: { candidateModelId: secondUserId },
+    },
+  ])(
+    "keeps the recovery barrier for an acknowledgement with $label",
+    async ({ acknowledgement }) => {
+      const harness = createHarness({ preferenceConflict: true, recoveryTimeoutMs: 20 });
+      const first = harness.coordinator.switchTo(firstUserId);
+      await harness.mailbox.expectRequest("prepare", firstUserId);
+      harness.mailbox.reply("ready");
+      await harness.mailbox.expectRequest("commit", firstUserId);
+      harness.mailbox.reply("visible");
+      await harness.mailbox.expectRequest("cancel", firstUserId);
+      await expect(first).rejects.toMatchObject({ code: "AVATAR_SWITCH_RECOVERY_PENDING" });
+
+      const blocked = harness.coordinator.switchTo(secondUserId);
+      void blocked.catch(() => undefined);
+      await harness.mailbox.expectPublishCount("cancel", firstUserId, 3);
+      harness.mailbox.reply("cancelled", acknowledgement);
+
+      await harness.mailbox.expectPublishCount("cancel", firstUserId, 4);
+      await expect(blocked).rejects.toMatchObject({ code: "AVATAR_SWITCH_RECOVERY_PENDING" });
+      expect(
+        harness.mailbox.history.some(
+          (request) => request.operation === "prepare" && request.modelId === secondUserId,
+        ),
+      ).toBe(false);
+
+      const unlocked = harness.coordinator.switchTo(secondUserId);
+      await harness.mailbox.expectPublishCount("cancel", firstUserId, 5);
+      harness.mailbox.reply("cancelled");
+      await harness.mailbox.expectRequest("prepare", secondUserId);
+      harness.mailbox.reply("ready");
+      await harness.mailbox.expectRequest("commit", secondUserId);
+      harness.mailbox.reply("visible");
+      await harness.mailbox.expectRequest("finalize", secondUserId);
+      harness.mailbox.reply("committed", { activeModelId: secondUserId });
+
+      await expect(unlocked).resolves.toMatchObject({ activeModelId: secondUserId });
+    },
+  );
 });
 
 function createHarness(
@@ -514,6 +562,21 @@ class SingleSlotMailbox implements AvatarModelMailboxPort {
       await Promise.resolve();
     }
     throw new Error(`missing ${operation} request for ${modelId}`);
+  }
+
+  async expectPublishCount(
+    operation: AvatarModelControlRequest["operation"],
+    modelId: string,
+    expectedCount: number,
+  ): Promise<void> {
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const count = this.history.filter(
+        (request) => request.operation === operation && request.modelId === modelId,
+      ).length;
+      if (count >= expectedCount) return;
+      await Promise.resolve();
+    }
+    throw new Error(`missing ${operation} request ${expectedCount} for ${modelId}`);
   }
 
   reply(
