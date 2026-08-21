@@ -5,6 +5,7 @@ export interface AvatarModelPaths {
   readonly catalogPath: string;
   readonly preferencesPath: string;
   readonly stagingRoot: string;
+  readonly userRoot: string;
   readonly bridgeRoot: string;
 }
 
@@ -23,6 +24,7 @@ export function resolveAvatarModelPaths(dataRoot: string): AvatarModelPaths {
     catalogPath: join(root, "catalog.json"),
     preferencesPath: join(trustedRoot, "avatar-model-preferences.json"),
     stagingRoot: join(root, ".staging"),
+    userRoot: join(root, "user"),
     bridgeRoot: join(trustedRoot, "bridge", "avatar-model"),
   });
 }

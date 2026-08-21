@@ -31,7 +31,11 @@ export async function readVerifiedAvatarResource(input: {
   readonly maximumBytes: number;
   readonly io?: VerifiedAvatarResourceReaderIo;
 }): Promise<Buffer> {
-  if (!isAbsolute(input.root) || !Number.isSafeInteger(input.maximumBytes) || input.maximumBytes <= 0) {
+  if (
+    !isAbsolute(input.root) ||
+    !Number.isSafeInteger(input.maximumBytes) ||
+    input.maximumBytes <= 0
+  ) {
     throw new Error("avatar resource root is invalid");
   }
   const io = input.io ?? nodeVerifiedAvatarResourceReaderIo;
@@ -49,6 +53,28 @@ export async function readVerifiedAvatarResource(input: {
     }
   }
   return readBoundedFile(io, candidate, input.maximumBytes);
+}
+
+export async function readVerifiedAvatarFile(input: {
+  readonly path: string;
+  readonly maximumBytes: number;
+  readonly io?: VerifiedAvatarResourceReaderIo;
+}): Promise<Buffer> {
+  if (
+    !isAbsolute(input.path) ||
+    !Number.isSafeInteger(input.maximumBytes) ||
+    input.maximumBytes <= 0
+  ) {
+    throw new Error("avatar resource source is invalid");
+  }
+  const io = input.io ?? nodeVerifiedAvatarResourceReaderIo;
+  const path = resolve(input.path);
+  const stats = await io.lstat(path, { bigint: true });
+  const canonical = await io.realpath(path);
+  if (stats.isSymbolicLink() || normalizePath(canonical) !== normalizePath(path)) {
+    throw new Error("avatar resource source is unsafe");
+  }
+  return readBoundedFile(io, path, input.maximumBytes);
 }
 
 function parseRelativePath(path: string): readonly string[] {
@@ -73,10 +99,7 @@ async function verifyPathComponent(
 ): Promise<BigIntStats> {
   const stats = await io.lstat(path, { bigint: true });
   const canonical = await io.realpath(path);
-  if (
-    stats.isSymbolicLink() ||
-    normalizePath(canonical) !== normalizePath(resolve(path))
-  ) {
+  if (stats.isSymbolicLink() || normalizePath(canonical) !== normalizePath(resolve(path))) {
     throw new Error("avatar resource path component is unsafe");
   }
   return stats;
@@ -121,7 +144,12 @@ function readOnlyNoFollowFlags(): string | number {
 }
 
 function requireRegularFile(stats: BigIntStats, maximumBytes: number): void {
-  if (!stats.isFile() || stats.isSymbolicLink() || stats.size <= 0n || stats.size > BigInt(maximumBytes)) {
+  if (
+    !stats.isFile() ||
+    stats.isSymbolicLink() ||
+    stats.size <= 0n ||
+    stats.size > BigInt(maximumBytes)
+  ) {
     throw new Error("avatar resource file is invalid");
   }
 }

@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  readVerifiedAvatarFile,
   readVerifiedAvatarResource,
   type VerifiedAvatarResourceReaderIo,
 } from "./verifiedAvatarResourceReader.js";
@@ -14,6 +15,19 @@ afterEach(async () => {
 });
 
 describe("readVerifiedAvatarResource", () => {
+  it("rejects growth and same-size file swaps for absolute picker sources", async () => {
+    const root = await createRoot();
+    const path = join(root, "skin.png");
+    await writeFile(path, "skin");
+
+    await expect(
+      readVerifiedAvatarFile({ path, maximumBytes: 16, io: extraByteIo(path) }),
+    ).rejects.toThrow("avatar resource changed during read");
+    await expect(
+      readVerifiedAvatarFile({ path, maximumBytes: 16, io: metadataDriftIo(path) }),
+    ).rejects.toThrow("avatar resource changed during read");
+  });
+
   it("rejects an ancestor link or reparse point when the platform permits one", async () => {
     const root = await mkdtemp(join(tmpdir(), "whitelily-avatar-reader-root-"));
     const outside = await mkdtemp(join(tmpdir(), "whitelily-avatar-reader-outside-"));
@@ -21,7 +35,11 @@ describe("readVerifiedAvatarResource", () => {
     cleanups.push(() => rm(outside, { recursive: true, force: true }));
     await writeFile(join(outside, "skin.png"), "skin");
     try {
-      await symlink(outside, join(root, "linked"), process.platform === "win32" ? "junction" : "dir");
+      await symlink(
+        outside,
+        join(root, "linked"),
+        process.platform === "win32" ? "junction" : "dir",
+      );
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "EPERM") return;
       throw error;
@@ -30,6 +48,31 @@ describe("readVerifiedAvatarResource", () => {
     await expect(
       readVerifiedAvatarResource({ root, relativePath: "linked/skin.png", maximumBytes: 16 }),
     ).rejects.toThrow("avatar resource path component is unsafe");
+  });
+
+  it("rejects a picker source reached through an ancestor link or reparse point", async () => {
+    const root = await mkdtemp(join(tmpdir(), "whitelily-avatar-reader-source-root-"));
+    const outside = await mkdtemp(join(tmpdir(), "whitelily-avatar-reader-source-outside-"));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    cleanups.push(() => rm(outside, { recursive: true, force: true }));
+    await writeFile(join(outside, "skin.png"), "skin");
+    try {
+      await symlink(
+        outside,
+        join(root, "linked"),
+        process.platform === "win32" ? "junction" : "dir",
+      );
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EPERM") return;
+      throw error;
+    }
+
+    await expect(
+      readVerifiedAvatarFile({
+        path: join(root, "linked", "skin.png"),
+        maximumBytes: 16,
+      }),
+    ).rejects.toThrow("avatar resource source is unsafe");
   });
 
   it("rejects an extra byte after reading the validated size", async () => {

@@ -5,6 +5,8 @@ import path from "node:path";
 import { inflateSync } from "node:zlib";
 import { renderSkinFrontPreview } from "./skin-front-preview.mjs";
 
+export { renderSkinFrontPreview } from "./skin-front-preview.mjs";
+
 const EXPECTED_THEMES = ["base", "leather", "iron", "gold", "diamond", "netherite"];
 const EXPECTED_BONES = [
   "head",
@@ -253,7 +255,7 @@ function sourceDigest(bytes) {
   return createHash("sha256").update(bytes).digest("hex").toUpperCase();
 }
 
-function pngCrc32(bytes) {
+export function pngCrc32(bytes) {
   let crc = 0xffffffff;
   for (const byte of bytes) {
     crc ^= byte;
@@ -335,9 +337,29 @@ function unfilterRgba(inflated, width, height, invalidPng) {
   return pixels;
 }
 
-function validateRgbaPng(bytes, { errorMessage, expectedWidth, expectedHeight, maxDimension }) {
+export function validateRgbaPng(
+  bytes,
+  {
+    errorMessage,
+    expectedWidth,
+    expectedHeight,
+    maxDimension,
+    maximumBytes = MAX_SKIN_PNG_BYTES,
+    maximumCompressedBytes = MAX_COMPRESSED_SKIN_BYTES,
+    decodePixels = true,
+  },
+) {
   const invalidPng = () => failure(errorMessage);
-  if (bytes.length < 8 || !bytes.subarray(0, 8).equals(PNG_SIGNATURE)) {
+  if (
+    !Number.isSafeInteger(maximumBytes) ||
+    !Number.isSafeInteger(maximumCompressedBytes) ||
+    maximumBytes <= 0 ||
+    maximumCompressedBytes <= 0 ||
+    maximumCompressedBytes > maximumBytes ||
+    bytes.length < 8 ||
+    bytes.length > maximumBytes ||
+    !bytes.subarray(0, 8).equals(PNG_SIGNATURE)
+  ) {
     throw invalidPng();
   }
 
@@ -359,7 +381,7 @@ function validateRgbaPng(bytes, { errorMessage, expectedWidth, expectedHeight, m
     chunkCount += 1;
     if (chunkCount > MAX_PNG_CHUNKS) throw invalidPng();
     const length = bytes.readUInt32BE(offset);
-    if (length > MAX_SKIN_PNG_BYTES - 12) throw invalidPng();
+    if (length > maximumBytes - 12) throw invalidPng();
     if (length > bytes.length - offset - 12) throw invalidPng();
 
     const typeBytes = bytes.subarray(offset + 4, offset + 8);
@@ -410,7 +432,7 @@ function validateRgbaPng(bytes, { errorMessage, expectedWidth, expectedHeight, m
       } else if (type === "IDAT") {
         if (idatEnded) throw invalidPng();
         compressedLength += length;
-        if (compressedLength > MAX_COMPRESSED_SKIN_BYTES) throw invalidPng();
+        if (compressedLength > maximumCompressedBytes) throw invalidPng();
         idatParts.push(bytes.subarray(dataStart, dataEnd));
         sawIdat = true;
       } else if (type === "IEND") {
@@ -435,11 +457,9 @@ function validateRgbaPng(bytes, { errorMessage, expectedWidth, expectedHeight, m
     colorType,
     invalidPng,
   );
-  return {
-    width,
-    height,
-    pixels: unfilterRgba(inflated, width, height, invalidPng),
-  };
+  return decodePixels
+    ? { width, height, pixels: unfilterRgba(inflated, width, height, invalidPng) }
+    : { width, height };
 }
 
 function validatePng64Rgba(bytes) {
@@ -692,7 +712,13 @@ function rgbaHexes(pixels) {
   return colors;
 }
 
-async function validateNativeSkinAssets(assetRoot, resourceRoot, namespaceRoot, allFiles, manifest) {
+async function validateNativeSkinAssets(
+  assetRoot,
+  resourceRoot,
+  namespaceRoot,
+  allFiles,
+  manifest,
+) {
   if (
     manifest.worldRenderer !== "minecraft-skin" ||
     manifest.armModel !== "slim" ||
@@ -728,7 +754,10 @@ async function validateNativeSkinAssets(assetRoot, resourceRoot, namespaceRoot, 
     inspectedSkins.push(inspected);
   }
 
-  if (!Array.isArray(manifest.runtimeAssets) || manifest.runtimeAssets.length !== EXPECTED_SKINS.length) {
+  if (
+    !Array.isArray(manifest.runtimeAssets) ||
+    manifest.runtimeAssets.length !== EXPECTED_SKINS.length
+  ) {
     throw failure("invalid runtime asset declarations");
   }
   const runtimeDeclarations = new Set();
@@ -791,13 +820,25 @@ async function validateNativeSkinAssets(assetRoot, resourceRoot, namespaceRoot, 
   if (!Array.isArray(manifest.conceptReferences) || manifest.conceptReferences.length !== 6) {
     throw failure("invalid concept reference declarations");
   }
-  const declaredAssetFiles = new Set(["manifest.json", "source/asset-license.json", ...skinPreviewPaths]);
+  const declaredAssetFiles = new Set([
+    "manifest.json",
+    "source/asset-license.json",
+    ...skinPreviewPaths,
+  ]);
   for (const [index, concept] of manifest.conceptReferences.entries()) {
-    if (!isPlainObject(concept) || concept.theme !== EXPECTED_THEMES[index] || typeof concept.sha256 !== "string") {
+    if (
+      !isPlainObject(concept) ||
+      concept.theme !== EXPECTED_THEMES[index] ||
+      typeof concept.sha256 !== "string"
+    ) {
       throw failure("invalid concept reference declarations");
     }
     const safePath = safeAssetPath(assetRoot, concept.path);
-    const bytes = await regularFile(safePath.resolved, `missing concept reference: ${safePath.declaredPath}`, MAX_RUNTIME_ASSET_BYTES);
+    const bytes = await regularFile(
+      safePath.resolved,
+      `missing concept reference: ${safePath.declaredPath}`,
+      MAX_RUNTIME_ASSET_BYTES,
+    );
     if (!/^[0-9A-F]{64}$/.test(concept.sha256) || sourceDigest(bytes) !== concept.sha256) {
       throw failure("concept reference SHA-256 mismatch");
     }
@@ -810,7 +851,11 @@ async function validateNativeSkinAssets(assetRoot, resourceRoot, namespaceRoot, 
   for (const source of manifest.sources) {
     const safePath = safeAssetPath(assetRoot, source?.path);
     const expectedHash = EXPECTED_SOURCES.get(safePath.declaredPath);
-    const bytes = await regularFile(safePath.resolved, "missing approved source image", MAX_SOURCE_IMAGE_BYTES);
+    const bytes = await regularFile(
+      safePath.resolved,
+      "missing approved source image",
+      MAX_SOURCE_IMAGE_BYTES,
+    );
     if (
       !expectedHash ||
       declaredSources.has(safePath.declaredPath) ||
@@ -827,16 +872,23 @@ async function validateNativeSkinAssets(assetRoot, resourceRoot, namespaceRoot, 
   if (
     !Array.isArray(manifest.researchAssetDirectories) ||
     researchDirectories.size !== manifest.researchAssetDirectories.length ||
-    [...researchDirectories].some((entry) => typeof entry !== "string" || !entry.endsWith("/") || entry.includes(".."))
+    [...researchDirectories].some(
+      (entry) => typeof entry !== "string" || !entry.endsWith("/") || entry.includes(".."),
+    )
   ) {
     throw failure("invalid research asset declarations");
   }
   for (const file of allFiles) {
-    if (declaredAssetFiles.has(file) || [...researchDirectories].some((directory) => file.startsWith(directory))) continue;
+    if (
+      declaredAssetFiles.has(file) ||
+      [...researchDirectories].some((directory) => file.startsWith(directory))
+    )
+      continue;
     throw failure(`undeclared asset: ${file}`);
   }
 
-  if (!Array.isArray(manifest.researchRuntimeAssets)) throw failure("invalid research runtime declarations");
+  if (!Array.isArray(manifest.researchRuntimeAssets))
+    throw failure("invalid research runtime declarations");
   const researchRuntime = new Set();
   for (const entry of manifest.researchRuntimeAssets) {
     const declared = manifestFile(entry, assetRoot, resourceRoot);
@@ -856,9 +908,14 @@ async function validateNativeSkinAssets(assetRoot, resourceRoot, namespaceRoot, 
     throw failure("research runtime declarations do not match preserved files");
   }
   return {
-    themes: [...manifest.themes], skinCount: skinPaths.length, skinPaths, skinPreviewPaths,
-    skinPreviewCount: skinPreviewPaths.length, runtimeAssetCount: runtimeDeclarations.size,
-    unreferencedTextureCount: 0, maxTextureDimension: 64,
+    themes: [...manifest.themes],
+    skinCount: skinPaths.length,
+    skinPaths,
+    skinPreviewPaths,
+    skinPreviewCount: skinPreviewPaths.length,
+    runtimeAssetCount: runtimeDeclarations.size,
+    unreferencedTextureCount: 0,
+    maxTextureDimension: 64,
   };
 }
 

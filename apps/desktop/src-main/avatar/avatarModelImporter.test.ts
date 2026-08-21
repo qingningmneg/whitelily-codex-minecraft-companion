@@ -3,19 +3,15 @@ import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import type {
-  AvatarBoneMapping,
-  AvatarModelRecord,
-} from "../../../../src/avatar/avatarModelTypes.js";
-import { createGlbFixture } from "./__fixtures__/createGlbFixture.js";
+import type { AvatarAppearanceRecord } from "../../../../src/avatar/avatarModelTypes.js";
 import { AvatarModelCatalog } from "./avatarModelCatalog.js";
 import {
   AvatarModelImporter,
   nodeAvatarModelImporterIo,
   type AvatarModelImporterIo,
-  type AvatarPreviewRendererPort,
 } from "./avatarModelImporter.js";
 import { resolveAvatarModelPaths } from "./avatarModelPaths.js";
+import { png, validSkinBytes } from "./pngImageValidator.test.js";
 
 const cleanups: Array<() => Promise<void>> = [];
 const importedUuid = "00000000-0000-4000-8000-000000000001";
@@ -26,171 +22,181 @@ afterEach(async () => {
 });
 
 describe("AvatarModelImporter", () => {
+  it("atomically imports a validated skin with its explicitly selected portrait", async () => {
+    const harness = await createHarness();
+    const skin = validSkinBytes();
+    const portrait = png({ width: 1, height: 1 });
+    await harness.writeSources(skin, portrait);
+
+    const record = await harness.importer.importSkin({
+      skinSourcePath: harness.skinSourcePath,
+      portraitSourcePath: harness.portraitSourcePath,
+      displayName: "  Lily\u0000\n  ",
+      armModel: "wide",
+    });
+
+    expect(record).toEqual({
+      id: importedId,
+      displayName: "Lily",
+      origin: "imported",
+      worldRenderer: "minecraft-skin",
+      skinAsset: `user/${importedUuid}/skin.png`,
+      skinSha256: sha256(skin),
+      armModel: "wide",
+      portraitAsset: `user/${importedUuid}/portrait.png`,
+      portraitSha256: sha256(portrait),
+      importedAt: "2026-08-21T08:00:00.000Z",
+      validation: { code: "AVATAR_VALID", validatedAt: "2026-08-21T08:00:00.000Z" },
+    });
+    await expect(readFile(join(harness.paths.root, record.skinAsset))).resolves.toEqual(skin);
+    await expect(readFile(join(harness.paths.root, record.portraitAsset!))).resolves.toEqual(
+      portrait,
+    );
+    await expect(
+      readFile(join(harness.paths.root, `user/${importedUuid}/preview.png`)),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+    expect((await harness.catalog.list()).models.map(({ id }) => id)).toEqual([
+      "builtin:whitelily",
+      importedId,
+    ]);
+    expect(await harness.stagingEntries()).toEqual([]);
+  });
+
+  it("creates a deterministic preview from the verified skin only when portrait is skipped", async () => {
+    const first = await createHarness();
+    const second = await createHarness();
+    const skin = validSkinBytes();
+    await first.writeSources(skin);
+    await second.writeSources(skin);
+    const record = await first.importer.importSkin({
+      skinSourcePath: first.skinSourcePath,
+      displayName: "No portrait",
+      armModel: "slim",
+    });
+    await second.importer.importSkin({
+      skinSourcePath: second.skinSourcePath,
+      displayName: "No portrait",
+      armModel: "slim",
+    });
+
+    expect(record).not.toHaveProperty("portraitAsset");
+    const [firstPreview, secondPreview] = await Promise.all([
+      readFile(join(first.paths.root, `user/${importedUuid}/preview.png`)),
+      readFile(join(second.paths.root, `user/${importedUuid}/preview.png`)),
+    ]);
+    expect(firstPreview).toEqual(secondPreview);
+  });
+
   it.each([
-    ["self-contained GLB", { format: "glb" }, "glb"],
-    ["VRM 0.x", { format: "vrm0" }, "vrm"],
-    ["VRM 1.0", { format: "vrm1" }, "vrm"],
+    ["a malformed skin", () => Buffer.from("not a png"), undefined, "AVATAR_SKIN_INVALID"],
+    [
+      "a malformed portrait",
+      validSkinBytes,
+      () => Buffer.from("not a png"),
+      "AVATAR_PORTRAIT_INVALID",
+    ],
   ] as const)(
-    "atomically imports %s into its managed copy",
-    async (_name, fixtureOptions, format) => {
+    "rejects %s without publishing files or a catalog record",
+    async (_name, skin, portrait, code) => {
       const harness = await createHarness();
-      const sourceBytes = createGlbFixture(fixtureOptions);
-      await harness.writeSource(sourceBytes);
-
-      const record = await harness.importer.importFile({
-        sourcePath: harness.sourcePath,
-        displayName: "  Lily\u0000\n  ",
-      });
-
-      expect(record).toMatchObject({
-        id: importedId,
-        displayName: "Lily",
-        origin: "imported",
-        format,
-        sha256: createHash("sha256").update(sourceBytes).digest("hex"),
-        previewStatus: "ready",
-        validation: { code: "AVATAR_VALID" },
-      });
-      expect((await harness.catalog.list()).models.map(({ id }) => id)).toEqual([
-        "builtin:whitelily-hd",
-        "builtin:whitelily-classic",
-        importedId,
-      ]);
-      expect(await harness.stagingEntries()).toEqual([]);
-
-      await rm(harness.sourcePath);
-      await expect(readFile(join(harness.paths.root, record.resourcePath))).resolves.toEqual(
-        sourceBytes,
-      );
+      await harness.writeSources(skin(), portrait?.());
       await expect(
-        readFile(join(harness.paths.root, `user/${importedUuid}/record.json`), "utf8").then(
-          JSON.parse,
-        ),
-      ).resolves.toEqual(record);
-    },
-  );
-
-  it.each([
-    ["wrong magic", { magic: "NOPE" }, "AVATAR_GLB_INVALID"],
-    ["remote image", { imageUri: "https://example.test/skin.png" }, "AVATAR_EXTERNAL_RESOURCE"],
-    ["external buffer", { bufferUri: "body.bin" }, "AVATAR_EXTERNAL_RESOURCE"],
-    ["missing hips", { omitBone: "hips" }, "AVATAR_REQUIRED_BONE_MISSING"],
-    ["bad accessor", { invalidAccessorBounds: true }, "AVATAR_GLB_INVALID"],
-  ] as const)(
-    "rejects %s without catalog mutation or staging residue",
-    async (_name, options, code) => {
-      const harness = await createHarness();
-      await harness.writeSource(createGlbFixture(options));
-
-      await expect(
-        harness.importer.importFile({ sourcePath: harness.sourcePath, displayName: "Unsafe" }),
+        harness.importer.importSkin({
+          skinSourcePath: harness.skinSourcePath,
+          ...(portrait === undefined ? {} : { portraitSourcePath: harness.portraitSourcePath }),
+          displayName: "Unsafe",
+          armModel: "slim",
+        }),
       ).rejects.toMatchObject({ code });
-      expect((await harness.catalog.list()).models).toHaveLength(2);
+      expect((await harness.catalog.list()).models).toHaveLength(1);
       expect(await harness.stagingEntries()).toEqual([]);
       expect(await harness.userEntries()).toEqual([]);
     },
   );
 
-  it("commits a neutral-only GLB without inventing facial animation", async () => {
-    const harness = await createHarness();
-    await harness.writeSource(createGlbFixture());
-
-    const record = await harness.importer.importFile({
-      sourcePath: harness.sourcePath,
-      displayName: "Neutral",
-    });
-
-    expect(record.expressions).toBe("neutral-only");
-  });
-
-  it("cleans staging when preview generation fails", async () => {
-    const harness = await createHarness({
-      previewRenderer: {
-        render: async () => {
-          throw new Error("injected preview failure");
-        },
+  it("cleans its staging directory when staged bytes fail their digest recheck", async () => {
+    const io = {
+      ...nodeAvatarModelImporterIo,
+      readFile: async (path: Parameters<typeof nodeAvatarModelImporterIo.readFile>[0]) => {
+        const bytes = (await nodeAvatarModelImporterIo.readFile(path)) as Buffer;
+        return String(path).endsWith("skin.png") ? Buffer.from("tampered") : bytes;
       },
-    });
-    await harness.writeSource(createGlbFixture());
-
+    } as AvatarModelImporterIo;
+    const harness = await createHarness({ io });
+    await harness.writeSources(validSkinBytes());
     await expect(
-      harness.importer.importFile({ sourcePath: harness.sourcePath, displayName: "Preview" }),
-    ).rejects.toMatchObject({ code: "AVATAR_PREVIEW_FAILED" });
-    expect((await harness.catalog.list()).models).toHaveLength(2);
+      harness.importer.importSkin({
+        skinSourcePath: harness.skinSourcePath,
+        displayName: "Digest",
+        armModel: "slim",
+      }),
+    ).rejects.toMatchObject({ code: "AVATAR_DIGEST_MISMATCH" });
     expect(await harness.stagingEntries()).toEqual([]);
     expect(await harness.userEntries()).toEqual([]);
   });
 
-  it("cleans staging when the atomic directory rename fails", async () => {
-    const io: AvatarModelImporterIo = {
+  it("cleans staging when atomic publication or catalog append fails", async () => {
+    const renameIo: AvatarModelImporterIo = {
       ...nodeAvatarModelImporterIo,
       rename: async () => {
         throw new Error("injected rename failure");
       },
     };
-    const harness = await createHarness({ io });
-    await harness.writeSource(createGlbFixture());
-
+    const renamed = await createHarness({ io: renameIo });
+    await renamed.writeSources(validSkinBytes());
     await expect(
-      harness.importer.importFile({ sourcePath: harness.sourcePath, displayName: "Rename" }),
+      renamed.importer.importSkin({
+        skinSourcePath: renamed.skinSourcePath,
+        displayName: "Rename",
+        armModel: "slim",
+      }),
     ).rejects.toMatchObject({ code: "AVATAR_IMPORT_FAILED" });
-    expect((await harness.catalog.list()).models).toHaveLength(2);
-    expect(await harness.stagingEntries()).toEqual([]);
-    expect(await harness.userEntries()).toEqual([]);
-  });
+    expect(await renamed.stagingEntries()).toEqual([]);
+    expect(await renamed.userEntries()).toEqual([]);
 
-  it("removes only the new managed directory when catalog append fails", async () => {
-    const harness = await createHarness({ catalogAppendFails: true });
-    await harness.writeSource(createGlbFixture());
-
+    const catalog = await createHarness({ catalogAppendFails: true });
+    await catalog.writeSources(validSkinBytes());
     await expect(
-      harness.importer.importFile({ sourcePath: harness.sourcePath, displayName: "Catalog" }),
+      catalog.importer.importSkin({
+        skinSourcePath: catalog.skinSourcePath,
+        displayName: "Catalog",
+        armModel: "slim",
+      }),
     ).rejects.toMatchObject({ code: "AVATAR_IMPORT_FAILED" });
-    expect((await harness.catalog.list()).models).toHaveLength(2);
-    expect(await harness.stagingEntries()).toEqual([]);
-    expect(await harness.userEntries()).toEqual([]);
+    expect(await catalog.stagingEntries()).toEqual([]);
+    expect(await catalog.userEntries()).toEqual([]);
   });
 });
 
 async function createHarness(
-  options: {
-    readonly previewRenderer?: AvatarPreviewRendererPort;
-    readonly io?: AvatarModelImporterIo;
-    readonly catalogAppendFails?: boolean;
-  } = {},
+  options: { readonly io?: AvatarModelImporterIo; readonly catalogAppendFails?: boolean } = {},
 ) {
-  const root = await mkdtemp(join(tmpdir(), "whitelily-avatar-importer-"));
+  const root = await mkdtemp(join(tmpdir(), "whitelily-skin-importer-"));
   cleanups.push(() => rm(root, { recursive: true, force: true }));
   const paths = resolveAvatarModelPaths(root);
-  const sourcePath = join(root, "selected-avatar.glb");
-  const catalog = new AvatarModelCatalog({ dataRoot: root, builtinModels: builtinModels() });
+  const skinSourcePath = join(root, "selected-skin.png");
+  const portraitSourcePath = join(root, "selected-portrait.png");
+  const catalog = new AvatarModelCatalog({ dataRoot: root, builtinModels: builtinAppearance() });
   await catalog.initialize();
-  const previewRenderer = options.previewRenderer ?? {
-    render: async ({ outputPath }) => {
-      await writeFile(outputPath, Buffer.from("preview-png", "utf8"));
-    },
-  };
   const catalogPort = options.catalogAppendFails
-    ? {
-        appendImported: async () => {
-          throw new Error("injected catalog append failure");
-        },
-      }
+    ? { appendImported: async () => Promise.reject(new Error("injected catalog append failure")) }
     : catalog;
   return {
-    root,
     paths,
-    sourcePath,
+    skinSourcePath,
+    portraitSourcePath,
     catalog,
     importer: new AvatarModelImporter({
       dataRoot: root,
       catalog: catalogPort,
-      previewRenderer,
       createId: () => importedUuid,
-      now: () => new Date("2026-08-16T08:00:00.000Z"),
+      now: () => new Date("2026-08-21T08:00:00.000Z"),
       ...(options.io === undefined ? {} : { io: options.io }),
     }),
-    writeSource: (bytes: Uint8Array) => writeFile(sourcePath, bytes),
+    writeSources: async (skin: Buffer, portrait?: Buffer) => {
+      await writeFile(skinSourcePath, skin);
+      if (portrait !== undefined) await writeFile(portraitSourcePath, portrait);
+    },
     stagingEntries: () => entriesOrEmpty(paths.stagingRoot),
     userEntries: () => entriesOrEmpty(join(paths.root, "user")),
   };
@@ -213,55 +219,21 @@ function isNotFound(error: unknown): boolean {
     Reflect.get(error, "code") === "ENOENT"
   );
 }
-
-const boneMapping = {
-  head: "Head",
-  neck: "Neck",
-  chest: "Chest",
-  hips: "Hips",
-  leftUpperArm: "LeftUpperArm",
-  leftLowerArm: "LeftLowerArm",
-  leftHand: "LeftHand",
-  rightUpperArm: "RightUpperArm",
-  rightLowerArm: "RightLowerArm",
-  rightHand: "RightHand",
-  leftUpperLeg: "LeftUpperLeg",
-  leftLowerLeg: "LeftLowerLeg",
-  leftFoot: "LeftFoot",
-  rightUpperLeg: "RightUpperLeg",
-  rightLowerLeg: "RightLowerLeg",
-  rightFoot: "RightFoot",
-} as const satisfies AvatarBoneMapping;
-
-function builtinModels(): readonly [AvatarModelRecord, AvatarModelRecord] {
-  const common = {
+function sha256(bytes: Buffer): string {
+  return createHash("sha256").update(bytes).digest("hex");
+}
+function builtinAppearance(): AvatarAppearanceRecord {
+  return {
+    id: "builtin:whitelily",
     displayName: "WhiteLily",
-    origin: "builtin" as const,
-    sha256: "a".repeat(64),
-    importedAt: "2026-08-16T00:00:00.000Z",
-    previewStatus: "ready" as const,
-    boneMapping,
-    bodyAnimation: "whitelily-humanoid-v1" as const,
-    expressions: "full" as const,
-    validation: {
-      code: "AVATAR_VALID" as const,
-      validatedAt: "2026-08-16T00:00:00.000Z",
-    },
+    origin: "builtin",
+    worldRenderer: "minecraft-skin",
+    skinAsset: "builtin/whitelily/skin/base.png",
+    skinSha256: "a".repeat(64),
+    armModel: "slim",
+    portraitAsset: "builtin/whitelily/portrait.png",
+    portraitSha256: "b".repeat(64),
+    importedAt: "2026-08-21T00:00:00.000Z",
+    validation: { code: "AVATAR_VALID", validatedAt: "2026-08-21T00:00:00.000Z" },
   };
-  return [
-    {
-      ...common,
-      id: "builtin:whitelily-hd",
-      format: "builtin-hd",
-      resourcePath: "builtin/whitelily-hd/high.glb",
-      previewPath: "builtin/whitelily-hd/turnaround.png",
-    },
-    {
-      ...common,
-      id: "builtin:whitelily-classic",
-      format: "builtin-classic",
-      resourcePath: "builtin/whitelily-classic/whitelily.geo.json",
-      previewPath: "builtin/whitelily-classic/preview.png",
-    },
-  ];
 }

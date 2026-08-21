@@ -12,6 +12,8 @@ import { AtomicJsonFile } from "../../../../src/storage/atomicJsonFile.js";
 import { resolveAvatarModelPaths, type AvatarModelPaths } from "./avatarModelPaths.js";
 import { readVerifiedAvatarResource } from "./verifiedAvatarResourceReader.js";
 
+const MAX_IMPORTED_AVATAR_PNG_BYTES = 8 * 1024 * 1024;
+
 export type AvatarModelCatalogErrorCode =
   | "AVATAR_CATALOG_INVALID"
   | "AVATAR_CATALOG_LEGACY_MODEL_SKIPPED"
@@ -207,11 +209,9 @@ export class AvatarModelCatalog {
     const failure =
       error instanceof AvatarModelCatalogError
         ? error
-        : new AvatarModelCatalogError(
-            "AVATAR_CATALOG_INVALID",
-            "avatar model catalog is invalid",
-            { cause: error },
-          );
+        : new AvatarModelCatalogError("AVATAR_CATALOG_INVALID", "avatar model catalog is invalid", {
+            cause: error,
+          });
     this.#diagnostic({ code: failure.code, modelId: "catalog" });
   }
 
@@ -242,7 +242,7 @@ export class AvatarModelCatalog {
       const skinBytes = await readVerifiedAvatarResource({
         root: this.#paths.root,
         relativePath: record.skinAsset,
-        maximumBytes: 2 * 1024 * 1024,
+        maximumBytes: MAX_IMPORTED_AVATAR_PNG_BYTES,
       });
       if (digest(skinBytes) !== record.skinSha256) {
         throw new AvatarModelCatalogError("AVATAR_DIGEST_MISMATCH", "avatar skin digest changed");
@@ -251,7 +251,7 @@ export class AvatarModelCatalog {
         const portraitBytes = await readVerifiedAvatarResource({
           root: this.#paths.root,
           relativePath: record.portraitAsset,
-          maximumBytes: 2 * 1024 * 1024,
+          maximumBytes: MAX_IMPORTED_AVATAR_PNG_BYTES,
         });
         if (digest(portraitBytes) !== record.portraitSha256) {
           throw new AvatarModelCatalogError(
@@ -294,7 +294,7 @@ function validateCatalogDocument(value: unknown): AvatarModelCatalogDocument {
   return Object.freeze({
     schemaVersion: 1,
     revision: Reflect.get(value, "revision") as number,
-    imported: Object.freeze([...((Reflect.get(value, "imported") as unknown[]))]),
+    imported: Object.freeze([...(Reflect.get(value, "imported") as unknown[])]),
   });
 }
 

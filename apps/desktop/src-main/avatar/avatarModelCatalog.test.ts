@@ -140,6 +140,21 @@ describe("AvatarModelCatalog", () => {
       armModel: "slim",
     });
   });
+
+  it("accepts a portrait up to the eight MiB importer limit", async () => {
+    const harness = await createHarness();
+    const imported = await harness.imported(importedId, "Large portrait");
+    const portrait = Buffer.alloc(3 * 1024 * 1024, 0x5a);
+    const portraitAsset = `user/${importedId.slice("user:".length)}/portrait.png`;
+    await writeFile(join(harness.paths.root, portraitAsset), portrait);
+
+    const state = await harness.catalog.appendImported({
+      ...imported,
+      portraitAsset,
+      portraitSha256: createHash("sha256").update(portrait).digest("hex"),
+    });
+    expect(state.models.at(-1)).toMatchObject({ id: importedId });
+  });
 });
 
 async function createHarness() {
