@@ -8,6 +8,12 @@ export interface AvatarModelPaths {
   readonly bridgeRoot: string;
 }
 
+export interface BuiltinAvatarAppearancePaths {
+  readonly root: string;
+  readonly skinPath: string;
+  readonly portraitPath: string;
+}
+
 export function resolveAvatarModelPaths(dataRoot: string): AvatarModelPaths {
   if (!isAbsolute(dataRoot)) throw new Error("invalid WhiteLily data root");
   const trustedRoot = resolve(dataRoot);
@@ -18,5 +24,17 @@ export function resolveAvatarModelPaths(dataRoot: string): AvatarModelPaths {
     preferencesPath: join(trustedRoot, "avatar-model-preferences.json"),
     stagingRoot: join(root, ".staging"),
     bridgeRoot: join(trustedRoot, "bridge", "avatar-model"),
+  });
+}
+
+export function resolveBuiltinAvatarAppearancePaths(
+  resourcesPath: string,
+): BuiltinAvatarAppearancePaths {
+  if (!isAbsolute(resourcesPath)) throw new Error("invalid WhiteLily resources root");
+  const root = join(resolve(resourcesPath), "avatar", "builtin", "whitelily");
+  return Object.freeze({
+    root,
+    skinPath: join(root, "skin", "base.png"),
+    portraitPath: join(root, "portrait.png"),
   });
 }

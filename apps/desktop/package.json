@@ -52,6 +52,13 @@
     ],
     "extraResources": [
       {
+        "from": "resources/avatar",
+        "to": "avatar",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
         "from": "../../build/electron-bundle/core",
         "to": "core",
         "filter": [

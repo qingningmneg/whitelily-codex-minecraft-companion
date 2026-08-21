@@ -5,8 +5,8 @@ import { isAbsolute, relative, resolve, sep } from "node:path";
 import {
   BUILTIN_AVATAR_MODEL_IDS,
   parseAvatarModelRecord,
+  type AvatarAppearanceRecord,
   type AvatarModelCatalogState,
-  type AvatarModelRecord,
   type AvatarRuntimeDescriptor,
 } from "../../../../src/avatar/avatarModelSchemas.js";
 import { AtomicJsonFile } from "../../../../src/storage/atomicJsonFile.js";
@@ -14,6 +14,7 @@ import { resolveAvatarModelPaths, type AvatarModelPaths } from "./avatarModelPat
 
 export type AvatarModelCatalogErrorCode =
   | "AVATAR_CATALOG_INVALID"
+  | "AVATAR_CATALOG_LEGACY_MODEL_SKIPPED"
   | "AVATAR_MODEL_DUPLICATE"
   | "AVATAR_MODEL_FILE_INVALID"
   | "AVATAR_DIGEST_MISMATCH"
@@ -38,12 +39,12 @@ export class AvatarModelCatalogError extends Error {
 interface AvatarModelCatalogDocument {
   readonly schemaVersion: 1;
   readonly revision: number;
-  readonly imported: readonly AvatarModelRecord[];
+  readonly imported: readonly unknown[];
 }
 
 interface AvatarModelCatalogOptions {
   readonly dataRoot: string;
-  readonly builtinModels: readonly [AvatarModelRecord, AvatarModelRecord];
+  readonly builtinModels: AvatarAppearanceRecord;
   readonly diagnostic?: (diagnostic: AvatarModelCatalogDiagnostic) => void;
 }
 
@@ -52,8 +53,9 @@ const catalogQueues = new Map<string, Promise<unknown>>();
 export class AvatarModelCatalog {
   readonly #paths: AvatarModelPaths;
   readonly #file: AtomicJsonFile<AvatarModelCatalogDocument>;
-  readonly #builtinModels: readonly [AvatarModelRecord, AvatarModelRecord];
+  readonly #builtinModel: AvatarAppearanceRecord;
   readonly #diagnostic: (diagnostic: AvatarModelCatalogDiagnostic) => void;
+  readonly #reportedLegacyRecordIds = new Set<string>();
   #initialized = false;
   #catalogUnavailable = false;
   #catalogFailureReported = false;
@@ -61,20 +63,11 @@ export class AvatarModelCatalog {
   constructor(options: AvatarModelCatalogOptions) {
     if (!isAbsolute(options.dataRoot)) throw new Error("invalid avatar model catalog root");
     this.#paths = resolveAvatarModelPaths(options.dataRoot);
-    const builtins = options.builtinModels.map((record) => parseAvatarModelRecord(record));
-    if (
-      builtins.length !== 2 ||
-      builtins[0]?.id !== BUILTIN_AVATAR_MODEL_IDS[0] ||
-      builtins[0].format !== "builtin-hd" ||
-      builtins[1]?.id !== BUILTIN_AVATAR_MODEL_IDS[1] ||
-      builtins[1].format !== "builtin-classic"
-    ) {
+    const builtin = parseAvatarModelRecord(options.builtinModels);
+    if (builtin.id !== BUILTIN_AVATAR_MODEL_IDS[0] || builtin.origin !== "builtin") {
       throw new Error("invalid builtin avatar model catalog");
     }
-    this.#builtinModels = Object.freeze([
-      Object.freeze(builtins[0]),
-      Object.freeze(builtins[1]),
-    ]);
+    this.#builtinModel = Object.freeze(builtin);
     this.#diagnostic = options.diagnostic ?? (() => undefined);
     this.#file = new AtomicJsonFile({
       rootDirectory: resolve(options.dataRoot),
@@ -110,8 +103,15 @@ export class AvatarModelCatalog {
       this.#markCatalogUnavailable(error);
       return this.#builtinOnlyState();
     }
-    const imported: AvatarModelRecord[] = [];
-    for (const record of document.imported) {
+    const imported: AvatarAppearanceRecord[] = [];
+    for (const candidate of document.imported) {
+      let record: AvatarAppearanceRecord;
+      try {
+        record = parseAvatarModelRecord(candidate);
+      } catch {
+        this.#reportLegacyRecord(candidate);
+        continue;
+      }
       try {
         await this.#validateManagedRecord(record);
         imported.push(record);
@@ -122,11 +122,11 @@ export class AvatarModelCatalog {
     }
     return Object.freeze({
       revision: document.revision,
-      models: Object.freeze([...this.#builtinModels, ...imported]),
+      models: Object.freeze([this.#builtinModel, ...imported]),
     });
   }
 
-  async appendImported(record: AvatarModelRecord): Promise<AvatarModelCatalogState> {
+  async appendImported(record: AvatarAppearanceRecord): Promise<AvatarModelCatalogState> {
     await this.initialize();
     if (this.#catalogUnavailable) {
       throw new AvatarModelCatalogError(
@@ -146,23 +146,20 @@ export class AvatarModelCatalog {
     return serializeCatalogOperation(key, async () => {
       const current = await this.#readDocument();
       if (
-        this.#builtinModels.some(({ id }) => id === validated.id) ||
-        current.imported.some(({ id }) => id === validated.id)
+        this.#builtinModel.id === validated.id ||
+        current.imported.some((candidate) => recordId(candidate) === validated.id)
       ) {
         throw new AvatarModelCatalogError(
           "AVATAR_MODEL_DUPLICATE",
           "avatar model id already exists",
         );
       }
-      const next = await this.#file.write({
+      await this.#file.write({
         schemaVersion: 1,
         revision: current.revision + 1,
         imported: [...current.imported, validated],
       });
-      return Object.freeze({
-        revision: next.revision,
-        models: Object.freeze([...this.#builtinModels, ...next.imported]),
-      });
+      return this.list();
     });
   }
 
@@ -178,21 +175,15 @@ export class AvatarModelCatalog {
     return Object.freeze({
       modelId: record.id,
       origin: record.origin,
-      format: record.format,
-      resourcePath: record.resourcePath,
-      sha256: record.sha256,
-      boneMapping: record.boneMapping,
-      bodyAnimation: record.bodyAnimation,
-      expressions: record.expressions,
+      worldRenderer: record.worldRenderer,
+      armModel: record.armModel,
     });
   }
 
   async #readDocument(): Promise<AvatarModelCatalogDocument> {
     try {
       const document = await this.#file.read();
-      if (document === undefined) {
-        throw new Error("avatar model catalog is missing");
-      }
+      if (document === undefined) throw new Error("avatar model catalog is missing");
       return document;
     } catch (error) {
       throw new AvatarModelCatalogError(
@@ -221,25 +212,36 @@ export class AvatarModelCatalog {
   #builtinOnlyState(): AvatarModelCatalogState {
     return Object.freeze({
       revision: 0,
-      models: Object.freeze([...this.#builtinModels]),
+      models: Object.freeze([this.#builtinModel]),
     });
   }
 
-  async #validateManagedRecord(record: AvatarModelRecord): Promise<void> {
+  #reportLegacyRecord(record: unknown): void {
+    const modelId = recordId(record) ?? "legacy";
+    if (this.#reportedLegacyRecordIds.has(modelId)) return;
+    this.#reportedLegacyRecordIds.add(modelId);
+    this.#diagnostic({ code: "AVATAR_CATALOG_LEGACY_MODEL_SKIPPED", modelId });
+  }
+
+  async #validateManagedRecord(record: AvatarAppearanceRecord): Promise<void> {
     try {
-      const modelBytes = await readVerifiedManagedFile(
-        this.#paths.root,
-        record.resourcePath,
-        128 * 1024 * 1024,
-      );
-      const digest = createHash("sha256").update(modelBytes).digest("hex");
-      if (digest !== record.sha256) {
-        throw new AvatarModelCatalogError(
-          "AVATAR_DIGEST_MISMATCH",
-          "avatar model digest changed",
-        );
+      const skinBytes = await readVerifiedManagedFile(this.#paths.root, record.skinAsset, 2 * 1024 * 1024);
+      if (digest(skinBytes) !== record.skinSha256) {
+        throw new AvatarModelCatalogError("AVATAR_DIGEST_MISMATCH", "avatar skin digest changed");
       }
-      await readVerifiedManagedFile(this.#paths.root, record.previewPath, 2 * 1024 * 1024);
+      if (record.portraitAsset !== undefined && record.portraitSha256 !== undefined) {
+        const portraitBytes = await readVerifiedManagedFile(
+          this.#paths.root,
+          record.portraitAsset,
+          2 * 1024 * 1024,
+        );
+        if (digest(portraitBytes) !== record.portraitSha256) {
+          throw new AvatarModelCatalogError(
+            "AVATAR_DIGEST_MISMATCH",
+            "avatar portrait digest changed",
+          );
+        }
+      }
     } catch (error) {
       if (error instanceof AvatarModelCatalogError) throw error;
       throw new AvatarModelCatalogError(
@@ -271,20 +273,21 @@ function validateCatalogDocument(value: unknown): AvatarModelCatalogDocument {
   ) {
     throw new Error("invalid avatar model catalog document");
   }
-  const imported = (Reflect.get(value, "imported") as unknown[]).map((record) =>
-    parseAvatarModelRecord(record),
-  );
-  if (
-    imported.some(({ origin }) => origin !== "imported") ||
-    new Set(imported.map(({ id }) => id)).size !== imported.length
-  ) {
-    throw new Error("invalid avatar model catalog document");
-  }
   return Object.freeze({
     schemaVersion: 1,
     revision: Reflect.get(value, "revision") as number,
-    imported: Object.freeze(imported),
+    imported: Object.freeze([...((Reflect.get(value, "imported") as unknown[]))]),
   });
+}
+
+function recordId(value: unknown): string | undefined {
+  if (!isPlainObject(value)) return undefined;
+  const id = Reflect.get(value, "id");
+  return typeof id === "string" && id.length <= 128 && id === id.toWellFormed() ? id : undefined;
+}
+
+function digest(bytes: Buffer): string {
+  return createHash("sha256").update(bytes).digest("hex");
 }
 
 async function readVerifiedManagedFile(

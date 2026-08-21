@@ -37,6 +37,10 @@ const DEFAULT_AVATAR_MODEL_PREFERENCE = Object.freeze({
   activeModelId: BUILTIN_AVATAR_MODEL_IDS[0],
 });
 const COMMITTED_REQUEST_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/u;
+const LEGACY_BUILTIN_AVATAR_MODEL_IDS = new Set([
+  "builtin:whitelily-hd",
+  "builtin:whitelily-classic",
+]);
 const preferenceQueues = new Map<string, Promise<unknown>>();
 
 export class AvatarModelPreferences {
@@ -94,7 +98,7 @@ export class AvatarModelPreferences {
     await mkdir(this.#root, { recursive: true });
     const key = await this.#file.coordinatorKey();
     return serializePreferenceOperation(key, async () => {
-      const current = await this.#readRaw();
+      const current = await this.#readRaw({ normalizeLegacy: false });
       if (current.committedRequestId === input.committedRequestId) {
         if (current.activeModelId !== activeModelId) {
           throw new AvatarModelPreferenceError(
@@ -123,16 +127,32 @@ export class AvatarModelPreferences {
     });
   }
 
-  async #readRaw(): Promise<AvatarModelPreferenceSnapshot> {
+  async #readRaw(options: { readonly normalizeLegacy?: boolean } = {}): Promise<AvatarModelPreferenceSnapshot> {
     await mkdir(this.#root, { recursive: true });
     try {
       await this.#file.writeIfAbsent(DEFAULT_AVATAR_MODEL_PREFERENCE);
       const current = await this.#file.read();
       if (current === undefined) throw new Error("avatar model preference is missing");
-      return current;
+      return options.normalizeLegacy === false ? current : await this.#migrateLegacyBuiltin(current);
     } catch (error) {
       throw wrapPreferenceError(error);
     }
+  }
+
+  async #migrateLegacyBuiltin(
+    current: AvatarModelPreferenceSnapshot,
+  ): Promise<AvatarModelPreferenceSnapshot> {
+    if (!LEGACY_BUILTIN_AVATAR_MODEL_IDS.has(current.activeModelId)) return current;
+    const key = await this.#file.coordinatorKey();
+    return serializePreferenceOperation(key, async () => {
+      const latest = await this.#file.read();
+      if (latest === undefined) throw new Error("avatar model preference is missing");
+      if (!LEGACY_BUILTIN_AVATAR_MODEL_IDS.has(latest.activeModelId)) return latest;
+      return this.#file.write({
+        ...latest,
+        activeModelId: BUILTIN_AVATAR_MODEL_IDS[0],
+      });
+    });
   }
 }
 
@@ -160,7 +180,7 @@ function validatePreferenceSnapshot(value: unknown): AvatarModelPreferenceSnapsh
   ) {
     throw new Error("invalid avatar model preference");
   }
-  const activeModelId = parseAvatarModelId(Reflect.get(value, "activeModelId"));
+  const activeModelId = parsePreferenceModelId(Reflect.get(value, "activeModelId"));
   const committedRequestId = Reflect.get(value, "committedRequestId");
   if (
     committedRequestId !== undefined &&
@@ -175,6 +195,11 @@ function validatePreferenceSnapshot(value: unknown): AvatarModelPreferenceSnapsh
     activeModelId,
     ...(committedRequestId === undefined ? {} : { committedRequestId }),
   });
+}
+
+function parsePreferenceModelId(value: unknown): string {
+  if (typeof value === "string" && LEGACY_BUILTIN_AVATAR_MODEL_IDS.has(value)) return value;
+  return parseAvatarModelId(value);
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
