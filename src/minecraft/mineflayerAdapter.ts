@@ -955,7 +955,7 @@ export class MineflayerAdapter implements MinecraftPort {
           return;
         }
         aborted = true;
-        this.safelyStopBot(session.bot);
+        const motionStopped = this.safelyStopBot(session.bot);
         try {
           abortCleanup?.();
         } catch {
@@ -974,17 +974,23 @@ export class MineflayerAdapter implements MinecraftPort {
             finishAfterFence("dig cancellation failed");
             return;
           }
-          startFenceTimer("dig cancellation timed out");
           if (isThenable(cancellationResult)) {
+            startFenceTimer("dig cancellation timed out");
             Promise.resolve(cancellationResult).then(
               () => finish(abortError()),
               () => finishAfterFence("dig cancellation acknowledgement failed"),
             );
+          } else {
+            finish(abortError());
           }
           return;
         }
         if (cancellation === "fence") {
           finishAfterFence("operation cancelled");
+          return;
+        }
+        if (motionStopped) {
+          finish(abortError());
           return;
         }
         startFenceTimer("motion cancellation timed out");
@@ -1074,16 +1080,26 @@ export class MineflayerAdapter implements MinecraftPort {
     });
   }
 
-  private safelyStopBot(bot: Bot | undefined): void {
+  private safelyStopBot(bot: Bot): boolean {
+    let stopped = true;
     try {
-      bot?.pathfinder?.stop();
+      bot.pathfinder.stop();
     } catch {
       // A partial Mineflayer bot may not have installed pathfinder yet.
+      stopped = false;
     }
     try {
-      bot?.clearControlStates?.();
+      bot.pathfinder.setGoal(null);
+    } catch {
+      // Clearing the goal releases Mineflayer's synchronous stop latch.
+      stopped = false;
+    }
+    try {
+      bot.clearControlStates();
     } catch {
       // Control state cleanup is best effort during failure paths.
+      stopped = false;
     }
+    return stopped;
   }
 }
