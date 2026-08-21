@@ -411,6 +411,10 @@ val stageMinecraftComponents = tasks.register("stageMinecraftComponents") {
               "{\"fileName\": \"whitelily-bridge-fabric-1.21.5-0.1.0.jar\", \"bytes\": 51837, " +
               "\"sha256\": \"380721d28236f5ad8206fd8d69af1e5629d741e9d38ec27c26c052c95266b6ce\", " +
               "\"modId\": \"whitelily_bridge\", \"version\": \"0.1.0\"}]"
+          } else if (artifact.modId == "whitelily_avatar") {
+            "[{\"fileName\": \"whitelily-avatar-fabric-1.21.5-0.1.0.jar\", \"bytes\": 239985, " +
+              "\"sha256\": \"1fdba2b89281d7dbfb96d8e2ab3637caf95b20452831377f46e5285d37531351\", " +
+              "\"modId\": \"whitelily_avatar\", \"version\": \"0.1.0\"}]"
           } else {
             "[]"
           }
@@ -500,8 +504,21 @@ val stageMinecraftComponents = tasks.register("stageMinecraftComponents") {
       listOf(
         Triple("fabric-api-0.128.2+1.21.5.jar", 2_248_994, "a82fd00827206e911936ed1e0ceaec6eb55d061ca5d3c5d63c7f0031426d29ae"),
         Triple("Fabric-API-LICENSE.txt", 11_357, "b40930bbcf80744c86c46a12bc9da056641d722716c378f5659b9e555ef833e1"),
-        Triple("minecraft-components-manifest.json", 1_624, "efe26a3217f02e1a5295c7462f5effc97612ae605e3c4bdb584e52d93563cda0"),
-        Triple("whitelily-avatar-fabric-1.21.5-0.1.0.jar", 256_057, "4225e0901bcc5de08dfd435d23f01838215f932a9495a14299334fe5049d132e"),
+        Triple("minecraft-components-manifest.json", 1_624, "edb2f426bf6a5a2f9365d2825f6e3949b15e703b0da4441d6ff9139806dc4083"),
+        Triple("whitelily-avatar-fabric-1.21.5-0.1.0.jar", 257_939, "38a28823ef5c5a8c8ac4b6f7e48d5bd71bb79a6019ba2ec4b81f700498a845ea"),
+        Triple("whitelily-bridge-fabric-1.21.5-0.1.2.jar", 53_984, "ac5bfab545b723b2346aeb017b3a6ea3186a6cbced370e16097f3836b128746d"),
+        Triple("WhiteLily-LICENSE.txt", 11_123, "226d0e41f61309952c27fcc11a5140c4e735115f702ff0484ff0c25cfbbeee16"),
+        Triple("WhiteLily-NOTICE.txt", 795, "bc5ab24ff5624664bc3ef3d5b850ac3c820dddf3b2f15a4125b355f1c65a2c2a"),
+      ).map { (name, bytes, hash) ->
+        "{\"name\":" + jsonString(name) + ",\"bytes\":" + bytes +
+          ",\"sha256\":" + jsonString(hash) + "}"
+      }
+    val previousVersionBumpFileRequests =
+      listOf(
+        Triple("fabric-api-0.128.2+1.21.5.jar", 2_248_994, "a82fd00827206e911936ed1e0ceaec6eb55d061ca5d3c5d63c7f0031426d29ae"),
+        Triple("Fabric-API-LICENSE.txt", 11_357, "b40930bbcf80744c86c46a12bc9da056641d722716c378f5659b9e555ef833e1"),
+        Triple("minecraft-components-manifest.json", 1_824, "2f176957ac2157f545afbe95006af5cdd10c3bbca1da1e982c153143543eaa05"),
+        Triple("whitelily-avatar-fabric-1.21.5-0.1.1.jar", 257_937, "9de84571120ab5268a1f4e94f7d7e72ed0183beda5389fb34c60c7aa14dc24c8"),
         Triple("whitelily-bridge-fabric-1.21.5-0.1.2.jar", 53_984, "ac5bfab545b723b2346aeb017b3a6ea3186a6cbced370e16097f3836b128746d"),
         Triple("WhiteLily-LICENSE.txt", 11_123, "226d0e41f61309952c27fcc11a5140c4e735115f702ff0484ff0c25cfbbeee16"),
         Triple("WhiteLily-NOTICE.txt", 795, "bc5ab24ff5624664bc3ef3d5b850ac3c820dddf3b2f15a4125b355f1c65a2c2a"),
@@ -519,6 +536,8 @@ val stageMinecraftComponents = tasks.register("stageMinecraftComponents") {
       when {
         existingNames.contains("geckolib-fabric-1.21.5-5.1.0.jar") -> legacyFileRequests
         existingManifestIsCurrent -> currentFileRequests
+        existingNames.contains("whitelily-avatar-fabric-1.21.5-0.1.1.jar") ->
+          previousVersionBumpFileRequests
         else -> previousNativeSkinFileRequests
       }
     val request =

@@ -29,7 +29,7 @@ final class ComponentPackJarContractTest {
   private static final Path BRIDGE =
       STAGING.resolve("whitelily-bridge-fabric-1.21.5-0.1.2.jar");
   private static final Path AVATAR =
-      STAGING.resolve("whitelily-avatar-fabric-1.21.5-0.1.0.jar");
+      STAGING.resolve("whitelily-avatar-fabric-1.21.5-0.1.1.jar");
   private static final Path FABRIC_API =
       STAGING.resolve("fabric-api-0.128.2+1.21.5.jar");
   private static final Set<String> AVATAR_THEME_RESOURCES =
@@ -165,7 +165,7 @@ final class ComponentPackJarContractTest {
   private static ComponentPackPolicy.ExpectedMod avatarExpectation() {
     return new ComponentPackPolicy.ExpectedMod(
         "whitelily_avatar",
-        "0.1.0",
+        "0.1.1",
         "client",
         Map.of(
             "minecraft", "=1.21.5",

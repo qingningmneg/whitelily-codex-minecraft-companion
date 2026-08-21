@@ -347,6 +347,7 @@ export function validateRgbaPng(
     maximumBytes = MAX_SKIN_PNG_BYTES,
     maximumCompressedBytes = MAX_COMPRESSED_SKIN_BYTES,
     decodePixels = true,
+    allowRgb = false,
   },
 ) {
   const invalidPng = () => failure(errorMessage);
@@ -406,7 +407,7 @@ export function validateRgbaPng(
         (expectedHeight !== undefined && height !== expectedHeight) ||
         (maxDimension !== undefined && (width > maxDimension || height > maxDimension)) ||
         bitDepth !== 8 ||
-        colorType !== 6 ||
+        (colorType !== 6 && !(allowRgb && colorType === 2)) ||
         bytes[dataStart + 10] !== 0 ||
         bytes[dataStart + 11] !== 0 ||
         bytes[dataStart + 12] !== 0

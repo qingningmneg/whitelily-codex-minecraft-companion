@@ -230,7 +230,7 @@ Expected: FAIL，当前 importer 只解析 VRM/GLB。
 
 - [ ] **Step 3：实现有界 PNG 解析与语义检查**
 
-复用仓库 `validate-assets.mjs` 已验证的 PNG 规则：签名、chunk 顺序、CRC、IHDR、IDAT 解压上限、IEND、8-bit RGBA、尺寸和基础 UV alpha。把共享算法移入可被 Node 工具与 Electron 调用的模块，避免复制两套不同规则。portrait 允许 1×1 至 4096×4096 RGBA PNG，压缩文件最多 8 MiB，解压字节数必须精确等于 `width * height * 4 + height`。
+复用仓库 `validate-assets.mjs` 已验证的 PNG 规则：签名、chunk 顺序、CRC、IHDR、IDAT 解压上限、IEND、尺寸和解压边界。把共享算法移入可被 Node 工具与 Electron 调用的模块，避免复制两套不同规则。皮肤仍只允许 8-bit RGBA 并检查基础 UV alpha；portrait 允许 1×1 至 4096×4096 的 8-bit RGB 或 RGBA PNG，压缩文件最多 8 MiB，解压字节数必须按实际通道数精确校验。
 
 - [ ] **Step 4：实现两阶段原子导入**
 

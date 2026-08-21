@@ -47,12 +47,20 @@ describe("desktop Minecraft component composition", () => {
         },
         {
           component: "avatar",
-          fileName: "whitelily-avatar-fabric-1.21.5-0.1.0.jar",
-          bytes: 255_675,
-          sha256: "426225094514c0fc2752e7beaab256322a0612a75b564bf509c64ae52d4c636f",
+          fileName: "whitelily-avatar-fabric-1.21.5-0.1.1.jar",
+          bytes: 257_936,
+          sha256: "11a4375fada69928a4d1e0d8f6d330bc35ba23ab99c8b8e4c444eaa69f3a9271",
           modId: "whitelily_avatar",
-          version: "0.1.0",
-          prior: [],
+          version: "0.1.1",
+          prior: [
+            {
+              fileName: "whitelily-avatar-fabric-1.21.5-0.1.0.jar",
+              bytes: 239_985,
+              sha256: "1fdba2b89281d7dbfb96d8e2ab3637caf95b20452831377f46e5285d37531351",
+              modId: "whitelily_avatar",
+              version: "0.1.0",
+            },
+          ],
         },
         {
           component: "avatar",

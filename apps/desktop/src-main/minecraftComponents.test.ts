@@ -34,7 +34,8 @@ const AFTER_PROCESS_START = new Date(PROCESS_STARTED_AT + 10_000);
 const BRIDGE_FILE = "whitelily-bridge-fabric-1.21.5-0.1.2.jar";
 const PRIOR_BRIDGE_FILE = "whitelily-bridge-fabric-1.21.5-0.1.1.jar";
 const LEGACY_BRIDGE_FILE = "whitelily-bridge-fabric-1.21.5-0.1.0.jar";
-const AVATAR_FILE = "whitelily-avatar-fabric-1.21.5-0.1.0.jar";
+const AVATAR_FILE = "whitelily-avatar-fabric-1.21.5-0.1.1.jar";
+const PRIOR_AVATAR_FILE = "whitelily-avatar-fabric-1.21.5-0.1.0.jar";
 const FABRIC_API_FILE = "fabric-api-0.128.2+1.21.5.jar";
 const FABRIC_LOADER_FILE = "fabric-loader-0.16.14.jar";
 
@@ -49,6 +50,7 @@ interface Fixture {
   readonly priorBridge: Buffer;
   readonly legacyBridge: Buffer;
   readonly avatar: Buffer;
+  readonly priorAvatar: Buffer;
   readonly fabricApi: Buffer;
   readonly loader: Buffer;
   readonly loaderPath: string;
@@ -95,7 +97,8 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
   const bridge = options.bridgeBytes ?? jar("whitelily_bridge", "0.1.2");
   const priorBridge = jar("whitelily_bridge", "0.1.1");
   const legacyBridge = jar("whitelily_bridge", "0.1.0");
-  const avatar = jar("whitelily_avatar", "0.1.0");
+  const avatar = jar("whitelily_avatar", "0.1.1");
+  const priorAvatar = jar("whitelily_avatar", "0.1.0");
   const fabricApi = jar("fabric-api", "0.128.2+1.21.5");
   const loaderVersion = options.loaderVersion ?? "0.16.14";
   const loader = options.loaderBytes ?? jar(options.loaderId ?? "fabricloader", loaderVersion);
@@ -143,8 +146,16 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
         bytes: avatar.byteLength,
         sha256: sha256(avatar),
         modId: "whitelily_avatar",
-        version: "0.1.0",
-        prior: [],
+        version: "0.1.1",
+        prior: [
+          {
+            fileName: PRIOR_AVATAR_FILE,
+            bytes: priorAvatar.byteLength,
+            sha256: sha256(priorAvatar),
+            modId: "whitelily_avatar",
+            version: "0.1.0",
+          },
+        ],
       },
       {
         component: "avatar",
@@ -168,6 +179,7 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
     priorBridge,
     legacyBridge,
     avatar,
+    priorAvatar,
     fabricApi,
     loader,
     loaderPath,
@@ -372,6 +384,30 @@ describe("Minecraft component manager", () => {
       }
     },
   );
+
+  it("updates the reviewed prior Avatar JAR without treating it as a foreign collision", async () => {
+    const fixture = await createFixture();
+    try {
+      await installFixtureFile(fixture, BRIDGE_FILE, fixture.bridge);
+      await installFixtureFile(fixture, PRIOR_AVATAR_FILE, fixture.priorAvatar);
+      await writePresence(fixture);
+
+      await expect(fixture.manager.install(fixture.candidateId, ["avatar"])).resolves.toMatchObject(
+        {
+          state: "bridge_restart_required",
+          bridgeInstalled: true,
+          restartRequired: true,
+        },
+      );
+
+      expect(await readFile(join(fixture.mods, AVATAR_FILE))).toEqual(fixture.avatar);
+      await expect(lstat(join(fixture.mods, PRIOR_AVATAR_FILE))).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+    } finally {
+      await fixture.cleanup();
+    }
+  });
 
   it("waits for the authorized Java session to exit before updating a reviewed prior JAR", async () => {
     let processVisible = true;

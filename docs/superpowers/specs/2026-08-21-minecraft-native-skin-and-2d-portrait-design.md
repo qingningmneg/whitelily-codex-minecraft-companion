@@ -75,7 +75,7 @@ WhiteLily 的平滑 3D 模型在 Minecraft 世界中与方块环境、原版人�
 ```
 
 - `skinAsset` 必须是合法 64×64 RGBA Minecraft 皮肤，必需基础 UV 区域不透明；
-- `portraitAsset` 可选，只用于软件显示；
+- `portraitAsset` 可选，只用于软件显示；接受 1×1 至 4096×4096 的 8-bit RGB 或 RGBA PNG，以便原字节保留用户提供的无透明通道原稿；
 - 导入时先验证、复制到受管目录，再原子写入清单；
 - 无 portrait 时从皮肤生成稳定的正面预览；
 - 用户条目不继承 WhiteLily 六主题或专属装备映射。

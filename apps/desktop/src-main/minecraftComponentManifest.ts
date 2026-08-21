@@ -100,7 +100,11 @@ export function validateMinecraftComponentManifest(
     !/^whitelily-bridge-fabric-1\.21\.5-[A-Za-z0-9.+_-]+\.jar$/u.test(bridge.fileName) ||
     avatarArtifacts.length !== 2 ||
     avatar?.component !== "avatar" ||
-    avatar.version !== "0.1.0" ||
+    avatar.version !== "0.1.1" ||
+    avatar.prior.length !== 1 ||
+    avatar.prior[0]?.fileName !== "whitelily-avatar-fabric-1.21.5-0.1.0.jar" ||
+    avatar.prior[0]?.modId !== "whitelily_avatar" ||
+    avatar.prior[0]?.version !== "0.1.0" ||
     !/^whitelily-avatar-fabric-1\.21\.5-[A-Za-z0-9.+_-]+\.jar$/u.test(avatar.fileName) ||
     fabricApi?.component !== "avatar" ||
     fabricApi.version !== "0.128.2+1.21.5" ||

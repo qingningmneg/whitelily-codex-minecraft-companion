@@ -96,6 +96,7 @@ export function validatePortrait(bytes: Buffer): ValidatedPortrait {
       maximumBytes: MAX_PNG_BYTES,
       maximumCompressedBytes: MAX_PNG_BYTES,
       decodePixels: false,
+      allowRgb: true,
     });
     return { width: image.width, height: image.height };
   } catch (error) {

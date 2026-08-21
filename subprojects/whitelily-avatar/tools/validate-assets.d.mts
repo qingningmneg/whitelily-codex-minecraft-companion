@@ -27,6 +27,7 @@ export function validateRgbaPng(
     readonly maximumBytes?: number;
     readonly maximumCompressedBytes?: number;
     readonly decodePixels: false;
+    readonly allowRgb?: boolean;
   },
 ): { readonly width: number; readonly height: number };
 

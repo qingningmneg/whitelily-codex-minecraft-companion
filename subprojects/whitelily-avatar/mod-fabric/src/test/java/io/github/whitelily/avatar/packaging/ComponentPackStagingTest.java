@@ -28,7 +28,7 @@ final class ComponentPackStagingTest {
           "WhiteLily-NOTICE.txt",
           "fabric-api-0.128.2+1.21.5.jar",
           "minecraft-components-manifest.json",
-          "whitelily-avatar-fabric-1.21.5-0.1.0.jar",
+          "whitelily-avatar-fabric-1.21.5-0.1.1.jar",
           "whitelily-bridge-fabric-1.21.5-0.1.2.jar");
 
   @Test
@@ -58,7 +58,7 @@ final class ComponentPackStagingTest {
     assertArtifact(
         manifest, 0, "bridge", "whitelily-bridge-fabric-1.21.5-0.1.2.jar", "whitelily_bridge", "0.1.2");
     assertArtifact(
-        manifest, 1, "avatar", "whitelily-avatar-fabric-1.21.5-0.1.0.jar", "whitelily_avatar", "0.1.0");
+        manifest, 1, "avatar", "whitelily-avatar-fabric-1.21.5-0.1.1.jar", "whitelily_avatar", "0.1.1");
     assertArtifact(
         manifest, 2, "avatar", "fabric-api-0.128.2+1.21.5.jar", "fabric-api", "0.128.2+1.21.5");
     for (var element : manifest.getAsJsonArray("licenses")) {
@@ -125,29 +125,25 @@ final class ComponentPackStagingTest {
             .append("\", \"version\": \"")
             .append(entry.get("version").getAsString())
             .append("\", \"prior\": ");
-        if (entry.get("component").getAsString().equals("bridge")) {
-          result.append('[');
-          JsonArray priorEntries = entry.getAsJsonArray("prior");
-          for (int priorIndex = 0; priorIndex < priorEntries.size(); priorIndex++) {
-            JsonObject prior = priorEntries.get(priorIndex).getAsJsonObject();
-            result
-                .append("{\"fileName\": \"")
-                .append(prior.get("fileName").getAsString())
-                .append("\", \"bytes\": ")
-                .append(prior.get("bytes").getAsLong())
-                .append(", \"sha256\": \"")
-                .append(prior.get("sha256").getAsString())
-                .append("\", \"modId\": \"")
-                .append(prior.get("modId").getAsString())
-                .append("\", \"version\": \"")
-                .append(prior.get("version").getAsString())
-                .append("\"}");
-            if (priorIndex + 1 < priorEntries.size()) result.append(',');
-          }
-          result.append(']');
-        } else {
-          result.append("[]");
+        result.append('[');
+        JsonArray priorEntries = entry.getAsJsonArray("prior");
+        for (int priorIndex = 0; priorIndex < priorEntries.size(); priorIndex++) {
+          JsonObject prior = priorEntries.get(priorIndex).getAsJsonObject();
+          result
+              .append("{\"fileName\": \"")
+              .append(prior.get("fileName").getAsString())
+              .append("\", \"bytes\": ")
+              .append(prior.get("bytes").getAsLong())
+              .append(", \"sha256\": \"")
+              .append(prior.get("sha256").getAsString())
+              .append("\", \"modId\": \"")
+              .append(prior.get("modId").getAsString())
+              .append("\", \"version\": \"")
+              .append(prior.get("version").getAsString())
+              .append("\"}");
+          if (priorIndex + 1 < priorEntries.size()) result.append(',');
         }
+        result.append(']');
       }
       result.append('}');
       if (index + 1 < entries.size()) {
@@ -192,6 +188,17 @@ final class ComponentPackStagingTest {
           legacy.get("sha256").getAsString());
       assertEquals("whitelily_bridge", legacy.get("modId").getAsString());
       assertEquals("0.1.0", legacy.get("version").getAsString());
+    } else if (modId.equals("whitelily_avatar")) {
+      JsonArray priorEntries = artifact.getAsJsonArray("prior");
+      assertEquals(1, priorEntries.size());
+      JsonObject prior = priorEntries.get(0).getAsJsonObject();
+      assertEquals("whitelily-avatar-fabric-1.21.5-0.1.0.jar", prior.get("fileName").getAsString());
+      assertEquals(239_985, prior.get("bytes").getAsLong());
+      assertEquals(
+          "1fdba2b89281d7dbfb96d8e2ab3637caf95b20452831377f46e5285d37531351",
+          prior.get("sha256").getAsString());
+      assertEquals("whitelily_avatar", prior.get("modId").getAsString());
+      assertEquals("0.1.0", prior.get("version").getAsString());
     } else {
       assertEquals(0, artifact.getAsJsonArray("prior").size());
     }

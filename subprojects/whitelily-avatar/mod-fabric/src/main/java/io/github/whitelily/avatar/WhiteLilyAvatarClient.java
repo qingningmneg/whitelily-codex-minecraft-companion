@@ -22,7 +22,7 @@ import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
 
 public final class WhiteLilyAvatarClient implements ClientModInitializer {
-  public static final String COMPONENT_VERSION = "0.1.0";
+  public static final String COMPONENT_VERSION = "0.1.1";
   public static final String NATIVE_SKIN_FAILURE_CODE = NativeSkinFailureDiagnostics.CODE;
 
   private static final WhiteLilyRenderRuntime RENDER_RUNTIME =

@@ -32,8 +32,12 @@ describe("PNG avatar image validation", () => {
     );
   });
 
-  it("bounds optional portraits to 1x1 through 4096x4096 RGBA PNGs", () => {
+  it("accepts bounded 8-bit RGB or RGBA portraits", () => {
     expect(validatePortrait(png({ width: 1, height: 1 }))).toMatchObject({ width: 1, height: 1 });
+    expect(validatePortrait(png({ width: 1306, height: 1204, colorType: 2 }))).toMatchObject({
+      width: 1306,
+      height: 1204,
+    });
     expect(validatePortrait(png({ width: 2048, height: 2048 }))).toMatchObject({
       width: 2048,
       height: 2048,

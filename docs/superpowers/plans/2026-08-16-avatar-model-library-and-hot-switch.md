@@ -831,7 +831,7 @@ git commit -m "refactor: isolate avatar render backends"
 - Consumes: Task 7 `AvatarRuntimeDescriptor`、Task 8 backend 契约和 `AvatarVisualState`。
 - Produces: `SmoothMeshRenderBackend`、GPU 蒙皮、身体动画、真实手持物挂点。
 
-- [ ] **Step 1: 写最小平滑样例、骨架姿势和资源释放失败测试**
+- [x] **Step 1: 写最小平滑样例、骨架姿势和资源释放失败测试**
 
 ```java
 @Test
@@ -850,25 +850,25 @@ void neutralOnlyModelsKeepABindPoseFaceWhileBodyAnimationRuns() {
 }
 ```
 
-- [ ] **Step 2: 运行红灯**
+- [x] **Step 2: 运行红灯**
 
 Run: `subprojects\whitelily-avatar\gradlew.bat -p subprojects\whitelily-avatar :mod-fabric:test --tests "io.github.whitelily.avatar.render.gltf.*"`
 
 Expected: FAIL，缺少 glTF 包。
 
-- [ ] **Step 3: 实现与 Electron 校验一致的有界 GLB 解码**
+- [x] **Step 3: 实现与 Electron 校验一致的有界 GLB 解码**
 
 Java 解码器复核 magic/version/chunk、摘要、bufferView/accessor、索引、材质/图片和节点层级，不信任桌面结果。只接受 TRIANGLES、最多 256 joints、每顶点最多 4 权重并归一化；上传前把 POSITION/NORMAL/UV/JOINTS/WEIGHTS/indices 转为不可变直接 ByteBuffer。PNG/JPEG 由 Minecraft NativeImage 解码；禁止任何 URI 和运行时下载。
 
-- [ ] **Step 4: 实现共享语义骨架和 GPU 蒙皮材质**
+- [x] **Step 4: 实现共享语义骨架和 GPU 蒙皮材质**
 
 `HumanoidAnimator.evaluate(AvatarVisualState, HumanoidSkeleton, float)` 把 Minecraft pose、走跑游泳睡觉、受伤、说话和工作语义混合为骨矩阵；缺少非必要头发/裙摆/表情只禁用对应通道。shader 接收 model/view/projection、最多 128 个活动 joint matrices、贴图、基础两到三段赛璐璐阈值和有界边缘高光；加载 shader 或高级材质失败时返回稳定错误，让 Task 11 的降级状态机处理。
 
-- [ ] **Step 5: 实现真实持有物和自定义盔甲规则**
+- [x] **Step 5: 实现真实持有物和自定义盔甲规则**
 
 `SmoothMeshRenderBackend` 从骨骼映射得到左右手矩阵，再委托现有 Minecraft item renderer 绘制真实主副手物品。若记录来源为 `imported`，永远不添加 WhiteLily armor theme mesh；`ArmorTheme` 只保留为游戏状态/诊断输入，盔甲属性继续由 Minecraft 自身决定。
 
-- [ ] **Step 6: 跑解析、动画、shader contract 和资源释放测试**
+- [x] **Step 6: 跑解析、动画、shader contract 和资源释放测试**
 
 测试至少覆盖：损坏 GLB、摘要不符、超过 joint 上限、权重未归一化、neutral-only、左右手、dispose 幂等、准备取消后不上传 GPU、渲染异常恢复图形状态。
 
@@ -876,7 +876,7 @@ Run: `subprojects\whitelily-avatar\gradlew.bat -p subprojects\whitelily-avatar :
 
 Expected: PASS。
 
-- [ ] **Step 7: 提交**
+- [x] **Step 7: 提交**
 
 ```powershell
 git add subprojects/whitelily-avatar/mod-fabric/src/main/java/io/github/whitelily/avatar/render/gltf subprojects/whitelily-avatar/mod-fabric/src/main/resources/assets/whitelily_avatar/shaders subprojects/whitelily-avatar/mod-fabric/src/test/java/io/github/whitelily/avatar/render/gltf subprojects/whitelily-avatar/mod-fabric/src/test/resources/avatar
@@ -904,7 +904,7 @@ git commit -m "feat: render smooth skinned avatar models"
 - Consumes: Task 5 `WhiteLilyAvatarApi` 和 `AvatarModelCatalogSnapshot`。
 - Produces: 独立 `avatarModels` route、固定高度模型库、导入/切换/失败 UI。
 
-- [ ] **Step 1: 写 12 张卡片、完整设定图和状态不抢跑测试**
+- [x] **Step 1: 写 12 张卡片、完整设定图和状态不抢跑测试**
 
 ```tsx
 it.each([736, 360])("keeps twelve cards on one horizontal track at %ipx", async (width) => {
@@ -924,17 +924,17 @@ it("keeps the turnaround image fully contained", async () => {
 });
 ```
 
-- [ ] **Step 2: 运行红灯**
+- [x] **Step 2: 运行红灯**
 
 Run: `npm run test --workspace @whitelily/desktop -- src/pages/AvatarModelPage.test.tsx src/components/AvatarModelCard.test.tsx src/styles.test.ts src/App.task5.test.tsx`
 
 Expected: FAIL，缺少页面和 route。
 
-- [ ] **Step 3: 建立与 ChatGPT 模型页并列的独立导航**
+- [x] **Step 3: 建立与 ChatGPT 模型页并列的独立导航**
 
 把现有 `model` route 和文案明确改名为 AI 模型设置，新增 `avatarModels` route，中文标题固定为“模型与外观”。页面挂载时调用 `listAvatarModels()` 并订阅目录事件；locale-only rerender 不重新加载、不清除 pending；卸载时取消订阅。导入按钮位于标题栏右侧，调用无参数 `importAvatarModel()`；取消静默保持页面，失败显示按稳定码映射的中文/英文错误，不添加卡片。
 
-- [ ] **Step 4: 实现固定轨道和两种卡片尺寸**
+- [x] **Step 4: 实现固定轨道和两种卡片尺寸**
 
 ```css
 .avatar-model-page { min-width: 0; overflow: hidden; height: 100%; }
@@ -947,7 +947,7 @@ Expected: FAIL，缺少页面和 route。
 
 轨道 viewport 固定在内容区可用高度内；真实 scrollbar 不隐藏。卡片依序使用 API 返回顺序，React key 使用稳定 model ID。活动卡显示“正在使用”，pending 卡显示 loading 且活动卡继续保留“正在使用”；点击当前卡幂等，切换错误恢复旧唯一选中状态。
 
-- [ ] **Step 5: 增加窄屏键盘和滚动可达性测试**
+- [x] **Step 5: 增加窄屏键盘和滚动可达性测试**
 
 测试 Home/End、Tab focus、触控板/滚轮不被自定义 handler 阻断、最后一张 `scrollIntoView({inline: "nearest"})` 可达、360px 时侧栏折叠但轨道仍单行、页面高度在 2 和 12 张卡时相同。不得用 CSS grid、`flex-wrap: wrap` 或隐藏 scrollbar。
 
@@ -955,7 +955,7 @@ Run: `npm run test --workspace @whitelily/desktop -- src/pages/AvatarModelPage.t
 
 Expected: PASS。
 
-- [ ] **Step 6: 构建并提交**
+- [x] **Step 6: 构建并提交**
 
 Run: `npm run build --workspace @whitelily/desktop`
 
@@ -983,7 +983,7 @@ git commit -m "feat: add horizontal avatar model library"
 - Consumes: 观察距离、图形能力、帧失败类型和 render session。
 - Produces: `AvatarDetailLevel.HIGH/LOW`、严格降级状态、结构化限频日志。
 
-- [ ] **Step 1: 写滞回、严格降级和经典模型不自动参与测试**
+- [x] **Step 1: 写滞回、严格降级和经典模型不自动参与测试**
 
 ```java
 @Test
@@ -1003,17 +1003,17 @@ void neverReturnsClassicAsAnAutomaticFallback() {
 }
 ```
 
-- [ ] **Step 2: 运行红灯**
+- [x] **Step 2: 运行红灯**
 
 Run: `subprojects\whitelily-avatar\gradlew.bat -p subprojects\whitelily-avatar :mod-fabric:test --tests "io.github.whitelily.avatar.render.quality.*" --tests "io.github.whitelily.avatar.render.diagnostics.*"`
 
 Expected: FAIL，缺少 quality/diagnostics 包。
 
-- [ ] **Step 3: 实现 14/18 滞回和固定降级链**
+- [x] **Step 3: 实现 14/18 滞回和固定降级链**
 
 首次出现时距离 `<=16` 选 high，`>16` 选 low；已 high 仅在 `>18` 转 low，已 low 仅在 `<14` 转 high。失败链严格为：关闭次级衣发动态/非必要透明 → 基础赛璐璐 → 同风格 low → 当前帧 vanilla。最后一级不改变活动模型 ID，不激活经典模型，并使当前外观验收标记为失败；资源重载或新会话重新从已校验活动模型协商，不无条件继承旧失败状态。
 
-- [ ] **Step 4: 实现结构化日志和每会话限频**
+- [x] **Step 4: 实现结构化日志和每会话限频**
 
 ```java
 public record AvatarRenderDiagnostic(
@@ -1030,13 +1030,13 @@ public record AvatarRenderDiagnostic(
 
 按 `(sessionId, modelId, errorCode)` 首次立即记录，随后 30 秒内抑制重复，窗口结束写一条含 `suppressedCount` 的摘要。错误码区分 `AVATAR_ASSET_VALIDATION_FAILED`、`AVATAR_MESH_LOAD_FAILED`、`AVATAR_SHADER_FAILED`、`AVATAR_ANIMATION_FAILED`、`AVATAR_FRAME_FALLBACK`；原因去除绝对用户路径、token 和控制字符并截断 240 字符。
 
-- [ ] **Step 5: 跑质量和完整 avatar 测试**
+- [x] **Step 5: 跑质量和完整 avatar 测试**
 
 Run: `npm run avatar:test`
 
 Expected: PASS。
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```powershell
 git add subprojects/whitelily-avatar/mod-fabric/src/main/java/io/github/whitelily/avatar/render/quality subprojects/whitelily-avatar/mod-fabric/src/main/java/io/github/whitelily/avatar/render/diagnostics subprojects/whitelily-avatar/mod-fabric/src/main/java/io/github/whitelily/avatar/render/gltf/SmoothMeshRenderBackend.java subprojects/whitelily-avatar/mod-fabric/src/main/java/io/github/whitelily/avatar/render/WhiteLilyRenderRuntime.java subprojects/whitelily-avatar/mod-fabric/src/test/java/io/github/whitelily/avatar/render/quality subprojects/whitelily-avatar/mod-fabric/src/test/java/io/github/whitelily/avatar/render/diagnostics

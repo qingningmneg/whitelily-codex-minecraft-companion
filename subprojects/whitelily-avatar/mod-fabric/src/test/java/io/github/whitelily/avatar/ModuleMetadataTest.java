@@ -21,14 +21,14 @@ final class ModuleMetadataTest {
 
   @Test
   void publishesTheStableComponentVersion() {
-    assertEquals("0.1.0", WhiteLilyAvatarClient.COMPONENT_VERSION);
+    assertEquals("0.1.1", WhiteLilyAvatarClient.COMPONENT_VERSION);
   }
 
   @Test
   void expandsTheComponentVersionIntoProcessedFabricMetadata() throws Exception {
     String json = Files.readString(Path.of("build/resources/main/fabric.mod.json"));
 
-    assertTrue(json.contains("\"version\": \"0.1.0\""), () -> json);
+    assertTrue(json.contains("\"version\": \"0.1.1\""), () -> json);
   }
 
   @Test
