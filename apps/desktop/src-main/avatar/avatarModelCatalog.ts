@@ -8,7 +8,7 @@ import {
   type AvatarModelCatalogState,
   type AvatarRuntimeDescriptor,
 } from "../../../../src/avatar/avatarModelSchemas.js";
-import { AtomicJsonFile } from "../../../../src/storage/atomicJsonFile.js";
+import { AtomicJsonFile, type AtomicJsonFileIo } from "../../../../src/storage/atomicJsonFile.js";
 import { resolveAvatarModelPaths, type AvatarModelPaths } from "./avatarModelPaths.js";
 import { readVerifiedAvatarResource } from "./verifiedAvatarResourceReader.js";
 
@@ -48,6 +48,7 @@ interface AvatarModelCatalogOptions {
   readonly dataRoot: string;
   readonly builtinModels: AvatarAppearanceRecord;
   readonly diagnostic?: (diagnostic: AvatarModelCatalogDiagnostic) => void;
+  readonly fileIo?: AtomicJsonFileIo;
 }
 
 const catalogQueues = new Map<string, Promise<unknown>>();
@@ -76,6 +77,7 @@ export class AvatarModelCatalog {
       path: this.#paths.catalogPath,
       validate: validateCatalogDocument,
       recoverFrom: () => false,
+      ...(options.fileIo === undefined ? {} : { io: options.fileIo }),
     });
   }
 

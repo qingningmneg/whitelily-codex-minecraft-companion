@@ -61,7 +61,7 @@ export async function readVerifiedAvatarFile(input: {
   readonly io?: VerifiedAvatarResourceReaderIo;
 }): Promise<Buffer> {
   if (
-    !isAbsolute(input.path) ||
+    !isSafeAbsoluteSourcePath(input.path) ||
     !Number.isSafeInteger(input.maximumBytes) ||
     input.maximumBytes <= 0
   ) {
@@ -69,12 +69,24 @@ export async function readVerifiedAvatarFile(input: {
   }
   const io = input.io ?? nodeVerifiedAvatarResourceReaderIo;
   const path = resolve(input.path);
-  const stats = await io.lstat(path, { bigint: true });
-  const canonical = await io.realpath(path);
-  if (stats.isSymbolicLink() || normalizePath(canonical) !== normalizePath(path)) {
-    throw new Error("avatar resource source is unsafe");
-  }
-  return readBoundedFile(io, path, input.maximumBytes);
+  const initial = await snapshotSource(io, path, input.maximumBytes);
+  return readBoundedFile(io, path, input.maximumBytes, {
+    before: initial.stats,
+    after: async () => {
+      let final: { readonly stats: BigIntStats; readonly canonical: string };
+      try {
+        final = await snapshotSource(io, path, input.maximumBytes);
+      } catch {
+        throw new Error("avatar resource source changed during read");
+      }
+      if (
+        normalizePath(final.canonical) !== normalizePath(initial.canonical) ||
+        !sameSnapshot(initial.stats, final.stats)
+      ) {
+        throw new Error("avatar resource source changed during read");
+      }
+    },
+  });
 }
 
 function parseRelativePath(path: string): readonly string[] {
@@ -109,8 +121,12 @@ async function readBoundedFile(
   io: VerifiedAvatarResourceReaderIo,
   path: string,
   maximumBytes: number,
+  expected?: { readonly before: BigIntStats; readonly after: () => Promise<void> },
 ): Promise<Buffer> {
   const before = await io.lstat(path, { bigint: true });
+  if (expected !== undefined && !sameSnapshot(expected.before, before)) {
+    throw new Error("avatar resource source changed during read");
+  }
   requireRegularFile(before, maximumBytes);
   const handle = await io.open(path, readOnlyNoFollowFlags());
   try {
@@ -131,10 +147,39 @@ async function readBoundedFile(
     }
     const after = await handle.stat({ bigint: true });
     assertStable(opened, after);
+    await expected?.after();
     return bytes;
   } finally {
     await handle.close();
   }
+}
+
+async function snapshotSource(
+  io: VerifiedAvatarResourceReaderIo,
+  path: string,
+  maximumBytes: number,
+): Promise<{ readonly stats: BigIntStats; readonly canonical: string }> {
+  const stats = await io.lstat(path, { bigint: true });
+  requireRegularFile(stats, maximumBytes);
+  const canonical = await io.realpath(path);
+  if (stats.isSymbolicLink() || normalizePath(canonical) !== normalizePath(path)) {
+    throw new Error("avatar resource source is unsafe");
+  }
+  return { stats, canonical };
+}
+
+function isSafeAbsoluteSourcePath(path: unknown): path is string {
+  if (
+    typeof path !== "string" ||
+    !isAbsolute(path) ||
+    path.includes("\u0000") ||
+    /^[A-Za-z][A-Za-z0-9+.-]*:\/\//u.test(path)
+  ) {
+    return false;
+  }
+  return path
+    .split(/[\\/]/u)
+    .every((part, index) => index === 0 || (part !== "." && part !== ".."));
 }
 
 function readOnlyNoFollowFlags(): string | number {
@@ -164,6 +209,16 @@ function assertStable(left: BigIntStats, right: BigIntStats): void {
   ) {
     throw new Error("avatar resource changed during read");
   }
+}
+
+function sameSnapshot(left: BigIntStats, right: BigIntStats): boolean {
+  return (
+    left.dev === right.dev &&
+    left.ino === right.ino &&
+    left.size === right.size &&
+    left.mtimeNs === right.mtimeNs &&
+    left.ctimeNs === right.ctimeNs
+  );
 }
 
 function normalizePath(path: string): string {

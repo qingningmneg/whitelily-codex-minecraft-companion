@@ -1,6 +1,6 @@
 import { lstat, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   readVerifiedAvatarFile,
@@ -15,6 +15,41 @@ afterEach(async () => {
 });
 
 describe("readVerifiedAvatarResource", () => {
+  it("rejects unresolved traversal and URL-like picker source strings", async () => {
+    const root = await createRoot();
+    const path = join(root, "skin.png");
+    await writeFile(path, "skin");
+
+    await expect(
+      readVerifiedAvatarFile({
+        path: `${root}${sep}nested${sep}..${sep}skin.png`,
+        maximumBytes: 16,
+      }),
+    ).rejects.toThrow("avatar resource source is invalid");
+    await expect(
+      readVerifiedAvatarFile({ path: "file:///C:/skin.png", maximumBytes: 16 }),
+    ).rejects.toThrow("avatar resource source is invalid");
+  });
+
+  it("rejects an ancestor replacement after the source handle opens", async () => {
+    const root = await createRoot();
+    const path = join(root, "skin.png");
+    await writeFile(path, "skin");
+    let realpathCalls = 0;
+    const io: VerifiedAvatarResourceReaderIo = {
+      lstat: (candidate, options) => lstat(candidate, options),
+      realpath: async (candidate) => {
+        realpathCalls += 1;
+        return realpathCalls === 1 ? candidate : join(root, "replaced", "skin.png");
+      },
+      open: async (candidate, flags) => (await import("node:fs/promises")).open(candidate, flags),
+    };
+
+    await expect(readVerifiedAvatarFile({ path, maximumBytes: 16, io })).rejects.toThrow(
+      "avatar resource source changed during read",
+    );
+  });
+
   it("rejects growth and same-size file swaps for absolute picker sources", async () => {
     const root = await createRoot();
     const path = join(root, "skin.png");

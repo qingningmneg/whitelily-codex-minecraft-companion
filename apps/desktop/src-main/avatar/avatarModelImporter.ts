@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
 import {
   parseAvatarModelRecord,
@@ -36,7 +36,6 @@ export class AvatarImportError extends Error {
 export interface AvatarModelImporterIo {
   mkdir: typeof mkdir;
   readFile: typeof readFile;
-  rename(source: string, destination: string): Promise<void>;
   rm: typeof rm;
   writeFile: typeof writeFile;
 }
@@ -44,13 +43,13 @@ export interface AvatarModelImporterIo {
 export const nodeAvatarModelImporterIo: AvatarModelImporterIo = {
   mkdir,
   readFile,
-  rename,
   rm,
   writeFile,
 };
 
 interface AvatarModelCatalogPort {
   appendImported(record: AvatarAppearanceRecord): Promise<unknown>;
+  has?(modelId: string): Promise<boolean>;
 }
 
 interface AvatarModelImporterOptions {
@@ -99,7 +98,7 @@ export class AvatarModelImporter {
 
     try {
       const skinSource = await readVerifiedAvatarFile({
-        path: resolve(input.skinSourcePath),
+        path: input.skinSourcePath,
         maximumBytes: MAX_IMPORTED_PNG_BYTES,
       });
       const skin = validateMinecraftSkin(skinSource);
@@ -107,7 +106,7 @@ export class AvatarModelImporter {
         input.portraitSourcePath === undefined
           ? undefined
           : await readVerifiedAvatarFile({
-              path: resolve(input.portraitSourcePath),
+              path: input.portraitSourcePath,
               maximumBytes: MAX_IMPORTED_PNG_BYTES,
             });
       if (portraitSource !== undefined) validatePortrait(portraitSource);
@@ -160,10 +159,33 @@ export class AvatarModelImporter {
         previewDigest: preview === undefined ? undefined : digest(preview),
       });
 
-      await this.#io.rename(stagingDirectory, managedDirectory);
-      stagingOwned = false;
+      await this.#io.mkdir(managedDirectory);
       managedOwned = true;
-      await this.#catalog.appendImported(record);
+      await writeManagedFiles(this.#io, managedDirectory, skinSource, portraitSource, preview);
+      await verifyStagedFiles(this.#io, {
+        skinPath: join(managedDirectory, "skin.png"),
+        skinDigest,
+        portraitPath:
+          portraitDigest === undefined ? undefined : join(managedDirectory, "portrait.png"),
+        portraitDigest,
+        previewPath: preview === undefined ? undefined : join(managedDirectory, "preview.png"),
+        previewDigest: preview === undefined ? undefined : digest(preview),
+      });
+      await cleanupOwnedDirectory(this.#io, stagingDirectory);
+      stagingOwned = false;
+      try {
+        await this.#catalog.appendImported(record);
+      } catch (error) {
+        const outcome = await this.#catalogCommitOutcome(record.id);
+        if (outcome === "committed") {
+          managedOwned = false;
+          return record;
+        }
+        if (outcome === "unknown") {
+          managedOwned = false;
+        }
+        throw error;
+      }
       managedOwned = false;
       return record;
     } catch (error) {
@@ -171,6 +193,32 @@ export class AvatarModelImporter {
       else if (stagingOwned) await cleanupOwnedDirectory(this.#io, stagingDirectory);
       throw wrapImportError(error);
     }
+  }
+
+  async #catalogCommitOutcome(modelId: string): Promise<"committed" | "uncommitted" | "unknown"> {
+    if (this.#catalog.has === undefined) return "unknown";
+    try {
+      return (await this.#catalog.has(modelId)) ? "committed" : "uncommitted";
+    } catch {
+      return "unknown";
+    }
+  }
+}
+
+async function writeManagedFiles(
+  io: AvatarModelImporterIo,
+  directory: string,
+  skin: Buffer,
+  portrait: Buffer | undefined,
+  preview: Buffer | undefined,
+): Promise<void> {
+  await io.writeFile(join(directory, "skin.png"), skin, { flag: "wx" });
+  if (portrait !== undefined) {
+    await io.writeFile(join(directory, "portrait.png"), portrait, { flag: "wx" });
+  } else if (preview !== undefined) {
+    await io.writeFile(join(directory, "preview.png"), preview, { flag: "wx" });
+  } else {
+    throw new AvatarImportError("AVATAR_IMPORT_FAILED", "avatar preview is unavailable");
   }
 }
 

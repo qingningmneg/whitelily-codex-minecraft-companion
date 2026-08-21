@@ -71,3 +71,48 @@ Output: `All matched files use Prettier code style!`
 - The requested Task 5 composition-level picker does not exist in this revision. Per the scope ruling, I did not invent or wire it. Task 5 must call `importSkin` only after the skin picker has returned one `.png` path, offer an explicit portrait skip path, return `{ status: "cancelled" }` for cancellation of either picker without calling the importer, and never pass renderer filesystem paths over IPC.
 - `apps/desktop` typecheck remains red on pre-existing migration work outside Task 3 (legacy `AvatarBoneMapping`/`AvatarModelListItem` references in preview, IPC, and Task 5 tests). A filtered rerun confirmed no diagnostics from Task 3 files. The focused Task 3 test suite is green.
 - `validate-assets.mjs` was formatted while exporting the shared routines; its executable validation passed after the change.
+
+## Fix Round 1
+
+### Review findings resolved
+
+- Added a narrow main-process-only `AvatarSkinImportPicker`. It opens a skin picker with an exact `.png` filter, then requires an explicit portrait choice (`pick`, `skip`, or `cancel`). Any picker/choice cancellation returns `{ status: "cancelled" }` and does not invoke the importer. The returned source paths remain inside this main-process abstraction; Task 5 retains composition and renderer subscription wiring.
+- Hardened raw source validation before `resolve`: only non-NUL absolute filesystem paths with no `.`/`..` components are accepted, and URI-like values are rejected. The verified reader now snapshots identity and canonical path before opening, verifies the opened handle, and snapshots the path again after the bounded read to detect ancestor replacement/TOCTOU changes.
+- Removed replace-capable directory publication. The importer exclusively reserves `user/<uuid>` with `mkdir`, creates each managed file with `wx`, verifies final digests, and never removes a destination it did not create. A pre-existing foreign directory, including an empty one, is therefore never clobbered or cleaned up.
+- Reconciled catalog append errors conservatively. Following an append failure, `catalog.has(id)` distinguishes committed, uncommitted, and unknown outcomes. Committed assets are retained and returned successfully; uncommitted assets are cleaned; uncertain outcomes retain assets so a possibly catalog-referenced resource is never deleted.
+
+### TDD evidence
+
+#### RED
+
+1. `npm run test --workspace @whitelily/desktop -- src-main/avatar/avatarSkinImportPicker.test.ts`
+   - Failed because `./avatarSkinImportPicker.js` did not exist.
+2. `npm run test --workspace @whitelily/desktop -- src-main/avatar/verifiedAvatarResourceReader.test.ts`
+   - New raw traversal/URI and ancestor-swap tests failed: traversal was normalized before validation and post-open canonical identity was not checked.
+3. `npm run test --workspace @whitelily/desktop -- src-main/avatar/avatarModelImporter.test.ts`
+   - The post-commit reconciliation test rejected despite a catalog entry having been appended, and the pre-existing-target test observed a replace-capable rename attempt.
+4. `npm run test --workspace @whitelily/desktop -- src-main/avatar/avatarModelCatalog.test.ts`
+   - The injected error after the actual catalog JSON rename did not occur while the file IO seam was ignored.
+5. `npm run test --workspace @whitelily/desktop -- src-main/avatar/avatarModelImporter.test.ts`
+   - The unknown catalog-outcome test found `skin.png` deleted, proving the unsafe cleanup behavior.
+
+#### GREEN
+
+`npm run test --workspace @whitelily/desktop -- src-main/avatar/avatarModelImporter.test.ts`
+
+Output: `Test Files  1 passed (1)` and `Tests  15 passed (15)`.
+
+`npm run test --workspace @whitelily/desktop -- src-main/avatar/pngImageValidator.test.ts src-main/avatar/avatarModelImporter.test.ts src-main/avatar/avatarModelCatalog.test.ts src-main/avatar/avatarSkinImportPicker.test.ts src-main/avatar/verifiedAvatarResourceReader.test.ts`
+
+Output: `Test Files  5 passed (5)` and `Tests  39 passed (39)`.
+
+`node subprojects/whitelily-avatar/tools/validate-assets.mjs`
+
+Output: `WhiteLily native skin asset validation passed.`
+
+### Fix Round 1 self-review
+
+- Reviewed the direct picker-to-importer workflow: only the main process obtains source paths, cancellation takes the no-import branch, and portrait omission produces the existing fallback preview path.
+- Reviewed publication ownership: a UUID collision/concurrent import produces a reservation failure for one caller; only the caller that created the directory can clean it.
+- Reviewed the real Atomic JSON post-rename injection path: the catalog can be durably updated even though its append throws, and importer reconciliation recognizes that committed record.
+- Task 5 still owns the final IPC composition/subscription integration. This round intentionally adds the narrow picker interface without modifying stale Task 5 UI types.

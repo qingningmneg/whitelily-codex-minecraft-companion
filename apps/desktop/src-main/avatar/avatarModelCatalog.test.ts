@@ -4,6 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type { AvatarAppearanceRecord } from "../../../../src/avatar/avatarModelTypes.js";
+import {
+  nodeAtomicJsonFileIo,
+  type AtomicJsonFileIo,
+} from "../../../../src/storage/atomicJsonFile.js";
 import { AvatarModelCatalog } from "./avatarModelCatalog.js";
 import { resolveAvatarModelPaths } from "./avatarModelPaths.js";
 
@@ -155,19 +159,41 @@ describe("AvatarModelCatalog", () => {
     });
     expect(state.models.at(-1)).toMatchObject({ id: importedId });
   });
+
+  it("can report an error after catalog rename while leaving the committed record readable", async () => {
+    let throwAfterRename = false;
+    const io: AtomicJsonFileIo = {
+      ...nodeAtomicJsonFileIo,
+      rename: async (source, destination) => {
+        await nodeAtomicJsonFileIo.rename(source, destination);
+        if (throwAfterRename && destination.endsWith("catalog.json")) {
+          throw new Error("injected post-rename error");
+        }
+      },
+    };
+    const harness = await createHarness({ fileIo: io });
+    const imported = await harness.imported(importedId, "Post rename");
+    throwAfterRename = true;
+
+    await expect(harness.catalog.appendImported(imported)).rejects.toThrow(
+      "injected post-rename error",
+    );
+    await expect(harness.catalog.has(importedId)).resolves.toBe(true);
+  });
 });
 
-async function createHarness() {
+async function createHarness(options: { readonly fileIo?: AtomicJsonFileIo } = {}) {
   const root = await mkdtemp(join(tmpdir(), "whitelily-avatar-catalog-"));
   cleanups.push(() => rm(root, { recursive: true, force: true }));
   const paths = resolveAvatarModelPaths(root);
   const diagnostics: Array<{ code: string; modelId: string }> = [];
-  const options = {
+  const catalogOptions = {
     dataRoot: root,
     builtinModels: builtinAppearance(),
     diagnostic: (diagnostic: { code: string; modelId: string }) => diagnostics.push(diagnostic),
+    ...(options.fileIo === undefined ? {} : { fileIo: options.fileIo }),
   };
-  const catalog = new AvatarModelCatalog(options);
+  const catalog = new AvatarModelCatalog(catalogOptions);
   return {
     catalog,
     diagnostics,
