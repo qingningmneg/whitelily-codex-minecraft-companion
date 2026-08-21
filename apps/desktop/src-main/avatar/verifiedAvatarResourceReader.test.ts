@@ -1,4 +1,15 @@
-import { lstat, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import {
+  link,
+  lstat,
+  mkdir,
+  mkdtemp,
+  open,
+  realpath,
+  rename,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, sep } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -31,23 +42,42 @@ describe("readVerifiedAvatarResource", () => {
     ).rejects.toThrow("avatar resource source is invalid");
   });
 
-  it("rejects an ancestor replacement after the source handle opens", async () => {
+  it("detects an on-disk ancestor swap even when the replacement leaf retains its identity", async () => {
     const root = await createRoot();
-    const path = join(root, "skin.png");
-    await writeFile(path, "skin");
-    let realpathCalls = 0;
+    const outside = await mkdtemp(join(tmpdir(), "whitelily-avatar-reader-outside-"));
+    cleanups.push(() => rm(outside, { recursive: true, force: true }));
+    const ancestor = join(root, "selected");
+    const retiredAncestor = join(root, "retired");
+    const sourcePath = join(ancestor, "skin.png");
+    const stableLeaf = join(outside, "skin.png");
+    await mkdir(ancestor);
+    await writeFile(stableLeaf, "skin");
+    await link(stableLeaf, sourcePath);
+    const initialLeaf = await lstat(sourcePath, { bigint: true });
+    let swapped = false;
     const io: VerifiedAvatarResourceReaderIo = {
-      lstat: (candidate, options) => lstat(candidate, options),
-      realpath: async (candidate) => {
-        realpathCalls += 1;
-        return realpathCalls === 1 ? candidate : join(root, "replaced", "skin.png");
+      lstat: async (candidate, options) => {
+        if (swapped && candidate === sourcePath) return initialLeaf;
+        return lstat(candidate, options);
       },
-      open: async (candidate, flags) => (await import("node:fs/promises")).open(candidate, flags),
+      realpath: (candidate) => realpath(candidate),
+      open: async (candidate, flags) => {
+        await rename(ancestor, retiredAncestor);
+        await mkdir(ancestor);
+        await link(stableLeaf, sourcePath);
+        swapped = true;
+        const handle = await open(candidate, flags);
+        return {
+          stat: async () => initialLeaf,
+          read: handle.read.bind(handle),
+          close: () => handle.close(),
+        };
+      },
     };
 
-    await expect(readVerifiedAvatarFile({ path, maximumBytes: 16, io })).rejects.toThrow(
-      "avatar resource source changed during read",
-    );
+    await expect(
+      readVerifiedAvatarFile({ path: sourcePath, maximumBytes: 16, io }),
+    ).rejects.toThrow("avatar resource source changed during read");
   });
 
   it("rejects growth and same-size file swaps for absolute picker sources", async () => {

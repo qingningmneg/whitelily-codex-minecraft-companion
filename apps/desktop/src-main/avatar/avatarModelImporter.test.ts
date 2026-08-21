@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, sep } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import type { AvatarAppearanceRecord } from "../../../../src/avatar/avatarModelTypes.js";
 import { AvatarModelCatalog } from "./avatarModelCatalog.js";
 import {
@@ -13,6 +13,7 @@ import {
   AvatarModelImporter,
   nodeAvatarModelImporterIo,
   type AvatarModelImporterIo,
+  type AvatarModelImporterPublisher,
 } from "./avatarModelImporter.js";
 import { resolveAvatarModelPaths } from "./avatarModelPaths.js";
 import { png, validSkinBytes } from "./pngImageValidator.test.js";
@@ -234,24 +235,53 @@ describe("AvatarModelImporter", () => {
     );
   });
 
-  it("never invokes replace-capable rename for a pre-existing UUID destination", async () => {
-    const rename = vi.fn();
-    const ioWithReplaceCapableRename = { ...nodeAvatarModelImporterIo, rename };
-    const harness = await createHarness({ io: ioWithReplaceCapableRename });
+  it("fails closed before import mutation on platforms without no-replace directory publication", async () => {
+    let mkdirCalls = 0;
+    const harness = await createHarness({
+      platform: "linux",
+      io: {
+        ...nodeAvatarModelImporterIo,
+        mkdir: async () => {
+          mkdirCalls += 1;
+          throw new Error("unsupported-platform importer attempted mkdir");
+        },
+      },
+    });
     await harness.writeSources(validSkinBytes());
-    await harness.reserveDestination(Buffer.from("foreign"));
 
     await expect(
       harness.importer.importSkin({
         skinSourcePath: harness.skinSourcePath,
-        displayName: "Collision",
+        displayName: "Unsupported platform",
         armModel: "slim",
       }),
     ).rejects.toMatchObject({ code: "AVATAR_IMPORT_FAILED" });
-    expect(rename).not.toHaveBeenCalled();
+    expect(mkdirCalls).toBe(0);
+    expect(await harness.stagingEntries()).toEqual([]);
+    expect(await harness.userEntries()).toEqual([]);
+  });
+
+  it("leaves the final destination absent when publication is interrupted before its single rename", async () => {
+    const harness = await createHarness({
+      publisher: {
+        publish: async ({ stagingDirectory, managedDirectory }) => {
+          await expect(readdir(stagingDirectory)).resolves.toEqual(["preview.png", "skin.png"]);
+          await expect(lstat(managedDirectory)).rejects.toMatchObject({ code: "ENOENT" });
+          throw new Error("injected interruption before publication");
+        },
+      },
+    });
+    await harness.writeSources(validSkinBytes());
+
     await expect(
-      readFile(join(harness.paths.userRoot, importedUuid, "foreign.txt")),
-    ).resolves.toEqual(Buffer.from("foreign"));
+      harness.importer.importSkin({
+        skinSourcePath: harness.skinSourcePath,
+        displayName: "Interrupted",
+        armModel: "slim",
+      }),
+    ).rejects.toMatchObject({ code: "AVATAR_IMPORT_FAILED" });
+    expect(await harness.stagingEntries()).toEqual([]);
+    expect(await harness.userEntries()).toEqual([]);
   });
 
   it("preserves a pre-existing empty UUID destination", async () => {
@@ -301,6 +331,8 @@ async function createHarness(
     readonly catalogAppendFailsAfterCommit?: boolean;
     readonly catalogAppendOutcomeUnknown?: boolean;
     readonly fileIo?: AtomicJsonFileIo;
+    readonly platform?: NodeJS.Platform;
+    readonly publisher?: AvatarModelImporterPublisher;
   } = {},
 ) {
   const root = await mkdtemp(join(tmpdir(), "whitelily-skin-importer-"));
@@ -346,6 +378,8 @@ async function createHarness(
       createId: () => importedUuid,
       now: () => new Date("2026-08-21T08:00:00.000Z"),
       ...(options.io === undefined ? {} : { io: options.io }),
+      ...(options.platform === undefined ? {} : { platform: options.platform }),
+      ...(options.publisher === undefined ? {} : { publisher: options.publisher }),
     }),
     writeSources: async (skin: Buffer, portrait?: Buffer) => {
       await writeFile(skinSourcePath, skin);

@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
 import {
   parseAvatarModelRecord,
@@ -36,6 +36,7 @@ export class AvatarImportError extends Error {
 export interface AvatarModelImporterIo {
   mkdir: typeof mkdir;
   readFile: typeof readFile;
+  rename: typeof rename;
   rm: typeof rm;
   writeFile: typeof writeFile;
 }
@@ -43,8 +44,22 @@ export interface AvatarModelImporterIo {
 export const nodeAvatarModelImporterIo: AvatarModelImporterIo = {
   mkdir,
   readFile,
+  rename,
   rm,
   writeFile,
+};
+
+export interface AvatarModelImporterPublisher {
+  publish(input: {
+    readonly io: AvatarModelImporterIo;
+    readonly stagingDirectory: string;
+    readonly managedDirectory: string;
+  }): Promise<void>;
+}
+
+export const nodeAvatarModelImporterPublisher: AvatarModelImporterPublisher = {
+  publish: ({ io, stagingDirectory, managedDirectory }) =>
+    io.rename(stagingDirectory, managedDirectory),
 };
 
 interface AvatarModelCatalogPort {
@@ -58,6 +73,8 @@ interface AvatarModelImporterOptions {
   readonly createId?: () => string;
   readonly now?: () => Date;
   readonly io?: AvatarModelImporterIo;
+  readonly platform?: NodeJS.Platform;
+  readonly publisher?: AvatarModelImporterPublisher;
 }
 
 const MAX_IMPORTED_PNG_BYTES = 8 * 1024 * 1024;
@@ -69,6 +86,8 @@ export class AvatarModelImporter {
   readonly #createId: () => string;
   readonly #now: () => Date;
   readonly #io: AvatarModelImporterIo;
+  readonly #platform: NodeJS.Platform;
+  readonly #publisher: AvatarModelImporterPublisher;
 
   constructor(options: AvatarModelImporterOptions) {
     if (!isAbsolute(options.dataRoot)) throw new Error("invalid avatar importer data root");
@@ -77,6 +96,8 @@ export class AvatarModelImporter {
     this.#createId = options.createId ?? randomUUID;
     this.#now = options.now ?? (() => new Date());
     this.#io = options.io ?? nodeAvatarModelImporterIo;
+    this.#platform = options.platform ?? process.platform;
+    this.#publisher = options.publisher ?? nodeAvatarModelImporterPublisher;
   }
 
   async importSkin(input: {
@@ -86,6 +107,12 @@ export class AvatarModelImporter {
     readonly armModel: AvatarArmModel;
   }): Promise<AvatarAppearanceRecord> {
     validateInput(input);
+    if (this.#platform !== "win32") {
+      throw new AvatarImportError(
+        "AVATAR_IMPORT_FAILED",
+        "atomic no-replace avatar publication is unavailable on this platform",
+      );
+    }
     const uuid = this.#createId();
     if (!UUID_PATTERN.test(uuid)) {
       throw new AvatarImportError("AVATAR_IMPORT_FAILED", "avatar import id is invalid");
@@ -159,9 +186,13 @@ export class AvatarModelImporter {
         previewDigest: preview === undefined ? undefined : digest(preview),
       });
 
-      await this.#io.mkdir(managedDirectory);
+      await this.#publisher.publish({
+        io: this.#io,
+        stagingDirectory,
+        managedDirectory,
+      });
+      stagingOwned = false;
       managedOwned = true;
-      await writeManagedFiles(this.#io, managedDirectory, skinSource, portraitSource, preview);
       await verifyStagedFiles(this.#io, {
         skinPath: join(managedDirectory, "skin.png"),
         skinDigest,
@@ -171,8 +202,6 @@ export class AvatarModelImporter {
         previewPath: preview === undefined ? undefined : join(managedDirectory, "preview.png"),
         previewDigest: preview === undefined ? undefined : digest(preview),
       });
-      await cleanupOwnedDirectory(this.#io, stagingDirectory);
-      stagingOwned = false;
       try {
         await this.#catalog.appendImported(record);
       } catch (error) {
@@ -202,23 +231,6 @@ export class AvatarModelImporter {
     } catch {
       return "unknown";
     }
-  }
-}
-
-async function writeManagedFiles(
-  io: AvatarModelImporterIo,
-  directory: string,
-  skin: Buffer,
-  portrait: Buffer | undefined,
-  preview: Buffer | undefined,
-): Promise<void> {
-  await io.writeFile(join(directory, "skin.png"), skin, { flag: "wx" });
-  if (portrait !== undefined) {
-    await io.writeFile(join(directory, "portrait.png"), portrait, { flag: "wx" });
-  } else if (preview !== undefined) {
-    await io.writeFile(join(directory, "preview.png"), preview, { flag: "wx" });
-  } else {
-    throw new AvatarImportError("AVATAR_IMPORT_FAILED", "avatar preview is unavailable");
   }
 }
 

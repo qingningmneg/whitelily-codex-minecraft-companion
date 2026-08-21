@@ -116,3 +116,36 @@ Output: `WhiteLily native skin asset validation passed.`
 - Reviewed publication ownership: a UUID collision/concurrent import produces a reservation failure for one caller; only the caller that created the directory can clean it.
 - Reviewed the real Atomic JSON post-rename injection path: the catalog can be durably updated even though its append throws, and importer reconciliation recognizes that committed record.
 - Task 5 still owns the final IPC composition/subscription integration. This round intentionally adds the narrow picker interface without modifying stale Task 5 UI types.
+
+## Fix Round 2
+
+### Review findings resolved
+
+- `readVerifiedAvatarFile` now snapshots every existing ancestor directory between the volume root and the selected file before opening it. Each snapshot records lstat identity and canonical path, requires a non-link directory with no reparse/junction alias, and is compared again after the bounded handle read. A real on-disk ancestor-directory swap regression uses a stable hard-linked leaf and a controlled open boundary, so it proves that ancestor identity—not a mocked `realpath` response or only leaf metadata—causes the rejection.
+- Restored complete staging-directory publication. On the Windows x64 release target the importer writes and verifies the complete asset set under `.staging/<uuid>`, then performs exactly one directory rename into `user/<uuid>`; it never writes an asset into the final directory incrementally. Existing destination directories make the Windows rename fail, preserving foreign and empty destinations. A publish seam verifies the final destination is absent before that one boundary and allows controlled interruption testing.
+- Node 24 does not expose a cross-platform no-replace directory rename primitive. The importer therefore fails closed before it calls its import filesystem IO on every non-Windows platform. A reviewed native primitive is required before enabling this operation elsewhere; no check-then-replace fallback, shell helper, symlink indirection, or incremental destination write is used.
+
+### TDD evidence
+
+#### RED
+
+1. `npm run test --workspace @whitelily/desktop -- src-main/avatar/verifiedAvatarResourceReader.test.ts`
+   - The real on-disk ancestor-swap regression resolved `Buffer[115, 107, 105, 110]` instead of rejecting. The original reader only compared the leaf source path.
+2. `npm run test --workspace @whitelily/desktop -- src-main/avatar/avatarModelImporter.test.ts`
+   - The new unsupported-platform test resolved an import, and the injected pre-publication interruption test also resolved an import. This demonstrated both the absent platform guard and the incremental final-directory write path.
+
+#### GREEN
+
+`npm run test --workspace @whitelily/desktop -- src-main/avatar/avatarModelImporter.test.ts src-main/avatar/verifiedAvatarResourceReader.test.ts`
+
+Output: `Test Files  2 passed (2)` and `Tests  24 passed (24)`.
+
+`npm run test --workspace @whitelily/desktop -- src-main/avatar/pngImageValidator.test.ts src-main/avatar/avatarModelImporter.test.ts src-main/avatar/avatarModelCatalog.test.ts src-main/avatar/avatarSkinImportPicker.test.ts src-main/avatar/verifiedAvatarResourceReader.test.ts`
+
+Output: `Test Files  5 passed (5)` and `Tests  40 passed (40)`.
+
+### Fix Round 2 self-review and constraints
+
+- Windows-target regression coverage includes a foreign destination, a pre-existing empty destination, and concurrent identical UUID imports. The node publisher is selected only when the injected/runtime platform is `win32`; the actual Windows filesystem test confirms the existing empty destination survives.
+- The interruption test checks that staging contains the complete verified skin/preview set while `user/<uuid>` does not yet exist, then forces the single publication boundary to fail. Cleanup removes only the still-owned staging directory.
+- `npm run typecheck --workspace @whitelily/desktop` remains red only on the pre-existing Task 5/legacy avatar migration diagnostics (`AvatarBoneMapping`, `AvatarModelListItem`, and related IPC/UI fixtures). Its final rerun reports no diagnostics in this round’s files.

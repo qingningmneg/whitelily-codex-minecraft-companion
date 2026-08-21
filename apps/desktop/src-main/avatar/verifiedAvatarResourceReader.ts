@@ -1,6 +1,6 @@
 import { constants, type BigIntStats } from "node:fs";
 import { lstat, open, realpath, type FileHandle } from "node:fs/promises";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
 
 export interface VerifiedAvatarResourceHandle {
   stat(options: { readonly bigint: true }): Promise<BigIntStats>;
@@ -73,7 +73,7 @@ export async function readVerifiedAvatarFile(input: {
   return readBoundedFile(io, path, input.maximumBytes, {
     before: initial.stats,
     after: async () => {
-      let final: { readonly stats: BigIntStats; readonly canonical: string };
+      let final: Awaited<ReturnType<typeof snapshotSource>>;
       try {
         final = await snapshotSource(io, path, input.maximumBytes);
       } catch {
@@ -81,7 +81,8 @@ export async function readVerifiedAvatarFile(input: {
       }
       if (
         normalizePath(final.canonical) !== normalizePath(initial.canonical) ||
-        !sameSnapshot(initial.stats, final.stats)
+        !sameSnapshot(initial.stats, final.stats) ||
+        !sameDirectorySnapshots(initial.ancestors, final.ancestors)
       ) {
         throw new Error("avatar resource source changed during read");
       }
@@ -158,14 +159,50 @@ async function snapshotSource(
   io: VerifiedAvatarResourceReaderIo,
   path: string,
   maximumBytes: number,
-): Promise<{ readonly stats: BigIntStats; readonly canonical: string }> {
+): Promise<{
+  readonly stats: BigIntStats;
+  readonly canonical: string;
+  readonly ancestors: readonly SourceDirectorySnapshot[];
+}> {
+  const ancestors = await snapshotSourceAncestors(io, path);
   const stats = await io.lstat(path, { bigint: true });
   requireRegularFile(stats, maximumBytes);
   const canonical = await io.realpath(path);
   if (stats.isSymbolicLink() || normalizePath(canonical) !== normalizePath(path)) {
     throw new Error("avatar resource source is unsafe");
   }
-  return { stats, canonical };
+  return { stats, canonical, ancestors };
+}
+
+interface SourceDirectorySnapshot {
+  readonly operationPath: string;
+  readonly canonicalPath: string;
+  readonly stats: BigIntStats;
+}
+
+async function snapshotSourceAncestors(
+  io: VerifiedAvatarResourceReaderIo,
+  path: string,
+): Promise<readonly SourceDirectorySnapshot[]> {
+  const directory = dirname(path);
+  const volumeRoot = parse(directory).root;
+  const parts = relative(volumeRoot, directory).split(sep).filter(Boolean);
+  const snapshots: SourceDirectorySnapshot[] = [];
+  let current = volumeRoot;
+  for (const part of parts) {
+    current = join(current, part);
+    const stats = await io.lstat(current, { bigint: true });
+    const canonicalPath = await io.realpath(current);
+    if (
+      stats.isSymbolicLink() ||
+      !stats.isDirectory() ||
+      normalizePath(canonicalPath) !== normalizePath(current)
+    ) {
+      throw new Error("avatar resource source is unsafe");
+    }
+    snapshots.push({ operationPath: current, canonicalPath, stats });
+  }
+  return snapshots;
 }
 
 function isSafeAbsoluteSourcePath(path: unknown): path is string {
@@ -218,6 +255,21 @@ function sameSnapshot(left: BigIntStats, right: BigIntStats): boolean {
     left.size === right.size &&
     left.mtimeNs === right.mtimeNs &&
     left.ctimeNs === right.ctimeNs
+  );
+}
+
+function sameDirectorySnapshots(
+  left: readonly SourceDirectorySnapshot[],
+  right: readonly SourceDirectorySnapshot[],
+): boolean {
+  return (
+    left.length === right.length &&
+    left.every(
+      (snapshot, index) =>
+        normalizePath(snapshot.operationPath) === normalizePath(right[index]!.operationPath) &&
+        normalizePath(snapshot.canonicalPath) === normalizePath(right[index]!.canonicalPath) &&
+        sameSnapshot(snapshot.stats, right[index]!.stats),
+    )
   );
 }
 
