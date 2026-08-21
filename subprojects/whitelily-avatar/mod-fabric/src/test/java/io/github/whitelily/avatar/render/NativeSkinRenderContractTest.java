@@ -1,6 +1,7 @@
 package io.github.whitelily.avatar.render;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -13,56 +14,90 @@ import io.github.whitelily.avatar.skin.WhiteLilySkinCatalog;
 import io.github.whitelily.avatar.theme.ArmorTheme;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
+import java.util.function.Supplier;
+import net.minecraft.SharedConstants;
+import net.minecraft.client.renderer.entity.state.PlayerRenderState;
 import net.minecraft.client.resources.PlayerSkin;
 import net.minecraft.resources.ResourceLocation;
+import net.minecraft.server.Bootstrap;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 final class NativeSkinRenderContractTest {
+  @BeforeAll
+  static void bootstrapMinecraftRegistries() {
+    SharedConstants.tryDetectVersion();
+    Bootstrap.bootStrap();
+  }
+
   @Test
-  void matchedDecisionSelectsTheBundledSkinForItsTheme() {
+  void matchedDecisionAppliesTheBundledSkinToThePlayerRenderState() {
     WhiteLilySkinCatalog catalog = new WhiteLilySkinCatalog();
     WhiteLilyRenderDecision decision = matchedDecision(ArmorTheme.NETHERITE);
-    PlayerSkin original = originalSkin();
+    PlayerRenderState state = stateWithOriginalSkin();
 
-    PlayerSkin applied =
-        assertDoesNotThrow(() -> apply(original, decision, catalog::skinFor));
+    assertDoesNotThrow(() -> apply(state, () -> decision, catalog::skinFor));
 
-    assertSame(catalog.skinFor(ArmorTheme.NETHERITE), applied);
+    assertSame(catalog.skinFor(ArmorTheme.NETHERITE), state.skin);
   }
 
   @Test
   void unmatchedDecisionLeavesTheEnteringVanillaSkinUntouched() {
-    PlayerSkin original = originalSkin();
+    PlayerRenderState state = stateWithOriginalSkin();
+    PlayerSkin original = state.skin;
 
-    PlayerSkin applied =
-        assertDoesNotThrow(
-            () ->
-                apply(
-                    original,
-                    WhiteLilyRenderDecision.vanilla(),
-                    ignored -> {
-                      throw new AssertionError("unmatched decisions must not resolve a native skin");
-                    }));
+    assertDoesNotThrow(
+        () ->
+            apply(
+                state,
+                WhiteLilyRenderDecision::vanilla,
+                ignored -> {
+                  throw new AssertionError("unmatched decisions must not resolve a native skin");
+                }));
 
-    assertSame(original, applied);
+    assertSame(original, state.skin);
   }
 
   @Test
-  void skinResolutionFailureLeavesTheEnteringVanillaSkinUntouched() {
-    PlayerSkin original = originalSkin();
+  void nullSkinResolutionLeavesTheEnteringVanillaSkinUntouched() {
+    PlayerRenderState state = stateWithOriginalSkin();
+    PlayerSkin original = state.skin;
 
-    PlayerSkin applied =
+    assertDoesNotThrow(
+        () -> apply(state, () -> matchedDecision(ArmorTheme.GOLD), ignored -> null));
+
+    assertSame(original, state.skin);
+  }
+
+  @Test
+  void skinResolutionFailureRestoresTheEnteringSkinAndReportsOnce() {
+    PlayerRenderState state = stateWithOriginalSkin();
+    PlayerSkin original = state.skin;
+    IllegalStateException failure = new IllegalStateException("catalog unavailable");
+    AtomicInteger reportCount = new AtomicInteger();
+    AtomicReference<RuntimeException> reported = new AtomicReference<>();
+
+    NativeSkinStateApplication.ApplicationResult result =
         assertDoesNotThrow(
             () ->
                 apply(
-                    original,
-                    matchedDecision(ArmorTheme.GOLD),
+                    state,
+                    () -> matchedDecision(ArmorTheme.GOLD),
                     ignored -> {
-                      throw new IllegalStateException("catalog unavailable");
+                      throw failure;
                     }));
+    result.reportFailure(
+        error -> {
+          reportCount.incrementAndGet();
+          reported.set(error);
+        });
 
-    assertSame(original, applied);
+    assertSame(original, state.skin);
+    assertEquals(1, reportCount.get());
+    assertSame(failure, reported.get());
   }
 
   @Test
@@ -98,11 +133,17 @@ final class NativeSkinRenderContractTest {
         true);
   }
 
-  private static PlayerSkin apply(
-      PlayerSkin original,
-      WhiteLilyRenderDecision decision,
+  private static PlayerRenderState stateWithOriginalSkin() {
+    PlayerRenderState state = new PlayerRenderState();
+    state.skin = originalSkin();
+    return state;
+  }
+
+  private static NativeSkinStateApplication.ApplicationResult apply(
+      PlayerRenderState state,
+      Supplier<WhiteLilyRenderDecision> decision,
       Function<ArmorTheme, PlayerSkin> skinFor) {
-    return NativeSkinStateApplication.apply(original, decision, skinFor);
+    return NativeSkinStateApplication.apply(state, decision, skinFor);
   }
 
   private static boolean contains(JsonArray values, String expected) {

@@ -27,6 +27,7 @@ import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
 
 public final class WhiteLilyAvatarClient implements ClientModInitializer {
   public static final String COMPONENT_VERSION = "0.1.0";
+  public static final String NATIVE_SKIN_FAILURE_CODE = "WL_AVATAR_SKIN_001";
 
   private static final WhiteLilyRenderRuntime RENDER_RUNTIME =
       new WhiteLilyRenderRuntime();
@@ -90,6 +91,14 @@ public final class WhiteLilyAvatarClient implements ClientModInitializer {
 
   public static void onRenderBoundary(AvatarModelController controller) {
     if (controller != null) controller.onRenderBoundary();
+  }
+
+  public static void reportNativeSkinFailure(RuntimeException error) {
+    try {
+      System.err.println(NATIVE_SKIN_FAILURE_CODE);
+    } catch (RuntimeException ignored) {
+      // Rendering must keep the entering vanilla state even if diagnostics are unavailable.
+    }
   }
 
   public static void installCandidateRuntime(AvatarCandidateRuntime runtime) {
