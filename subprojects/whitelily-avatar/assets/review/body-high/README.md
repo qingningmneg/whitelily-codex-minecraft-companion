@@ -12,7 +12,7 @@ rebuilt together with:
 The ordinary no-write verification command is:
 
 ```powershell
-$env:WHITELILY_BLENDER_PATH = 'C:\Users\Admin\.cache\whitelily-tools\blender-4.5.3\blender-4.5.3-windows-x64\blender.exe'
+$env:WHITELILY_BLENDER_PATH = 'C:\Users\Owner\.cache\whitelily-tools\blender-4.5.3\blender-4.5.3-windows-x64\blender.exe'
 npm run avatar:anime:check -- --stage body-high
 ```
 

@@ -23,7 +23,7 @@ describe("desktop message catalogs", () => {
     );
     expect(() =>
       translate("en", "minecraft.connected", {
-        leakedPath: String.raw`C:\Users\private`,
+        leakedPath: String.raw`C:\Users\Other`,
       }),
     ).toThrow("unexpected interpolation parameter: leakedPath");
   });

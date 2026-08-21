@@ -132,7 +132,7 @@ describe("Task 5 preload API", () => {
 
     expect(failure).toMatchObject({ code: "AVATAR_GLB_INVALID" });
     expect(failure).toBeInstanceOf(Error);
-    expect((failure as Error).message).not.toContain(String.raw`C:\Users\private\avatar.glb`);
+    expect((failure as Error).message).not.toContain(String.raw`C:\Users\Other\avatar.glb`);
   });
 
   it("drops malformed avatar catalog events at the preload boundary", () => {

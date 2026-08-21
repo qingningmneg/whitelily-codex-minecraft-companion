@@ -325,7 +325,7 @@ describe("CompanionActionQueue", () => {
       taskLease,
       worldGeneration: 1,
       action: { kind: "jump" },
-      summary: String.raw`password=hunter2 C:\Users\Admin\private\task.txt`,
+      summary: String.raw`password=hunter2 C:\Users\Other\private\task.txt`,
       trustedObservationKey: "observation-a",
     });
     queue.claimNext(taskLease, 1);
@@ -333,13 +333,13 @@ describe("CompanionActionQueue", () => {
       "queue-1",
       taskLease,
       1,
-      String.raw`token=private-token C:\Users\Admin\private\failure.txt`,
+      String.raw`token=private-token C:\Users\Other\private\failure.txt`,
     );
 
     const diagnostic = JSON.stringify(queue.snapshot());
     expect(diagnostic).not.toContain("hunter2");
     expect(diagnostic).not.toContain("private-token");
-    expect(diagnostic).not.toContain(String.raw`C:\Users\Admin`);
+    expect(diagnostic).not.toContain(String.raw`C:\Users\Other`);
   });
 
   it("records a bounded failure reason exactly once", () => {
