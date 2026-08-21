@@ -1,7 +1,6 @@
 import { createHash } from "node:crypto";
-import type { Stats } from "node:fs";
-import { lstat, mkdir, open, realpath } from "node:fs/promises";
-import { isAbsolute, relative, resolve, sep } from "node:path";
+import { mkdir } from "node:fs/promises";
+import { isAbsolute, resolve } from "node:path";
 import {
   BUILTIN_AVATAR_MODEL_IDS,
   parseAvatarModelRecord,
@@ -11,6 +10,7 @@ import {
 } from "../../../../src/avatar/avatarModelSchemas.js";
 import { AtomicJsonFile } from "../../../../src/storage/atomicJsonFile.js";
 import { resolveAvatarModelPaths, type AvatarModelPaths } from "./avatarModelPaths.js";
+import { readVerifiedAvatarResource } from "./verifiedAvatarResourceReader.js";
 
 export type AvatarModelCatalogErrorCode =
   | "AVATAR_CATALOG_INVALID"
@@ -104,6 +104,7 @@ export class AvatarModelCatalog {
       return this.#builtinOnlyState();
     }
     const imported: AvatarAppearanceRecord[] = [];
+    const seenIds = new Set([this.#builtinModel.id]);
     for (const candidate of document.imported) {
       let record: AvatarAppearanceRecord;
       try {
@@ -112,6 +113,11 @@ export class AvatarModelCatalog {
         this.#reportLegacyRecord(candidate);
         continue;
       }
+      if (record.origin !== "imported" || seenIds.has(record.id)) {
+        this.#reportInvalidRecord(record.id);
+        continue;
+      }
+      seenIds.add(record.id);
       try {
         await this.#validateManagedRecord(record);
         imported.push(record);
@@ -218,23 +224,35 @@ export class AvatarModelCatalog {
 
   #reportLegacyRecord(record: unknown): void {
     const modelId = recordId(record) ?? "legacy";
+    this.#reportSkippedRecord("AVATAR_CATALOG_LEGACY_MODEL_SKIPPED", modelId);
+  }
+
+  #reportInvalidRecord(modelId: string): void {
+    this.#reportSkippedRecord("AVATAR_CATALOG_INVALID", diagnosticModelId(modelId));
+  }
+
+  #reportSkippedRecord(code: AvatarModelCatalogErrorCode, modelId: string): void {
     if (this.#reportedLegacyRecordIds.has(modelId)) return;
     this.#reportedLegacyRecordIds.add(modelId);
-    this.#diagnostic({ code: "AVATAR_CATALOG_LEGACY_MODEL_SKIPPED", modelId });
+    this.#diagnostic({ code, modelId });
   }
 
   async #validateManagedRecord(record: AvatarAppearanceRecord): Promise<void> {
     try {
-      const skinBytes = await readVerifiedManagedFile(this.#paths.root, record.skinAsset, 2 * 1024 * 1024);
+      const skinBytes = await readVerifiedAvatarResource({
+        root: this.#paths.root,
+        relativePath: record.skinAsset,
+        maximumBytes: 2 * 1024 * 1024,
+      });
       if (digest(skinBytes) !== record.skinSha256) {
         throw new AvatarModelCatalogError("AVATAR_DIGEST_MISMATCH", "avatar skin digest changed");
       }
       if (record.portraitAsset !== undefined && record.portraitSha256 !== undefined) {
-        const portraitBytes = await readVerifiedManagedFile(
-          this.#paths.root,
-          record.portraitAsset,
-          2 * 1024 * 1024,
-        );
+        const portraitBytes = await readVerifiedAvatarResource({
+          root: this.#paths.root,
+          relativePath: record.portraitAsset,
+          maximumBytes: 2 * 1024 * 1024,
+        });
         if (digest(portraitBytes) !== record.portraitSha256) {
           throw new AvatarModelCatalogError(
             "AVATAR_DIGEST_MISMATCH",
@@ -283,55 +301,18 @@ function validateCatalogDocument(value: unknown): AvatarModelCatalogDocument {
 function recordId(value: unknown): string | undefined {
   if (!isPlainObject(value)) return undefined;
   const id = Reflect.get(value, "id");
-  return typeof id === "string" && id.length <= 128 && id === id.toWellFormed() ? id : undefined;
+  return typeof id === "string" && USER_AVATAR_MODEL_ID_PATTERN.test(id) ? id : undefined;
+}
+
+const USER_AVATAR_MODEL_ID_PATTERN =
+  /^user:[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+
+function diagnosticModelId(value: string): string {
+  return USER_AVATAR_MODEL_ID_PATTERN.test(value) ? value : "legacy";
 }
 
 function digest(bytes: Buffer): string {
   return createHash("sha256").update(bytes).digest("hex");
-}
-
-async function readVerifiedManagedFile(
-  managedRoot: string,
-  declaredPath: string,
-  maximumBytes: number,
-): Promise<Buffer> {
-  const canonicalRoot = await realpath(managedRoot);
-  const candidate = resolve(managedRoot, ...declaredPath.split("/"));
-  if (!isWithin(canonicalRoot, candidate)) throw new Error("managed avatar path escaped");
-  const before = await lstat(candidate);
-  requireRegularFile(before, maximumBytes);
-  const canonicalCandidate = await realpath(candidate);
-  if (!isWithin(canonicalRoot, canonicalCandidate)) throw new Error("managed avatar path escaped");
-  const handle = await open(candidate, "r");
-  try {
-    const opened = await handle.stat();
-    requireSameFile(before, opened);
-    requireRegularFile(opened, maximumBytes);
-    const bytes = await handle.readFile();
-    const after = await handle.stat();
-    requireSameFile(opened, after);
-    if (bytes.length !== after.size) throw new Error("managed avatar file changed during read");
-    return bytes;
-  } finally {
-    await handle.close();
-  }
-}
-
-function requireRegularFile(stats: Stats, maximumBytes: number): void {
-  if (stats.isSymbolicLink() || !stats.isFile() || stats.size <= 0 || stats.size > maximumBytes) {
-    throw new Error("managed avatar file is invalid");
-  }
-}
-
-function requireSameFile(left: Stats, right: Stats): void {
-  if (left.dev !== right.dev || left.ino !== right.ino || left.size !== right.size) {
-    throw new Error("managed avatar file changed during read");
-  }
-}
-
-function isWithin(root: string, candidate: string): boolean {
-  const child = relative(root, candidate);
-  return child.length > 0 && child !== ".." && !child.startsWith(`..${sep}`) && !isAbsolute(child);
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {

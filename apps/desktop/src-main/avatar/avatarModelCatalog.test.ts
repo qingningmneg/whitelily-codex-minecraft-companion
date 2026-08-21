@@ -58,6 +58,64 @@ describe("AvatarModelCatalog", () => {
     ]);
   });
 
+  it("does not publish a builtin-shaped entry stored in imported records", async () => {
+    const harness = await createHarness();
+    await harness.catalog.initialize();
+    await writeFile(
+      harness.paths.catalogPath,
+      JSON.stringify({ schemaVersion: 1, revision: 4, imported: [builtinAppearance()] }),
+      "utf8",
+    );
+
+    await expect(harness.catalog.list()).resolves.toMatchObject({
+      models: [{ id: "builtin:whitelily" }],
+    });
+    expect(harness.diagnostics).toContainEqual({
+      code: "AVATAR_CATALOG_INVALID",
+      modelId: "legacy",
+    });
+  });
+
+  it("publishes one imported appearance when the legacy catalog duplicates its id", async () => {
+    const harness = await createHarness();
+    const imported = await harness.imported(importedId, "First");
+    await harness.catalog.initialize();
+    await writeFile(
+      harness.paths.catalogPath,
+      JSON.stringify({ schemaVersion: 1, revision: 4, imported: [imported, imported] }),
+      "utf8",
+    );
+
+    expect((await harness.catalog.list()).models.map(({ id }) => id)).toEqual([
+      "builtin:whitelily",
+      importedId,
+    ]);
+    expect(harness.diagnostics).toContainEqual({
+      code: "AVATAR_CATALOG_INVALID",
+      modelId: importedId,
+    });
+  });
+
+  it("uses a fixed diagnostic id for unsafe legacy record ids", async () => {
+    const harness = await createHarness();
+    await harness.catalog.initialize();
+    await writeFile(
+      harness.paths.catalogPath,
+      JSON.stringify({
+        schemaVersion: 1,
+        revision: 4,
+        imported: [{ id: "user:unsafe\\n\u202E", format: "glb" }],
+      }),
+      "utf8",
+    );
+
+    await harness.catalog.list();
+
+    expect(harness.diagnostics).toEqual([
+      { code: "AVATAR_CATALOG_LEGACY_MODEL_SKIPPED", modelId: "legacy" },
+    ]);
+  });
+
   it("keeps startup usable with the builtin when the catalog document is corrupt", async () => {
     const harness = await createHarness();
     await harness.catalog.initialize();
