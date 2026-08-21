@@ -204,6 +204,7 @@ const ownerIntentDecisionPolicyPrompt = [
   "Use clarify only when execution-critical information such as the target, object, direction, or destination cannot be inferred safely from the owner message and available context. Ask only for the missing information.",
   "Use continue_task for the active goal and replace_task for a different requested goal. A clear action request must not become chat or clarify merely because another task is active.",
   "Use priority_task for a temporary help request that should preserve the active goal, do the urgent help first, and replan the prior goal afterward.",
+  "Use stop_task when the owner semantically asks to stop, cancel, or discontinue the active work. A polite or temporary stop request still stops and clears that task; it is not chat.",
   "When farmingPermission.pending is true, classify an unambiguous natural agreement as grant_farming_permission and an unambiguous refusal as deny_farming_permission.",
   'A short contextual agreement such as "可以" grants wheat-farming permission only while farmingPermission.pending is true.',
   "Only an explicit global wheat-farming authorization may grant permission without a pending request.",
@@ -214,6 +215,9 @@ const ownerIntentDecisionPolicyPrompt = [
   '\"Cut down a tree.\" -> start_task.',
   '\"Good morning.\" -> chat.',
   '\"Put it there.\" -> clarify only when the object or destination cannot be resolved from context.',
+  "Examples when a task is active:",
+  '\"先停下来吧\" -> stop_task.',
+  '\"先来帮我一下\" -> priority_task.',
 ].join("\n");
 
 export function buildOwnerIntentTurn(input: OwnerIntentContext): string {

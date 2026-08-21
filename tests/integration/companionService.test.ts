@@ -91,6 +91,12 @@ function taskPlanFromPrompt(prompt: string): unknown {
   return JSON.parse(match[1]) as unknown;
 }
 
+function ownerIntentContextFromPrompt(prompt: string): unknown {
+  const match = /\nCONTEXT\n([^\n]+)\nEND_CONTEXT\n/u.exec(prompt);
+  if (!match?.[1]) throw new Error("expected one owner intent CONTEXT JSON section");
+  return JSON.parse(match[1]) as unknown;
+}
+
 const internalDisclosurePattern =
   /任务披露|minecraft_[a-z0-9_]+|get_state|find_block|move_to|follow_owner|look_at|dig_block|place_block|craft_item|smelt_item|collect_dropped|equip_item|attack_hostile|工具调用|预算|租约|停止条件|expectedActions|allowedActions|maxToolCalls|maxBlockChanges|maxHorizontalTravel|maxDurationMs|maxDangerousOperations|leaseId|stopCondition/iu;
 const leakingInternalModelReply =
@@ -3771,6 +3777,52 @@ describe("CompanionService recovery", () => {
     );
     expect(value.mode.snapshot().paused).toBe(false);
     expect(value.minecraft.chatLog).toEqual(["已恢复。"]);
+  });
+
+  it("exposes a recovered active task to owner intent routing so natural stop clears it", async () => {
+    const value = await harness({
+      persistedState: {
+        lastMode: "friend",
+        paused: true,
+        unfinishedTaskSummary: '{"goal":"继续建造别墅"}',
+      },
+      intentResponses: [JSON.stringify({ kind: "stop_task", reply: "好，我先停下来。" })],
+      executionResponses: [
+        outcome({
+          task: {
+            goal: "继续建造别墅",
+            allowedActions: ["move_to", "place_block"],
+            actionBudget: 12,
+            successCondition: "别墅建造完成",
+            stopCondition: "主人要求停止",
+            status: "active",
+          },
+        }),
+      ],
+    });
+    await value.start();
+    await emitCommand(value, "!resume");
+    expect(value.mode.snapshot()).toMatchObject({ paused: false, taskId: "继续建造别墅" });
+    expect(await value.state.load()).toMatchObject({
+      unfinishedTaskSummary: JSON.stringify({
+        goal: "继续建造别墅",
+        success: "别墅建造完成",
+        stop: "主人要求停止",
+      }),
+    });
+
+    await value.emitOwnerText("先停下来吧");
+    await value.untilChat("好，我先停下来。");
+
+    expect(
+      ownerIntentContextFromPrompt(value.codex.turnsFor("intent")[0]?.text ?? ""),
+    ).toMatchObject({
+      activeTask: {
+        goal: "继续建造别墅",
+      },
+    });
+    expect(value.mode.snapshot()).toMatchObject({ paused: false, taskId: null });
+    expect(await value.state.load()).toMatchObject({ unfinishedTaskSummary: null });
   });
 
   it("recovery prompt keeps hostile Unicode data in exactly eight sections and never labels it as owner speech", async () => {

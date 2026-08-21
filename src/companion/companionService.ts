@@ -88,6 +88,13 @@ const farmingPermissionQuestion = "我可以在这里种小麦吗？";
 const farmingFallbackConstraint = "不得新建农田，寻找现成的成熟小麦";
 const farmingMutationKinds = new Set(["till_soil", "plant_crop"] as const);
 const wheatObservationDelayMs = 60_000;
+const recoveredIntentOnlyTaskLimits: TaskLimits = Object.freeze({
+  maxToolCalls: 0,
+  maxBlockChanges: 0,
+  maxHorizontalTravel: 0,
+  maxDurationMs: 0,
+  maxDangerousOperations: 0,
+});
 const filteredModelReply = "好，我知道了。";
 const ambiguousNaturalToolNames = new Set<ToolActionKind>(["say", "jump", "wait"]);
 const ambiguousNaturalToolNamePattern = [...ambiguousNaturalToolNames].join("|");
@@ -1249,6 +1256,10 @@ export class CompanionService {
     let prompt: string;
     try {
       const activeTask = this.dependencies.taskController.current();
+      const recoveredTaskGoal =
+        activeTask === null && this.unfinishedTaskSummary !== null
+          ? this.dependencies.mode.snapshot().taskId
+          : null;
       prompt = buildOwnerIntentTurn({
         ownerMessage: text,
         mode: this.dependencies.mode.getMode(),
@@ -1261,7 +1272,13 @@ export class CompanionService {
               allowedActions: activeTask.disclosure.expectedActions,
               limits: activeTask.disclosure.limits,
             }
-          : null,
+          : recoveredTaskGoal
+            ? {
+                goal: recoveredTaskGoal,
+                allowedActions: [],
+                limits: recoveredIntentOnlyTaskLimits,
+              }
+            : null,
         farmingPermission: {
           status: this.dependencies.farmingPreference.snapshot().status,
           pending: this.farmingPermissionCoordinator.isPending(),

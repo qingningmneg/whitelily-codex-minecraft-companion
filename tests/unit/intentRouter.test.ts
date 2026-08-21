@@ -223,6 +223,11 @@ describe("buildOwnerIntentTurn", () => {
     expect(activePrompt).toContain(
       "Use priority_task for a temporary help request that should preserve the active goal",
     );
+    expect(activePrompt).toContain(
+      "Use stop_task when the owner semantically asks to stop, cancel, or discontinue the active work",
+    );
+    expect(activePrompt).toContain('"先停下来吧" -> stop_task');
+    expect(activePrompt).toContain('"先来帮我一下" -> priority_task');
   });
 
   it("places owner text as bounded JSON data behind a tool-free semantic boundary", () => {

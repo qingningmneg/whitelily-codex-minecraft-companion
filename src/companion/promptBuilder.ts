@@ -1,5 +1,5 @@
 import * as z from "zod/v4";
-import type { CompanionMode, WorldSnapshot } from "../domain/types.js";
+import { GAME_ACTION_KINDS, type CompanionMode, type WorldSnapshot } from "../domain/types.js";
 import type { MemoryRecord } from "../memory/memoryStore.js";
 import type { ToolActionKind } from "../mcp/toolBudget.js";
 import {
@@ -19,22 +19,6 @@ const maximumHostiles = 8;
 const maximumNearbyBlocks = 16;
 const maximumMemories = 8;
 
-const allowedActions = [
-  "say",
-  "move_to",
-  "follow_owner",
-  "look_at",
-  "jump",
-  "dig_block",
-  "place_block",
-  "craft_item",
-  "smelt_item",
-  "collect_dropped",
-  "equip_item",
-  "attack_hostile",
-  "wait",
-] as const;
-
 const memoryCategories = ["preference", "place", "project", "promise", "experience"] as const;
 const proactiveKinds = ["chat", "suggestion"] as const;
 
@@ -45,7 +29,7 @@ export const companionTurnOutcomeSchema = z
     task: z
       .object({
         goal: z.string().min(1).max(160),
-        allowedActions: z.array(z.enum(allowedActions)).max(14),
+        allowedActions: z.array(z.enum(GAME_ACTION_KINDS)).max(14),
         actionBudget: z.number().int().min(1).max(64),
         successCondition: z.string().min(1).max(160),
         stopCondition: z.string().min(1).max(160),

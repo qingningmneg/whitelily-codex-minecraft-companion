@@ -8,6 +8,7 @@ import {
   companionTaskExecutionOutcomeSchema,
   companionTurnOutcomeSchema,
 } from "../../src/companion/promptBuilder.js";
+import { GAME_ACTION_KINDS } from "../../src/domain/types.js";
 import type { MemoryRecord } from "../../src/memory/memoryStore.js";
 import { createDefaultCompanionProfile } from "../../src/profile/profileSchema.js";
 
@@ -764,6 +765,18 @@ describe("companionTurnOutcomeSchema", () => {
 
   it("accepts the bounded structured outcome", () => {
     expect(companionTurnOutcomeSchema.parse(validOutcome)).toEqual(validOutcome);
+  });
+
+  it("accepts every game action supported by the runtime", () => {
+    for (const action of GAME_ACTION_KINDS) {
+      expect(
+        companionTurnOutcomeSchema.safeParse({
+          ...validOutcome,
+          task: { ...validOutcome.task, allowedActions: [action] },
+        }).success,
+        action,
+      ).toBe(true);
+    }
   });
 
   it("accepts every inclusive maximum boundary", () => {
