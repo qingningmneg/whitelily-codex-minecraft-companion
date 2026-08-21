@@ -19,6 +19,8 @@ describe("native skin appearance flow", () => {
     await app.expectRequest("commit");
     app.fabricReply("failed", "AVATAR_FRAME_FAILED");
 
+    await app.expectRequest("cancel");
+    app.fabricReply("cancelled");
     await expect(switching).rejects.toMatchObject({ code: "AVATAR_SWITCH_FAILED" });
     expect((await app.list()).activeModelId).toBe("builtin:whitelily");
     await app.restart();
@@ -34,15 +36,71 @@ describe("native skin appearance flow", () => {
     await app.expectRequest("commit");
     app.fabricReply("visible");
 
-    await expect(switching).rejects.toMatchObject({ code: "AVATAR_SWITCH_FAILED" });
     await app.expectRequest("cancel");
+    app.fabricReply("cancelled");
+    await expect(switching).rejects.toMatchObject({ code: "AVATAR_SWITCH_FAILED" });
     expect((await app.list()).activeModelId).toBe("builtin:whitelily");
     await app.restart();
     expect((await app.list()).activeModelId).toBe("builtin:whitelily");
   });
+
+  it("keeps Fabric and desktop old across a world boundary after a lost cancel ACK", async () => {
+    const app = launchHarness({
+      activeModelId: "builtin:whitelily",
+      preferenceFailure: true,
+      recoveryTimeoutMs: 20,
+    });
+    const imported = "user:00000000-0000-4000-8000-000000000001";
+    const switching = app.switchTo(imported);
+    await app.expectRequest("prepare");
+    app.fabricReply("ready");
+    await app.expectRequest("commit");
+    app.fabricReply("visible");
+    await app.expectRequest("cancel");
+
+    app.fabricConsumeRecoveryWithoutAck();
+    await expect(switching).rejects.toMatchObject({
+      code: "AVATAR_SWITCH_RECOVERY_PENDING",
+    });
+    app.worldBoundary();
+
+    expect(app.fabricActiveModelId).toBe("builtin:whitelily");
+    expect((await app.list()).activeModelId).toBe("builtin:whitelily");
+  });
+
+  it("keeps Fabric and desktop new across a world boundary after a lost finalize ACK", async () => {
+    const app = launchHarness({
+      activeModelId: "builtin:whitelily",
+      compensationFailure: true,
+      recoveryTimeoutMs: 20,
+    });
+    const imported = "user:00000000-0000-4000-8000-000000000001";
+    const switching = app.switchTo(imported);
+    await app.expectRequest("prepare");
+    app.fabricReply("ready");
+    await app.expectRequest("commit");
+    app.fabricReply("visible");
+    await app.expectRequest("finalize");
+    app.fabricReply("failed", "AVATAR_FINALIZE_FAILED");
+    await app.expectRequest("finalize");
+
+    app.fabricConsumeRecoveryWithoutAck();
+    await expect(switching).rejects.toMatchObject({
+      code: "AVATAR_SWITCH_RECOVERY_PENDING",
+    });
+    app.worldBoundary();
+
+    expect(app.fabricActiveModelId).toBe(imported);
+    expect((await app.list()).activeModelId).toBe(imported);
+  });
 });
 
-function launchHarness(options: { activeModelId: string; preferenceFailure?: boolean }) {
+function launchHarness(options: {
+  activeModelId: string;
+  preferenceFailure?: boolean;
+  compensationFailure?: boolean;
+  recoveryTimeoutMs?: number;
+}) {
   let preference = { schemaVersion: 1 as const, revision: 0, activeModelId: options.activeModelId };
   const mailbox = new HarnessMailbox();
   const catalog = {
@@ -70,6 +128,7 @@ function launchHarness(options: { activeModelId: string; preferenceFailure?: boo
       activeModelId: string;
       committedRequestId: string;
     }) => {
+      if (options.compensationFailure) throw new Error("preference compensation failed");
       preference = {
         schemaVersion: 1,
         revision: preference.revision + 1,
@@ -90,6 +149,7 @@ function launchHarness(options: { activeModelId: string; preferenceFailure?: boo
       item("user:00000000-0000-4000-8000-000000000001", "imported"),
     ],
   });
+  let requestSequence = 0;
   let coordinator = createCoordinator();
   function createCoordinator() {
     return new AvatarModelSwitchCoordinator({
@@ -99,8 +159,9 @@ function launchHarness(options: { activeModelId: string; preferenceFailure?: boo
       currentWorldSessionId: () => "world-0001",
       projectSnapshot: project,
       publishSnapshot: () => undefined,
-      createRequestId: () => `request-${mailbox.requestCount + 1}`,
+      createRequestId: () => `request-${++requestSequence}`,
       now: () => new Date("2026-08-21T00:00:00.000Z"),
+      commitTimeoutMs: options.recoveryTimeoutMs ?? 500,
     });
   }
   return {
@@ -110,6 +171,11 @@ function launchHarness(options: { activeModelId: string; preferenceFailure?: boo
       mailbox.expectRequest(operation),
     fabricReply: (phase: AvatarModelControlState["phase"], errorCode?: string) =>
       mailbox.reply(phase, errorCode),
+    fabricConsumeRecoveryWithoutAck: () => mailbox.consumeRecoveryWithoutAck(),
+    worldBoundary: () => mailbox.worldBoundary(),
+    get fabricActiveModelId() {
+      return mailbox.fabricActiveModelId;
+    },
     restart: async () => {
       coordinator = createCoordinator();
     },
@@ -128,31 +194,89 @@ function item(id: string, origin: "builtin" | "imported") {
 }
 
 class HarnessMailbox implements AvatarModelMailboxPort {
-  readonly requests: AvatarModelControlRequest[] = [];
-  readonly waiters: Array<(state: AvatarModelControlState) => void> = [];
-  get requestCount() {
-    return this.requests.length;
+  slot: AvatarModelControlRequest | undefined;
+  #stateSlot: AvatarModelControlState | undefined;
+  #waiter:
+    | {
+        requestId: string;
+        accepted: readonly AvatarModelControlState["phase"][];
+        resolve(state: AvatarModelControlState): void;
+        timeout: ReturnType<typeof setTimeout>;
+      }
+    | undefined;
+  #fabricActiveModelId = "builtin:whitelily";
+  #checkpoint:
+    | { readonly previousModelId: string; readonly candidateModelId: string; finalized: boolean }
+    | undefined;
+
+  get fabricActiveModelId() {
+    return this.#fabricActiveModelId;
   }
+
   async publish(request: AvatarModelControlRequest) {
-    this.requests.push(request);
+    this.slot = request;
   }
-  async waitForState() {
-    return new Promise<AvatarModelControlState>((resolve) => this.waiters.push(resolve));
-  }
-  async expectRequest(operation: AvatarModelControlRequest["operation"]) {
-    for (
-      let attempt = 0;
-      attempt < 100 && this.requests.at(-1)?.operation !== operation;
-      attempt += 1
+
+  async waitForState(input: {
+    readonly requestId: string;
+    readonly accepted: readonly AvatarModelControlState["phase"][];
+    readonly signal: AbortSignal;
+    readonly timeoutMs: number;
+  }) {
+    const current = this.#stateSlot;
+    if (
+      current !== undefined &&
+      current.requestId === input.requestId &&
+      input.accepted.includes(current.phase)
     ) {
+      return current;
+    }
+    return new Promise<AvatarModelControlState>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        if (this.#waiter?.timeout === timeout) this.#waiter = undefined;
+        reject(Object.assign(new Error("mailbox timeout"), { code: "AVATAR_MAILBOX_TIMEOUT" }));
+      }, input.timeoutMs);
+      this.#waiter = {
+        requestId: input.requestId,
+        accepted: input.accepted,
+        resolve,
+        timeout,
+      };
+      const abort = () => {
+        clearTimeout(timeout);
+        reject(input.signal.reason ?? new Error("aborted"));
+      };
+      if (input.signal.aborted) abort();
+      else input.signal.addEventListener("abort", abort, { once: true });
+    });
+  }
+
+  async expectRequest(operation: AvatarModelControlRequest["operation"]) {
+    for (let attempt = 0; attempt < 100 && this.slot?.operation !== operation; attempt += 1) {
       await Promise.resolve();
     }
-    expect(this.requests.at(-1)?.operation).toBe(operation);
-    return this.requests.at(-1)!;
+    expect(this.slot?.operation).toBe(operation);
+    return this.slot!;
   }
+
   reply(phase: AvatarModelControlState["phase"], errorCode?: string) {
-    const request = this.requests.at(-1)!;
-    this.waiters.shift()?.({
+    const request = this.slot!;
+    if (phase === "visible") {
+      this.#checkpoint = {
+        previousModelId: this.#fabricActiveModelId,
+        candidateModelId: request.modelId,
+        finalized: false,
+      };
+      this.#fabricActiveModelId = request.modelId;
+    } else if (phase === "committed") {
+      this.#fabricActiveModelId = request.modelId;
+      if (this.#checkpoint !== undefined) this.#checkpoint.finalized = true;
+    } else if (phase === "cancelled") {
+      this.#rollbackCheckpoint();
+    } else if (phase === "failed" && request.operation === "commit") {
+      this.#rollbackCheckpoint();
+    }
+    const state: AvatarModelControlState = {
       schemaVersion: 1,
       requestId: request.requestId,
       phase,
@@ -161,6 +285,45 @@ class HarnessMailbox implements AvatarModelMailboxPort {
       worldSessionId: request.worldSessionId,
       ...(errorCode === undefined ? {} : { errorCode }),
       updatedAt: "2026-08-21T00:00:01.000Z",
-    });
+    };
+    this.#stateSlot = state;
+    const waiter = this.#waiter;
+    if (
+      waiter !== undefined &&
+      waiter.requestId === state.requestId &&
+      waiter.accepted.includes(state.phase)
+    ) {
+      this.#waiter = undefined;
+      clearTimeout(waiter.timeout);
+      waiter.resolve(state);
+    }
+  }
+
+  consumeRecoveryWithoutAck() {
+    const request = this.slot;
+    if (request?.operation === "cancel") {
+      this.#rollbackCheckpoint();
+      return;
+    }
+    if (request?.operation === "finalize") {
+      this.#fabricActiveModelId = request.modelId;
+      if (this.#checkpoint !== undefined) this.#checkpoint.finalized = true;
+      return;
+    }
+    throw new Error("single mailbox slot does not contain a recovery operation");
+  }
+
+  worldBoundary() {
+    if (this.#checkpoint !== undefined && !this.#checkpoint.finalized) {
+      this.#fabricActiveModelId = this.#checkpoint.previousModelId;
+    }
+    this.#checkpoint = undefined;
+  }
+
+  #rollbackCheckpoint() {
+    if (this.#checkpoint !== undefined) {
+      this.#fabricActiveModelId = this.#checkpoint.previousModelId;
+    }
+    this.#checkpoint = undefined;
   }
 }

@@ -25,6 +25,24 @@ describe("AvatarModelMailbox", () => {
     expect(JSON.parse(await readFile(harness.requestPath, "utf8"))).toEqual(request);
   });
 
+  it("uses one production request slot whose next write replaces the previous operation", async () => {
+    const harness = await createHarness();
+    const prepare = prepareRequest();
+    const cancellation: AvatarModelControlRequest = {
+      schemaVersion: 1,
+      requestId: prepare.requestId,
+      operation: "cancel",
+      modelId: prepare.modelId,
+      worldSessionId: prepare.worldSessionId,
+      issuedAt: "2026-08-16T08:00:02.000Z",
+    };
+
+    await harness.mailbox.publish(prepare);
+    await harness.mailbox.publish(cancellation);
+
+    expect(JSON.parse(await readFile(harness.requestPath, "utf8"))).toEqual(cancellation);
+  });
+
   it("ignores stale request ids and wrong worlds before accepting a matching state", async () => {
     const harness = await createHarness();
     const request = prepareRequest();

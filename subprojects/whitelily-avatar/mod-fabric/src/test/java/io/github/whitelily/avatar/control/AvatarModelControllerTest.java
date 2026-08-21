@@ -79,6 +79,20 @@ final class AvatarModelControllerTest {
   }
 
   @Test
+  void failedVisibleFrameKeepsACancelReceiptForDesktopRecovery() {
+    Harness harness = new Harness();
+    harness.prepareReadyAndCommit("switch-0001", FIRST);
+    harness.controller.onVisibleFrameResult(AvatarVisibleFrameResult.FAILED);
+    int publishedStates = harness.states.size();
+
+    harness.controller.accept(cancel("switch-0001", FIRST));
+
+    assertEquals(publishedStates + 1, harness.states.size());
+    assertEquals(AvatarModelPhase.CANCELLED, harness.lastState().phase());
+    assertEquals(CLASSIC, harness.lastState().activeModelId());
+  }
+
+  @Test
   void completeVisibleFrameRemainsReversibleUntilDesktopFinalization() {
     Harness harness = new Harness();
     harness.prepareReadyAndCommit("switch-0001", FIRST);
@@ -105,6 +119,87 @@ final class AvatarModelControllerTest {
     assertEquals(CLASSIC, harness.controller.confirmedActiveModelId());
     assertEquals(AvatarModelPhase.CANCELLED, harness.lastState().phase());
     assertTrue(harness.runtime.cancelled.contains(FIRST));
+  }
+
+  @Test
+  void replaysTheMatchingCancelledReceiptAfterAnAcknowledgementIsLost() {
+    Harness harness = new Harness();
+    harness.prepareReadyAndCommit("switch-0001", FIRST);
+    harness.controller.onVisibleFrameResult(AvatarVisibleFrameResult.COMPLETE);
+    AvatarModelControlRequest cancellation = cancel("switch-0001", FIRST);
+    harness.controller.accept(cancellation);
+    int publishedStates = harness.states.size();
+
+    harness.controller.accept(cancellation);
+
+    assertEquals(publishedStates + 1, harness.states.size());
+    assertEquals(AvatarModelPhase.CANCELLED, harness.lastState().phase());
+    assertEquals(CLASSIC, harness.lastState().activeModelId());
+  }
+
+  @Test
+  void replaysTheMatchingCommittedReceiptAfterAnAcknowledgementIsLost() {
+    Harness harness = new Harness();
+    harness.prepareReadyAndCommit("switch-0001", FIRST);
+    harness.controller.onVisibleFrameResult(AvatarVisibleFrameResult.COMPLETE);
+    AvatarModelControlRequest finalization = finalizeCommit("switch-0001", FIRST);
+    harness.controller.accept(finalization);
+    int publishedStates = harness.states.size();
+
+    harness.controller.accept(finalization);
+
+    assertEquals(publishedStates + 1, harness.states.size());
+    assertEquals(AvatarModelPhase.COMMITTED, harness.lastState().phase());
+    assertEquals(FIRST, harness.lastState().activeModelId());
+  }
+
+  @Test
+  void worldBoundaryRollsBackAnUnfinalizedCheckpointAndKeepsCancellationReplayable() {
+    Harness harness = new Harness();
+    harness.prepareReadyAndCommit("switch-0001", FIRST);
+    harness.controller.onVisibleFrameResult(AvatarVisibleFrameResult.COMPLETE);
+
+    harness.controller.cancelForWorldChange();
+    int publishedStates = harness.states.size();
+    harness.controller.accept(cancel("switch-0001", FIRST));
+
+    assertEquals(CLASSIC, harness.controller.confirmedActiveModelId());
+    assertEquals(publishedStates + 1, harness.states.size());
+    assertEquals(AvatarModelPhase.CANCELLED, harness.lastState().phase());
+  }
+
+  @Test
+  void worldBoundarySealsAFinalizedCheckpointAndKeepsFinalizationReplayable() {
+    Harness harness = new Harness();
+    harness.prepareReadyAndCommit("switch-0001", FIRST);
+    harness.controller.onVisibleFrameResult(AvatarVisibleFrameResult.COMPLETE);
+    harness.controller.accept(finalizeCommit("switch-0001", FIRST));
+
+    harness.controller.cancelForWorldChange();
+    int publishedStates = harness.states.size();
+    harness.controller.accept(finalizeCommit("switch-0001", FIRST));
+
+    assertEquals(FIRST, harness.controller.confirmedActiveModelId());
+    assertEquals(publishedStates + 1, harness.states.size());
+    assertEquals(AvatarModelPhase.COMMITTED, harness.lastState().phase());
+  }
+
+  @Test
+  void nextPrepareRollsBackVisibleButSealsFinalizedCheckpoints() {
+    Harness rollback = new Harness();
+    rollback.prepareReadyAndCommit("switch-0001", FIRST);
+    rollback.controller.onVisibleFrameResult(AvatarVisibleFrameResult.COMPLETE);
+    rollback.controller.accept(prepare("switch-0002", SECOND));
+    assertEquals(CLASSIC, rollback.controller.confirmedActiveModelId());
+    assertTrue(rollback.runtime.cancelled.contains(FIRST));
+
+    Harness seal = new Harness();
+    seal.prepareReadyAndCommit("switch-0001", FIRST);
+    seal.controller.onVisibleFrameResult(AvatarVisibleFrameResult.COMPLETE);
+    seal.controller.accept(finalizeCommit("switch-0001", FIRST));
+    seal.controller.accept(prepare("switch-0002", SECOND));
+    assertEquals(FIRST, seal.controller.confirmedActiveModelId());
+    assertFalse(seal.runtime.cancelled.contains(FIRST));
   }
 
   @Test

@@ -404,6 +404,48 @@ describe("IPC registry", () => {
     expect(harness.handlers.has(WHITE_LILY_IPC_CHANNELS.switchAvatarModel)).toBe(false);
   });
 
+  it("keeps ordinary status and stop IPC responsive while avatar recovery is pending", async () => {
+    let rejectSwitch: ((reason: unknown) => void) | undefined;
+    const switchTo = vi.fn(
+      () =>
+        new Promise<Awaited<ReturnType<AvatarModelsPort["switchTo"]>>>(
+          (_resolve, reject) => {
+          rejectSwitch = reject;
+          },
+        ),
+    );
+    const avatarModels: AvatarModelsPort = {
+      list: async () => structuredClone(avatarSnapshot),
+      importFromPicker: async () => ({ status: "cancelled" }),
+      switchTo,
+      subscribe: () => () => undefined,
+    };
+    const harness = createRegistryHarness(
+      idleSnapshot,
+      undefined,
+      vi.fn(async () => undefined),
+      avatarModels,
+    );
+
+    const avatarSwitch = harness.invoke(
+      WHITE_LILY_IPC_CHANNELS.switchAvatarModel,
+      "builtin:whitelily",
+    );
+    await expect(harness.invoke(WHITE_LILY_IPC_CHANNELS.status)).resolves.toEqual(idleSnapshot);
+    await expect(harness.invoke(WHITE_LILY_IPC_CHANNELS.stopTask)).resolves.toEqual(idleSnapshot);
+    rejectSwitch?.(
+      Object.assign(new Error("avatar recovery timed out"), {
+        code: "AVATAR_SWITCH_RECOVERY_PENDING",
+      }),
+    );
+    await expect(avatarSwitch).resolves.toEqual({
+      status: "error",
+      code: "AVATAR_SWITCH_RECOVERY_PENDING",
+    });
+
+    harness.cleanup();
+  });
+
   it("returns a safe allowlisted avatar failure envelope instead of forwarding main-process errors", async () => {
     const importFromPicker = vi.fn(async () => {
       throw Object.assign(new Error(String.raw`failed to import C:\Users\Other\avatar.glb`), {

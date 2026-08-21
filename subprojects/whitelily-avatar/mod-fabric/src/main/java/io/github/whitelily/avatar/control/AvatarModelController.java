@@ -28,6 +28,7 @@ public final class AvatarModelController {
   private boolean finalizedCheckpoint;
   private boolean worldAvailable;
   private String worldSessionId;
+  private TerminalReceipt terminalReceipt;
   private long generation;
 
   public AvatarModelController(
@@ -56,7 +57,9 @@ public final class AvatarModelController {
     Objects.requireNonNull(request, "request");
     PreparationLaunch launch = null;
     synchronized (this) {
-      if (!worldAvailable || request.schemaVersion() != 1) return;
+      if (request.schemaVersion() != 1) return;
+      if (replayTerminalReceipt(request)) return;
+      if (!worldAvailable) return;
       if (worldSessionId == null) {
         if (request.operation() != AvatarModelOperation.PREPARE) return;
         worldSessionId = request.worldSessionId();
@@ -94,6 +97,7 @@ public final class AvatarModelController {
       readyCandidate = null;
       commitRequested = false;
       publish(AvatarModelPhase.FAILED, pendingRequest, "AVATAR_COMMIT_FAILED");
+      rememberCancelled(pendingRequest);
       pendingRequest = null;
     }
   }
@@ -116,6 +120,7 @@ public final class AvatarModelController {
     visibleCandidate = null;
     pendingRequest = null;
     publish(AvatarModelPhase.FAILED, request, "AVATAR_FRAME_FAILED");
+    rememberCancelled(request);
   }
 
   public synchronized void cancelForWorldChange() {
@@ -125,6 +130,7 @@ public final class AvatarModelController {
         sealFinalizedCheckpoint();
       } else {
         discardPending();
+        rememberCancelled(request);
         publish(AvatarModelPhase.CANCELLED, request, null);
       }
     }
@@ -133,9 +139,14 @@ public final class AvatarModelController {
   }
 
   public synchronized void beginWorldSession() {
-    if (pendingRequest != null) {
+    AvatarModelControlRequest request = pendingRequest;
+    if (request != null) {
       if (finalizedCheckpoint) sealFinalizedCheckpoint();
-      else discardPending();
+      else {
+        discardPending();
+        rememberCancelled(request);
+        publish(AvatarModelPhase.CANCELLED, request, null);
+      }
     }
     worldSessionId = null;
     worldAvailable = true;
@@ -157,6 +168,7 @@ public final class AvatarModelController {
       if (finalizedCheckpoint) sealFinalizedCheckpoint();
       else discardPending();
     }
+    terminalReceipt = null;
     pendingRequest = request;
     long capturedGeneration = ++generation;
     publish(AvatarModelPhase.PREPARING, request, null);
@@ -171,6 +183,7 @@ public final class AvatarModelController {
       synchronized (this) {
         if (launch.generation() == generation && pendingRequest == launch.request()) {
           publish(AvatarModelPhase.FAILED, launch.request(), "AVATAR_PREPARE_FAILED");
+          rememberCancelled(launch.request());
           pendingRequest = null;
         }
       }
@@ -204,6 +217,7 @@ public final class AvatarModelController {
     if (failure != null || candidate == null || !request.modelId().equals(candidate.modelId())) {
       if (candidate != null) runtime.release(candidate);
       publish(AvatarModelPhase.FAILED, request, "AVATAR_PREPARE_FAILED");
+      rememberCancelled(request);
       pendingRequest = null;
       return;
     }
@@ -228,6 +242,7 @@ public final class AvatarModelController {
       return;
     }
     discardPending();
+    rememberCancelled(request);
     publish(AvatarModelPhase.CANCELLED, request, null);
   }
 
@@ -240,6 +255,7 @@ public final class AvatarModelController {
       return;
     }
     confirmedActiveModelId = visibleCandidate.modelId();
+    terminalReceipt = TerminalReceipt.committed(request);
     publish(AvatarModelPhase.COMMITTED, request, null);
     awaitingFinalization = false;
     finalizedCheckpoint = true;
@@ -278,6 +294,17 @@ public final class AvatarModelController {
     finalizedCheckpoint = false;
   }
 
+  private boolean replayTerminalReceipt(AvatarModelControlRequest request) {
+    TerminalReceipt receipt = terminalReceipt;
+    if (receipt == null || !receipt.matches(request)) return false;
+    publish(receipt.phase(), request, null);
+    return true;
+  }
+
+  private void rememberCancelled(AvatarModelControlRequest request) {
+    terminalReceipt = TerminalReceipt.cancelled(request);
+  }
+
   private void publish(
       AvatarModelPhase phase, AvatarModelControlRequest request, String errorCode) {
     String candidateModelId =
@@ -299,4 +326,36 @@ public final class AvatarModelController {
 
   private record PreparationLaunch(
       long generation, AvatarModelControlRequest request) {}
+
+  private record TerminalReceipt(
+      String requestId,
+      String modelId,
+      String worldSessionId,
+      AvatarModelOperation operation,
+      AvatarModelPhase phase) {
+    private static TerminalReceipt cancelled(AvatarModelControlRequest request) {
+      return new TerminalReceipt(
+          request.requestId(),
+          request.modelId(),
+          request.worldSessionId(),
+          AvatarModelOperation.CANCEL,
+          AvatarModelPhase.CANCELLED);
+    }
+
+    private static TerminalReceipt committed(AvatarModelControlRequest request) {
+      return new TerminalReceipt(
+          request.requestId(),
+          request.modelId(),
+          request.worldSessionId(),
+          AvatarModelOperation.FINALIZE,
+          AvatarModelPhase.COMMITTED);
+    }
+
+    private boolean matches(AvatarModelControlRequest request) {
+      return operation == request.operation()
+          && requestId.equals(request.requestId())
+          && modelId.equals(request.modelId())
+          && worldSessionId.equals(request.worldSessionId());
+    }
+  }
 }

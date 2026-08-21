@@ -45,7 +45,8 @@ export type AvatarModelSwitchErrorCode =
   | "AVATAR_WORLD_CHANGED"
   | "AVATAR_BRIDGE_DISCONNECTED"
   | "AVATAR_PREFERENCE_CONFLICT"
-  | "AVATAR_PREFERENCE_COMPENSATION_FAILED";
+  | "AVATAR_PREFERENCE_COMPENSATION_FAILED"
+  | "AVATAR_SWITCH_RECOVERY_PENDING";
 
 export class AvatarModelSwitchError extends Error {
   constructor(
@@ -85,6 +86,14 @@ interface PendingSwitch {
   completion: Promise<AvatarModelCatalogSnapshot>;
 }
 
+interface RecoveryBarrier {
+  readonly request: AvatarModelControlRequest;
+  readonly terminalPhase: "cancelled" | "committed";
+  readonly expectedActiveModelId: string;
+}
+
+const RECOVERY_MAX_ATTEMPTS = 2;
+
 export class AvatarModelSwitchCoordinator {
   readonly #catalog: AvatarModelCatalogPort;
   readonly #preferences: AvatarModelPreferencesPort;
@@ -97,6 +106,7 @@ export class AvatarModelSwitchCoordinator {
   readonly #prepareTimeoutMs: number;
   readonly #commitTimeoutMs: number;
   #pending: PendingSwitch | undefined;
+  #recovery: RecoveryBarrier | undefined;
   #lastPublishedSnapshot: string | undefined;
 
   constructor(options: AvatarModelSwitchCoordinatorOptions) {
@@ -174,6 +184,7 @@ export class AvatarModelSwitchCoordinator {
     persistSelection: boolean,
   ): Promise<AvatarModelCatalogSnapshot> {
     try {
+      await this.#settleRecoveryBarrier(transaction.controller.signal);
       this.#throwIfAborted(transaction);
       const preference = await this.#preferences.read(this.#catalog);
       transaction.oldActiveModelId = preference.activeModelId;
@@ -285,9 +296,12 @@ export class AvatarModelSwitchCoordinator {
         });
       } catch (error) {
         if (transaction.worldSessionId !== undefined) {
-          await this.#mailbox
-            .publish(this.#controlRequest("finalize", transaction, transaction.worldSessionId))
-            .catch(() => undefined);
+          this.#recovery = {
+            request: this.#controlRequest("finalize", transaction, transaction.worldSessionId),
+            terminalPhase: "committed",
+            expectedActiveModelId: transaction.modelId,
+          };
+          await this.#settleRecoveryBarrier(new AbortController().signal);
         }
         throw new AvatarModelSwitchError(
           "AVATAR_PREFERENCE_COMPENSATION_FAILED",
@@ -297,12 +311,60 @@ export class AvatarModelSwitchCoordinator {
       }
     }
     if (transaction.preparePublished && transaction.worldSessionId !== undefined) {
-      await this.#mailbox
-        .publish(this.#controlRequest("cancel", transaction, transaction.worldSessionId))
-        .catch(() => undefined);
+      this.#recovery = {
+        request: this.#controlRequest("cancel", transaction, transaction.worldSessionId),
+        terminalPhase: "cancelled",
+        expectedActiveModelId: transaction.oldActiveModelId ?? transaction.modelId,
+      };
+      await this.#settleRecoveryBarrier(new AbortController().signal);
     }
     if (this.#pending === transaction && transaction.oldActiveModelId !== undefined) {
       await this.#publishProjected(transaction.oldActiveModelId).catch(() => undefined);
+    }
+  }
+
+  async #settleRecoveryBarrier(signal: AbortSignal): Promise<void> {
+    const recovery = this.#recovery;
+    if (recovery === undefined) return;
+    let lastFailure: unknown;
+    for (let attempt = 0; attempt < RECOVERY_MAX_ATTEMPTS; attempt += 1) {
+      if (signal.aborted) throw signal.reason;
+      try {
+        await this.#mailbox.publish(recovery.request);
+        const state = await this.#mailbox.waitForState({
+          requestId: recovery.request.requestId,
+          accepted: [recovery.terminalPhase],
+          signal,
+          timeoutMs: this.#commitTimeoutMs,
+        });
+        this.#assertRecoveryState(state, recovery);
+        if (this.#recovery === recovery) this.#recovery = undefined;
+        return;
+      } catch (error) {
+        if (signal.aborted) throw signal.reason;
+        lastFailure = error;
+      }
+    }
+    throw new AvatarModelSwitchError(
+      "AVATAR_SWITCH_RECOVERY_PENDING",
+      "previous avatar model recovery is still awaiting Minecraft acknowledgement",
+      { cause: lastFailure },
+    );
+  }
+
+  #assertRecoveryState(state: AvatarModelControlState, recovery: RecoveryBarrier): void {
+    const request = recovery.request;
+    if (
+      state.requestId !== request.requestId ||
+      state.worldSessionId !== request.worldSessionId ||
+      state.phase !== recovery.terminalPhase ||
+      state.activeModelId !== recovery.expectedActiveModelId ||
+      (state.candidateModelId !== undefined && state.candidateModelId !== request.modelId)
+    ) {
+      throw new AvatarModelSwitchError(
+        "AVATAR_SWITCH_RECOVERY_PENDING",
+        "Minecraft returned a non-matching avatar recovery acknowledgement",
+      );
     }
   }
 

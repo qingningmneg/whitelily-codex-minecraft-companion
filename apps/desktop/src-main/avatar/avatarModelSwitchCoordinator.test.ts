@@ -44,8 +44,9 @@ describe("AvatarModelSwitchCoordinator", () => {
 
     const second = harness.coordinator.switchTo(secondUserId);
 
-    await expect(first).rejects.toMatchObject({ code: "AVATAR_SWITCH_SUPERSEDED" });
     await harness.mailbox.expectRequest("cancel", firstUserId);
+    harness.mailbox.reply("cancelled");
+    await expect(first).rejects.toMatchObject({ code: "AVATAR_SWITCH_SUPERSEDED" });
     await harness.mailbox.expectRequest("prepare", secondUserId);
     harness.mailbox.reply("ready");
     await harness.mailbox.expectRequest("commit", secondUserId);
@@ -62,10 +63,11 @@ describe("AvatarModelSwitchCoordinator", () => {
 
     harness.mailbox.reply("failed", { errorCode: "AVATAR_SHADER_FAILED" });
 
+    await harness.mailbox.expectRequest("cancel", firstUserId);
+    harness.mailbox.reply("cancelled");
     await expect(switching).rejects.toMatchObject({ code: "AVATAR_SWITCH_FAILED" });
     expect(harness.commitActiveModelId).not.toHaveBeenCalled();
     expect(harness.preference.activeModelId).toBe("builtin:whitelily");
-    await harness.mailbox.expectRequest("cancel", firstUserId);
   });
 
   it("keeps the previous skin when the first native frame fails", async () => {
@@ -84,10 +86,11 @@ describe("AvatarModelSwitchCoordinator", () => {
     await harness.mailbox.expectRequest("commit", firstUserId);
     harness.mailbox.reply("failed", { errorCode: "AVATAR_FRAME_FAILED" });
 
+    await harness.mailbox.expectRequest("cancel", firstUserId);
+    harness.mailbox.reply("cancelled");
     await expect(switching).rejects.toMatchObject({ code: "AVATAR_SWITCH_FAILED" });
     expect(harness.preference.activeModelId).toBe("builtin:whitelily");
     expect(harness.commitActiveModelId).not.toHaveBeenCalled();
-    await harness.mailbox.expectRequest("cancel", firstUserId);
   });
 
   it("cancels before commit when the world changes after ready", async () => {
@@ -98,9 +101,10 @@ describe("AvatarModelSwitchCoordinator", () => {
     harness.worldSessionId = "world-0002";
     harness.mailbox.reply("ready");
 
+    await harness.mailbox.expectRequest("cancel", firstUserId);
+    harness.mailbox.reply("cancelled");
     await expect(switching).rejects.toMatchObject({ code: "AVATAR_WORLD_CHANGED" });
     expect(harness.commitActiveModelId).not.toHaveBeenCalled();
-    await harness.mailbox.expectRequest("cancel", firstUserId);
   });
 
   it("cancels when the validated candidate digest drifts after ready", async () => {
@@ -110,9 +114,10 @@ describe("AvatarModelSwitchCoordinator", () => {
 
     harness.mailbox.reply("ready");
 
+    await harness.mailbox.expectRequest("cancel", firstUserId);
+    harness.mailbox.reply("cancelled");
     await expect(switching).rejects.toMatchObject({ code: "AVATAR_SWITCH_FAILED" });
     expect(harness.commitActiveModelId).not.toHaveBeenCalled();
-    await harness.mailbox.expectRequest("cancel", firstUserId);
   });
 
   it("makes selecting the already committed model idempotent", async () => {
@@ -122,7 +127,7 @@ describe("AvatarModelSwitchCoordinator", () => {
       activeModelId: "builtin:whitelily",
       pendingModelId: undefined,
     });
-    expect(harness.mailbox.requests).toEqual([]);
+    expect(harness.mailbox.history).toEqual([]);
     expect(harness.commitActiveModelId).not.toHaveBeenCalled();
   });
 
@@ -148,9 +153,10 @@ describe("AvatarModelSwitchCoordinator", () => {
     await harness.mailbox.expectRequest("commit", firstUserId);
     harness.mailbox.reply("visible");
 
+    await harness.mailbox.expectRequest("cancel", firstUserId);
+    harness.mailbox.reply("cancelled");
     await expect(switching).rejects.toMatchObject({ code: "AVATAR_PREFERENCE_CONFLICT" });
     expect(harness.preference.activeModelId).toBe("builtin:whitelily");
-    await harness.mailbox.expectRequest("cancel", firstUserId);
   });
 
   it.each(["projection", "publication"] as const)(
@@ -166,10 +172,11 @@ describe("AvatarModelSwitchCoordinator", () => {
       await harness.mailbox.expectRequest("commit", firstUserId);
       harness.mailbox.reply("visible");
 
+      await harness.mailbox.expectRequest("cancel", firstUserId);
+      harness.mailbox.reply("cancelled");
       await expect(switching).rejects.toMatchObject({ code: "AVATAR_SWITCH_FAILED" });
       expect(harness.commitActiveModelId).not.toHaveBeenCalled();
       expect(harness.preference.activeModelId).toBe("builtin:whitelily");
-      await harness.mailbox.expectRequest("cancel", firstUserId);
       expect(harness.notifications.at(-1)).toMatchObject({
         activeModelId: "builtin:whitelily",
       });
@@ -187,6 +194,8 @@ describe("AvatarModelSwitchCoordinator", () => {
     await harness.mailbox.expectRequest("finalize", firstUserId);
     harness.mailbox.reply("failed", { errorCode: "AVATAR_FINALIZE_FAILED" });
 
+    await harness.mailbox.expectRequest("cancel", firstUserId);
+    harness.mailbox.reply("cancelled");
     await expect(switching).rejects.toMatchObject({ code: "AVATAR_SWITCH_FAILED" });
     expect(harness.compensateActiveModelId).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -195,7 +204,6 @@ describe("AvatarModelSwitchCoordinator", () => {
       }),
     );
     expect(harness.preference.activeModelId).toBe("builtin:whitelily");
-    await harness.mailbox.expectRequest("cancel", firstUserId);
   });
 
   it("keeps the forward-consistent selection when preference compensation fails", async () => {
@@ -208,14 +216,16 @@ describe("AvatarModelSwitchCoordinator", () => {
     await harness.mailbox.expectRequest("finalize", firstUserId);
     harness.mailbox.reply("failed", { errorCode: "AVATAR_FINALIZE_FAILED" });
 
+    await harness.mailbox.expectRequest("finalize", firstUserId);
+    harness.mailbox.reply("committed", { activeModelId: firstUserId });
     await expect(switching).rejects.toMatchObject({
       code: "AVATAR_PREFERENCE_COMPENSATION_FAILED",
     });
     expect(harness.preference.activeModelId).toBe(firstUserId);
     expect(
-      harness.mailbox.requests.filter(({ operation }) => operation === "finalize"),
+      harness.mailbox.history.filter(({ operation }) => operation === "finalize"),
     ).toHaveLength(2);
-    expect(harness.mailbox.requests.some(({ operation }) => operation === "cancel")).toBe(false);
+    expect(harness.mailbox.history.some(({ operation }) => operation === "cancel")).toBe(false);
     expect(harness.notifications.at(-1)?.activeModelId).toBe(firstUserId);
   });
 
@@ -224,10 +234,98 @@ describe("AvatarModelSwitchCoordinator", () => {
     const switching = harness.coordinator.switchTo(firstUserId);
     await harness.mailbox.expectRequest("prepare", firstUserId);
 
-    await harness.coordinator.cancelPending("bridge_disconnected");
+    const cancelling = harness.coordinator.cancelPending("bridge_disconnected");
 
-    await expect(switching).rejects.toMatchObject({ code: "AVATAR_BRIDGE_DISCONNECTED" });
     await harness.mailbox.expectRequest("cancel", firstUserId);
+    harness.mailbox.reply("cancelled");
+    await cancelling;
+    await expect(switching).rejects.toMatchObject({ code: "AVATAR_BRIDGE_DISCONNECTED" });
+  });
+
+  it("replays a lost cancel before a second prepare can overwrite the single slot", async () => {
+    const harness = createHarness({ preferenceConflict: true, recoveryTimeoutMs: 20 });
+    const first = harness.coordinator.switchTo(firstUserId);
+    await harness.mailbox.expectRequest("prepare", firstUserId);
+    harness.mailbox.reply("ready");
+    await harness.mailbox.expectRequest("commit", firstUserId);
+    harness.mailbox.reply("visible");
+    await harness.mailbox.expectRequest("cancel", firstUserId);
+
+    await expect(first).rejects.toMatchObject({ code: "AVATAR_SWITCH_RECOVERY_PENDING" });
+    const second = harness.coordinator.switchTo(secondUserId);
+
+    await harness.mailbox.expectRequest("cancel", firstUserId);
+    expect(
+      harness.mailbox.history.some(
+        (request) => request.operation === "prepare" && request.modelId === secondUserId,
+      ),
+    ).toBe(false);
+    harness.mailbox.reply("cancelled");
+    await harness.mailbox.expectRequest("prepare", secondUserId);
+    harness.mailbox.reply("ready");
+    await harness.mailbox.expectRequest("commit", secondUserId);
+    harness.mailbox.reply("visible");
+    await harness.mailbox.expectRequest("finalize", secondUserId);
+    harness.mailbox.reply("committed", { activeModelId: secondUserId });
+
+    await expect(second).resolves.toMatchObject({ activeModelId: secondUserId });
+  });
+
+  it("replays a lost forward finalize before a second prepare can overwrite the single slot", async () => {
+    const harness = createHarness({ compensationFailure: true, recoveryTimeoutMs: 20 });
+    const first = harness.coordinator.switchTo(firstUserId);
+    await harness.mailbox.expectRequest("prepare", firstUserId);
+    harness.mailbox.reply("ready");
+    await harness.mailbox.expectRequest("commit", firstUserId);
+    harness.mailbox.reply("visible");
+    await harness.mailbox.expectRequest("finalize", firstUserId);
+    harness.mailbox.reply("failed", { errorCode: "AVATAR_FINALIZE_FAILED" });
+    await harness.mailbox.expectRequest("finalize", firstUserId);
+
+    await expect(first).rejects.toMatchObject({ code: "AVATAR_SWITCH_RECOVERY_PENDING" });
+    expect(harness.preference.activeModelId).toBe(firstUserId);
+    const second = harness.coordinator.switchTo(secondUserId);
+
+    await harness.mailbox.expectRequest("finalize", firstUserId);
+    expect(
+      harness.mailbox.history.some(
+        (request) => request.operation === "prepare" && request.modelId === secondUserId,
+      ),
+    ).toBe(false);
+    harness.mailbox.reply("committed", { activeModelId: firstUserId });
+    await harness.mailbox.expectRequest("prepare", secondUserId);
+    harness.mailbox.reply("ready");
+    await harness.mailbox.expectRequest("commit", secondUserId);
+    harness.mailbox.reply("visible");
+    await harness.mailbox.expectRequest("finalize", secondUserId);
+    harness.mailbox.reply("committed", { activeModelId: secondUserId });
+
+    await expect(second).resolves.toMatchObject({ activeModelId: secondUserId });
+  });
+
+  it("returns a stable error while recovery remains unacknowledged", async () => {
+    const harness = createHarness({ preferenceConflict: true, recoveryTimeoutMs: 20 });
+    const first = harness.coordinator.switchTo(firstUserId);
+    await harness.mailbox.expectRequest("prepare", firstUserId);
+    harness.mailbox.reply("ready");
+    await harness.mailbox.expectRequest("commit", firstUserId);
+    harness.mailbox.reply("visible");
+    await harness.mailbox.expectRequest("cancel", firstUserId);
+    await expect(first).rejects.toMatchObject({ code: "AVATAR_SWITCH_RECOVERY_PENDING" });
+
+    const second = harness.coordinator.switchTo(secondUserId);
+    await harness.mailbox.expectRequest("cancel", firstUserId);
+    harness.mailbox.reply("cancelled", { requestId: "foreign-recovery" });
+    await expect(second).rejects.toMatchObject({ code: "AVATAR_SWITCH_RECOVERY_PENDING" });
+    expect(harness.mailbox.slot).toMatchObject({
+      operation: "cancel",
+      requestId: "switch-request-0001",
+    });
+    expect(
+      harness.mailbox.history.some(
+        (request) => request.operation === "prepare" && request.modelId === secondUserId,
+      ),
+    ).toBe(false);
   });
 });
 
@@ -238,15 +336,17 @@ function createHarness(
     readonly compensationFailure?: boolean;
     readonly finalProjectionFailure?: boolean;
     readonly finalPublicationFailure?: boolean;
+    readonly recoveryTimeoutMs?: number;
   } = {},
 ) {
-  const mailbox = new FakeMailbox();
+  const mailbox = new SingleSlotMailbox();
   let preference: AvatarModelPreferenceSnapshot = {
     schemaVersion: 1,
     revision: 0,
     activeModelId: "builtin:whitelily",
   };
   let descriptorReads = 0;
+  let preferenceConflictRemaining = options.preferenceConflict ?? false;
   const catalog = {
     resolveRuntimeDescriptor: vi.fn(async (modelId: string) => {
       descriptorReads += 1;
@@ -258,7 +358,8 @@ function createHarness(
     has: vi.fn(async () => true),
   };
   const commitActiveModelId = vi.fn(async (input: { activeModelId: string }) => {
-    if (options.preferenceConflict) {
+    if (preferenceConflictRemaining) {
+      preferenceConflictRemaining = false;
       const error = Object.assign(new Error("preference conflict"), {
         code: "AVATAR_PREFERENCE_CONFLICT",
       });
@@ -294,6 +395,7 @@ function createHarness(
   const state = {
     worldSessionId: "world-0001",
   };
+  let requestSequence = 0;
   const coordinator = new AvatarModelSwitchCoordinator({
     catalog,
     preferences,
@@ -319,10 +421,10 @@ function createHarness(
       }
       notifications.push(value);
     },
-    createRequestId: () => "switch-request-0001",
+    createRequestId: () => `switch-request-${String(++requestSequence).padStart(4, "0")}`,
     now: () => new Date("2026-08-16T08:00:00.000Z"),
     prepareTimeoutMs: 500,
-    commitTimeoutMs: 500,
+    commitTimeoutMs: options.recoveryTimeoutMs ?? 500,
   });
   return {
     get worldSessionId() {
@@ -344,27 +446,59 @@ function createHarness(
   };
 }
 
-class FakeMailbox implements AvatarModelMailboxPort {
-  readonly requests: AvatarModelControlRequest[] = [];
+class SingleSlotMailbox implements AvatarModelMailboxPort {
+  readonly history: AvatarModelControlRequest[] = [];
+  slot: AvatarModelControlRequest | undefined;
+  #stateSlot: AvatarModelControlState | undefined;
   #waiter:
     | {
+        requestId: string;
         accepted: readonly AvatarModelControlState["phase"][];
         resolve(value: AvatarModelControlState): void;
         reject(reason: unknown): void;
+        timeout: ReturnType<typeof setTimeout>;
       }
     | undefined;
 
   async publish(request: AvatarModelControlRequest): Promise<void> {
-    this.requests.push(request);
+    this.slot = request;
+    this.history.push(request);
   }
 
   waitForState(input: {
+    readonly requestId: string;
     readonly accepted: readonly AvatarModelControlState["phase"][];
     readonly signal: AbortSignal;
+    readonly timeoutMs: number;
   }): Promise<AvatarModelControlState> {
     return new Promise((resolve, reject) => {
-      this.#waiter = { accepted: input.accepted, resolve, reject };
-      const abort = (): void => reject(input.signal.reason ?? new Error("aborted"));
+      const state = this.#stateSlot;
+      if (
+        state !== undefined &&
+        state.requestId === input.requestId &&
+        input.accepted.includes(state.phase)
+      ) {
+        resolve(state);
+        return;
+      }
+      const timeout = setTimeout(
+        () => {
+          if (this.#waiter?.timeout === timeout) this.#waiter = undefined;
+          reject(Object.assign(new Error("mailbox timeout"), { code: "AVATAR_MAILBOX_TIMEOUT" }));
+        },
+        input.timeoutMs,
+      );
+      this.#waiter = {
+        requestId: input.requestId,
+        accepted: input.accepted,
+        resolve,
+        reject,
+        timeout,
+      };
+      const abort = (): void => {
+        clearTimeout(timeout);
+        reject(input.signal.reason ?? new Error("aborted"));
+      };
       if (input.signal.aborted) abort();
       else input.signal.addEventListener("abort", abort, { once: true });
     });
@@ -375,10 +509,8 @@ class FakeMailbox implements AvatarModelMailboxPort {
     modelId: string,
   ): Promise<AvatarModelControlRequest> {
     for (let attempt = 0; attempt < 100; attempt += 1) {
-      const request = this.requests.find(
-        (candidate) => candidate.operation === operation && candidate.modelId === modelId,
-      );
-      if (request !== undefined) return request;
+      const request = this.slot;
+      if (request?.operation === operation && request.modelId === modelId) return request;
       await Promise.resolve();
     }
     throw new Error(`missing ${operation} request for ${modelId}`);
@@ -389,14 +521,9 @@ class FakeMailbox implements AvatarModelMailboxPort {
     overrides: Partial<AvatarModelControlState> = {},
   ): void {
     const waiter = this.#waiter;
-    const request = [...this.requests]
-      .reverse()
-      .find((candidate) => candidate.operation === "prepare" || candidate.operation === "commit");
-    if (waiter === undefined || request === undefined || !waiter.accepted.includes(phase)) {
-      throw new Error(`no waiter accepts ${phase}`);
-    }
-    this.#waiter = undefined;
-    waiter.resolve({
+    const request = this.slot;
+    if (request === undefined) throw new Error(`no request can receive ${phase}`);
+    const state: AvatarModelControlState = {
       schemaVersion: 1,
       requestId: request.requestId,
       phase,
@@ -406,7 +533,17 @@ class FakeMailbox implements AvatarModelMailboxPort {
       ...(phase === "failed" ? { errorCode: "AVATAR_SHADER_FAILED" } : {}),
       updatedAt: "2026-08-16T08:00:01.000Z",
       ...overrides,
-    });
+    };
+    this.#stateSlot = state;
+    if (
+      waiter !== undefined &&
+      waiter.requestId === state.requestId &&
+      waiter.accepted.includes(phase)
+    ) {
+      this.#waiter = undefined;
+      clearTimeout(waiter.timeout);
+      waiter.resolve(state);
+    }
   }
 }
 

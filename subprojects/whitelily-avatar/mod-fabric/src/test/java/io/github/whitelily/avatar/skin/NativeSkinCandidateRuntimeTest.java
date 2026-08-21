@@ -68,6 +68,27 @@ final class NativeSkinCandidateRuntimeTest {
     assertEquals("user:00000000-0000-4000-8000-000000000002", visible.activeModelId());
   }
 
+  @Test
+  void releasingThePreviousCheckpointDoesNotRollBackTheFinalizedVisibleSkin() {
+    WhiteLilySkinCatalog visible = new WhiteLilySkinCatalog();
+    NativeSkinCandidateRuntime runtime = new NativeSkinCandidateRuntime(
+        null,
+        visible,
+        approved -> CompletableFuture.failedFuture(new AssertionError("registrar is unused")));
+    PreparedCandidate first = runtime.prepare(descriptor("builtin", "minecraft-skin", "slim"))
+        .toCompletableFuture().join();
+    runtime.requestCommit(first);
+    assertEquals(first, runtime.consumeVisibleCommit().orElseThrow());
+    PreparedCandidate second = runtime.prepare(descriptor("builtin", "minecraft-skin", "slim"))
+        .toCompletableFuture().join();
+    runtime.requestCommit(second);
+    assertEquals(second, runtime.consumeVisibleCommit().orElseThrow());
+
+    runtime.release(first);
+
+    assertEquals("builtin:whitelily", visible.activeModelId());
+  }
+
   private static AvatarRuntimeDescriptor descriptor(String origin, String renderer, String armModel) {
     String modelId = "builtin".equals(origin)
         ? "builtin:whitelily"
