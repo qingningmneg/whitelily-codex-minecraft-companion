@@ -68,16 +68,12 @@ final class RuntimeBridgeApprovalContractTest {
     }
   }
 
-  private static AvatarRuntimeDescriptor descriptor(String modelId, String format) {
+  private static AvatarRuntimeDescriptor descriptor(String modelId, String worldRenderer) {
     return new AvatarRuntimeDescriptor(
         modelId,
         "builtin",
-        format,
-        "Z:/this/path/must/not/be/read/missing-avatar.bin",
-        "not-read",
-        Map.of(),
-        "not-read",
-        "not-read");
+        worldRenderer,
+        "slim");
   }
 
   @Test

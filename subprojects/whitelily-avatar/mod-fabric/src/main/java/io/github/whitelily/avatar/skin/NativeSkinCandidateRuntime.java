@@ -2,7 +2,6 @@ package io.github.whitelily.avatar.skin;
 
 import io.github.whitelily.avatar.control.AvatarCandidateRuntime;
 import io.github.whitelily.avatar.control.AvatarRuntimeDescriptor;
-import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
@@ -12,12 +11,6 @@ import java.util.concurrent.atomic.AtomicReference;
 
 /** Candidate runtime for model switches implemented entirely by the vanilla player skin. */
 public final class NativeSkinCandidateRuntime implements AvatarCandidateRuntime {
-  private static final Map<String, Set<String>> SUPPORTED_ALIASES =
-      Map.of(
-          "builtin:whitelily", Set.of("minecraft-skin"),
-          "builtin:whitelily-hd", Set.of("minecraft-skin", "builtin-hd"),
-          "builtin:whitelily-classic", Set.of("minecraft-skin", "builtin-classic"));
-
   private final Set<NativeCandidate> liveCandidates = ConcurrentHashMap.newKeySet();
   private final AtomicReference<NativeCandidate> awaitingVisible = new AtomicReference<>();
 
@@ -62,13 +55,14 @@ public final class NativeSkinCandidateRuntime implements AvatarCandidateRuntime 
   private static boolean isSupported(AvatarRuntimeDescriptor descriptor) {
     if (descriptor == null
         || descriptor.modelId() == null
-        || descriptor.format() == null
+        || descriptor.worldRenderer() == null
+        || descriptor.armModel() == null
         || !"builtin".equals(descriptor.origin())) {
       return false;
     }
-    return SUPPORTED_ALIASES
-        .getOrDefault(descriptor.modelId(), Set.of())
-        .contains(descriptor.format());
+    return "builtin:whitelily".equals(descriptor.modelId())
+        && "minecraft-skin".equals(descriptor.worldRenderer())
+        && ("slim".equals(descriptor.armModel()) || "wide".equals(descriptor.armModel()));
   }
 
   private NativeCandidate owned(PreparedCandidate candidate) {

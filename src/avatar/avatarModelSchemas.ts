@@ -1,13 +1,11 @@
 import { z } from "zod";
 import {
   BUILTIN_AVATAR_MODEL_IDS,
-  type AvatarBoneMapping,
+  type AvatarAppearanceListItem,
   type AvatarModelCatalogSnapshot,
   type AvatarModelControlRequest,
   type AvatarModelControlState,
-  type AvatarModelFormat,
   type AvatarModelId,
-  type AvatarModelListItem,
   type AvatarModelOrigin,
   type AvatarModelRecord,
   type AvatarRuntimeDescriptor,
@@ -45,77 +43,45 @@ const canonicalIsoTimeSchema = z
 const displayNameSchema = boundedWellFormedString(80).refine(
   (value) => value.length > 0 && value.trim() === value && !/[\u0000-\u001f\u007f]/u.test(value),
 );
-const boneNameSchema = boundedWellFormedString(128).refine(
-  (value) => value.length > 0 && value.trim() === value && !/[\u0000-\u001f\u007f]/u.test(value),
-);
 const managedRelativePathSchema = z
   .string()
   .regex(MANAGED_PATH_PATTERN)
   .refine((value) => {
     if (value.startsWith("/") || value.endsWith("/") || value.includes("\\")) return false;
     if (/^[A-Za-z][A-Za-z0-9+.-]*:/u.test(value)) return false;
-    const pieces = value.split("/");
-    return pieces.every((piece) => piece.length > 0 && piece !== "." && piece !== "..");
+    return value
+      .split("/")
+      .every((piece) => piece.length > 0 && piece !== "." && piece !== "..");
   });
 
 const avatarModelOriginSchema = z.enum(["builtin", "imported"]);
-const avatarModelFormatSchema = z.enum(["builtin-hd", "builtin-classic", "vrm", "glb"]);
-const bodyAnimationSchema = z.literal("whitelily-humanoid-v1");
-const expressionCapabilitySchema = z.enum(["full", "neutral-only"]);
-
-export const avatarBoneMappingSchema = z
-  .object({
-    head: boneNameSchema,
-    neck: boneNameSchema,
-    chest: boneNameSchema,
-    hips: boneNameSchema,
-    leftUpperArm: boneNameSchema,
-    leftLowerArm: boneNameSchema,
-    leftHand: boneNameSchema,
-    rightUpperArm: boneNameSchema,
-    rightLowerArm: boneNameSchema,
-    rightHand: boneNameSchema,
-    leftUpperLeg: boneNameSchema,
-    leftLowerLeg: boneNameSchema,
-    leftFoot: boneNameSchema,
-    rightUpperLeg: boneNameSchema,
-    rightLowerLeg: boneNameSchema,
-    rightFoot: boneNameSchema,
-  })
-  .strict()
-  .refine((mapping) => new Set(Object.values(mapping)).size === Object.keys(mapping).length);
+const worldRendererSchema = z.literal("minecraft-skin");
+const armModelSchema = z.enum(["slim", "wide"]);
 
 const runtimeDescriptorFields = {
   modelId: avatarModelIdSchema,
   origin: avatarModelOriginSchema,
-  format: avatarModelFormatSchema,
-  resourcePath: managedRelativePathSchema,
-  sha256: sha256Schema,
-  boneMapping: avatarBoneMappingSchema,
-  bodyAnimation: bodyAnimationSchema,
-  expressions: expressionCapabilitySchema,
+  worldRenderer: worldRendererSchema,
+  armModel: armModelSchema,
 } as const;
 
 export const avatarRuntimeDescriptorSchema = z
   .object(runtimeDescriptorFields)
   .strict()
-  .refine(isCoherentModelIdentity)
-  .refine(hasCoherentManagedPath);
+  .refine(isCoherentModelIdentity);
 
 export const avatarModelRecordSchema = z
   .object({
     id: avatarModelIdSchema,
     displayName: displayNameSchema,
     origin: avatarModelOriginSchema,
-    format: avatarModelFormatSchema,
-    resourcePath: managedRelativePathSchema,
-    sha256: sha256Schema,
+    worldRenderer: worldRendererSchema,
+    skinAsset: managedRelativePathSchema,
+    skinSha256: sha256Schema,
+    armModel: armModelSchema,
+    portraitAsset: managedRelativePathSchema.optional(),
+    portraitSha256: sha256Schema.optional(),
     importedAt: canonicalIsoTimeSchema,
-    previewPath: managedRelativePathSchema,
-    previewStatus: z.literal("ready"),
-    boneMapping: avatarBoneMappingSchema,
-    bodyAnimation: bodyAnimationSchema,
-    expressions: expressionCapabilitySchema,
     validation: z
       .object({
         code: z.literal("AVATAR_VALID"),
@@ -124,40 +90,52 @@ export const avatarModelRecordSchema = z
       .strict(),
   })
   .strict()
-  .refine(({ id, origin, format }) => isCoherentModelIdentity({ modelId: id, origin, format }))
-  .refine(({ id, origin, resourcePath }) =>
-    hasCoherentManagedPath({ modelId: id, origin, resourcePath }),
-  )
-  .refine(({ id, origin, previewPath }) =>
-    hasCoherentManagedPath({ modelId: id, origin, resourcePath: previewPath }),
-  );
+  .superRefine((record, context) => {
+    if (!isCoherentModelIdentity({ modelId: record.id, origin: record.origin })) {
+      context.addIssue({ code: "custom", message: "avatar appearance identity is incoherent" });
+    }
+    if (!hasCoherentManagedPath(record.id, record.origin, record.skinAsset)) {
+      context.addIssue({ code: "custom", path: ["skinAsset"], message: "skin asset is incoherent" });
+    }
+    const hasPortraitAsset = record.portraitAsset !== undefined;
+    const hasPortraitSha256 = record.portraitSha256 !== undefined;
+    if (hasPortraitAsset !== hasPortraitSha256) {
+      context.addIssue({ code: "custom", message: "portrait fields must appear together" });
+    }
+    if (record.origin === "builtin" && !hasPortraitAsset) {
+      context.addIssue({ code: "custom", message: "builtin appearance needs a portrait" });
+    }
+    if (
+      hasPortraitAsset &&
+      !hasCoherentManagedPath(record.id, record.origin, record.portraitAsset)
+    ) {
+      context.addIssue({ code: "custom", path: ["portraitAsset"], message: "portrait asset is incoherent" });
+    }
+  });
 
-export const avatarModelListItemSchema = z
+export const avatarAppearanceListItemSchema = z
   .object({
     id: avatarModelIdSchema,
     displayName: displayNameSchema,
     origin: avatarModelOriginSchema,
-    format: avatarModelFormatSchema,
+    worldRenderer: worldRendererSchema,
+    armModel: armModelSchema,
     previewDataUrl: z.string().max(3_000_000).regex(PNG_DATA_URL_PATTERN),
-    bodyAnimation: bodyAnimationSchema,
-    expressions: expressionCapabilitySchema,
+    portraitDataUrl: z.string().max(3_000_000).regex(PNG_DATA_URL_PATTERN).optional(),
   })
   .strict()
-  .refine(({ id, origin, format }) => isCoherentModelIdentity({ modelId: id, origin, format }));
+  .refine(({ id, origin }) => isCoherentModelIdentity({ modelId: id, origin }));
 
 export const avatarModelCatalogSnapshotSchema = z
   .object({
     revision: z.number().int().safe().nonnegative(),
-    models: z.array(avatarModelListItemSchema).min(2).max(1_024),
+    models: z.array(avatarAppearanceListItemSchema).min(1).max(1_024),
     activeModelId: avatarModelIdSchema,
     pendingModelId: avatarModelIdSchema.optional(),
   })
   .strict()
   .superRefine(({ models, activeModelId, pendingModelId }, context) => {
-    if (
-      models[0]?.id !== BUILTIN_AVATAR_MODEL_IDS[0] ||
-      models[1]?.id !== BUILTIN_AVATAR_MODEL_IDS[1]
-    ) {
+    if (models[0]?.id !== BUILTIN_AVATAR_MODEL_IDS[0]) {
       context.addIssue({ code: "custom", message: "builtin avatar order is invalid" });
     }
     const ids = models.map(({ id }) => id);
@@ -251,8 +229,8 @@ export function parseAvatarModelCatalogSnapshot(value: unknown): AvatarModelCata
   );
 }
 
-export function parseAvatarModelListItem(value: unknown): AvatarModelListItem {
-  return parseOrThrow(avatarModelListItemSchema, value, "invalid avatar model list item");
+export function parseAvatarAppearanceListItem(value: unknown): AvatarAppearanceListItem {
+  return parseOrThrow(avatarAppearanceListItemSchema, value, "invalid avatar appearance list item");
 }
 
 export function parseAvatarModelControlRequest(value: unknown): AvatarModelControlRequest {
@@ -268,42 +246,21 @@ export function parseAvatarModelControlState(value: unknown): AvatarModelControl
 }
 
 function isAvatarModelId(value: string): value is AvatarModelId {
-  return (
-    value === BUILTIN_AVATAR_MODEL_IDS[0] ||
-    value === BUILTIN_AVATAR_MODEL_IDS[1] ||
-    USER_AVATAR_MODEL_ID_PATTERN.test(value)
-  );
+  return value === BUILTIN_AVATAR_MODEL_IDS[0] || USER_AVATAR_MODEL_ID_PATTERN.test(value);
 }
 
 function isCoherentModelIdentity(value: {
   readonly modelId: string;
   readonly origin: AvatarModelOrigin;
-  readonly format: AvatarModelFormat;
 }): boolean {
-  if (value.modelId === BUILTIN_AVATAR_MODEL_IDS[0]) {
-    return value.origin === "builtin" && value.format === "builtin-hd";
-  }
-  if (value.modelId === BUILTIN_AVATAR_MODEL_IDS[1]) {
-    return value.origin === "builtin" && value.format === "builtin-classic";
-  }
-  return (
-    USER_AVATAR_MODEL_ID_PATTERN.test(value.modelId) &&
-    value.origin === "imported" &&
-    (value.format === "vrm" || value.format === "glb")
-  );
+  return value.modelId === BUILTIN_AVATAR_MODEL_IDS[0]
+    ? value.origin === "builtin"
+    : USER_AVATAR_MODEL_ID_PATTERN.test(value.modelId) && value.origin === "imported";
 }
 
-function hasCoherentManagedPath(value: {
-  readonly modelId: string;
-  readonly origin: AvatarModelOrigin;
-  readonly resourcePath: string;
-}): boolean {
-  if (value.origin === "builtin") {
-    const builtinDirectory = value.modelId.slice("builtin:".length);
-    return value.resourcePath.startsWith(`builtin/${builtinDirectory}/`);
-  }
-  const uuid = value.modelId.slice("user:".length);
-  return value.resourcePath.startsWith(`user/${uuid}/`);
+function hasCoherentManagedPath(modelId: string, origin: AvatarModelOrigin, path: string): boolean {
+  if (origin === "builtin") return path.startsWith("builtin/whitelily/");
+  return path.startsWith(`user/${modelId.slice("user:".length)}/`);
 }
 
 function parseOrThrow<T>(schema: z.ZodType<T>, value: unknown, message: string): T {

@@ -19,7 +19,7 @@ import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 
 final class AvatarModelControllerTest {
-  private static final String CLASSIC = "builtin:whitelily-classic";
+  private static final String CLASSIC = "builtin:whitelily";
   private static final String FIRST = "user:00000000-0000-4000-8000-000000000001";
   private static final String SECOND = "user:00000000-0000-4000-8000-000000000002";
 
@@ -205,22 +205,11 @@ final class AvatarModelControllerTest {
   }
 
   private static AvatarRuntimeDescriptor descriptor(String modelId) {
-    Map<String, String> bones = new LinkedHashMap<>();
-    for (String name : List.of(
-        "head", "neck", "chest", "hips", "leftUpperArm", "leftLowerArm", "leftHand",
-        "rightUpperArm", "rightLowerArm", "rightHand", "leftUpperLeg", "leftLowerLeg",
-        "leftFoot", "rightUpperLeg", "rightLowerLeg", "rightFoot")) {
-      bones.put(name, Character.toUpperCase(name.charAt(0)) + name.substring(1));
-    }
     return new AvatarRuntimeDescriptor(
         modelId,
         "imported",
-        "glb",
-        "user/00000000-0000-4000-8000-000000000001/model.glb",
-        "a".repeat(64),
-        bones,
-        "whitelily-humanoid-v1",
-        "neutral-only");
+        "minecraft-skin",
+        "wide");
   }
 
   private static final class Harness {

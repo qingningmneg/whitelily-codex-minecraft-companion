@@ -1,226 +1,164 @@
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
   BUILTIN_AVATAR_MODEL_IDS,
   parseAvatarModelCatalogSnapshot,
   parseAvatarModelControlRequest,
-  parseAvatarModelControlState,
   parseAvatarModelRecord,
   parseAvatarRuntimeDescriptor,
-  type AvatarBoneMapping,
-  type AvatarModelRecord,
 } from "../../src/avatar/avatarModelSchemas.js";
 
-const fixturesRoot = new URL(
-  "../../subprojects/whitelily-avatar/protocol/fixtures/",
-  import.meta.url,
-);
+const importedId = "user:00000000-0000-4000-8000-000000000001";
+const importedSkin = "user/00000000-0000-4000-8000-000000000001/skin.png";
 
-const sha256 = "a".repeat(64);
-
-const boneMapping = {
-  head: "Head",
-  neck: "Neck",
-  chest: "Chest",
-  hips: "Hips",
-  leftUpperArm: "LeftUpperArm",
-  leftLowerArm: "LeftLowerArm",
-  leftHand: "LeftHand",
-  rightUpperArm: "RightUpperArm",
-  rightLowerArm: "RightLowerArm",
-  rightHand: "RightHand",
-  leftUpperLeg: "LeftUpperLeg",
-  leftLowerLeg: "LeftLowerLeg",
-  leftFoot: "LeftFoot",
-  rightUpperLeg: "RightUpperLeg",
-  rightLowerLeg: "RightLowerLeg",
-  rightFoot: "RightFoot",
-} as const satisfies AvatarBoneMapping;
-
-function fixture(name: string): unknown {
-  return JSON.parse(readFileSync(fileURLToPath(new URL(name, fixturesRoot)), "utf8")) as unknown;
-}
-
-function record(overrides: Partial<AvatarModelRecord> = {}): AvatarModelRecord {
+function appearance(overrides: Record<string, unknown> = {}) {
   return {
-    id: "user:00000000-0000-4000-8000-000000000001",
-    displayName: "Imported avatar",
+    id: importedId,
+    displayName: "Imported skin",
     origin: "imported",
-    format: "glb",
-    resourcePath: "user/00000000-0000-4000-8000-000000000001/model.glb",
-    sha256,
-    importedAt: "2026-08-16T08:00:00.000Z",
-    previewPath: "user/00000000-0000-4000-8000-000000000001/preview.png",
-    previewStatus: "ready",
-    boneMapping,
-    bodyAnimation: "whitelily-humanoid-v1",
-    expressions: "neutral-only",
-    validation: {
-      code: "AVATAR_VALID",
-      validatedAt: "2026-08-16T08:00:01.000Z",
-    },
+    worldRenderer: "minecraft-skin",
+    skinAsset: importedSkin,
+    skinSha256: "a".repeat(64),
+    armModel: "wide",
+    importedAt: "2026-08-21T00:00:00.000Z",
+    validation: { code: "AVATAR_VALID", validatedAt: "2026-08-21T00:00:00.000Z" },
     ...overrides,
   };
 }
 
-describe("avatar model schemas", () => {
-  it("parses the reviewed prepare, ready, and committed cross-language fixtures", () => {
-    const request = parseAvatarModelControlRequest(fixture("prepare-request.json"));
-    const ready = parseAvatarModelControlState(fixture("ready-state.json"));
-    const committed = parseAvatarModelControlState(fixture("committed-state.json"));
-
-    expect(request).toMatchObject({
-      requestId: "switch-0001",
-      operation: "prepare",
-      modelId: "builtin:whitelily-hd",
-      candidate: {
-        origin: "builtin",
-        resourcePath: "builtin/whitelily-hd/high.glb",
-      },
-    });
-    expect(ready).toMatchObject({
-      requestId: "switch-0001",
-      phase: "ready",
-      activeModelId: "builtin:whitelily-classic",
-      candidateModelId: "builtin:whitelily-hd",
-    });
-    expect(committed).toMatchObject({
-      requestId: "switch-0001",
-      phase: "committed",
-      activeModelId: "builtin:whitelily-hd",
-      candidateModelId: "builtin:whitelily-hd",
-    });
+describe("avatar appearance schemas", () => {
+  it("accepts the builtin native skin appearance", () => {
+    expect(parseAvatarModelRecord({
+      id: "builtin:whitelily",
+      displayName: "WhiteLily",
+      origin: "builtin",
+      worldRenderer: "minecraft-skin",
+      skinAsset: "builtin/whitelily/skin/base.png",
+      skinSha256: "a".repeat(64),
+      armModel: "slim",
+      portraitAsset: "builtin/whitelily/portrait.png",
+      portraitSha256: "b".repeat(64),
+      importedAt: "2026-08-21T00:00:00.000Z",
+      validation: { code: "AVATAR_VALID", validatedAt: "2026-08-21T00:00:00.000Z" },
+    }).id).toBe("builtin:whitelily");
   });
 
-  it("keeps the two builtins in the fixed product order", () => {
-    expect(BUILTIN_AVATAR_MODEL_IDS).toEqual(["builtin:whitelily-hd", "builtin:whitelily-classic"]);
+  it("keeps the sole builtin id frozen", () => {
+    expect(BUILTIN_AVATAR_MODEL_IDS).toEqual(["builtin:whitelily"]);
     expect(Object.isFrozen(BUILTIN_AVATAR_MODEL_IDS)).toBe(true);
   });
 
   it.each([
     "",
-    "../escape.glb",
-    "models/../escape.glb",
-    "C:\\outside.glb",
-    "/outside.glb",
-    "https://host/model.glb",
-    "user\\avatar\\model.glb",
-  ])("rejects an unsafe managed resource path: %s", (resourcePath) => {
-    expect(() => parseAvatarModelRecord(record({ resourcePath }))).toThrow(
+    "../escape.png",
+    "user/00000000-0000-4000-8000-000000000001/../escape.png",
+    "C:\\outside.png",
+    "/outside.png",
+    "https://host/skin.png",
+    "user\\avatar\\skin.png",
+    "builtin/other/skin.png",
+    "user/other/skin.png",
+  ])("rejects an unsafe or incoherent skin asset: %s", (skinAsset) => {
+    expect(() => parseAvatarModelRecord(appearance({ skinAsset }))).toThrow(
       "invalid avatar model record",
     );
   });
 
-  it("rejects duplicate semantic bone mappings", () => {
+  it("requires builtin appearances to carry a complete portrait", () => {
+    const builtin = {
+      ...appearance({
+        id: "builtin:whitelily",
+        displayName: "WhiteLily",
+        origin: "builtin",
+        skinAsset: "builtin/whitelily/skin/base.png",
+        armModel: "slim",
+      }),
+    };
+    expect(() => parseAvatarModelRecord(builtin)).toThrow("invalid avatar model record");
     expect(() =>
-      parseAvatarModelRecord(record({ boneMapping: { ...boneMapping, neck: boneMapping.head } })),
+      parseAvatarModelRecord({ ...builtin, portraitAsset: "builtin/whitelily/portrait.png" }),
     ).toThrow("invalid avatar model record");
   });
 
-  it.each([
-    record({ id: "builtin:whitelily-hd", origin: "imported", format: "glb" }),
-    record({ id: "user:00000000-0000-4000-8000-000000000001", origin: "builtin" }),
-    record({ origin: "builtin", format: "builtin-classic" }),
-  ])("rejects records whose id, origin, and format disagree", (value) => {
-    expect(() => parseAvatarModelRecord(value)).toThrow("invalid avatar model record");
+  it("allows imported appearances without a portrait but rejects half portraits", () => {
+    expect(parseAvatarModelRecord(appearance()).id).toBe(importedId);
+    expect(() =>
+      parseAvatarModelRecord(appearance({ portraitAsset: "user/00000000-0000-4000-8000-000000000001/portrait.png" })),
+    ).toThrow("invalid avatar model record");
   });
 
-  it("requires prepare candidates to match the outer model id", () => {
-    const request = fixture("prepare-request.json") as Record<string, unknown>;
-    const candidate = request.candidate as Record<string, unknown>;
-    expect(() =>
-      parseAvatarModelControlRequest({
-        ...request,
-        candidate: { ...candidate, modelId: "builtin:whitelily-classic" },
-      }),
-    ).toThrow("invalid avatar model control request");
-  });
-
-  it("rejects a committed state that names a different active model", () => {
-    const state = fixture("committed-state.json") as Record<string, unknown>;
-    expect(() =>
-      parseAvatarModelControlState({
-        ...state,
-        activeModelId: "builtin:whitelily-classic",
-      }),
-    ).toThrow("invalid avatar model control state");
-  });
-
-  it("requires a stable error code only for failed states", () => {
-    const ready = fixture("ready-state.json") as Record<string, unknown>;
-    expect(() =>
-      parseAvatarModelControlState({ ...ready, errorCode: "AVATAR_MESH_LOAD_FAILED" }),
-    ).toThrow("invalid avatar model control state");
-
+  it("accepts only the four-field native skin runtime descriptor", () => {
     expect(
-      parseAvatarModelControlState({
-        ...ready,
-        phase: "failed",
-        errorCode: "AVATAR_MESH_LOAD_FAILED",
+      parseAvatarRuntimeDescriptor({
+        modelId: "builtin:whitelily",
+        origin: "builtin",
+        worldRenderer: "minecraft-skin",
+        armModel: "slim",
       }),
-    ).toMatchObject({ phase: "failed", errorCode: "AVATAR_MESH_LOAD_FAILED" });
+    ).toEqual({
+      modelId: "builtin:whitelily",
+      origin: "builtin",
+      worldRenderer: "minecraft-skin",
+      armModel: "slim",
+    });
   });
 
-  it("rejects unknown fields at every public protocol boundary", () => {
-    expect(() => parseAvatarModelRecord({ ...record(), unexpected: true })).toThrow();
+  it("rejects legacy 3D fields and incoherent runtime descriptors", () => {
     expect(() =>
+      parseAvatarRuntimeDescriptor({
+        modelId: importedId,
+        origin: "builtin",
+        worldRenderer: "minecraft-skin",
+        armModel: "wide",
+      }),
+    ).toThrow("invalid avatar runtime descriptor");
+    expect(() =>
+      parseAvatarRuntimeDescriptor({
+        modelId: "builtin:whitelily",
+        origin: "builtin",
+        worldRenderer: "minecraft-skin",
+        armModel: "slim",
+        skinAsset: "builtin/whitelily/skin/base.png",
+      }),
+    ).toThrow("invalid avatar runtime descriptor");
+  });
+
+  it("accepts native skin prepare requests without asset paths", () => {
+    expect(
       parseAvatarModelControlRequest({
-        ...(fixture("prepare-request.json") as object),
-        unexpected: true,
-      }),
-    ).toThrow();
-    expect(() =>
-      parseAvatarModelControlState({
-        ...(fixture("ready-state.json") as object),
-        unexpected: true,
-      }),
-    ).toThrow();
+        schemaVersion: 1,
+        requestId: "switch-0001",
+        operation: "prepare",
+        modelId: "builtin:whitelily",
+        worldSessionId: "world-0001",
+        candidate: {
+          modelId: "builtin:whitelily",
+          origin: "builtin",
+          worldRenderer: "minecraft-skin",
+          armModel: "slim",
+        },
+        issuedAt: "2026-08-21T00:00:00.000Z",
+      }).candidate,
+    ).not.toHaveProperty("skinAsset");
   });
 
-  it("parses renderer-safe catalog snapshots without managed paths", () => {
+  it("parses renderer-safe native skin catalog snapshots", () => {
     const parsed = parseAvatarModelCatalogSnapshot({
       revision: 4,
       models: [
         {
-          id: "builtin:whitelily-hd",
-          displayName: "WhiteLily 高清动漫 3D",
+          id: "builtin:whitelily",
+          displayName: "WhiteLily",
           origin: "builtin",
-          format: "builtin-hd",
+          worldRenderer: "minecraft-skin",
+          armModel: "slim",
           previewDataUrl: "data:image/png;base64,iVBORw0KGgo=",
-          bodyAnimation: "whitelily-humanoid-v1",
-          expressions: "full",
-        },
-        {
-          id: "builtin:whitelily-classic",
-          displayName: "WhiteLily 经典 Minecraft",
-          origin: "builtin",
-          format: "builtin-classic",
-          previewDataUrl: "data:image/png;base64,iVBORw0KGgo=",
-          bodyAnimation: "whitelily-humanoid-v1",
-          expressions: "full",
+          portraitDataUrl: "data:image/png;base64,iVBORw0KGgo=",
         },
       ],
-      activeModelId: "builtin:whitelily-hd",
-      pendingModelId: "builtin:whitelily-classic",
+      activeModelId: "builtin:whitelily",
     });
 
-    expect(parsed.models[0]).not.toHaveProperty("resourcePath");
-    expect(parsed.activeModelId).toBe("builtin:whitelily-hd");
-  });
-
-  it("rejects runtime descriptors that could expose an imported model as builtin", () => {
-    expect(() =>
-      parseAvatarRuntimeDescriptor({
-        modelId: "user:00000000-0000-4000-8000-000000000001",
-        origin: "builtin",
-        format: "glb",
-        resourcePath: "user/00000000-0000-4000-8000-000000000001/model.glb",
-        sha256,
-        boneMapping,
-        bodyAnimation: "whitelily-humanoid-v1",
-        expressions: "neutral-only",
-      }),
-    ).toThrow("invalid avatar runtime descriptor");
+    expect(parsed.models[0]).not.toHaveProperty("skinAsset");
+    expect(parsed.activeModelId).toBe("builtin:whitelily");
   });
 });

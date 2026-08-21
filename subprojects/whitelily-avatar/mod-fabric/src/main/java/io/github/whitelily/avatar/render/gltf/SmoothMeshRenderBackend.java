@@ -15,6 +15,7 @@ import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.attribute.BasicFileAttributes;
+import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
@@ -47,23 +48,8 @@ public final class SmoothMeshRenderBackend implements WhiteLilyAvatarRenderBacke
   @Override
   public PreparedAvatarResources prepare(AvatarRuntimeDescriptor descriptor)
       throws AvatarRenderException {
-    validateDescriptor(descriptor);
-    GlbMeshDecoder.GlbMesh mesh;
-    try {
-      mesh = loader.load(descriptor);
-    } catch (AvatarRenderException error) {
-      throw new AvatarRenderException("AVATAR_MESH_LOAD_FAILED", "avatar mesh could not be loaded", error);
-    }
-    if (!descriptor.modelId().equals(mesh.modelId()) && !mesh.modelId().equals(descriptor.sha256())) {
-      throw new AvatarRenderException("AVATAR_MESH_LOAD_FAILED", "avatar mesh identity is invalid");
-    }
-    negotiations.keySet().removeIf(key -> key.modelId().equals(descriptor.modelId()));
-    return new SmoothResources(
-        descriptor.modelId(),
-        descriptor.origin(),
-        descriptor.expressions(),
-        mesh,
-        new AvatarGpuResources(mesh));
+    throw new AvatarRenderException(
+        "AVATAR_BACKEND_MISMATCH", "smooth mesh rendering is unavailable for native skin descriptors");
   }
 
   @Override
@@ -232,18 +218,7 @@ public final class SmoothMeshRenderBackend implements WhiteLilyAvatarRenderBacke
     }
   }
 
-  private void validateDescriptor(AvatarRuntimeDescriptor descriptor) throws AvatarRenderException {
-    if (descriptor == null
-        || !java.util.Set.of("glb", "vrm", "builtin-hd").contains(descriptor.format())
-        || !java.util.Set.of("builtin", "imported").contains(descriptor.origin())
-        || !"whitelily-humanoid-v1".equals(descriptor.bodyAnimation())
-        || !java.util.Set.of("full", "neutral-only").contains(descriptor.expressions())) {
-      throw new AvatarRenderException(
-          "AVATAR_ASSET_VALIDATION_FAILED", "invalid smooth avatar descriptor");
-    }
-  }
-
-  private GlbMeshDecoder.GlbMesh read(AvatarRuntimeDescriptor descriptor)
+  private GlbMeshDecoder.GlbMesh read(LegacyMeshDescriptor descriptor)
       throws AvatarRenderException {
     Path relative;
     try {
@@ -291,8 +266,14 @@ public final class SmoothMeshRenderBackend implements WhiteLilyAvatarRenderBacke
 
   @FunctionalInterface
   interface MeshLoader {
-    GlbMeshDecoder.GlbMesh load(AvatarRuntimeDescriptor descriptor) throws AvatarRenderException;
+    GlbMeshDecoder.GlbMesh load(LegacyMeshDescriptor descriptor) throws AvatarRenderException;
   }
+
+  record LegacyMeshDescriptor(
+      String resourcePath,
+      String sha256,
+      Map<String, String> boneMapping,
+      String expressions) {}
 
   private record SmoothResources(
       String modelId,

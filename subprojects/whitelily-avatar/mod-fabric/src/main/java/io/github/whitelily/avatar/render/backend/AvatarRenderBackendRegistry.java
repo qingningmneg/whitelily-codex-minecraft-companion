@@ -52,10 +52,10 @@ public final class AvatarRenderBackendRegistry implements AvatarCandidateRuntime
 
   @Override
   public CompletionStage<PreparedCandidate> prepare(AvatarRuntimeDescriptor descriptor) {
-    WhiteLilyAvatarRenderBackend backend = backends.get(descriptor.format());
+    WhiteLilyAvatarRenderBackend backend = backends.get(descriptor.worldRenderer());
     if (backend == null) {
       return CompletableFuture.failedFuture(
-          new IllegalArgumentException("no avatar backend accepts this format"));
+          new IllegalArgumentException("no avatar backend accepts this world renderer"));
     }
     if (closed.get()) {
       return CompletableFuture.failedFuture(new IllegalStateException("avatar registry is closed"));

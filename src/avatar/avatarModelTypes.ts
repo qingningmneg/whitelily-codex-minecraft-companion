@@ -1,91 +1,54 @@
-export const BUILTIN_AVATAR_MODEL_IDS = Object.freeze([
-  "builtin:whitelily-hd",
-  "builtin:whitelily-classic",
-] as const);
+export const BUILTIN_AVATAR_MODEL_IDS = Object.freeze(["builtin:whitelily"] as const);
 
 export type AvatarModelId = string;
 export type AvatarModelOrigin = "builtin" | "imported";
-export type AvatarModelFormat = "builtin-hd" | "builtin-classic" | "vrm" | "glb";
-export type AvatarExpressionCapability = "full" | "neutral-only";
-export type AvatarBodyAnimationCapability = "whitelily-humanoid-v1";
-export type AvatarModelValidationCode =
-  | "AVATAR_VALID"
-  | "AVATAR_FORMAT_UNSUPPORTED"
-  | "AVATAR_GLB_INVALID"
-  | "AVATAR_EXTERNAL_RESOURCE"
-  | "AVATAR_REQUIRED_BONE_MISSING"
-  | "AVATAR_PREVIEW_FAILED"
-  | "AVATAR_DIGEST_MISMATCH";
+export type AvatarWorldRenderer = "minecraft-skin";
+export type AvatarArmModel = "slim" | "wide";
 
-export interface AvatarBoneMapping {
-  readonly head: string;
-  readonly neck: string;
-  readonly chest: string;
-  readonly hips: string;
-  readonly leftUpperArm: string;
-  readonly leftLowerArm: string;
-  readonly leftHand: string;
-  readonly rightUpperArm: string;
-  readonly rightLowerArm: string;
-  readonly rightHand: string;
-  readonly leftUpperLeg: string;
-  readonly leftLowerLeg: string;
-  readonly leftFoot: string;
-  readonly rightUpperLeg: string;
-  readonly rightLowerLeg: string;
-  readonly rightFoot: string;
-}
-
-export interface AvatarModelRecord {
-  readonly id: AvatarModelId;
+export interface AvatarAppearanceRecord {
+  readonly id: string;
   readonly displayName: string;
-  readonly origin: AvatarModelOrigin;
-  readonly format: AvatarModelFormat;
-  readonly resourcePath: string;
-  readonly sha256: string;
+  readonly origin: "builtin" | "imported";
+  readonly worldRenderer: AvatarWorldRenderer;
+  readonly skinAsset: string;
+  readonly skinSha256: string;
+  readonly armModel: AvatarArmModel;
+  readonly portraitAsset?: string;
+  readonly portraitSha256?: string;
   readonly importedAt: string;
-  readonly previewPath: string;
-  readonly previewStatus: "ready";
-  readonly boneMapping: AvatarBoneMapping;
-  readonly bodyAnimation: AvatarBodyAnimationCapability;
-  readonly expressions: AvatarExpressionCapability;
-  readonly validation: {
-    readonly code: "AVATAR_VALID";
-    readonly validatedAt: string;
-  };
+  readonly validation: { readonly code: "AVATAR_VALID"; readonly validatedAt: string };
 }
 
-export interface AvatarModelListItem {
-  readonly id: AvatarModelId;
+export interface AvatarAppearanceListItem {
+  readonly id: string;
   readonly displayName: string;
-  readonly origin: AvatarModelOrigin;
-  readonly format: AvatarModelFormat;
+  readonly origin: "builtin" | "imported";
+  readonly worldRenderer: "minecraft-skin";
+  readonly armModel: "slim" | "wide";
   readonly previewDataUrl: string;
-  readonly bodyAnimation: AvatarBodyAnimationCapability;
-  readonly expressions: AvatarExpressionCapability;
+  readonly portraitDataUrl?: string;
 }
+
+export interface AvatarRuntimeDescriptor {
+  readonly modelId: string;
+  readonly origin: "builtin" | "imported";
+  readonly worldRenderer: "minecraft-skin";
+  readonly armModel: "slim" | "wide";
+}
+
+// Keeps existing IPC method names stable during the appearance-contract migration.
+export type AvatarModelRecord = AvatarAppearanceRecord;
 
 export interface AvatarModelCatalogSnapshot {
   readonly revision: number;
-  readonly models: readonly AvatarModelListItem[];
+  readonly models: readonly AvatarAppearanceListItem[];
   readonly activeModelId: AvatarModelId;
   readonly pendingModelId?: AvatarModelId | undefined;
 }
 
 export interface AvatarModelCatalogState {
   readonly revision: number;
-  readonly models: readonly AvatarModelRecord[];
-}
-
-export interface AvatarRuntimeDescriptor {
-  readonly modelId: AvatarModelId;
-  readonly origin: AvatarModelOrigin;
-  readonly format: AvatarModelFormat;
-  readonly resourcePath: string;
-  readonly sha256: string;
-  readonly boneMapping: AvatarBoneMapping;
-  readonly bodyAnimation: AvatarBodyAnimationCapability;
-  readonly expressions: AvatarExpressionCapability;
+  readonly models: readonly AvatarAppearanceRecord[];
 }
 
 export type AvatarModelControlRequest =

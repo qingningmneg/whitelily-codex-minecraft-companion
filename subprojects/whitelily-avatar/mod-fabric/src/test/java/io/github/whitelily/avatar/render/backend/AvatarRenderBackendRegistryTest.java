@@ -123,12 +123,8 @@ final class AvatarRenderBackendRegistryTest {
     return new AvatarRuntimeDescriptor(
         "user:00000000-0000-4000-8000-000000000001",
         "imported",
-        "glb",
-        "user/00000000-0000-4000-8000-000000000001/model.glb",
-        "a".repeat(64),
-        Map.of(),
-        "whitelily-humanoid-v1",
-        "neutral-only");
+        "minecraft-skin",
+        "wide");
   }
 
   private static AvatarVisualState snapshot() {

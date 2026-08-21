@@ -6,12 +6,8 @@ public final class ClassicGeckoRenderBackend implements WhiteLilyAvatarRenderBac
   @Override
   public PreparedAvatarResources prepare(AvatarRuntimeDescriptor descriptor)
       throws AvatarRenderException {
-    if (!"builtin:whitelily-classic".equals(descriptor.modelId())
-        || !"builtin-classic".equals(descriptor.format())) {
-      throw new AvatarRenderException(
-          "AVATAR_BACKEND_MISMATCH", "classic renderer accepts only the classic builtin model");
-    }
-    return new ClassicResources(descriptor.modelId());
+    throw new AvatarRenderException(
+        "AVATAR_BACKEND_MISMATCH", "classic Gecko rendering is unavailable for native skin descriptors");
   }
 
   @Override

@@ -20,7 +20,12 @@ final class AvatarModelMailboxTest {
       throws Exception {
     AvatarModelMailbox mailbox = new AvatarModelMailbox(dataRoot.toAbsolutePath());
     Path bridgeRoot = dataRoot.resolve("bridge").resolve("avatar-model");
-    Files.copy(fixture("prepare-request.json"), bridgeRoot.resolve("request.json"));
+    Files.writeString(
+        bridgeRoot.resolve("request.json"),
+        """
+        {"schemaVersion":1,"requestId":"switch-0001","operation":"prepare","modelId":"builtin:whitelily","worldSessionId":"world-0001","candidate":{"modelId":"builtin:whitelily","origin":"builtin","worldRenderer":"minecraft-skin","armModel":"slim"},"issuedAt":"2026-08-21T00:00:00.000Z"}
+        """,
+        UTF_8);
 
     AvatarModelControlRequest request = mailbox.poll().orElseThrow();
 
@@ -32,7 +37,7 @@ final class AvatarModelMailboxTest {
             1,
             request.requestId(),
             AvatarModelPhase.READY,
-            "builtin:whitelily-classic",
+            "builtin:whitelily",
             request.modelId(),
             request.worldSessionId(),
             null,

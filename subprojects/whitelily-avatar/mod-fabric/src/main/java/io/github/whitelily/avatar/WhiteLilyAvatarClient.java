@@ -135,7 +135,7 @@ public final class WhiteLilyAvatarClient implements ClientModInitializer {
                           reportControlFailure(error);
                         }
                       }),
-              "builtin:whitelily-classic",
+              "builtin:whitelily",
               null);
       modelMailbox = mailbox;
       controlExecutor = executor;

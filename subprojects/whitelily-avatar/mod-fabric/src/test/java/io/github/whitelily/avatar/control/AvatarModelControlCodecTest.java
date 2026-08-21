@@ -15,32 +15,49 @@ final class AvatarModelControlCodecTest {
   private final AvatarModelControlCodec codec = new AvatarModelControlCodec();
 
   @Test
-  void parsesTheReviewedPrepareFixture() throws Exception {
-    AvatarModelControlRequest request = codec.read(fixture("prepare-request.json"));
+  void parsesTheNativeSkinPrepareCandidate(@TempDir Path temporary) throws Exception {
+    AvatarModelControlRequest request = codec.read(writeCandidate(temporary, "candidate.json", ""));
 
     assertEquals("switch-0001", request.requestId());
     assertEquals(AvatarModelOperation.PREPARE, request.operation());
-    assertEquals("builtin:whitelily-hd", request.modelId());
-    assertEquals("builtin/whitelily-hd/high.glb", request.candidate().resourcePath());
+    assertEquals("builtin:whitelily", request.modelId());
+    assertEquals("minecraft-skin", request.candidate().worldRenderer());
+    assertEquals("slim", request.candidate().armModel());
   }
 
   @Test
-  void rejectsUnknownKeysAndUppercaseDigests(@TempDir Path temporary) throws Exception {
-    String fixture = Files.readString(fixture("prepare-request.json"), UTF_8);
-    Path unknown = temporary.resolve("unknown.json");
+  void rejectsCandidatesWithSkinOrLegacy3dFields(@TempDir Path temporary) throws Exception {
+    for (String extra :
+        new String[] {
+          ",\n  \"skinAsset\": \"builtin/whitelily/skin/base.png\"",
+          ",\n  \"boneMapping\": {}",
+          ",\n  \"bodyAnimation\": \"whitelily-humanoid-v1\"",
+          ",\n  \"expressions\": \"full\"",
+          ",\n  \"skinAsset\": \"C:/outside.png\""
+        }) {
+      AvatarModelControlException error =
+          assertThrows(
+              AvatarModelControlException.class,
+              () ->
+                  codec.read(
+                      writeCandidate(
+                          temporary, "candidate-" + extra.hashCode() + ".json", extra)));
+      assertEquals("AVATAR_CONTROL_INVALID", error.code());
+    }
+  }
+
+  @Test
+  void rejectsUnknownKeysAndNonNativeSkinCandidates(@TempDir Path temporary) throws Exception {
+    Path unknown = writeCandidate(temporary, "unknown.json", ",\n  \"extra\": true");
+    Path renderer = temporary.resolve("renderer-invalid.json");
     Files.writeString(
-        unknown,
-        fixture.replace("\"schemaVersion\": 1,", "\"schemaVersion\": 1,\n  \"extra\": true,"),
-        UTF_8);
-    Path uppercaseDigest = temporary.resolve("uppercase.json");
-    Files.writeString(
-        uppercaseDigest,
-        fixture.replace("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+        renderer,
+        Files.readString(writeCandidate(temporary, "renderer-source.json", ""), UTF_8)
+            .replace("minecraft-skin", "vrm"),
         UTF_8);
 
     assertThrows(AvatarModelControlException.class, () -> codec.read(unknown));
-    assertThrows(AvatarModelControlException.class, () -> codec.read(uppercaseDigest));
+    assertThrows(AvatarModelControlException.class, () -> codec.read(renderer));
   }
 
   @Test
@@ -61,49 +78,39 @@ final class AvatarModelControlCodecTest {
             1,
             "switch-0001",
             AvatarModelPhase.READY,
-            "builtin:whitelily-classic",
-            "builtin:whitelily-hd",
+            "builtin:whitelily",
+            "builtin:whitelily",
             "world-0001",
             null,
-            Instant.parse("2026-08-16T08:00:01Z"));
+            Instant.parse("2026-08-21T00:00:01Z"));
 
     String encoded = new String(codec.write(state), UTF_8);
 
-    assertTrue(encoded.contains("\"updatedAt\":\"2026-08-16T08:00:01.000Z\""));
+    assertTrue(encoded.contains("\"updatedAt\":\"2026-08-21T00:00:01.000Z\""));
   }
 
-  @Test
-  void reportsDuplicateBoneNamesAsAStableProtocolError(@TempDir Path temporary)
+  private static Path writeCandidate(Path directory, String name, String candidateExtra)
       throws Exception {
-    String fixture = Files.readString(fixture("prepare-request.json"), UTF_8);
-    Path duplicateBones = temporary.resolve("duplicate-bones.json");
+    Path path = directory.resolve(name);
     Files.writeString(
-        duplicateBones,
-        fixture.replace("\"neck\": \"Neck\"", "\"neck\": \"Head\""),
+        path,
+        """
+        {
+          "schemaVersion": 1,
+          "requestId": "switch-0001",
+          "operation": "prepare",
+          "modelId": "builtin:whitelily",
+          "worldSessionId": "world-0001",
+          "candidate": {
+            "modelId": "builtin:whitelily",
+            "origin": "builtin",
+            "worldRenderer": "minecraft-skin",
+            "armModel": "slim"%s
+          },
+          "issuedAt": "2026-08-21T00:00:00.000Z"
+        }
+        """.formatted(candidateExtra),
         UTF_8);
-
-    AvatarModelControlException error =
-        assertThrows(AvatarModelControlException.class, () -> codec.read(duplicateBones));
-
-    assertEquals("AVATAR_CONTROL_INVALID", error.code());
-  }
-
-  @Test
-  void rejectsATimestampThatTheDesktopWouldCanonicalizeDifferently(@TempDir Path temporary)
-      throws Exception {
-    String fixture = Files.readString(fixture("prepare-request.json"), UTF_8);
-    Path nonCanonicalTime = temporary.resolve("non-canonical-time.json");
-    Files.writeString(
-        nonCanonicalTime,
-        fixture.replace("2026-08-16T08:00:00.000Z", "2026-08-16T08:00:00Z"),
-        UTF_8);
-
-    assertThrows(AvatarModelControlException.class, () -> codec.read(nonCanonicalTime));
-  }
-
-  private static Path fixture(String name) {
-    return Path.of(System.getProperty("user.dir"), "..", "protocol", "fixtures", name)
-        .toAbsolutePath()
-        .normalize();
+    return path;
   }
 }
