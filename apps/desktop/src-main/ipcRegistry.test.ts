@@ -408,11 +408,9 @@ describe("IPC registry", () => {
     let rejectSwitch: ((reason: unknown) => void) | undefined;
     const switchTo = vi.fn(
       () =>
-        new Promise<Awaited<ReturnType<AvatarModelsPort["switchTo"]>>>(
-          (_resolve, reject) => {
+        new Promise<Awaited<ReturnType<AvatarModelsPort["switchTo"]>>>((_resolve, reject) => {
           rejectSwitch = reject;
-          },
-        ),
+        }),
     );
     const avatarModels: AvatarModelsPort = {
       list: async () => structuredClone(avatarSnapshot),

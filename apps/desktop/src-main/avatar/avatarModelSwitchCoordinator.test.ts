@@ -529,13 +529,10 @@ class SingleSlotMailbox implements AvatarModelMailboxPort {
         resolve(state);
         return;
       }
-      const timeout = setTimeout(
-        () => {
-          if (this.#waiter?.timeout === timeout) this.#waiter = undefined;
-          reject(Object.assign(new Error("mailbox timeout"), { code: "AVATAR_MAILBOX_TIMEOUT" }));
-        },
-        input.timeoutMs,
-      );
+      const timeout = setTimeout(() => {
+        if (this.#waiter?.timeout === timeout) this.#waiter = undefined;
+        reject(Object.assign(new Error("mailbox timeout"), { code: "AVATAR_MAILBOX_TIMEOUT" }));
+      }, input.timeoutMs);
       this.#waiter = {
         requestId: input.requestId,
         accepted: input.accepted,

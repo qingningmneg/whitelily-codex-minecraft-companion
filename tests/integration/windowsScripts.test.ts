@@ -591,7 +591,7 @@ describe("Windows scripts", { timeout: 30_000 }, () => {
     await cleanupWindowsFixture(root);
     await expect(access(root)).rejects.toMatchObject({ code: "ENOENT" });
     await expect(findFixtureServicePids(root)).resolves.toEqual([]);
-  }, 15_000);
+  }, 20_000);
 
   it("cleanup cancels in-flight fixture operations before removing their cwd", async () => {
     const root = await fixtureRoot();

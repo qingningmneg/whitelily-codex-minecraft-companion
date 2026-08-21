@@ -4,13 +4,7 @@
     "assets/source/whitelily-turnaround.png",
     "assets/source/whitelily-armor-themes.png"
   ],
-  "requiredPalette": [
-    "#F7F6F2",
-    "#E9F1EA",
-    "#CDE2C8",
-    "#D4C7A3",
-    "#A67C52"
-  ],
+  "requiredPalette": ["#F7F6F2", "#E9F1EA", "#CDE2C8", "#D4C7A3", "#A67C52"],
   "irisSamples": [
     {
       "role": "deep",
