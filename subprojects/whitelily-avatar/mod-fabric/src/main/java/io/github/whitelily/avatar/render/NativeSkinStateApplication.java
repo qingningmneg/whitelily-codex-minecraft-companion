@@ -18,31 +18,55 @@ public final class NativeSkinStateApplication {
     PlayerSkin original = playerRenderState.skin;
     try {
       WhiteLilyRenderDecision decision = captureDecision.get();
-      if (decision == null || !decision.usesNativeSkin()) return ApplicationResult.success();
+      if (decision == null || !decision.usesNativeSkin()) return ApplicationResult.unchanged();
       PlayerSkin nativeSkin = skinFor.apply(decision.armorTheme());
-      if (nativeSkin != null) playerRenderState.skin = nativeSkin;
-      return ApplicationResult.success();
+      if (nativeSkin == null) return ApplicationResult.unchanged();
+      playerRenderState.skin = nativeSkin;
+      return ApplicationResult.applied();
     } catch (RuntimeException error) {
       playerRenderState.skin = original;
       return ApplicationResult.failure(error);
     }
   }
 
-  public static final class ApplicationResult {
-    private static final ApplicationResult SUCCESS = new ApplicationResult(null);
+  public enum Status {
+    APPLIED,
+    UNCHANGED,
+    FAILED
+  }
 
+  public static final class ApplicationResult {
+    private static final ApplicationResult APPLIED =
+        new ApplicationResult(Status.APPLIED, null);
+    private static final ApplicationResult UNCHANGED =
+        new ApplicationResult(Status.UNCHANGED, null);
+
+    private final Status status;
     private final RuntimeException failure;
 
-    private ApplicationResult(RuntimeException failure) {
+    private ApplicationResult(Status status, RuntimeException failure) {
+      this.status = status;
       this.failure = failure;
     }
 
-    private static ApplicationResult success() {
-      return SUCCESS;
+    private static ApplicationResult applied() {
+      return APPLIED;
+    }
+
+    private static ApplicationResult unchanged() {
+      return UNCHANGED;
     }
 
     private static ApplicationResult failure(RuntimeException error) {
-      return new ApplicationResult(error);
+      return new ApplicationResult(Status.FAILED, error);
+    }
+
+    public Status status() {
+      return status;
+    }
+
+    public void onApplied(Runnable listener) {
+      if (status == Status.APPLIED) listener.run();
     }
 
     public void reportFailure(Consumer<RuntimeException> reporter) {

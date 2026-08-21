@@ -25,14 +25,15 @@ public abstract class PlayerRendererMixin {
       PlayerRenderState playerRenderState,
       float partialTick,
       CallbackInfo callback) {
-    NativeSkinStateApplication
-        .apply(
+    NativeSkinStateApplication.ApplicationResult result =
+        NativeSkinStateApplication.apply(
             playerRenderState,
             () -> {
               WhiteLilyAvatarClient.onRenderBoundary(WhiteLilyAvatarClient.modelController());
               return WhiteLilyAvatarClient.renderRuntime().captureDecision(player);
             },
-            SKINS::skinFor)
-        .reportFailure(WhiteLilyAvatarClient::reportNativeSkinFailure);
+            SKINS::skinFor);
+    result.onApplied(WhiteLilyAvatarClient::onNativeSkinFrameVisible);
+    result.reportFailure(WhiteLilyAvatarClient::reportNativeSkinFailure);
   }
 }

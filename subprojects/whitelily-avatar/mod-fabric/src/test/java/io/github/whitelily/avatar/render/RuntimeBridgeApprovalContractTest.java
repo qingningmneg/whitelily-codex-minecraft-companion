@@ -3,9 +3,19 @@ package io.github.whitelily.avatar.render;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 
+import io.github.whitelily.avatar.WhiteLilyAvatarClient;
+import io.github.whitelily.avatar.control.AvatarModelControlRequest;
+import io.github.whitelily.avatar.control.AvatarModelControlState;
+import io.github.whitelily.avatar.control.AvatarModelController;
+import io.github.whitelily.avatar.control.AvatarModelOperation;
+import io.github.whitelily.avatar.control.AvatarModelPhase;
+import io.github.whitelily.avatar.control.AvatarRuntimeDescriptor;
+import io.github.whitelily.avatar.skin.NativeSkinCandidateRuntime;
 import java.io.InputStream;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import org.junit.jupiter.api.Test;
 import org.objectweb.asm.ClassReader;
 import org.objectweb.asm.ClassVisitor;
@@ -13,6 +23,63 @@ import org.objectweb.asm.MethodVisitor;
 import org.objectweb.asm.Opcodes;
 
 final class RuntimeBridgeApprovalContractTest {
+  @Test
+  void legacyBuiltinAliasesCompleteOneNativeVisibleFrameWithoutReadingTheirResources() {
+    for (AvatarRuntimeDescriptor descriptor :
+        List.of(
+            descriptor("builtin:whitelily-hd", "builtin-hd"),
+            descriptor("builtin:whitelily-classic", "builtin-classic"))) {
+      NativeSkinCandidateRuntime runtime = new NativeSkinCandidateRuntime();
+      List<AvatarModelControlState> states = new ArrayList<>();
+      String initialModelId =
+          descriptor.modelId().endsWith("-hd")
+              ? "builtin:whitelily-classic"
+              : "builtin:whitelily-hd";
+      AvatarModelController controller =
+          new AvatarModelController(runtime, states::add, initialModelId, "world-0001");
+      controller.accept(
+          new AvatarModelControlRequest(
+              1,
+              "switch-0001",
+              AvatarModelOperation.PREPARE,
+              descriptor.modelId(),
+              "world-0001",
+              descriptor,
+              Instant.parse("2026-08-21T08:00:00Z")));
+      controller.tick();
+      controller.accept(
+          new AvatarModelControlRequest(
+              1,
+              "switch-0001",
+              AvatarModelOperation.COMMIT,
+              descriptor.modelId(),
+              "world-0001",
+              null,
+              Instant.parse("2026-08-21T08:00:01Z")));
+
+      WhiteLilyAvatarClient.onRenderBoundary(controller);
+      WhiteLilyAvatarClient.onNativeSkinFrameVisible(runtime, controller);
+      WhiteLilyAvatarClient.onNativeSkinFrameVisible(runtime, controller);
+
+      assertEquals(descriptor.modelId(), controller.confirmedActiveModelId());
+      assertEquals(
+          1,
+          states.stream().filter(state -> state.phase() == AvatarModelPhase.COMMITTED).count());
+    }
+  }
+
+  private static AvatarRuntimeDescriptor descriptor(String modelId, String format) {
+    return new AvatarRuntimeDescriptor(
+        modelId,
+        "builtin",
+        format,
+        "Z:/this/path/must/not/be/read/missing-avatar.bin",
+        "not-read",
+        Map.of(),
+        "not-read",
+        "not-read");
+  }
+
   @Test
   void productionCaptureUsesOnlyTheReadOnlyBridgeApprovalInsteadOfScoreboardAuthority()
       throws Exception {

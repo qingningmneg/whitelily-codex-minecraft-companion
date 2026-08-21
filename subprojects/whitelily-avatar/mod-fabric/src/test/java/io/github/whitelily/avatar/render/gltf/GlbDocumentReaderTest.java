@@ -9,10 +9,7 @@ import com.google.gson.Gson;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
-import io.github.whitelily.avatar.WhiteLilyAvatarClient;
 import io.github.whitelily.avatar.control.AvatarRuntimeDescriptor;
-import io.github.whitelily.avatar.render.backend.PreparedAvatarResources;
-import io.github.whitelily.avatar.render.backend.WhiteLilyAvatarRenderBackend;
 import io.github.whitelily.avatar.render.backend.AvatarVisualState;
 import io.github.whitelily.avatar.render.backend.AvatarRenderException;
 import io.github.whitelily.avatar.theme.ArmorTheme;
@@ -166,40 +163,6 @@ final class GlbDocumentReaderTest {
                     sha256(expected),
                     boneMapping(),
                     false));
-  }
-
-  @Test
-  void productionBackendResolvesDescriptorsFromTheRealModelsRoot() throws Exception {
-    Path dataRoot = temporaryDirectory.resolve("WhiteLily");
-    Path model =
-        dataRoot
-            .resolve("models")
-            .resolve("00000000-0000-4000-8000-000000000001")
-            .resolve("model.glb");
-    Files.createDirectories(model.getParent());
-    byte[] bytes = fixture(16, false, false);
-    Files.write(model, bytes);
-    var factory =
-        WhiteLilyAvatarClient.class.getDeclaredMethod("smoothBackends", Path.class);
-    factory.setAccessible(true);
-    @SuppressWarnings("unchecked")
-    Map<String, WhiteLilyAvatarRenderBackend> backends =
-        (Map<String, WhiteLilyAvatarRenderBackend>) factory.invoke(null, dataRoot);
-    AvatarRuntimeDescriptor descriptor =
-        new AvatarRuntimeDescriptor(
-            sha256(bytes),
-            "imported",
-            "glb",
-            "00000000-0000-4000-8000-000000000001/model.glb",
-            sha256(bytes),
-            boneMapping(),
-            "whitelily-humanoid-v1",
-            "neutral-only");
-
-    PreparedAvatarResources prepared = backends.get("glb").prepare(descriptor);
-
-    assertEquals(descriptor.modelId(), prepared.modelId());
-    backends.get("glb").dispose(prepared);
   }
 
   @Test

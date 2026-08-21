@@ -1,20 +1,14 @@
 package io.github.whitelily.avatar;
 
-import io.github.whitelily.avatar.control.AvatarCandidateRuntime;
 import io.github.whitelily.avatar.control.AvatarModelControlException;
 import io.github.whitelily.avatar.control.AvatarModelController;
 import io.github.whitelily.avatar.control.AvatarModelMailbox;
-import io.github.whitelily.avatar.control.AvatarRuntimeDescriptor;
+import io.github.whitelily.avatar.control.AvatarVisibleFrameResult;
 import io.github.whitelily.avatar.render.WhiteLilyRenderRuntime;
-import io.github.whitelily.avatar.render.backend.AvatarRenderBackendRegistry;
-import io.github.whitelily.avatar.render.backend.ClassicGeckoRenderBackend;
-import io.github.whitelily.avatar.render.gltf.SmoothMeshRenderBackend;
+import io.github.whitelily.avatar.skin.NativeSkinCandidateRuntime;
 import java.nio.file.Path;
-import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ArrayBlockingQueue;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
@@ -33,13 +27,12 @@ public final class WhiteLilyAvatarClient implements ClientModInitializer {
       new WhiteLilyRenderRuntime();
   private static final NativeSkinFailureDiagnostics NATIVE_SKIN_FAILURE_DIAGNOSTICS =
       new NativeSkinFailureDiagnostics(System.err::println);
+  private static final NativeSkinCandidateRuntime CANDIDATE_RUNTIME =
+      new NativeSkinCandidateRuntime();
   private static final long CONTROL_POLL_NANOS = 250_000_000L;
   private static final AtomicBoolean CONTROL_POLL_IN_FLIGHT = new AtomicBoolean();
-  private static volatile AvatarCandidateRuntime candidateRuntime =
-      new UnavailableCandidateRuntime();
   private static volatile AvatarModelController modelController;
   private static volatile AvatarModelMailbox modelMailbox;
-  private static volatile AvatarRenderBackendRegistry renderBackendRegistry;
   private static volatile ExecutorService controlExecutor;
   private static volatile long nextControlPollNanos;
 
@@ -87,21 +80,29 @@ public final class WhiteLilyAvatarClient implements ClientModInitializer {
     return modelController;
   }
 
-  public static AvatarRenderBackendRegistry renderBackendRegistry() {
-    return renderBackendRegistry;
-  }
-
   public static void onRenderBoundary(AvatarModelController controller) {
     if (controller != null) controller.onRenderBoundary();
   }
 
-  public static void reportNativeSkinFailure(RuntimeException error) {
-    NATIVE_SKIN_FAILURE_DIAGNOSTICS.report(error);
+  public static void onNativeSkinFrameVisible() {
+    onNativeSkinFrameVisible(CANDIDATE_RUNTIME, modelController);
   }
 
-  public static void installCandidateRuntime(AvatarCandidateRuntime runtime) {
-    if (runtime == null) throw new IllegalArgumentException("avatar candidate runtime is required");
-    candidateRuntime = runtime;
+  /** Narrow composition seam for the native candidate's first-visible-frame handoff. */
+  public static void onNativeSkinFrameVisible(
+      NativeSkinCandidateRuntime runtime, AvatarModelController controller) {
+    if (runtime == null || controller == null) return;
+    try {
+      runtime
+          .consumeVisibleCommit()
+          .ifPresent(ignored -> controller.onVisibleFrameResult(AvatarVisibleFrameResult.COMPLETE));
+    } catch (RuntimeException error) {
+      reportNativeSkinFailure(error);
+    }
+  }
+
+  public static void reportNativeSkinFailure(RuntimeException error) {
+    NATIVE_SKIN_FAILURE_DIAGNOSTICS.report(error);
   }
 
   private static void initializeModelControl() {
@@ -124,7 +125,7 @@ public final class WhiteLilyAvatarClient implements ClientModInitializer {
               new ThreadPoolExecutor.AbortPolicy());
       AvatarModelController controller =
           new AvatarModelController(
-              new DelegatingCandidateRuntime(),
+              CANDIDATE_RUNTIME,
               state ->
                   submitControl(
                       () -> {
@@ -136,28 +137,7 @@ public final class WhiteLilyAvatarClient implements ClientModInitializer {
                       }),
               "builtin:whitelily-classic",
               null);
-      AvatarRenderBackendRegistry registry =
-          new AvatarRenderBackendRegistry(
-              smoothBackends(dataRoot.get()),
-              controller::onVisibleFrameResult);
-      AvatarCandidateRuntime.PreparedCandidate classic =
-          registry
-              .prepare(
-                  new AvatarRuntimeDescriptor(
-                      "builtin:whitelily-classic",
-                      "builtin",
-                      "builtin-classic",
-                      "builtin/whitelily-classic/whitelily.geo.json",
-                      "a".repeat(64),
-                      Map.of(),
-                      "whitelily-humanoid-v1",
-                      "full"))
-              .toCompletableFuture()
-              .join();
-      registry.activateInitial(classic);
-      candidateRuntime = registry;
       modelMailbox = mailbox;
-      renderBackendRegistry = registry;
       controlExecutor = executor;
       modelController = controller;
       Runtime.getRuntime()
@@ -208,20 +188,7 @@ public final class WhiteLilyAvatarClient implements ClientModInitializer {
     return Optional.of(Path.of(localAppData).toAbsolutePath().normalize().resolve("WhiteLily"));
   }
 
-  private static Map<String, io.github.whitelily.avatar.render.backend.WhiteLilyAvatarRenderBackend>
-      smoothBackends(Path root) {
-    SmoothMeshRenderBackend smooth = new SmoothMeshRenderBackend(root.resolve("models"));
-    return Map.of(
-        "builtin-classic", new ClassicGeckoRenderBackend(),
-        "builtin-hd", smooth,
-        "glb", smooth,
-        "vrm", smooth);
-  }
-
   private static void shutdownControl() {
-    AvatarRenderBackendRegistry registry = renderBackendRegistry;
-    renderBackendRegistry = null;
-    if (registry != null) registry.close();
     ExecutorService executor = controlExecutor;
     controlExecutor = null;
     if (executor != null) executor.shutdownNow();
@@ -233,64 +200,6 @@ public final class WhiteLilyAvatarClient implements ClientModInitializer {
             ? controlError.code()
             : "AVATAR_CONTROL_FAILED";
     System.err.println(code);
-  }
-
-  private static final class DelegatingCandidateRuntime implements AvatarCandidateRuntime {
-    @Override
-    public CompletionStage<PreparedCandidate> prepare(AvatarRuntimeDescriptor descriptor) {
-      AvatarCandidateRuntime owner = candidateRuntime;
-      return owner.prepare(descriptor).thenApply(candidate -> new OwnedCandidate(owner, candidate));
-    }
-
-    @Override
-    public void requestCommit(PreparedCandidate candidate) {
-      OwnedCandidate owned = owned(candidate);
-      owned.owner().requestCommit(owned.candidate());
-    }
-
-    @Override
-    public void cancel(PreparedCandidate candidate) {
-      OwnedCandidate owned = owned(candidate);
-      owned.owner().cancel(owned.candidate());
-    }
-
-    @Override
-    public void release(PreparedCandidate candidate) {
-      OwnedCandidate owned = owned(candidate);
-      owned.owner().release(owned.candidate());
-    }
-
-    private static OwnedCandidate owned(PreparedCandidate candidate) {
-      if (candidate instanceof OwnedCandidate owned) return owned;
-      throw new IllegalArgumentException("avatar candidate has no runtime owner");
-    }
-  }
-
-  private record OwnedCandidate(
-      AvatarCandidateRuntime owner, AvatarCandidateRuntime.PreparedCandidate candidate)
-      implements AvatarCandidateRuntime.PreparedCandidate {
-    @Override
-    public String modelId() {
-      return candidate.modelId();
-    }
-  }
-
-  private static final class UnavailableCandidateRuntime implements AvatarCandidateRuntime {
-    @Override
-    public CompletionStage<PreparedCandidate> prepare(AvatarRuntimeDescriptor descriptor) {
-      return CompletableFuture.failedFuture(new IllegalStateException("avatar renderer unavailable"));
-    }
-
-    @Override
-    public void requestCommit(PreparedCandidate candidate) {
-      throw new IllegalStateException("avatar renderer unavailable");
-    }
-
-    @Override
-    public void cancel(PreparedCandidate candidate) {}
-
-    @Override
-    public void release(PreparedCandidate candidate) {}
   }
 
 }

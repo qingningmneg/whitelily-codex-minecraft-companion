@@ -39,9 +39,14 @@ final class NativeSkinRenderContractTest {
     WhiteLilyRenderDecision decision = matchedDecision(ArmorTheme.NETHERITE);
     PlayerRenderState state = stateWithOriginalSkin();
 
-    assertDoesNotThrow(() -> apply(state, () -> decision, catalog::skinFor));
+    NativeSkinStateApplication.ApplicationResult result =
+        assertDoesNotThrow(() -> apply(state, () -> decision, catalog::skinFor));
+    AtomicInteger visibleNotifications = new AtomicInteger();
+    result.onApplied(visibleNotifications::incrementAndGet);
 
     assertSame(catalog.skinFor(ArmorTheme.NETHERITE), state.skin);
+    assertEquals(NativeSkinStateApplication.Status.APPLIED, result.status());
+    assertEquals(1, visibleNotifications.get());
   }
 
   @Test
@@ -49,16 +54,21 @@ final class NativeSkinRenderContractTest {
     PlayerRenderState state = stateWithOriginalSkin();
     PlayerSkin original = state.skin;
 
-    assertDoesNotThrow(
-        () ->
-            apply(
-                state,
-                WhiteLilyRenderDecision::vanilla,
-                ignored -> {
-                  throw new AssertionError("unmatched decisions must not resolve a native skin");
-                }));
+    NativeSkinStateApplication.ApplicationResult result =
+        assertDoesNotThrow(
+            () ->
+                apply(
+                    state,
+                    WhiteLilyRenderDecision::vanilla,
+                    ignored -> {
+                      throw new AssertionError("unmatched decisions must not resolve a native skin");
+                    }));
+    AtomicInteger visibleNotifications = new AtomicInteger();
+    result.onApplied(visibleNotifications::incrementAndGet);
 
     assertSame(original, state.skin);
+    assertEquals(NativeSkinStateApplication.Status.UNCHANGED, result.status());
+    assertEquals(0, visibleNotifications.get());
   }
 
   @Test
@@ -66,10 +76,15 @@ final class NativeSkinRenderContractTest {
     PlayerRenderState state = stateWithOriginalSkin();
     PlayerSkin original = state.skin;
 
-    assertDoesNotThrow(
-        () -> apply(state, () -> matchedDecision(ArmorTheme.GOLD), ignored -> null));
+    NativeSkinStateApplication.ApplicationResult result =
+        assertDoesNotThrow(
+            () -> apply(state, () -> matchedDecision(ArmorTheme.GOLD), ignored -> null));
+    AtomicInteger visibleNotifications = new AtomicInteger();
+    result.onApplied(visibleNotifications::incrementAndGet);
 
     assertSame(original, state.skin);
+    assertEquals(NativeSkinStateApplication.Status.UNCHANGED, result.status());
+    assertEquals(0, visibleNotifications.get());
   }
 
   @Test
@@ -94,8 +109,12 @@ final class NativeSkinRenderContractTest {
           reportCount.incrementAndGet();
           reported.set(error);
         });
+    AtomicInteger visibleNotifications = new AtomicInteger();
+    result.onApplied(visibleNotifications::incrementAndGet);
 
     assertSame(original, state.skin);
+    assertEquals(NativeSkinStateApplication.Status.FAILED, result.status());
+    assertEquals(0, visibleNotifications.get());
     assertEquals(1, reportCount.get());
     assertSame(failure, reported.get());
   }
