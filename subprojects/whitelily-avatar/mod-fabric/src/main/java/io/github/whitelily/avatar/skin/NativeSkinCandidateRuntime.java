@@ -62,7 +62,7 @@ public final class NativeSkinCandidateRuntime implements AvatarCandidateRuntime 
     }
     return "builtin:whitelily".equals(descriptor.modelId())
         && "minecraft-skin".equals(descriptor.worldRenderer())
-        && ("slim".equals(descriptor.armModel()) || "wide".equals(descriptor.armModel()));
+        && "slim".equals(descriptor.armModel());
   }
 
   private NativeCandidate owned(PreparedCandidate candidate) {

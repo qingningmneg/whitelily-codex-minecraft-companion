@@ -24,48 +24,40 @@ import org.objectweb.asm.Opcodes;
 
 final class RuntimeBridgeApprovalContractTest {
   @Test
-  void legacyBuiltinAliasesCompleteOneNativeVisibleFrameWithoutReadingTheirResources() {
-    for (AvatarRuntimeDescriptor descriptor :
-        List.of(
-            descriptor("builtin:whitelily-hd", "builtin-hd"),
-            descriptor("builtin:whitelily-classic", "builtin-classic"))) {
-      NativeSkinCandidateRuntime runtime = new NativeSkinCandidateRuntime();
-      List<AvatarModelControlState> states = new ArrayList<>();
-      String initialModelId =
-          descriptor.modelId().endsWith("-hd")
-              ? "builtin:whitelily-classic"
-              : "builtin:whitelily-hd";
-      AvatarModelController controller =
-          new AvatarModelController(runtime, states::add, initialModelId, "world-0001");
-      controller.accept(
-          new AvatarModelControlRequest(
-              1,
-              "switch-0001",
-              AvatarModelOperation.PREPARE,
-              descriptor.modelId(),
-              "world-0001",
-              descriptor,
-              Instant.parse("2026-08-21T08:00:00Z")));
-      controller.tick();
-      controller.accept(
-          new AvatarModelControlRequest(
-              1,
-              "switch-0001",
-              AvatarModelOperation.COMMIT,
-              descriptor.modelId(),
-              "world-0001",
-              null,
-              Instant.parse("2026-08-21T08:00:01Z")));
+  void builtinNativeSkinCompletesOneVisibleFrame() {
+    AvatarRuntimeDescriptor descriptor = descriptor("builtin:whitelily", "minecraft-skin");
+    NativeSkinCandidateRuntime runtime = new NativeSkinCandidateRuntime();
+    List<AvatarModelControlState> states = new ArrayList<>();
+    AvatarModelController controller =
+        new AvatarModelController(runtime, states::add, "builtin:whitelily", "world-0001");
+    controller.accept(
+        new AvatarModelControlRequest(
+            1,
+            "switch-0001",
+            AvatarModelOperation.PREPARE,
+            descriptor.modelId(),
+            "world-0001",
+            descriptor,
+            Instant.parse("2026-08-21T08:00:00Z")));
+    controller.tick();
+    controller.accept(
+        new AvatarModelControlRequest(
+            1,
+            "switch-0001",
+            AvatarModelOperation.COMMIT,
+            descriptor.modelId(),
+            "world-0001",
+            null,
+            Instant.parse("2026-08-21T08:00:01Z")));
 
-      WhiteLilyAvatarClient.onRenderBoundary(controller);
-      WhiteLilyAvatarClient.onNativeSkinFrameVisible(runtime, controller);
-      WhiteLilyAvatarClient.onNativeSkinFrameVisible(runtime, controller);
+    WhiteLilyAvatarClient.onRenderBoundary(controller);
+    WhiteLilyAvatarClient.onNativeSkinFrameVisible(runtime, controller);
+    WhiteLilyAvatarClient.onNativeSkinFrameVisible(runtime, controller);
 
-      assertEquals(descriptor.modelId(), controller.confirmedActiveModelId());
-      assertEquals(
-          1,
-          states.stream().filter(state -> state.phase() == AvatarModelPhase.COMMITTED).count());
-    }
+    assertEquals(descriptor.modelId(), controller.confirmedActiveModelId());
+    assertEquals(
+        1,
+        states.stream().filter(state -> state.phase() == AvatarModelPhase.COMMITTED).count());
   }
 
   private static AvatarRuntimeDescriptor descriptor(String modelId, String worldRenderer) {

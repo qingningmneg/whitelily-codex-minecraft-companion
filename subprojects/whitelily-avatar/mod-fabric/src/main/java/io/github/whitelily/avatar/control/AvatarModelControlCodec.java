@@ -144,7 +144,8 @@ public final class AvatarModelControlCodec {
     validateModelId(modelId);
     if (!Set.of("builtin", "imported").contains(origin)
         || !"minecraft-skin".equals(worldRenderer)
-        || !Set.of("slim", "wide").contains(armModel)) {
+        || !Set.of("slim", "wide").contains(armModel)
+        || ("builtin:whitelily".equals(modelId) && !"slim".equals(armModel))) {
       throw invalid("avatar candidate properties are invalid");
     }
     validateCoherentIdentity(modelId, origin);

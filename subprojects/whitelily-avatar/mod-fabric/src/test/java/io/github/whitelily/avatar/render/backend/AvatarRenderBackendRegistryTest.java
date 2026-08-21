@@ -25,7 +25,7 @@ final class AvatarRenderBackendRegistryTest {
     FakeContext context = new FakeContext();
     ArrayDeque<AvatarVisibleFrameResult> visibleResults = new ArrayDeque<>();
     AvatarRenderBackendRegistry registry =
-        new AvatarRenderBackendRegistry(Map.of("glb", backend), visibleResults::add);
+        new AvatarRenderBackendRegistry(Map.of("minecraft-skin", backend), visibleResults::add);
     PreparedCandidate candidate = registry.prepare(descriptor()).toCompletableFuture().join();
     registry.requestCommit(candidate);
 
@@ -51,7 +51,7 @@ final class AvatarRenderBackendRegistryTest {
     FakeBackend imported = new FakeBackend();
     AvatarRenderBackendRegistry registry =
         new AvatarRenderBackendRegistry(
-            Map.of("builtin-classic", classic, "glb", imported), ignored -> {});
+            Map.of("legacy-research", classic, "minecraft-skin", imported), ignored -> {});
     PreparedCandidate candidate = registry.prepare(descriptor()).toCompletableFuture().join();
     registry.requestCommit(candidate);
     imported.nextResult = AvatarFrameResult.failed("AVATAR_MESH_LOAD_FAILED");
@@ -67,7 +67,7 @@ final class AvatarRenderBackendRegistryTest {
   void deferredCommitFailureRestoresVanillaAndLetsTheActiveBackendAdvanceItsOwnFallback() {
     FakeBackend backend = new FakeBackend();
     AvatarRenderBackendRegistry registry =
-        new AvatarRenderBackendRegistry(Map.of("glb", backend), ignored -> {});
+        new AvatarRenderBackendRegistry(Map.of("minecraft-skin", backend), ignored -> {});
     PreparedCandidate candidate = registry.prepare(descriptor()).toCompletableFuture().join();
     registry.requestCommit(candidate);
     FakeContext context = new FakeContext();
@@ -85,7 +85,7 @@ final class AvatarRenderBackendRegistryTest {
   void releaseIsIdempotentAndDisposesOnlyTheOwningBackend() {
     FakeBackend backend = new FakeBackend();
     AvatarRenderBackendRegistry registry =
-        new AvatarRenderBackendRegistry(Map.of("glb", backend), ignored -> {});
+        new AvatarRenderBackendRegistry(Map.of("minecraft-skin", backend), ignored -> {});
     PreparedCandidate candidate = registry.prepare(descriptor()).toCompletableFuture().join();
 
     registry.release(candidate);
@@ -98,7 +98,7 @@ final class AvatarRenderBackendRegistryTest {
   void prepareReturnsAsynchronouslyAndCancelledLateDecodeIsDisposed() throws Exception {
     BlockingBackend backend = new BlockingBackend();
     AvatarRenderBackendRegistry registry =
-        new AvatarRenderBackendRegistry(Map.of("glb", backend), ignored -> {});
+        new AvatarRenderBackendRegistry(Map.of("minecraft-skin", backend), ignored -> {});
     ExecutorService caller = Executors.newSingleThreadExecutor();
     try {
       Future<CompletionStage<PreparedCandidate>> invocation =

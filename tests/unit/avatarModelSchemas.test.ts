@@ -122,6 +122,17 @@ describe("avatar appearance schemas", () => {
     ).toThrow("invalid avatar runtime descriptor");
   });
 
+  it("rejects the wide arm model for the builtin WhiteLily appearance", () => {
+    expect(() =>
+      parseAvatarRuntimeDescriptor({
+        modelId: "builtin:whitelily",
+        origin: "builtin",
+        worldRenderer: "minecraft-skin",
+        armModel: "wide",
+      }),
+    ).toThrow("invalid avatar runtime descriptor");
+  });
+
   it("accepts native skin prepare requests without asset paths", () => {
     expect(
       parseAvatarModelControlRequest({

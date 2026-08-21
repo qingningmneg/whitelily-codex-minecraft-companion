@@ -52,6 +52,28 @@ public final class SmoothMeshRenderBackend implements WhiteLilyAvatarRenderBacke
         "AVATAR_BACKEND_MISMATCH", "smooth mesh rendering is unavailable for native skin descriptors");
   }
 
+  /** Package-private research seam; production native-skin control never invokes it. */
+  PreparedAvatarResources prepareLegacyResearch(LegacyMeshDescriptor descriptor)
+      throws AvatarRenderException {
+    validateLegacyDescriptor(descriptor);
+    GlbMeshDecoder.GlbMesh mesh;
+    try {
+      mesh = loader.load(descriptor);
+    } catch (AvatarRenderException error) {
+      throw new AvatarRenderException("AVATAR_MESH_LOAD_FAILED", "avatar mesh could not be loaded", error);
+    }
+    if (!descriptor.modelId().equals(mesh.modelId()) && !mesh.modelId().equals(descriptor.sha256())) {
+      throw new AvatarRenderException("AVATAR_MESH_LOAD_FAILED", "avatar mesh identity is invalid");
+    }
+    negotiations.keySet().removeIf(key -> key.modelId().equals(descriptor.modelId()));
+    return new SmoothResources(
+        descriptor.modelId(),
+        descriptor.origin(),
+        descriptor.expressions(),
+        mesh,
+        new AvatarGpuResources(mesh));
+  }
+
   @Override
   public AvatarFrameResult renderFrame(
       PreparedAvatarResources resources,
@@ -218,6 +240,20 @@ public final class SmoothMeshRenderBackend implements WhiteLilyAvatarRenderBacke
     }
   }
 
+  private void validateLegacyDescriptor(LegacyMeshDescriptor descriptor)
+      throws AvatarRenderException {
+    if (descriptor == null
+        || !java.util.Set.of("builtin", "imported").contains(descriptor.origin())
+        || descriptor.modelId() == null
+        || descriptor.resourcePath() == null
+        || descriptor.sha256() == null
+        || descriptor.boneMapping() == null
+        || !java.util.Set.of("full", "neutral-only").contains(descriptor.expressions())) {
+      throw new AvatarRenderException(
+          "AVATAR_ASSET_VALIDATION_FAILED", "invalid smooth mesh research descriptor");
+    }
+  }
+
   private GlbMeshDecoder.GlbMesh read(LegacyMeshDescriptor descriptor)
       throws AvatarRenderException {
     Path relative;
@@ -270,6 +306,8 @@ public final class SmoothMeshRenderBackend implements WhiteLilyAvatarRenderBacke
   }
 
   record LegacyMeshDescriptor(
+      String modelId,
+      String origin,
       String resourcePath,
       String sha256,
       Map<String, String> boneMapping,

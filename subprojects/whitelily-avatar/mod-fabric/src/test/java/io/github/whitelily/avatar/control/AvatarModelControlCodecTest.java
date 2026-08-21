@@ -61,6 +61,21 @@ final class AvatarModelControlCodecTest {
   }
 
   @Test
+  void rejectsTheWideArmModelForBuiltinWhiteLily(@TempDir Path temporary) throws Exception {
+    Path candidate = temporary.resolve("wide-arm.json");
+    Files.writeString(
+        candidate,
+        Files.readString(writeCandidate(temporary, "wide-arm-source.json", ""), UTF_8)
+            .replace("\"armModel\": \"slim\"", "\"armModel\": \"wide\""),
+        UTF_8);
+
+    AvatarModelControlException error =
+        assertThrows(AvatarModelControlException.class, () -> codec.read(candidate));
+
+    assertEquals("AVATAR_CONTROL_INVALID", error.code());
+  }
+
+  @Test
   void rejectsOversizedAndNonRegularRequestFiles(@TempDir Path temporary) throws Exception {
     Path oversized = temporary.resolve("oversized.json");
     Files.writeString(oversized, " ".repeat(65 * 1024), UTF_8);

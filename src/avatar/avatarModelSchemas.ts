@@ -68,7 +68,8 @@ const runtimeDescriptorFields = {
 export const avatarRuntimeDescriptorSchema = z
   .object(runtimeDescriptorFields)
   .strict()
-  .refine(isCoherentModelIdentity);
+  .refine(isCoherentModelIdentity)
+  .refine(({ modelId, armModel }) => hasCoherentArmModel(modelId, armModel));
 
 export const avatarModelRecordSchema = z
   .object({
@@ -93,6 +94,9 @@ export const avatarModelRecordSchema = z
   .superRefine((record, context) => {
     if (!isCoherentModelIdentity({ modelId: record.id, origin: record.origin })) {
       context.addIssue({ code: "custom", message: "avatar appearance identity is incoherent" });
+    }
+    if (!hasCoherentArmModel(record.id, record.armModel)) {
+      context.addIssue({ code: "custom", path: ["armModel"], message: "avatar arm model is incoherent" });
     }
     if (!hasCoherentManagedPath(record.id, record.origin, record.skinAsset)) {
       context.addIssue({ code: "custom", path: ["skinAsset"], message: "skin asset is incoherent" });
@@ -261,6 +265,10 @@ function isCoherentModelIdentity(value: {
 function hasCoherentManagedPath(modelId: string, origin: AvatarModelOrigin, path: string): boolean {
   if (origin === "builtin") return path.startsWith("builtin/whitelily/");
   return path.startsWith(`user/${modelId.slice("user:".length)}/`);
+}
+
+function hasCoherentArmModel(modelId: string, armModel: "slim" | "wide"): boolean {
+  return modelId !== BUILTIN_AVATAR_MODEL_IDS[0] || armModel === "slim";
 }
 
 function parseOrThrow<T>(schema: z.ZodType<T>, value: unknown, message: string): T {
