@@ -1,5 +1,8 @@
 {
   "schemaVersion": 2,
+  "worldRenderer": "minecraft-skin",
+  "armModel": "slim",
+  "defaultTheme": "base",
   "themes": ["base", "leather", "iron", "gold", "diamond", "netherite"],
   "model": {
     "blockbench": "blockbench/whitelily.bbmodel",
@@ -172,7 +175,7 @@
       "sha256": "8BFA790FBFAC1C5E5816765FAC5D4466FDB856B9C3FA407C725B9C29270D5A46"
     }
   ],
-  "runtimeAssets": [
+  "previousRuntimeAssets": [
     {
       "path": "assets/whitelily_avatar/geckolib/models/whitelily.geo.json",
       "root": "resources",
@@ -238,5 +241,35 @@
       "root": "resources",
       "sha256": "990664D2BBE8C5D198C76BA529AC939F3518EF31D4A41ECE7F079E130FE48D64"
     }
+  ],
+  "researchAssetDirectories": [
+    "blender/",
+    "blockbench/",
+    "measurements/",
+    "palettes/",
+    "previews/",
+    "review/",
+    "rig/",
+    "textures/source/"
+  ],
+  "researchRuntimeAssets": [
+    { "path": "assets/whitelily_avatar/geckolib/models/whitelily.geo.json", "root": "resources" },
+    { "path": "assets/whitelily_avatar/shaders/core/avatar_skinning.fsh", "root": "resources" },
+    { "path": "assets/whitelily_avatar/shaders/core/avatar_skinning.json", "root": "resources" },
+    { "path": "assets/whitelily_avatar/shaders/core/avatar_skinning.vsh", "root": "resources" },
+    { "path": "assets/whitelily_avatar/textures/entity/base.png", "root": "resources" },
+    { "path": "assets/whitelily_avatar/textures/entity/leather.png", "root": "resources" },
+    { "path": "assets/whitelily_avatar/textures/entity/iron.png", "root": "resources" },
+    { "path": "assets/whitelily_avatar/textures/entity/gold.png", "root": "resources" },
+    { "path": "assets/whitelily_avatar/textures/entity/diamond.png", "root": "resources" },
+    { "path": "assets/whitelily_avatar/textures/entity/netherite.png", "root": "resources" }
+  ],
+  "runtimeAssets": [
+    { "path": "assets/whitelily_avatar/textures/skin/base.png", "root": "resources", "sha256": "A9D54DD1D7792525388E9C9D26B9E6241FE61427B114317FABBD48A2C93C35EC" },
+    { "path": "assets/whitelily_avatar/textures/skin/leather.png", "root": "resources", "sha256": "0E17099C664069EB134BBFC0493D42FB18BE25133D7C43694B270F4D87D7FF2A" },
+    { "path": "assets/whitelily_avatar/textures/skin/iron.png", "root": "resources", "sha256": "AAE44C0829F15D7C1A8D296982D2D18DBC3DEE55F989D608AAE36817E236536F" },
+    { "path": "assets/whitelily_avatar/textures/skin/gold.png", "root": "resources", "sha256": "B964FC1AA251D5BD6B2E075E6A426E5F1DD5EA04857363EB48B5B21914FA04EC" },
+    { "path": "assets/whitelily_avatar/textures/skin/diamond.png", "root": "resources", "sha256": "8BAC47DE31A6E67B4B5D705BB2DB4449DF31C333413A2B484E4013592F885DA9" },
+    { "path": "assets/whitelily_avatar/textures/skin/netherite.png", "root": "resources", "sha256": "990664D2BBE8C5D198C76BA529AC939F3518EF31D4A41ECE7F079E130FE48D64" }
   ]
 }

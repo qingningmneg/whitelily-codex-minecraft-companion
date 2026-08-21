@@ -692,6 +692,167 @@ function rgbaHexes(pixels) {
   return colors;
 }
 
+async function validateNativeSkinAssets(assetRoot, resourceRoot, namespaceRoot, allFiles, manifest) {
+  if (
+    manifest.worldRenderer !== "minecraft-skin" ||
+    manifest.armModel !== "slim" ||
+    manifest.defaultTheme !== "base"
+  ) {
+    throw failure("manifest must declare the native slim skin renderer");
+  }
+  requireExactThemes(manifest.themes);
+  if (!Array.isArray(manifest.skins) || manifest.skins.length !== EXPECTED_THEMES.length) {
+    throw failure("manifest must declare six exact fallback skin paths");
+  }
+  const skinPaths = [];
+  const inspectedSkins = [];
+  for (const [index, skin] of manifest.skins.entries()) {
+    if (
+      !isPlainObject(skin) ||
+      skin.theme !== EXPECTED_THEMES[index] ||
+      skin.path !== EXPECTED_SKINS[index] ||
+      skin.root !== "resources"
+    ) {
+      throw failure("manifest must declare six exact fallback skin paths");
+    }
+    const safePath = safeAssetPath(resourceRoot, skin.path);
+    const inspected = validatePng64Rgba(
+      await regularFile(
+        safePath.resolved,
+        `missing declared runtime asset: ${safePath.declaredPath}`,
+        MAX_SKIN_PNG_BYTES,
+      ),
+    );
+    validateSkinSemantics(inspected.pixels);
+    skinPaths.push(safePath.declaredPath);
+    inspectedSkins.push(inspected);
+  }
+
+  if (!Array.isArray(manifest.runtimeAssets) || manifest.runtimeAssets.length !== EXPECTED_SKINS.length) {
+    throw failure("invalid runtime asset declarations");
+  }
+  const runtimeDeclarations = new Set();
+  for (const [index, runtimeAsset] of manifest.runtimeAssets.entries()) {
+    const declared = manifestFile(runtimeAsset, assetRoot, resourceRoot);
+    if (
+      declared.rootName !== "resources" ||
+      declared.declaredPath !== EXPECTED_SKINS[index] ||
+      runtimeDeclarations.has(declared.declaredPath) ||
+      typeof runtimeAsset.sha256 !== "string" ||
+      !/^[0-9A-F]{64}$/.test(runtimeAsset.sha256)
+    ) {
+      throw failure("invalid runtime asset declarations");
+    }
+    const bytes = await regularFile(
+      declared.resolved,
+      `missing declared runtime asset: ${declared.declaredPath}`,
+      MAX_SKIN_PNG_BYTES,
+    );
+    if (sourceDigest(bytes) !== runtimeAsset.sha256) {
+      throw failure(`runtime asset SHA-256 mismatch: ${declared.declaredPath}`);
+    }
+    runtimeDeclarations.add(declared.declaredPath);
+  }
+
+  if (
+    !Array.isArray(manifest.skinPreviews) ||
+    manifest.skinPreviews.length !== EXPECTED_THEMES.length
+  ) {
+    throw failure("manifest must declare six exact skin preview paths");
+  }
+  const skinPreviewPaths = [];
+  for (const [index, preview] of manifest.skinPreviews.entries()) {
+    if (
+      !isPlainObject(preview) ||
+      preview.theme !== EXPECTED_THEMES[index] ||
+      preview.path !== EXPECTED_SKIN_PREVIEWS[index] ||
+      typeof preview.sha256 !== "string" ||
+      !/^[0-9A-F]{64}$/.test(preview.sha256)
+    ) {
+      throw failure("manifest must declare six exact skin preview paths");
+    }
+    const safePath = safeAssetPath(assetRoot, preview.path);
+    const bytes = await regularFile(
+      safePath.resolved,
+      `missing declared skin preview: ${safePath.declaredPath}`,
+      MAX_SKIN_PNG_BYTES,
+    );
+    const inspected = validateSkinPreview(bytes);
+    if (sourceDigest(bytes) !== preview.sha256) {
+      throw failure(`skin preview SHA-256 mismatch: ${safePath.declaredPath}`);
+    }
+    const expectedPreview = renderSkinFrontPreview(inspectedSkins[index]);
+    if (!inspected.pixels.equals(expectedPreview.pixels)) {
+      throw failure(`skin preview pixels must match its fallback skin: ${safePath.declaredPath}`);
+    }
+    skinPreviewPaths.push(safePath.declaredPath);
+  }
+
+  if (!Array.isArray(manifest.conceptReferences) || manifest.conceptReferences.length !== 6) {
+    throw failure("invalid concept reference declarations");
+  }
+  const declaredAssetFiles = new Set(["manifest.json", "source/asset-license.json", ...skinPreviewPaths]);
+  for (const [index, concept] of manifest.conceptReferences.entries()) {
+    if (!isPlainObject(concept) || concept.theme !== EXPECTED_THEMES[index] || typeof concept.sha256 !== "string") {
+      throw failure("invalid concept reference declarations");
+    }
+    const safePath = safeAssetPath(assetRoot, concept.path);
+    const bytes = await regularFile(safePath.resolved, `missing concept reference: ${safePath.declaredPath}`, MAX_RUNTIME_ASSET_BYTES);
+    if (!/^[0-9A-F]{64}$/.test(concept.sha256) || sourceDigest(bytes) !== concept.sha256) {
+      throw failure("concept reference SHA-256 mismatch");
+    }
+    declaredAssetFiles.add(safePath.declaredPath);
+  }
+  if (!Array.isArray(manifest.sources) || manifest.sources.length !== EXPECTED_SOURCES.size) {
+    throw failure("invalid source declarations");
+  }
+  for (const source of manifest.sources) {
+    const safePath = safeAssetPath(assetRoot, source?.path);
+    const expectedHash = EXPECTED_SOURCES.get(safePath.declaredPath);
+    const bytes = await regularFile(safePath.resolved, "missing approved source image", MAX_SOURCE_IMAGE_BYTES);
+    if (source.sha256 !== expectedHash || sourceDigest(bytes) !== expectedHash) throw failure("source SHA-256 mismatch");
+    declaredAssetFiles.add(safePath.declaredPath);
+  }
+
+  const researchDirectories = new Set(manifest.researchAssetDirectories);
+  if (
+    !Array.isArray(manifest.researchAssetDirectories) ||
+    researchDirectories.size !== manifest.researchAssetDirectories.length ||
+    [...researchDirectories].some((entry) => typeof entry !== "string" || !entry.endsWith("/") || entry.includes(".."))
+  ) {
+    throw failure("invalid research asset declarations");
+  }
+  for (const file of allFiles) {
+    if (declaredAssetFiles.has(file) || [...researchDirectories].some((directory) => file.startsWith(directory))) continue;
+    throw failure(`undeclared asset: ${file}`);
+  }
+
+  if (!Array.isArray(manifest.researchRuntimeAssets)) throw failure("invalid research runtime declarations");
+  const researchRuntime = new Set();
+  for (const entry of manifest.researchRuntimeAssets) {
+    const declared = manifestFile(entry, assetRoot, resourceRoot);
+    if (declared.rootName !== "resources" || runtimeDeclarations.has(declared.declaredPath)) {
+      throw failure("invalid research runtime declarations");
+    }
+    researchRuntime.add(declared.declaredPath);
+  }
+  const namespaceFiles = await walk(namespaceRoot);
+  for (const relative of namespaceFiles) {
+    const declared = `${RUNTIME_PREFIX}/${relative}`;
+    if (!runtimeDeclarations.has(declared) && !researchRuntime.has(declared)) {
+      throw failure(`undeclared runtime asset: ${declared}`);
+    }
+  }
+  if (runtimeDeclarations.size + researchRuntime.size !== namespaceFiles.length) {
+    throw failure("research runtime declarations do not match preserved files");
+  }
+  return {
+    themes: [...manifest.themes], skinCount: skinPaths.length, skinPaths, skinPreviewPaths,
+    skinPreviewCount: skinPreviewPaths.length, runtimeAssetCount: runtimeDeclarations.size,
+    unreferencedTextureCount: 0, maxTextureDimension: 64,
+  };
+}
+
 export async function validateAvatarAssets(root) {
   const assetRoot = asAssetRoot(root);
   const subprojectRoot = path.dirname(assetRoot);
@@ -707,6 +868,8 @@ export async function validateAvatarAssets(root) {
   if (!isPlainObject(manifest) || manifest.schemaVersion !== 2) {
     throw failure("unsupported manifest schema");
   }
+
+  return validateNativeSkinAssets(assetRoot, resourceRoot, namespaceRoot, allFiles, manifest);
 
   requireExactThemes(manifest.themes);
   const declaredAssetFiles = new Set(["manifest.json", "source/asset-license.json"]);
@@ -1065,4 +1228,5 @@ export async function validateAvatarAssets(root) {
 
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
   await validateAvatarAssets(new URL("../assets/", import.meta.url));
+  console.log("WhiteLily native skin asset validation passed.");
 }
