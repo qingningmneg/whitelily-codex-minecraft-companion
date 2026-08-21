@@ -61,7 +61,17 @@ export async function createAvatarModelComposition(options: {
     builtinModels: builtin,
     diagnostic: ({ code, modelId }) => diagnostic(code, modelId),
   }).initialize();
-  const approved = new AvatarApprovedSkinCatalog({ dataRoot });
+  const approved = new AvatarApprovedSkinCatalog({
+    dataRoot,
+    diagnostic: ({ code, modelId }) => diagnostic(code, modelId),
+  });
+  const refreshApprovedSkins = async (
+    records: readonly AvatarAppearanceRecord[],
+  ): Promise<void> => {
+    await approved
+      .publish(records)
+      .catch(() => diagnostic("AVATAR_APPROVED_SKIN_CATALOG_UNAVAILABLE"));
+  };
   const preferences = new AvatarModelPreferences({ dataRoot });
   const projector = new AvatarAppearanceSnapshotProjector({
     dataRoot,
@@ -80,7 +90,7 @@ export async function createAvatarModelComposition(options: {
     pendingModelId?: string,
   ): Promise<AvatarModelCatalogSnapshot> => {
     const state = await catalog.list();
-    await approved.publish(state.models);
+    await refreshApprovedSkins(state.models);
     return projector.project(state, activeModelId, pendingModelId);
   };
   const publishSnapshot = (snapshot: AvatarModelCatalogSnapshot): void => {
@@ -104,7 +114,7 @@ export async function createAvatarModelComposition(options: {
   });
 
   const initialState = await catalog.list();
-  await approved.publish(initialState.models);
+  await refreshApprovedSkins(initialState.models);
 
   let disposed = false;
   const unsubscribeRuntime = options.subscribeRuntime((event) => {
@@ -143,7 +153,7 @@ export async function createAvatarModelComposition(options: {
     },
     switchTo: async (modelId) => {
       const state = await catalog.list();
-      await approved.publish(state.models);
+      await refreshApprovedSkins(state.models);
       return coordinator.switchTo(modelId);
     },
     subscribe: (listener) => {

@@ -15,7 +15,7 @@ const firstUserId = "user:00000000-0000-4000-8000-000000000001";
 const secondUserId = "user:00000000-0000-4000-8000-000000000002";
 
 describe("AvatarModelSwitchCoordinator", () => {
-  it("persists only after the matching visible-frame committed state", async () => {
+  it("persists only after the matching visible state and finalizes afterward", async () => {
     const harness = createHarness();
     const switching = harness.coordinator.switchTo(firstUserId);
 
@@ -23,6 +23,9 @@ describe("AvatarModelSwitchCoordinator", () => {
     harness.mailbox.reply("ready");
     await harness.mailbox.expectRequest("commit", firstUserId);
     expect(harness.commitActiveModelId).not.toHaveBeenCalled();
+    harness.mailbox.reply("visible");
+    await harness.mailbox.expectRequest("finalize", firstUserId);
+    expect(harness.commitActiveModelId).toHaveBeenCalledOnce();
     harness.mailbox.reply("committed");
 
     await expect(switching).resolves.toMatchObject({ activeModelId: firstUserId });
@@ -46,6 +49,8 @@ describe("AvatarModelSwitchCoordinator", () => {
     await harness.mailbox.expectRequest("prepare", secondUserId);
     harness.mailbox.reply("ready");
     await harness.mailbox.expectRequest("commit", secondUserId);
+    harness.mailbox.reply("visible");
+    await harness.mailbox.expectRequest("finalize", secondUserId);
     harness.mailbox.reply("committed");
     await expect(second).resolves.toMatchObject({ activeModelId: secondUserId });
   });
@@ -128,6 +133,8 @@ describe("AvatarModelSwitchCoordinator", () => {
     await harness.mailbox.expectRequest("prepare", "builtin:whitelily");
     harness.mailbox.reply("ready");
     await harness.mailbox.expectRequest("commit", "builtin:whitelily");
+    harness.mailbox.reply("visible");
+    await harness.mailbox.expectRequest("finalize", "builtin:whitelily");
     harness.mailbox.reply("committed");
 
     await expect(reconciling).resolves.toBeUndefined();
@@ -139,11 +146,77 @@ describe("AvatarModelSwitchCoordinator", () => {
     await harness.mailbox.expectRequest("prepare", firstUserId);
     harness.mailbox.reply("ready");
     await harness.mailbox.expectRequest("commit", firstUserId);
-    harness.mailbox.reply("committed");
+    harness.mailbox.reply("visible");
 
     await expect(switching).rejects.toMatchObject({ code: "AVATAR_PREFERENCE_CONFLICT" });
     expect(harness.preference.activeModelId).toBe("builtin:whitelily");
     await harness.mailbox.expectRequest("cancel", firstUserId);
+  });
+
+  it.each(["projection", "publication"] as const)(
+    "rolls back the visible candidate when final %s fails",
+    async (failure) => {
+      const harness = createHarness({
+        finalProjectionFailure: failure === "projection",
+        finalPublicationFailure: failure === "publication",
+      });
+      const switching = harness.coordinator.switchTo(firstUserId);
+      await harness.mailbox.expectRequest("prepare", firstUserId);
+      harness.mailbox.reply("ready");
+      await harness.mailbox.expectRequest("commit", firstUserId);
+      harness.mailbox.reply("visible");
+
+      await expect(switching).rejects.toMatchObject({ code: "AVATAR_SWITCH_FAILED" });
+      expect(harness.commitActiveModelId).not.toHaveBeenCalled();
+      expect(harness.preference.activeModelId).toBe("builtin:whitelily");
+      await harness.mailbox.expectRequest("cancel", firstUserId);
+      expect(harness.notifications.at(-1)).toMatchObject({
+        activeModelId: "builtin:whitelily",
+      });
+      expect(harness.notifications.at(-1)?.pendingModelId).toBeUndefined();
+    },
+  );
+
+  it("compensates the persisted preference when finalization fails", async () => {
+    const harness = createHarness();
+    const switching = harness.coordinator.switchTo(firstUserId);
+    await harness.mailbox.expectRequest("prepare", firstUserId);
+    harness.mailbox.reply("ready");
+    await harness.mailbox.expectRequest("commit", firstUserId);
+    harness.mailbox.reply("visible");
+    await harness.mailbox.expectRequest("finalize", firstUserId);
+    harness.mailbox.reply("failed", { errorCode: "AVATAR_FINALIZE_FAILED" });
+
+    await expect(switching).rejects.toMatchObject({ code: "AVATAR_SWITCH_FAILED" });
+    expect(harness.compensateActiveModelId).toHaveBeenCalledWith(
+      expect.objectContaining({
+        activeModelId: "builtin:whitelily",
+        committedRequestId: "switch-request-0001",
+      }),
+    );
+    expect(harness.preference.activeModelId).toBe("builtin:whitelily");
+    await harness.mailbox.expectRequest("cancel", firstUserId);
+  });
+
+  it("keeps the forward-consistent selection when preference compensation fails", async () => {
+    const harness = createHarness({ compensationFailure: true });
+    const switching = harness.coordinator.switchTo(firstUserId);
+    await harness.mailbox.expectRequest("prepare", firstUserId);
+    harness.mailbox.reply("ready");
+    await harness.mailbox.expectRequest("commit", firstUserId);
+    harness.mailbox.reply("visible");
+    await harness.mailbox.expectRequest("finalize", firstUserId);
+    harness.mailbox.reply("failed", { errorCode: "AVATAR_FINALIZE_FAILED" });
+
+    await expect(switching).rejects.toMatchObject({
+      code: "AVATAR_PREFERENCE_COMPENSATION_FAILED",
+    });
+    expect(harness.preference.activeModelId).toBe(firstUserId);
+    expect(
+      harness.mailbox.requests.filter(({ operation }) => operation === "finalize"),
+    ).toHaveLength(2);
+    expect(harness.mailbox.requests.some(({ operation }) => operation === "cancel")).toBe(false);
+    expect(harness.notifications.at(-1)?.activeModelId).toBe(firstUserId);
   });
 
   it("cancels an in-flight candidate when the bridge disconnects", async () => {
@@ -159,7 +232,13 @@ describe("AvatarModelSwitchCoordinator", () => {
 });
 
 function createHarness(
-  options: { readonly preferenceConflict?: boolean; readonly digestDrift?: boolean } = {},
+  options: {
+    readonly preferenceConflict?: boolean;
+    readonly digestDrift?: boolean;
+    readonly compensationFailure?: boolean;
+    readonly finalProjectionFailure?: boolean;
+    readonly finalPublicationFailure?: boolean;
+  } = {},
 ) {
   const mailbox = new FakeMailbox();
   let preference: AvatarModelPreferenceSnapshot = {
@@ -193,10 +272,23 @@ function createHarness(
     };
     return preference;
   });
+  const compensateActiveModelId = vi.fn(
+    async (input: { activeModelId: string; committedRequestId: string }) => {
+      if (options.compensationFailure) throw new Error("preference compensation failed");
+      preference = {
+        schemaVersion: 1,
+        revision: preference.revision + 1,
+        activeModelId: input.activeModelId,
+        committedRequestId: input.committedRequestId,
+      };
+      return preference;
+    },
+  );
   const preferences = {
     read: vi.fn(async () => preference),
     readActiveModelId: vi.fn(async () => preference.activeModelId),
     commitActiveModelId,
+    compensateActiveModelId,
   };
   const notifications: AvatarModelCatalogSnapshot[] = [];
   const state = {
@@ -207,9 +299,26 @@ function createHarness(
     preferences,
     mailbox,
     currentWorldSessionId: () => state.worldSessionId,
-    projectSnapshot: async (activeModelId, pendingModelId) =>
-      snapshot(activeModelId, pendingModelId),
-    publishSnapshot: (value) => notifications.push(value),
+    projectSnapshot: async (activeModelId, pendingModelId) => {
+      if (
+        options.finalProjectionFailure &&
+        activeModelId === firstUserId &&
+        pendingModelId === undefined
+      ) {
+        throw new Error("final projection failed");
+      }
+      return snapshot(activeModelId, pendingModelId);
+    },
+    publishSnapshot: (value) => {
+      if (
+        options.finalPublicationFailure &&
+        value.activeModelId === firstUserId &&
+        value.pendingModelId === undefined
+      ) {
+        throw new Error("final publication failed");
+      }
+      notifications.push(value);
+    },
     createRequestId: () => "switch-request-0001",
     now: () => new Date("2026-08-16T08:00:00.000Z"),
     prepareTimeoutMs: 500,
@@ -228,6 +337,7 @@ function createHarness(
     catalog,
     preferences,
     commitActiveModelId,
+    compensateActiveModelId,
     mailbox,
     notifications,
     coordinator,

@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.github.whitelily.avatar.control.AvatarCandidateRuntime.PreparedCandidate;
 import io.github.whitelily.avatar.control.AvatarRuntimeDescriptor;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import org.junit.jupiter.api.Test;
 
@@ -47,6 +48,24 @@ final class NativeSkinCandidateRuntimeTest {
 
     assertEquals(candidate, runtime.consumeVisibleCommit().orElseThrow());
     assertTrue(runtime.consumeVisibleCommit().isEmpty());
+  }
+
+  @Test
+  void cancelRestoresThePreviousSkinAfterTheCandidateBecameVisible() {
+    WhiteLilySkinCatalog visible = new WhiteLilySkinCatalog();
+    visible.activate("user:00000000-0000-4000-8000-000000000002", null);
+    NativeSkinCandidateRuntime runtime = new NativeSkinCandidateRuntime(
+        null,
+        visible,
+        approved -> CompletableFuture.failedFuture(new AssertionError("registrar is unused")));
+    PreparedCandidate candidate = runtime.prepare(descriptor("builtin", "minecraft-skin", "slim"))
+        .toCompletableFuture().join();
+
+    runtime.requestCommit(candidate);
+    assertEquals(candidate, runtime.consumeVisibleCommit().orElseThrow());
+    runtime.cancel(candidate);
+
+    assertEquals("user:00000000-0000-4000-8000-000000000002", visible.activeModelId());
   }
 
   private static AvatarRuntimeDescriptor descriptor(String origin, String renderer, String armModel) {

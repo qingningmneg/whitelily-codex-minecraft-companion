@@ -39,6 +39,10 @@ final class AvatarModelControllerTest {
 
     harness.controller.onVisibleFrameResult(AvatarVisibleFrameResult.COMPLETE);
 
+    assertEquals(CLASSIC, harness.controller.confirmedActiveModelId());
+    assertEquals(AvatarModelPhase.VISIBLE, harness.lastState().phase());
+    harness.controller.accept(finalizeCommit("switch-0001", FIRST));
+
     assertEquals(FIRST, harness.controller.confirmedActiveModelId());
     assertEquals(AvatarModelPhase.COMMITTED, harness.lastState().phase());
   }
@@ -53,6 +57,7 @@ final class AvatarModelControllerTest {
 
     WhiteLilyAvatarClient.onRenderBoundary(harness.controller);
     harness.controller.onVisibleFrameResult(AvatarVisibleFrameResult.COMPLETE);
+    harness.controller.accept(finalizeCommit("switch-0001", FIRST));
 
     assertEquals(List.of(FIRST), harness.runtime.commitRequests);
     assertEquals(FIRST, harness.controller.confirmedActiveModelId());
@@ -71,6 +76,35 @@ final class AvatarModelControllerTest {
     assertEquals("AVATAR_FRAME_FAILED", harness.lastState().errorCode());
     assertTrue(harness.runtime.cancelled.contains(FIRST));
     assertTrue(harness.runtime.released.contains(FIRST));
+  }
+
+  @Test
+  void completeVisibleFrameRemainsReversibleUntilDesktopFinalization() {
+    Harness harness = new Harness();
+    harness.prepareReadyAndCommit("switch-0001", FIRST);
+
+    harness.controller.onVisibleFrameResult(AvatarVisibleFrameResult.COMPLETE);
+    assertEquals(CLASSIC, harness.controller.confirmedActiveModelId());
+    harness.controller.accept(cancel("switch-0001", FIRST));
+
+    assertEquals(CLASSIC, harness.controller.confirmedActiveModelId());
+    assertEquals(AvatarModelPhase.CANCELLED, harness.lastState().phase());
+    assertTrue(harness.runtime.cancelled.contains(FIRST));
+  }
+
+  @Test
+  void matchingCancelCanCompensateAnAcknowledgedFinalization() {
+    Harness harness = new Harness();
+    harness.prepareReadyAndCommit("switch-0001", FIRST);
+    harness.controller.onVisibleFrameResult(AvatarVisibleFrameResult.COMPLETE);
+    harness.controller.accept(finalizeCommit("switch-0001", FIRST));
+    assertEquals(FIRST, harness.controller.confirmedActiveModelId());
+
+    harness.controller.accept(cancel("switch-0001", FIRST));
+
+    assertEquals(CLASSIC, harness.controller.confirmedActiveModelId());
+    assertEquals(AvatarModelPhase.CANCELLED, harness.lastState().phase());
+    assertTrue(harness.runtime.cancelled.contains(FIRST));
   }
 
   @Test
@@ -202,6 +236,28 @@ final class AvatarModelControllerTest {
         worldSessionId,
         null,
         Instant.parse("2026-08-16T08:00:01Z"));
+  }
+
+  private static AvatarModelControlRequest cancel(String requestId, String modelId) {
+    return new AvatarModelControlRequest(
+        1,
+        requestId,
+        AvatarModelOperation.CANCEL,
+        modelId,
+        "world-0001",
+        null,
+        Instant.parse("2026-08-16T08:00:02Z"));
+  }
+
+  private static AvatarModelControlRequest finalizeCommit(String requestId, String modelId) {
+    return new AvatarModelControlRequest(
+        1,
+        requestId,
+        AvatarModelOperation.FINALIZE,
+        modelId,
+        "world-0001",
+        null,
+        Instant.parse("2026-08-16T08:00:02Z"));
   }
 
   private static AvatarRuntimeDescriptor descriptor(String modelId) {

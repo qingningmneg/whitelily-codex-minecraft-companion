@@ -33,6 +33,11 @@ export interface ApprovedSkinCatalogEntry {
   readonly armModel: "slim" | "wide";
 }
 
+export interface AvatarApprovedSkinCatalogDiagnostic {
+  readonly code: AvatarApprovedSkinCatalogErrorCode;
+  readonly modelId: string;
+}
+
 interface ApprovedSkinCatalogDocument {
   readonly schemaVersion: 1;
   readonly skins: readonly ApprovedSkinCatalogEntry[];
@@ -41,12 +46,17 @@ interface ApprovedSkinCatalogDocument {
 export class AvatarApprovedSkinCatalog {
   readonly #modelRoot: string;
   readonly #file: AtomicJsonFile<ApprovedSkinCatalogDocument>;
+  readonly #diagnostic: (diagnostic: AvatarApprovedSkinCatalogDiagnostic) => void;
 
-  constructor(options: { readonly dataRoot: string }) {
+  constructor(options: {
+    readonly dataRoot: string;
+    readonly diagnostic?: (diagnostic: AvatarApprovedSkinCatalogDiagnostic) => void;
+  }) {
     if (!isAbsolute(options.dataRoot)) throw new Error("invalid approved skin catalog root");
     const dataRoot = resolve(options.dataRoot);
     const paths = resolveAvatarModelPaths(dataRoot);
     this.#modelRoot = paths.root;
+    this.#diagnostic = options.diagnostic ?? (() => undefined);
     this.#file = new AtomicJsonFile({
       rootDirectory: dataRoot,
       path: join(paths.bridgeRoot, "approved-skins.json"),
@@ -58,41 +68,51 @@ export class AvatarApprovedSkinCatalog {
   async publish(records: readonly AvatarAppearanceRecord[]): Promise<void> {
     const skins: ApprovedSkinCatalogEntry[] = [];
     for (const candidate of records) {
-      const record = parseAvatarModelRecord(candidate);
-      let bytes: Buffer;
       try {
-        bytes = await readVerifiedAvatarResource({
+        const record = parseAvatarModelRecord(candidate);
+        const bytes = await readVerifiedAvatarResource({
           root: this.#modelRoot,
           relativePath: record.skinAsset,
           maximumBytes: MAX_APPROVED_SKIN_BYTES,
         });
         validateMinecraftSkin(bytes);
+        const actualDigest = sha256(bytes);
+        if (actualDigest !== record.skinSha256) {
+          throw new AvatarApprovedSkinCatalogError(
+            "AVATAR_DIGEST_MISMATCH",
+            "approved avatar skin digest changed",
+          );
+        }
+        skins.push(
+          Object.freeze({
+            id: record.id,
+            origin: record.origin,
+            skinAsset: record.skinAsset,
+            skinSha256: actualDigest,
+            armModel: record.armModel,
+          }),
+        );
       } catch (error) {
-        throw new AvatarApprovedSkinCatalogError(
-          "AVATAR_MODEL_FILE_INVALID",
-          "approved avatar skin is invalid",
-          { cause: error },
-        );
+        this.#diagnostic({
+          code:
+            error instanceof AvatarApprovedSkinCatalogError
+              ? error.code
+              : "AVATAR_MODEL_FILE_INVALID",
+          modelId: diagnosticModelId(candidate),
+        });
+        continue;
       }
-      const actualDigest = sha256(bytes);
-      if (actualDigest !== record.skinSha256) {
-        throw new AvatarApprovedSkinCatalogError(
-          "AVATAR_DIGEST_MISMATCH",
-          "approved avatar skin digest changed",
-        );
-      }
-      skins.push(
-        Object.freeze({
-          id: record.id,
-          origin: record.origin,
-          skinAsset: record.skinAsset,
-          skinSha256: actualDigest,
-          armModel: record.armModel,
-        }),
-      );
     }
+    if (skins.length === 0) return;
     await this.#file.write({ schemaVersion: 1, skins });
   }
+}
+
+function diagnosticModelId(candidate: AvatarAppearanceRecord): string {
+  return typeof candidate?.id === "string" &&
+    /^(?:builtin:whitelily|user:[0-9a-f-]{36})$/u.test(candidate.id)
+    ? candidate.id
+    : "catalog";
 }
 
 function validateDocument(value: unknown): ApprovedSkinCatalogDocument {

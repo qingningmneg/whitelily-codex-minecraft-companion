@@ -335,6 +335,18 @@ function createRegistryHarness(
 }
 
 describe("IPC registry", () => {
+  it("keeps non-avatar IPC registered when avatar composition is unavailable", () => {
+    const harness = createRegistryHarness();
+
+    expect(harness.handlers.has(WHITE_LILY_IPC_CHANNELS.status)).toBe(true);
+    expect(harness.handlers.has(WHITE_LILY_IPC_CHANNELS.stopTask)).toBe(true);
+    expect(harness.handlers.has(WHITE_LILY_IPC_CHANNELS.listAvatarModels)).toBe(false);
+    expect(harness.handlers.has(WHITE_LILY_IPC_CHANNELS.importAvatarModel)).toBe(false);
+    expect(harness.handlers.has(WHITE_LILY_IPC_CHANNELS.switchAvatarModel)).toBe(false);
+
+    harness.cleanup();
+  });
+
   it("registers path-free avatar handlers and removes their subscription on cleanup", async () => {
     let publish: Parameters<AvatarModelsPort["subscribe"]>[0] | undefined;
     const unsubscribeAvatarModels = vi.fn();

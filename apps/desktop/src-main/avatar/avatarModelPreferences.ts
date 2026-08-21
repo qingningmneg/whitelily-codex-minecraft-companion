@@ -9,9 +9,7 @@ import type { AvatarModelCatalog } from "./avatarModelCatalog.js";
 import { resolveAvatarModelPaths } from "./avatarModelPaths.js";
 
 export type AvatarModelPreferenceErrorCode =
-  | "AVATAR_PREFERENCE_CONFLICT"
-  | "AVATAR_PREFERENCE_INVALID"
-  | "AVATAR_MODEL_NOT_FOUND";
+  "AVATAR_PREFERENCE_CONFLICT" | "AVATAR_PREFERENCE_INVALID" | "AVATAR_MODEL_NOT_FOUND";
 
 export class AvatarModelPreferenceError extends Error {
   constructor(
@@ -127,13 +125,69 @@ export class AvatarModelPreferences {
     });
   }
 
-  async #readRaw(options: { readonly normalizeLegacy?: boolean } = {}): Promise<AvatarModelPreferenceSnapshot> {
+  async compensateActiveModelId(input: {
+    readonly catalog: AvatarModelCatalog;
+    readonly expectedRevision: number;
+    readonly activeModelId: string;
+    readonly committedRequestId: string;
+  }): Promise<AvatarModelPreferenceSnapshot> {
+    if (
+      !Number.isSafeInteger(input.expectedRevision) ||
+      input.expectedRevision < 0 ||
+      !COMMITTED_REQUEST_ID_PATTERN.test(input.committedRequestId)
+    ) {
+      throw new AvatarModelPreferenceError(
+        "AVATAR_PREFERENCE_INVALID",
+        "avatar model preference compensation is invalid",
+      );
+    }
+    const activeModelId = parseAvatarModelId(input.activeModelId);
+    if (!(await input.catalog.has(activeModelId))) {
+      throw new AvatarModelPreferenceError(
+        "AVATAR_MODEL_NOT_FOUND",
+        "avatar model preference compensation target is unavailable",
+      );
+    }
+    const key = await this.#file.coordinatorKey();
+    return serializePreferenceOperation(key, async () => {
+      const current = await this.#readRaw({ normalizeLegacy: false });
+      if (current.committedRequestId !== input.committedRequestId) {
+        throw new AvatarModelPreferenceError(
+          "AVATAR_PREFERENCE_CONFLICT",
+          "avatar model preference was committed by another request",
+        );
+      }
+      if (current.activeModelId === activeModelId) return current;
+      if (current.revision !== input.expectedRevision) {
+        throw new AvatarModelPreferenceError(
+          "AVATAR_PREFERENCE_CONFLICT",
+          "avatar model preference revision changed before compensation",
+        );
+      }
+      try {
+        return await this.#file.write({
+          schemaVersion: 1,
+          revision: current.revision + 1,
+          activeModelId,
+          committedRequestId: input.committedRequestId,
+        });
+      } catch (error) {
+        throw wrapPreferenceError(error);
+      }
+    });
+  }
+
+  async #readRaw(
+    options: { readonly normalizeLegacy?: boolean } = {},
+  ): Promise<AvatarModelPreferenceSnapshot> {
     await mkdir(this.#root, { recursive: true });
     try {
       await this.#file.writeIfAbsent(DEFAULT_AVATAR_MODEL_PREFERENCE);
       const current = await this.#file.read();
       if (current === undefined) throw new Error("avatar model preference is missing");
-      return options.normalizeLegacy === false ? current : await this.#migrateLegacyBuiltin(current);
+      return options.normalizeLegacy === false
+        ? current
+        : await this.#migrateLegacyBuiltin(current);
     } catch (error) {
       throw wrapPreferenceError(error);
     }

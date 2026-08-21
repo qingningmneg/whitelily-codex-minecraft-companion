@@ -24,6 +24,8 @@ public final class AvatarModelController {
   private AvatarModelControlRequest pendingRequest;
   private CompletableFuture<PreparedCandidate> preparation;
   private boolean commitRequested;
+  private boolean awaitingFinalization;
+  private boolean finalizedCheckpoint;
   private boolean worldAvailable;
   private String worldSessionId;
   private long generation;
@@ -63,6 +65,7 @@ public final class AvatarModelController {
       switch (request.operation()) {
         case PREPARE -> launch = beginPreparation(request);
         case COMMIT -> requestCommit(request);
+        case FINALIZE -> finalizeCommit(request);
         case CANCEL -> cancel(request);
       }
     }
@@ -99,14 +102,9 @@ public final class AvatarModelController {
     if (visibleCandidate == null || pendingRequest == null) return;
     PreparedCandidate candidate = visibleCandidate;
     AvatarModelControlRequest request = pendingRequest;
-    visibleCandidate = null;
-    pendingRequest = null;
     if (result == AvatarVisibleFrameResult.COMPLETE) {
-      confirmedActiveModelId = candidate.modelId();
-      publish(AvatarModelPhase.COMMITTED, request, null);
-      if (oldCandidate != null) runtime.release(oldCandidate);
-      oldCandidate = null;
-      oldActiveModelId = null;
+      awaitingFinalization = true;
+      publish(AvatarModelPhase.VISIBLE, request, null);
       return;
     }
     runtime.cancel(candidate);
@@ -115,21 +113,30 @@ public final class AvatarModelController {
     confirmedActiveModelId = oldActiveModelId == null ? confirmedActiveModelId : oldActiveModelId;
     oldCandidate = null;
     oldActiveModelId = null;
+    visibleCandidate = null;
+    pendingRequest = null;
     publish(AvatarModelPhase.FAILED, request, "AVATAR_FRAME_FAILED");
   }
 
   public synchronized void cancelForWorldChange() {
     AvatarModelControlRequest request = pendingRequest;
     if (request != null) {
-      discardPending();
-      publish(AvatarModelPhase.CANCELLED, request, null);
+      if (finalizedCheckpoint) {
+        sealFinalizedCheckpoint();
+      } else {
+        discardPending();
+        publish(AvatarModelPhase.CANCELLED, request, null);
+      }
     }
     worldAvailable = false;
     worldSessionId = null;
   }
 
   public synchronized void beginWorldSession() {
-    if (pendingRequest != null) discardPending();
+    if (pendingRequest != null) {
+      if (finalizedCheckpoint) sealFinalizedCheckpoint();
+      else discardPending();
+    }
     worldSessionId = null;
     worldAvailable = true;
   }
@@ -146,7 +153,10 @@ public final class AvatarModelController {
     if (request.candidate() == null || !request.modelId().equals(request.candidate().modelId())) {
       return null;
     }
-    if (pendingRequest != null) discardPending();
+    if (pendingRequest != null) {
+      if (finalizedCheckpoint) sealFinalizedCheckpoint();
+      else discardPending();
+    }
     pendingRequest = request;
     long capturedGeneration = ++generation;
     publish(AvatarModelPhase.PREPARING, request, null);
@@ -221,11 +231,27 @@ public final class AvatarModelController {
     publish(AvatarModelPhase.CANCELLED, request, null);
   }
 
+  private void finalizeCommit(AvatarModelControlRequest request) {
+    if (pendingRequest == null
+        || visibleCandidate == null
+        || !awaitingFinalization
+        || !pendingRequest.requestId().equals(request.requestId())
+        || !pendingRequest.modelId().equals(request.modelId())) {
+      return;
+    }
+    confirmedActiveModelId = visibleCandidate.modelId();
+    publish(AvatarModelPhase.COMMITTED, request, null);
+    awaitingFinalization = false;
+    finalizedCheckpoint = true;
+  }
+
   private void discardPending() {
     generation++;
     if (preparation != null) preparation.cancel(true);
     preparation = null;
     commitRequested = false;
+    awaitingFinalization = false;
+    finalizedCheckpoint = false;
     if (readyCandidate != null) {
       runtime.cancel(readyCandidate);
       runtime.release(readyCandidate);
@@ -243,11 +269,20 @@ public final class AvatarModelController {
     pendingRequest = null;
   }
 
+  private void sealFinalizedCheckpoint() {
+    if (oldCandidate != null) runtime.release(oldCandidate);
+    oldCandidate = null;
+    oldActiveModelId = null;
+    visibleCandidate = null;
+    pendingRequest = null;
+    finalizedCheckpoint = false;
+  }
+
   private void publish(
       AvatarModelPhase phase, AvatarModelControlRequest request, String errorCode) {
     String candidateModelId =
         switch (phase) {
-          case PREPARING, READY, COMMITTED -> request.modelId();
+          case PREPARING, READY, VISIBLE, COMMITTED -> request.modelId();
           case CANCELLED, FAILED -> request.modelId();
         };
     statePublisher.accept(

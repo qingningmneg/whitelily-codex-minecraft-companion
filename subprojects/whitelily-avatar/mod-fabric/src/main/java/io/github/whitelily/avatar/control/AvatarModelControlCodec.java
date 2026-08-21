@@ -59,7 +59,11 @@ public final class AvatarModelControlCodec {
     validateRequestId(state.requestId());
     validateWorldId(state.worldSessionId());
     if ((state.phase() == AvatarModelPhase.FAILED) != (state.errorCode() != null)
-        || (Set.of(AvatarModelPhase.PREPARING, AvatarModelPhase.READY, AvatarModelPhase.COMMITTED)
+        || (Set.of(
+                    AvatarModelPhase.PREPARING,
+                    AvatarModelPhase.READY,
+                    AvatarModelPhase.VISIBLE,
+                    AvatarModelPhase.COMMITTED)
                 .contains(state.phase())
             && state.candidateModelId() == null)
         || (state.phase() == AvatarModelPhase.COMMITTED
@@ -95,6 +99,7 @@ public final class AvatarModelControlCodec {
         switch (operationText) {
           case "prepare" -> AvatarModelOperation.PREPARE;
           case "commit" -> AvatarModelOperation.COMMIT;
+          case "finalize" -> AvatarModelOperation.FINALIZE;
           case "cancel" -> AvatarModelOperation.CANCEL;
           default -> throw invalid("avatar control operation is invalid");
         };

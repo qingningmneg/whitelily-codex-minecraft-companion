@@ -113,12 +113,11 @@ public final class NativeSkinCandidateRuntime implements AvatarCandidateRuntime 
   /** Consumes the candidate waiting for its first successfully applied vanilla frame. */
   public synchronized Optional<PreparedCandidate> consumeVisibleCommit() {
     NativeCandidate candidate = awaitingVisible.getAndSet(null);
-    if (candidate != null) candidate.committed = true;
     return Optional.ofNullable(candidate);
   }
 
   private void rollback(NativeCandidate candidate) {
-    if (!candidate.activated || candidate.committed || candidate.previous == null) return;
+    if (!candidate.activated || candidate.previous == null) return;
     visibleCatalog.restore(candidate.previous);
     candidate.activated = false;
   }
@@ -194,7 +193,6 @@ public final class NativeSkinCandidateRuntime implements AvatarCandidateRuntime 
     private final RegisteredSkin registered;
     private WhiteLilySkinCatalog.Selection previous;
     private boolean activated;
-    private boolean committed;
     private boolean released;
 
     private NativeCandidate(

@@ -53,8 +53,18 @@ final class RuntimeBridgeApprovalContractTest {
     WhiteLilyAvatarClient.onRenderBoundary(controller);
     WhiteLilyAvatarClient.onNativeSkinFrameVisible(runtime, controller);
     WhiteLilyAvatarClient.onNativeSkinFrameVisible(runtime, controller);
+    controller.accept(
+        new AvatarModelControlRequest(
+            1,
+            "switch-0001",
+            AvatarModelOperation.FINALIZE,
+            descriptor.modelId(),
+            "world-0001",
+            null,
+            Instant.parse("2026-08-21T08:00:02Z")));
 
     assertEquals(descriptor.modelId(), controller.confirmedActiveModelId());
+    assertEquals(1, states.stream().filter(state -> state.phase() == AvatarModelPhase.VISIBLE).count());
     assertEquals(
         1,
         states.stream().filter(state -> state.phase() == AvatarModelPhase.COMMITTED).count());

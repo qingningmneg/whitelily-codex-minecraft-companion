@@ -24,9 +24,25 @@ describe("native skin appearance flow", () => {
     await app.restart();
     expect((await app.list()).activeModelId).toBe("builtin:whitelily");
   });
+
+  it("restores the previous selection across restart when persistence fails after visibility", async () => {
+    const app = launchHarness({ activeModelId: "builtin:whitelily", preferenceFailure: true });
+    const imported = "user:00000000-0000-4000-8000-000000000001";
+    const switching = app.switchTo(imported);
+    await app.expectRequest("prepare");
+    app.fabricReply("ready");
+    await app.expectRequest("commit");
+    app.fabricReply("visible");
+
+    await expect(switching).rejects.toMatchObject({ code: "AVATAR_SWITCH_FAILED" });
+    await app.expectRequest("cancel");
+    expect((await app.list()).activeModelId).toBe("builtin:whitelily");
+    await app.restart();
+    expect((await app.list()).activeModelId).toBe("builtin:whitelily");
+  });
 });
 
-function launchHarness(options: { activeModelId: string }) {
+function launchHarness(options: { activeModelId: string; preferenceFailure?: boolean }) {
   let preference = { schemaVersion: 1 as const, revision: 0, activeModelId: options.activeModelId };
   const mailbox = new HarnessMailbox();
   const catalog = {
@@ -42,6 +58,18 @@ function launchHarness(options: { activeModelId: string }) {
     read: async () => ({ ...preference }),
     readActiveModelId: async () => preference.activeModelId,
     commitActiveModelId: async (input: { activeModelId: string; committedRequestId: string }) => {
+      if (options.preferenceFailure) throw new Error("preference write failed");
+      preference = {
+        schemaVersion: 1,
+        revision: preference.revision + 1,
+        activeModelId: input.activeModelId,
+      };
+      return { ...preference, committedRequestId: input.committedRequestId };
+    },
+    compensateActiveModelId: async (input: {
+      activeModelId: string;
+      committedRequestId: string;
+    }) => {
       preference = {
         schemaVersion: 1,
         revision: preference.revision + 1,

@@ -500,8 +500,8 @@ val stageMinecraftComponents = tasks.register("stageMinecraftComponents") {
       listOf(
         Triple("fabric-api-0.128.2+1.21.5.jar", 2_248_994, "a82fd00827206e911936ed1e0ceaec6eb55d061ca5d3c5d63c7f0031426d29ae"),
         Triple("Fabric-API-LICENSE.txt", 11_357, "b40930bbcf80744c86c46a12bc9da056641d722716c378f5659b9e555ef833e1"),
-        Triple("minecraft-components-manifest.json", 1_624, "f85607f9c41dc567b8925c74b8d1454990be5f869f6f703ac201a309415a9817"),
-        Triple("whitelily-avatar-fabric-1.21.5-0.1.0.jar", 255_715, "43eec15d55dc56a3daae6319c9f3cc9289fbcd76549f6d6a6ceeab6f419e13b4"),
+        Triple("minecraft-components-manifest.json", 1_624, "acf58b6935c1cb2ff1f9607874e6b1dbe0219e81453551b121d4adc184782ff5"),
+        Triple("whitelily-avatar-fabric-1.21.5-0.1.0.jar", 255_675, "426225094514c0fc2752e7beaab256322a0612a75b564bf509c64ae52d4c636f"),
         Triple("whitelily-bridge-fabric-1.21.5-0.1.2.jar", 53_984, "ac5bfab545b723b2346aeb017b3a6ea3186a6cbced370e16097f3836b128746d"),
         Triple("WhiteLily-LICENSE.txt", 11_123, "226d0e41f61309952c27fcc11a5140c4e735115f702ff0484ff0c25cfbbeee16"),
         Triple("WhiteLily-NOTICE.txt", 795, "bc5ab24ff5624664bc3ef3d5b850ac3c820dddf3b2f15a4125b355f1c65a2c2a"),

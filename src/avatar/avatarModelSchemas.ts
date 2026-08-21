@@ -189,10 +189,14 @@ const commitRequestSchema = z
   .strict();
 
 const cancelRequestSchema = commitRequestSchema.extend({ operation: z.literal("cancel") }).strict();
+const finalizeRequestSchema = commitRequestSchema
+  .extend({ operation: z.literal("finalize") })
+  .strict();
 
 export const avatarModelControlRequestSchema = z.discriminatedUnion("operation", [
   prepareRequestSchema,
   commitRequestSchema,
+  finalizeRequestSchema,
   cancelRequestSchema,
 ]);
 
@@ -200,7 +204,7 @@ export const avatarModelControlStateSchema = z
   .object({
     schemaVersion: z.literal(1),
     requestId: requestIdSchema,
-    phase: z.enum(["preparing", "ready", "committed", "cancelled", "failed"]),
+    phase: z.enum(["preparing", "ready", "visible", "committed", "cancelled", "failed"]),
     activeModelId: avatarModelIdSchema,
     candidateModelId: avatarModelIdSchema.optional(),
     worldSessionId: worldSessionIdSchema,
@@ -209,7 +213,10 @@ export const avatarModelControlStateSchema = z
   })
   .strict()
   .superRefine(({ phase, activeModelId, candidateModelId, errorCode }, context) => {
-    if (["preparing", "ready", "committed"].includes(phase) && candidateModelId === undefined) {
+    if (
+      ["preparing", "ready", "visible", "committed"].includes(phase) &&
+      candidateModelId === undefined
+    ) {
       context.addIssue({ code: "custom", message: "candidate avatar model is missing" });
     }
     if (phase === "committed" && activeModelId !== candidateModelId) {

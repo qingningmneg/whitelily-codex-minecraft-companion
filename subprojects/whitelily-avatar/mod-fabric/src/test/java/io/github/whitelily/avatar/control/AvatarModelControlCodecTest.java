@@ -26,6 +26,31 @@ final class AvatarModelControlCodecTest {
   }
 
   @Test
+  void parsesPathFreeFinalizeWithinMailboxSchemaVersionOne(@TempDir Path temporary)
+      throws Exception {
+    Path path = temporary.resolve("finalize.json");
+    Files.writeString(
+        path,
+        """
+        {
+          "schemaVersion": 1,
+          "requestId": "switch-0001",
+          "operation": "finalize",
+          "modelId": "builtin:whitelily",
+          "worldSessionId": "world-0001",
+          "issuedAt": "2026-08-21T00:00:02.000Z"
+        }
+        """,
+        UTF_8);
+
+    AvatarModelControlRequest request = codec.read(path);
+
+    assertEquals(1, request.schemaVersion());
+    assertEquals(AvatarModelOperation.FINALIZE, request.operation());
+    assertEquals(null, request.candidate());
+  }
+
+  @Test
   void rejectsCandidatesWithSkinOrLegacy3dFields(@TempDir Path temporary) throws Exception {
     for (String extra :
         new String[] {
@@ -102,6 +127,26 @@ final class AvatarModelControlCodecTest {
     String encoded = new String(codec.write(state), UTF_8);
 
     assertTrue(encoded.contains("\"updatedAt\":\"2026-08-21T00:00:01.000Z\""));
+  }
+
+  @Test
+  void writesTheReversibleVisiblePhaseWithinMailboxSchemaVersionOne() throws Exception {
+    AvatarModelControlState state =
+        new AvatarModelControlState(
+            1,
+            "switch-0001",
+            AvatarModelPhase.VISIBLE,
+            "builtin:whitelily",
+            "user:00000000-0000-4000-8000-000000000001",
+            "world-0001",
+            null,
+            Instant.parse("2026-08-21T00:00:01Z"));
+
+    String encoded = new String(codec.write(state), UTF_8);
+
+    assertTrue(encoded.contains("\"schemaVersion\":1"));
+    assertTrue(encoded.contains("\"phase\":\"visible\""));
+    assertTrue(!encoded.contains("skinAsset"));
   }
 
   private static Path writeCandidate(Path directory, String name, String candidateExtra)

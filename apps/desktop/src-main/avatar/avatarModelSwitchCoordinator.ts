@@ -31,6 +31,12 @@ interface AvatarModelPreferencesPort {
     readonly activeModelId: string;
     readonly committedRequestId: string;
   }): Promise<AvatarModelPreferenceSnapshot>;
+  compensateActiveModelId(input: {
+    readonly catalog: AvatarModelCatalogPort;
+    readonly expectedRevision: number;
+    readonly activeModelId: string;
+    readonly committedRequestId: string;
+  }): Promise<AvatarModelPreferenceSnapshot>;
 }
 
 export type AvatarModelSwitchErrorCode =
@@ -38,7 +44,8 @@ export type AvatarModelSwitchErrorCode =
   | "AVATAR_SWITCH_FAILED"
   | "AVATAR_WORLD_CHANGED"
   | "AVATAR_BRIDGE_DISCONNECTED"
-  | "AVATAR_PREFERENCE_CONFLICT";
+  | "AVATAR_PREFERENCE_CONFLICT"
+  | "AVATAR_PREFERENCE_COMPENSATION_FAILED";
 
 export class AvatarModelSwitchError extends Error {
   constructor(
@@ -73,6 +80,7 @@ interface PendingSwitch {
   readonly controller: AbortController;
   worldSessionId?: string;
   oldActiveModelId?: string;
+  persistedPreference?: AvatarModelPreferenceSnapshot;
   preparePublished: boolean;
   completion: Promise<AvatarModelCatalogSnapshot>;
 }
@@ -211,22 +219,22 @@ export class AvatarModelSwitchCoordinator {
       this.#throwIfAborted(transaction);
 
       await this.#mailbox.publish(this.#controlRequest("commit", transaction, worldSessionId));
-      const committed = await this.#mailbox.waitForState({
+      const visible = await this.#mailbox.waitForState({
         requestId: transaction.requestId,
-        accepted: ["committed", "failed", "cancelled"],
+        accepted: ["visible", "failed", "cancelled"],
         signal: transaction.controller.signal,
         timeoutMs: this.#commitTimeoutMs,
       });
-      this.#assertMatchingState(committed, transaction, worldSessionId);
-      if (committed.phase !== "committed" || committed.activeModelId !== transaction.modelId) {
-        throw this.#stateFailure(committed);
-      }
+      this.#assertMatchingState(visible, transaction, worldSessionId);
+      if (visible.phase !== "visible") throw this.#stateFailure(visible);
       this.#assertWorldUnchanged(worldSessionId);
       this.#throwIfAborted(transaction);
 
+      const snapshot = await this.#projectSnapshot(transaction.modelId);
+      this.#publishProjectedValue(snapshot);
       if (persistSelection) {
         try {
-          await this.#preferences.commitActiveModelId({
+          transaction.persistedPreference = await this.#preferences.commitActiveModelId({
             catalog: this.#catalog,
             expectedRevision: preference.revision,
             activeModelId: transaction.modelId,
@@ -243,8 +251,19 @@ export class AvatarModelSwitchCoordinator {
           throw error;
         }
       }
-      const snapshot = await this.#projectSnapshot(transaction.modelId);
-      this.#publishProjectedValue(snapshot);
+      await this.#mailbox.publish(this.#controlRequest("finalize", transaction, worldSessionId));
+      const committed = await this.#mailbox.waitForState({
+        requestId: transaction.requestId,
+        accepted: ["committed", "failed", "cancelled"],
+        signal: transaction.controller.signal,
+        timeoutMs: this.#commitTimeoutMs,
+      });
+      this.#assertMatchingState(committed, transaction, worldSessionId);
+      if (committed.phase !== "committed" || committed.activeModelId !== transaction.modelId) {
+        throw this.#stateFailure(committed);
+      }
+      this.#assertWorldUnchanged(worldSessionId);
+      this.#throwIfAborted(transaction);
       return snapshot;
     } catch (error) {
       await this.#rollback(transaction);
@@ -253,6 +272,30 @@ export class AvatarModelSwitchCoordinator {
   }
 
   async #rollback(transaction: PendingSwitch): Promise<void> {
+    if (
+      transaction.persistedPreference !== undefined &&
+      transaction.oldActiveModelId !== undefined
+    ) {
+      try {
+        await this.#preferences.compensateActiveModelId({
+          catalog: this.#catalog,
+          expectedRevision: transaction.persistedPreference.revision,
+          activeModelId: transaction.oldActiveModelId,
+          committedRequestId: transaction.requestId,
+        });
+      } catch (error) {
+        if (transaction.worldSessionId !== undefined) {
+          await this.#mailbox
+            .publish(this.#controlRequest("finalize", transaction, transaction.worldSessionId))
+            .catch(() => undefined);
+        }
+        throw new AvatarModelSwitchError(
+          "AVATAR_PREFERENCE_COMPENSATION_FAILED",
+          "avatar model preference compensation failed",
+          { cause: error },
+        );
+      }
+    }
     if (transaction.preparePublished && transaction.worldSessionId !== undefined) {
       await this.#mailbox
         .publish(this.#controlRequest("cancel", transaction, transaction.worldSessionId))
@@ -280,7 +323,7 @@ export class AvatarModelSwitchCoordinator {
   }
 
   #controlRequest(
-    operation: "commit" | "cancel",
+    operation: "commit" | "finalize" | "cancel",
     transaction: PendingSwitch,
     worldSessionId: string,
   ): AvatarModelControlRequest {

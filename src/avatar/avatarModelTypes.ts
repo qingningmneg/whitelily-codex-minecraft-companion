@@ -64,7 +64,7 @@ export type AvatarModelControlRequest =
   | {
       readonly schemaVersion: 1;
       readonly requestId: string;
-      readonly operation: "commit" | "cancel";
+      readonly operation: "commit" | "finalize" | "cancel";
       readonly modelId: AvatarModelId;
       readonly worldSessionId: string;
       readonly issuedAt: string;
@@ -73,7 +73,7 @@ export type AvatarModelControlRequest =
 export interface AvatarModelControlState {
   readonly schemaVersion: 1;
   readonly requestId: string;
-  readonly phase: "preparing" | "ready" | "committed" | "cancelled" | "failed";
+  readonly phase: "preparing" | "ready" | "visible" | "committed" | "cancelled" | "failed";
   readonly activeModelId: AvatarModelId;
   readonly candidateModelId?: AvatarModelId | undefined;
   readonly worldSessionId: string;
