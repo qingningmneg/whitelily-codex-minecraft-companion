@@ -1,11 +1,59 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { copyFile, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { validateAvatarAssets } from "./validate-assets.mjs";
 
 const ASSET_ROOT = fileURLToPath(new URL("../assets/", import.meta.url));
+const RESOURCE_ROOT = fileURLToPath(
+  new URL("../mod-fabric/src/main/resources/", import.meta.url),
+);
+const THEMES = ["base", "leather", "iron", "gold", "diamond", "netherite"];
+
+function digest(bytes) {
+  return createHash("sha256").update(bytes).digest("hex").toUpperCase();
+}
+
+async function fixture(mutate) {
+  const root = await mkdtemp(join(tmpdir(), "whitelily-native-skin-"));
+  const assets = join(root, "assets");
+  const resources = join(root, "mod-fabric", "src", "main", "resources");
+  const manifest = JSON.parse(await readFile(join(ASSET_ROOT, "manifest.json"), "utf8"));
+  manifest.researchAssetDirectories = [];
+  manifest.researchRuntimeAssets = [];
+  for (const theme of THEMES) {
+    for (const relative of [
+      `assets/whitelily_avatar/textures/skin/${theme}.png`,
+      `previews/skins/${theme}-front.png`,
+      `concepts/${theme}.png`,
+    ]) {
+      const source = relative.startsWith("assets/") ? join(RESOURCE_ROOT, ...relative.split("/")) : join(ASSET_ROOT, ...relative.split("/"));
+      const destination = relative.startsWith("assets/") ? join(resources, ...relative.split("/")) : join(assets, ...relative.split("/"));
+      await mkdir(join(destination, ".."), { recursive: true });
+      await copyFile(source, destination);
+    }
+  }
+  for (const relative of ["source/asset-license.json", "source/whitelily-turnaround.png", "source/whitelily-armor-themes.png"]) {
+    const destination = join(assets, ...relative.split("/"));
+    await mkdir(join(destination, ".."), { recursive: true });
+    await copyFile(join(ASSET_ROOT, ...relative.split("/")), destination);
+  }
+  await mutate({ assets, resources, manifest });
+  await writeFile(join(assets, "manifest.json"), JSON.stringify(manifest));
+  return { root, assets, resources };
+}
+
+async function rejectsFixture(mutate, expected) {
+  const { root, assets } = await fixture(mutate);
+  try {
+    await assert.rejects(validateAvatarAssets(assets), expected);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}
 
 test("declares the native slim renderer and six exact skins", async () => {
   const manifest = JSON.parse(await readFile(join(ASSET_ROOT, "manifest.json"), "utf8"));
@@ -42,5 +90,49 @@ test("classifies retained Blender, Gecko, and entity files as research assets", 
   );
   assert.ok(
     manifest.researchRuntimeAssets.some(({ path }) => path.includes("textures/entity/base.png")),
+  );
+});
+
+test("rejects duplicate source declarations", async () => {
+  await rejectsFixture(
+    async ({ manifest }) => {
+      manifest.sources = [manifest.sources[0], manifest.sources[0]];
+    },
+    /invalid source declarations/i,
+  );
+});
+
+test("rejects a malformed skin PNG even when its runtime hash is coordinated", async () => {
+  await rejectsFixture(
+    async ({ manifest, resources }) => {
+      const bytes = Buffer.from("not a PNG");
+      const skin = manifest.runtimeAssets[0];
+      skin.sha256 = digest(bytes);
+      await writeFile(join(resources, ...skin.path.split("/")), bytes);
+    },
+    /64x64 RGBA PNG/i,
+  );
+});
+
+test("rejects runtime hash tampering, traversal paths, and unknown resource files", async () => {
+  await rejectsFixture(
+    async ({ manifest }) => {
+      manifest.runtimeAssets[0].sha256 = "0".repeat(64);
+    },
+    /runtime asset SHA-256 mismatch/i,
+  );
+  await rejectsFixture(
+    async ({ manifest }) => {
+      manifest.runtimeAssets[0].path = "assets/whitelily_avatar/textures/skin/../base.png";
+    },
+    /invalid runtime asset declarations|unsafe manifest path/i,
+  );
+  await rejectsFixture(
+    async ({ resources }) => {
+      const unknown = join(resources, "assets", "whitelily_avatar", "textures", "skin", "orphan.png");
+      await mkdir(join(unknown, ".."), { recursive: true });
+      await writeFile(unknown, Buffer.from("unknown"));
+    },
+    /undeclared runtime asset/i,
   );
 });

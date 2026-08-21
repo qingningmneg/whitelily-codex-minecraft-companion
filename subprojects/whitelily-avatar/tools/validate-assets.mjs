@@ -806,11 +806,20 @@ async function validateNativeSkinAssets(assetRoot, resourceRoot, namespaceRoot, 
   if (!Array.isArray(manifest.sources) || manifest.sources.length !== EXPECTED_SOURCES.size) {
     throw failure("invalid source declarations");
   }
+  const declaredSources = new Set();
   for (const source of manifest.sources) {
     const safePath = safeAssetPath(assetRoot, source?.path);
     const expectedHash = EXPECTED_SOURCES.get(safePath.declaredPath);
     const bytes = await regularFile(safePath.resolved, "missing approved source image", MAX_SOURCE_IMAGE_BYTES);
-    if (source.sha256 !== expectedHash || sourceDigest(bytes) !== expectedHash) throw failure("source SHA-256 mismatch");
+    if (
+      !expectedHash ||
+      declaredSources.has(safePath.declaredPath) ||
+      source.sha256 !== expectedHash ||
+      sourceDigest(bytes) !== expectedHash
+    ) {
+      throw failure("invalid source declarations");
+    }
+    declaredSources.add(safePath.declaredPath);
     declaredAssetFiles.add(safePath.declaredPath);
   }
 
@@ -869,7 +878,12 @@ export async function validateAvatarAssets(root) {
     throw failure("unsupported manifest schema");
   }
 
-  return validateNativeSkinAssets(assetRoot, resourceRoot, namespaceRoot, allFiles, manifest);
+  // Schema-v2 manifests without a renderer are historical migration inputs.  Native manifests
+  // always take the skin-only path above; the retained branch below remains callable only to
+  // validate those archived inputs while their research records are migrated.
+  if (manifest.worldRenderer !== undefined) {
+    return validateNativeSkinAssets(assetRoot, resourceRoot, namespaceRoot, allFiles, manifest);
+  }
 
   requireExactThemes(manifest.themes);
   const declaredAssetFiles = new Set(["manifest.json", "source/asset-license.json"]);
