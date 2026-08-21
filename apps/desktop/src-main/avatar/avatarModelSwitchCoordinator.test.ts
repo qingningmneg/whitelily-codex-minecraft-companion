@@ -59,7 +59,29 @@ describe("AvatarModelSwitchCoordinator", () => {
 
     await expect(switching).rejects.toMatchObject({ code: "AVATAR_SWITCH_FAILED" });
     expect(harness.commitActiveModelId).not.toHaveBeenCalled();
-    expect(harness.preference.activeModelId).toBe("builtin:whitelily-classic");
+    expect(harness.preference.activeModelId).toBe("builtin:whitelily");
+    await harness.mailbox.expectRequest("cancel", firstUserId);
+  });
+
+  it("keeps the previous skin when the first native frame fails", async () => {
+    const harness = createHarness();
+    const switching = harness.coordinator.switchTo(firstUserId);
+    const prepare = await harness.mailbox.expectRequest("prepare", firstUserId);
+
+    if (prepare.operation !== "prepare") throw new Error("expected prepare request");
+    expect(prepare.candidate).toEqual({
+      modelId: firstUserId,
+      origin: "imported",
+      worldRenderer: "minecraft-skin",
+      armModel: "slim",
+    });
+    harness.mailbox.reply("ready");
+    await harness.mailbox.expectRequest("commit", firstUserId);
+    harness.mailbox.reply("failed", { errorCode: "AVATAR_FRAME_FAILED" });
+
+    await expect(switching).rejects.toMatchObject({ code: "AVATAR_SWITCH_FAILED" });
+    expect(harness.preference.activeModelId).toBe("builtin:whitelily");
+    expect(harness.commitActiveModelId).not.toHaveBeenCalled();
     await harness.mailbox.expectRequest("cancel", firstUserId);
   });
 
@@ -91,8 +113,8 @@ describe("AvatarModelSwitchCoordinator", () => {
   it("makes selecting the already committed model idempotent", async () => {
     const harness = createHarness();
 
-    await expect(harness.coordinator.switchTo("builtin:whitelily-classic")).resolves.toMatchObject({
-      activeModelId: "builtin:whitelily-classic",
+    await expect(harness.coordinator.switchTo("builtin:whitelily")).resolves.toMatchObject({
+      activeModelId: "builtin:whitelily",
       pendingModelId: undefined,
     });
     expect(harness.mailbox.requests).toEqual([]);
@@ -103,9 +125,9 @@ describe("AvatarModelSwitchCoordinator", () => {
     const harness = createHarness();
     const reconciling = harness.coordinator.reconcilePersistedSelection();
 
-    await harness.mailbox.expectRequest("prepare", "builtin:whitelily-classic");
+    await harness.mailbox.expectRequest("prepare", "builtin:whitelily");
     harness.mailbox.reply("ready");
-    await harness.mailbox.expectRequest("commit", "builtin:whitelily-classic");
+    await harness.mailbox.expectRequest("commit", "builtin:whitelily");
     harness.mailbox.reply("committed");
 
     await expect(reconciling).resolves.toBeUndefined();
@@ -120,7 +142,7 @@ describe("AvatarModelSwitchCoordinator", () => {
     harness.mailbox.reply("committed");
 
     await expect(switching).rejects.toMatchObject({ code: "AVATAR_PREFERENCE_CONFLICT" });
-    expect(harness.preference.activeModelId).toBe("builtin:whitelily-classic");
+    expect(harness.preference.activeModelId).toBe("builtin:whitelily");
     await harness.mailbox.expectRequest("cancel", firstUserId);
   });
 
@@ -143,7 +165,7 @@ function createHarness(
   let preference: AvatarModelPreferenceSnapshot = {
     schemaVersion: 1,
     revision: 0,
-    activeModelId: "builtin:whitelily-classic",
+    activeModelId: "builtin:whitelily",
   };
   let descriptorReads = 0;
   const catalog = {
@@ -151,7 +173,7 @@ function createHarness(
       descriptorReads += 1;
       const value = descriptor(modelId);
       return options.digestDrift && descriptorReads > 1
-        ? { ...value, sha256: "b".repeat(64) }
+        ? { ...value, armModel: "wide" as const }
         : value;
     }),
     has: vi.fn(async () => true),
@@ -268,7 +290,7 @@ class FakeMailbox implements AvatarModelMailboxPort {
       schemaVersion: 1,
       requestId: request.requestId,
       phase,
-      activeModelId: phase === "committed" ? request.modelId : "builtin:whitelily-classic",
+      activeModelId: phase === "committed" ? request.modelId : "builtin:whitelily",
       candidateModelId: request.modelId,
       worldSessionId: request.worldSessionId,
       ...(phase === "failed" ? { errorCode: "AVATAR_SHADER_FAILED" } : {}),
@@ -283,35 +305,8 @@ function descriptor(modelId: string): AvatarRuntimeDescriptor {
   return {
     modelId,
     origin: builtin ? "builtin" : "imported",
-    format:
-      modelId === "builtin:whitelily-classic" ? "builtin-classic" : builtin ? "builtin-hd" : "glb",
-    resourcePath:
-      modelId === "builtin:whitelily-classic"
-        ? "builtin/whitelily-classic/whitelily.geo.json"
-        : builtin
-          ? "builtin/whitelily-hd/high.glb"
-          : `user/${modelId.slice("user:".length)}/model.glb`,
-    sha256: "a".repeat(64),
-    boneMapping: {
-      head: "Head",
-      neck: "Neck",
-      chest: "Chest",
-      hips: "Hips",
-      leftUpperArm: "LeftUpperArm",
-      leftLowerArm: "LeftLowerArm",
-      leftHand: "LeftHand",
-      rightUpperArm: "RightUpperArm",
-      rightLowerArm: "RightLowerArm",
-      rightHand: "RightHand",
-      leftUpperLeg: "LeftUpperLeg",
-      leftLowerLeg: "LeftLowerLeg",
-      leftFoot: "LeftFoot",
-      rightUpperLeg: "RightUpperLeg",
-      rightLowerLeg: "RightLowerLeg",
-      rightFoot: "RightFoot",
-    },
-    bodyAnimation: "whitelily-humanoid-v1",
-    expressions: builtin ? "full" : "neutral-only",
+    worldRenderer: "minecraft-skin",
+    armModel: "slim",
   };
 }
 
@@ -321,22 +316,28 @@ function snapshot(activeModelId: string, pendingModelId?: string): AvatarModelCa
     revision: 0,
     models: [
       {
-        id: "builtin:whitelily-hd",
-        displayName: "HD",
+        id: "builtin:whitelily",
+        displayName: "WhiteLily",
         origin: "builtin",
-        format: "builtin-hd",
+        worldRenderer: "minecraft-skin",
+        armModel: "slim",
         previewDataUrl,
-        bodyAnimation: "whitelily-humanoid-v1",
-        expressions: "full",
       },
       {
-        id: "builtin:whitelily-classic",
-        displayName: "Classic",
-        origin: "builtin",
-        format: "builtin-classic",
+        id: firstUserId,
+        displayName: "Imported one",
+        origin: "imported",
+        worldRenderer: "minecraft-skin",
+        armModel: "slim",
         previewDataUrl,
-        bodyAnimation: "whitelily-humanoid-v1",
-        expressions: "full",
+      },
+      {
+        id: secondUserId,
+        displayName: "Imported two",
+        origin: "imported",
+        worldRenderer: "minecraft-skin",
+        armModel: "slim",
+        previewDataUrl,
       },
     ],
     activeModelId,

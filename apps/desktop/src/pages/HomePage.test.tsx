@@ -490,7 +490,8 @@ describe("bilingual control-center home", () => {
 
     const navigation = screen.getByRole("navigation", { name: "主导航" });
     expect(navigation).toBeTruthy();
-    expect(navigation.textContent).not.toMatch(/[A-Za-z]/u);
+    expect(navigation.textContent).toContain("AI 模型");
+    expect(navigation.textContent?.replace("AI", "")).not.toMatch(/[A-Za-z]/u);
     expect(screen.getByRole("heading", { name: "运行概览" })).toBeTruthy();
     expect(screen.getByRole("heading", { name: "当前世界" })).toBeTruthy();
     expect(screen.queryByText("session_7F2A")).toBeNull();

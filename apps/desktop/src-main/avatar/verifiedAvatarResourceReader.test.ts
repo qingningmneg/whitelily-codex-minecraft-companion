@@ -80,6 +80,32 @@ describe("readVerifiedAvatarResource", () => {
     ).rejects.toThrow("avatar resource source changed during read");
   });
 
+  it("allows ancestor metadata churn when the directory identity remains stable", async () => {
+    const root = await createRoot();
+    const path = join(root, "skin.png");
+    await writeFile(path, "skin");
+    let rootStatCalls = 0;
+    const io: VerifiedAvatarResourceReaderIo = {
+      lstat: async (candidate, options) => {
+        const stats = await lstat(candidate, options);
+        if (candidate !== root || rootStatCalls++ === 0) return stats;
+        return new Proxy(stats, {
+          get(target, property, receiver) {
+            if (property === "mtimeNs") return target.mtimeNs + 1n;
+            if (property === "ctimeNs") return target.ctimeNs + 1n;
+            return Reflect.get(target, property, receiver);
+          },
+        });
+      },
+      realpath,
+      open: async (candidate, flags) => open(candidate, flags),
+    };
+
+    await expect(readVerifiedAvatarFile({ path, maximumBytes: 16, io })).resolves.toEqual(
+      Buffer.from("skin"),
+    );
+  });
+
   it("rejects growth and same-size file swaps for absolute picker sources", async () => {
     const root = await createRoot();
     const path = join(root, "skin.png");

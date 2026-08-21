@@ -11,6 +11,7 @@ public final class WhiteLilySkinCatalog {
   private static final String NAMESPACE = "whitelily_avatar";
 
   private final Map<ArmorTheme, PlayerSkin> skins;
+  private volatile Selection active = new Selection("builtin:whitelily", null);
 
   public WhiteLilySkinCatalog() {
     EnumMap<ArmorTheme, PlayerSkin> built = new EnumMap<>(ArmorTheme.class);
@@ -24,6 +25,24 @@ public final class WhiteLilySkinCatalog {
   }
 
   public PlayerSkin skinFor(ArmorTheme theme) {
+    PlayerSkin override = active.skin();
+    if (override != null) return override;
     return skins.getOrDefault(theme == null ? ArmorTheme.BASE : theme, skins.get(ArmorTheme.BASE));
   }
+
+  public String activeModelId() {
+    return active.modelId();
+  }
+
+  synchronized Selection activate(String modelId, PlayerSkin skin) {
+    Selection previous = active;
+    active = new Selection(modelId, skin);
+    return previous;
+  }
+
+  synchronized void restore(Selection selection) {
+    active = selection;
+  }
+
+  record Selection(String modelId, PlayerSkin skin) {}
 }

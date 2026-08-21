@@ -49,25 +49,15 @@ const avatarSnapshot = {
   revision: 2,
   models: [
     {
-      id: "builtin:whitelily-hd",
-      displayName: "WhiteLily 高清动漫",
+      id: "builtin:whitelily",
+      displayName: "WhiteLily",
       origin: "builtin",
-      format: "builtin-hd",
+      worldRenderer: "minecraft-skin",
+      armModel: "slim",
       previewDataUrl: "data:image/png;base64,iVBORw0KGgo=",
-      bodyAnimation: "whitelily-humanoid-v1",
-      expressions: "full",
-    },
-    {
-      id: "builtin:whitelily-classic",
-      displayName: "WhiteLily 经典",
-      origin: "builtin",
-      format: "builtin-classic",
-      previewDataUrl: "data:image/png;base64,iVBORw0KGgo=",
-      bodyAnimation: "whitelily-humanoid-v1",
-      expressions: "full",
     },
   ],
-  activeModelId: "builtin:whitelily-hd",
+  activeModelId: "builtin:whitelily",
 } as const;
 
 const pcl2Candidates = [
@@ -376,11 +366,11 @@ describe("IPC registry", () => {
       value: { status: "cancelled" },
     });
     await expect(
-      harness.invoke(WHITE_LILY_IPC_CHANNELS.switchAvatarModel, "builtin:whitelily-classic"),
+      harness.invoke(WHITE_LILY_IPC_CHANNELS.switchAvatarModel, "builtin:whitelily"),
     ).resolves.toEqual({ status: "success", value: avatarSnapshot });
     expect(list).toHaveBeenCalledOnce();
     expect(importFromPicker).toHaveBeenCalledOnce();
-    expect(switchTo).toHaveBeenCalledWith("builtin:whitelily-classic");
+    expect(switchTo).toHaveBeenCalledWith("builtin:whitelily");
 
     await expect(
       harness.invoke(WHITE_LILY_IPC_CHANNELS.importAvatarModel, String.raw`C:\secret.glb`),
@@ -431,7 +421,9 @@ describe("IPC registry", () => {
     const avatarModels: AvatarModelsPort = {
       list: vi.fn(async () => structuredClone(avatarSnapshot)),
       importFromPicker: vi.fn(async () => {
-        throw Object.assign(new Error("private importer detail"), { code: "AVATAR_UNKNOWN_INTERNAL" });
+        throw Object.assign(new Error("private importer detail"), {
+          code: "AVATAR_UNKNOWN_INTERNAL",
+        });
       }),
       switchTo: vi.fn(async () => structuredClone(avatarSnapshot)),
       subscribe: vi.fn(() => vi.fn()),

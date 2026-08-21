@@ -197,13 +197,13 @@ const minecraftComponentFiles = [
     source: "build/minecraft-components/minecraft-components-manifest.json",
     target: "minecraft-components/minecraft-components-manifest.json",
     bytes: 1_624,
-    sha256: "ab184d3351b274e5af387ba5c20dd3f989571048c318ba5ae66cb810374f50b3",
+    sha256: "acf58b6935c1cb2ff1f9607874e6b1dbe0219e81453551b121d4adc184782ff5",
   },
   {
     source: "build/minecraft-components/whitelily-avatar-fabric-1.21.5-0.1.0.jar",
     target: "minecraft-components/whitelily-avatar-fabric-1.21.5-0.1.0.jar",
-    bytes: 239_985,
-    sha256: "1fdba2b89281d7dbfb96d8e2ab3637caf95b20452831377f46e5285d37531351",
+    bytes: 255_675,
+    sha256: "426225094514c0fc2752e7beaab256322a0612a75b564bf509c64ae52d4c636f",
   },
   {
     source: "build/minecraft-components/whitelily-bridge-fabric-1.21.5-0.1.2.jar",

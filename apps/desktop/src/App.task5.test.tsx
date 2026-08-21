@@ -140,25 +140,24 @@ function createAppApi(
       revision: 1,
       models: [
         {
-          id: "builtin:whitelily-hd",
-          displayName: "WhiteLily 高清动漫 3D 模型设定图",
+          id: "builtin:whitelily",
+          displayName: "WhiteLily",
           origin: "builtin" as const,
-          format: "builtin-hd" as const,
+          worldRenderer: "minecraft-skin" as const,
+          armModel: "slim" as const,
           previewDataUrl: "data:image/png;base64,AA==",
-          bodyAnimation: "whitelily-humanoid-v1" as const,
-          expressions: "full" as const,
+          portraitDataUrl: "data:image/png;base64,AA==",
         },
         {
-          id: "builtin:whitelily-classic",
-          displayName: "WhiteLily Classic",
-          origin: "builtin" as const,
-          format: "builtin-classic" as const,
+          id: "user:00000000-0000-4000-8000-000000000001",
+          displayName: "Imported skin",
+          origin: "imported" as const,
+          worldRenderer: "minecraft-skin" as const,
+          armModel: "wide" as const,
           previewDataUrl: "data:image/png;base64,AA==",
-          bodyAnimation: "whitelily-humanoid-v1" as const,
-          expressions: "full" as const,
         },
       ],
-      activeModelId: "builtin:whitelily-hd",
+      activeModelId: "builtin:whitelily",
     })),
     importAvatarModel: vi.fn(async () => ({ status: "cancelled" as const })),
     switchAvatarModel: vi.fn(),
@@ -223,9 +222,9 @@ describe("Task 5 application routing", () => {
 
     expect(await screen.findByRole("heading", { name: "Models & appearance" })).toBeTruthy();
     expect(screen.getByRole("link", { name: "AI model" }).getAttribute("aria-current")).toBeNull();
-    expect(screen.getByRole("link", { name: "Models & appearance" }).getAttribute("aria-current")).toBe(
-      "page",
-    );
+    expect(
+      screen.getByRole("link", { name: "Models & appearance" }).getAttribute("aria-current"),
+    ).toBe("page");
     await waitFor(() => expect(harness.api.listAvatarModels).toHaveBeenCalledOnce());
   });
 

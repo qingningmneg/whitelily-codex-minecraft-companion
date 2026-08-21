@@ -185,6 +185,7 @@ describe("WhiteLily assisted Windows installer configuration", () => {
         },
       ],
       extraResources: [
+        { from: "resources/avatar", to: "avatar", filter: ["**/*"] },
         { from: "../../build/electron-bundle/core", to: "core", filter: ["**/*"] },
         { from: "../../build/electron-bundle/codex", to: "codex", filter: ["**/*"] },
         {

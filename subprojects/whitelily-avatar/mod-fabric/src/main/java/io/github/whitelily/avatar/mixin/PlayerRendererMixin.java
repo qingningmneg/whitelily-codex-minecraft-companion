@@ -2,7 +2,6 @@ package io.github.whitelily.avatar.mixin;
 
 import io.github.whitelily.avatar.WhiteLilyAvatarClient;
 import io.github.whitelily.avatar.render.NativeSkinStateApplication;
-import io.github.whitelily.avatar.skin.WhiteLilySkinCatalog;
 import net.minecraft.client.player.AbstractClientPlayer;
 import net.minecraft.client.renderer.entity.player.PlayerRenderer;
 import net.minecraft.client.renderer.entity.state.PlayerRenderState;
@@ -13,8 +12,6 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 @Mixin(PlayerRenderer.class)
 public abstract class PlayerRendererMixin {
-  private static final WhiteLilySkinCatalog SKINS = new WhiteLilySkinCatalog();
-
   @Inject(
       method =
           "extractRenderState(Lnet/minecraft/client/player/AbstractClientPlayer;"
@@ -32,7 +29,7 @@ public abstract class PlayerRendererMixin {
               WhiteLilyAvatarClient.onRenderBoundary(WhiteLilyAvatarClient.modelController());
               return WhiteLilyAvatarClient.renderRuntime().captureDecision(player);
             },
-            SKINS::skinFor);
+            WhiteLilyAvatarClient.skinCatalog()::skinFor);
     result.onApplied(WhiteLilyAvatarClient::onNativeSkinFrameVisible);
     result.reportFailure(WhiteLilyAvatarClient::reportNativeSkinFailure);
   }

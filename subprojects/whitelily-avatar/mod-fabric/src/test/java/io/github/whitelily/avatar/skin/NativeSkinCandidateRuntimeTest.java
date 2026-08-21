@@ -28,7 +28,6 @@ final class NativeSkinCandidateRuntimeTest {
         new AvatarRuntimeDescriptor[] {
           descriptor("builtin", "vrm", "slim"),
           descriptor("builtin", "minecraft-skin", "wide"),
-          descriptor("imported", "minecraft-skin", "wide"),
           new AvatarRuntimeDescriptor("builtin:whitelily", "builtin", "minecraft-skin", null)
         }) {
       CompletionException failure =

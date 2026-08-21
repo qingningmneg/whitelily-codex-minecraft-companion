@@ -79,12 +79,14 @@ export async function readVerifiedAvatarFile(input: {
       } catch {
         throw new Error("avatar resource source changed during read");
       }
-      if (
-        normalizePath(final.canonical) !== normalizePath(initial.canonical) ||
-        !sameSnapshot(initial.stats, final.stats) ||
-        !sameDirectorySnapshots(initial.ancestors, final.ancestors)
-      ) {
-        throw new Error("avatar resource source changed during read");
+      if (normalizePath(final.canonical) !== normalizePath(initial.canonical)) {
+        throw new Error("avatar resource source changed during read: canonical path");
+      }
+      if (!sameSnapshot(initial.stats, final.stats)) {
+        throw new Error("avatar resource source changed during read: file metadata");
+      }
+      if (!sameDirectorySnapshots(initial.ancestors, final.ancestors)) {
+        throw new Error("avatar resource source changed during read: ancestor identity");
       }
     },
   });
@@ -268,9 +270,13 @@ function sameDirectorySnapshots(
       (snapshot, index) =>
         normalizePath(snapshot.operationPath) === normalizePath(right[index]!.operationPath) &&
         normalizePath(snapshot.canonicalPath) === normalizePath(right[index]!.canonicalPath) &&
-        sameSnapshot(snapshot.stats, right[index]!.stats),
+        sameDirectoryIdentity(snapshot.stats, right[index]!.stats),
     )
   );
+}
+
+function sameDirectoryIdentity(left: BigIntStats, right: BigIntStats): boolean {
+  return left.dev === right.dev && left.ino === right.ino && left.birthtimeNs === right.birthtimeNs;
 }
 
 function normalizePath(path: string): string {

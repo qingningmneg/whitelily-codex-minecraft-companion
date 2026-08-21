@@ -6,6 +6,8 @@ import io.github.whitelily.avatar.control.AvatarModelMailbox;
 import io.github.whitelily.avatar.control.AvatarVisibleFrameResult;
 import io.github.whitelily.avatar.render.WhiteLilyRenderRuntime;
 import io.github.whitelily.avatar.skin.NativeSkinCandidateRuntime;
+import io.github.whitelily.avatar.skin.ApprovedSkinCatalog;
+import io.github.whitelily.avatar.skin.WhiteLilySkinCatalog;
 import java.nio.file.Path;
 import java.util.Optional;
 import java.util.concurrent.ArrayBlockingQueue;
@@ -27,8 +29,11 @@ public final class WhiteLilyAvatarClient implements ClientModInitializer {
       new WhiteLilyRenderRuntime();
   private static final NativeSkinFailureDiagnostics NATIVE_SKIN_FAILURE_DIAGNOSTICS =
       new NativeSkinFailureDiagnostics(System.err::println);
-  private static final NativeSkinCandidateRuntime CANDIDATE_RUNTIME =
-      new NativeSkinCandidateRuntime();
+  private static final WhiteLilySkinCatalog SKIN_CATALOG = new WhiteLilySkinCatalog();
+  private static volatile NativeSkinCandidateRuntime candidateRuntime =
+      new NativeSkinCandidateRuntime(null, SKIN_CATALOG, approved ->
+          java.util.concurrent.CompletableFuture.failedFuture(
+              new IllegalStateException("approved skin runtime is unavailable")));
   private static final long CONTROL_POLL_NANOS = 250_000_000L;
   private static final AtomicBoolean CONTROL_POLL_IN_FLIGHT = new AtomicBoolean();
   private static volatile AvatarModelController modelController;
@@ -80,12 +85,16 @@ public final class WhiteLilyAvatarClient implements ClientModInitializer {
     return modelController;
   }
 
+  public static WhiteLilySkinCatalog skinCatalog() {
+    return SKIN_CATALOG;
+  }
+
   public static void onRenderBoundary(AvatarModelController controller) {
     if (controller != null) controller.onRenderBoundary();
   }
 
   public static void onNativeSkinFrameVisible() {
-    onNativeSkinFrameVisible(CANDIDATE_RUNTIME, modelController);
+    onNativeSkinFrameVisible(candidateRuntime, modelController);
   }
 
   /** Narrow composition seam for the native candidate's first-visible-frame handoff. */
@@ -102,6 +111,8 @@ public final class WhiteLilyAvatarClient implements ClientModInitializer {
   }
 
   public static void reportNativeSkinFailure(RuntimeException error) {
+    AvatarModelController controller = modelController;
+    if (controller != null) controller.onVisibleFrameResult(AvatarVisibleFrameResult.FAILED);
     NATIVE_SKIN_FAILURE_DIAGNOSTICS.report(error);
   }
 
@@ -110,6 +121,8 @@ public final class WhiteLilyAvatarClient implements ClientModInitializer {
     if (dataRoot.isEmpty()) return;
     try {
       AvatarModelMailbox mailbox = new AvatarModelMailbox(dataRoot.get());
+      NativeSkinCandidateRuntime runtime = NativeSkinCandidateRuntime.forMinecraft(
+          new ApprovedSkinCatalog(dataRoot.get()), SKIN_CATALOG);
       ExecutorService executor =
           new ThreadPoolExecutor(
               1,
@@ -125,7 +138,7 @@ public final class WhiteLilyAvatarClient implements ClientModInitializer {
               new ThreadPoolExecutor.AbortPolicy());
       AvatarModelController controller =
           new AvatarModelController(
-              CANDIDATE_RUNTIME,
+              runtime,
               state ->
                   submitControl(
                       () -> {
@@ -138,6 +151,7 @@ public final class WhiteLilyAvatarClient implements ClientModInitializer {
               "builtin:whitelily",
               null);
       modelMailbox = mailbox;
+      candidateRuntime = runtime;
       controlExecutor = executor;
       modelController = controller;
       Runtime.getRuntime()

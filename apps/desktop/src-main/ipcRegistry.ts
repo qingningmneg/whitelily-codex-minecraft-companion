@@ -10,8 +10,8 @@ import {
 import type { RuntimeSnapshot } from "../../../src/runtime/runtimeEvents.js";
 import { parseAvatarModelId } from "../../../src/avatar/avatarModelSchemas.js";
 import type {
+  AvatarAppearanceListItem,
   AvatarModelCatalogSnapshot,
-  AvatarModelListItem,
 } from "../../../src/avatar/avatarModelTypes.js";
 import {
   parseMinecraftJavaUsername,
@@ -109,7 +109,7 @@ export interface IpcRegistryOptions {
     list(): Promise<AvatarModelCatalogSnapshot>;
     importFromPicker(): Promise<
       | { readonly status: "cancelled" }
-      | { readonly status: "imported"; readonly model: AvatarModelListItem }
+      | { readonly status: "imported"; readonly model: AvatarAppearanceListItem }
     >;
     switchTo(modelId: string): Promise<AvatarModelCatalogSnapshot>;
     subscribe(listener: (snapshot: AvatarModelCatalogSnapshot) => void): () => void;
@@ -723,7 +723,9 @@ export function registerIpcHandlers(options: IpcRegistryOptions): () => void {
       options.ipcMain.handle(WHITE_LILY_IPC_CHANNELS.importAvatarModel, async (_event, ...args) => {
         validateNoIpcInput(args);
         try {
-          return avatarIpcSuccess(parseAvatarImportResult(await options.avatarModels?.importFromPicker()));
+          return avatarIpcSuccess(
+            parseAvatarImportResult(await options.avatarModels?.importFromPicker()),
+          );
         } catch (error) {
           return avatarIpcFailure(error, "AVATAR_IMPORT_FAILED");
         }

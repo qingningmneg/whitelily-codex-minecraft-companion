@@ -49,9 +49,7 @@ const managedRelativePathSchema = z
   .refine((value) => {
     if (value.startsWith("/") || value.endsWith("/") || value.includes("\\")) return false;
     if (/^[A-Za-z][A-Za-z0-9+.-]*:/u.test(value)) return false;
-    return value
-      .split("/")
-      .every((piece) => piece.length > 0 && piece !== "." && piece !== "..");
+    return value.split("/").every((piece) => piece.length > 0 && piece !== "." && piece !== "..");
   });
 
 const avatarModelOriginSchema = z.enum(["builtin", "imported"]);
@@ -96,10 +94,18 @@ export const avatarModelRecordSchema = z
       context.addIssue({ code: "custom", message: "avatar appearance identity is incoherent" });
     }
     if (!hasCoherentArmModel(record.id, record.armModel)) {
-      context.addIssue({ code: "custom", path: ["armModel"], message: "avatar arm model is incoherent" });
+      context.addIssue({
+        code: "custom",
+        path: ["armModel"],
+        message: "avatar arm model is incoherent",
+      });
     }
     if (!hasCoherentManagedPath(record.id, record.origin, record.skinAsset)) {
-      context.addIssue({ code: "custom", path: ["skinAsset"], message: "skin asset is incoherent" });
+      context.addIssue({
+        code: "custom",
+        path: ["skinAsset"],
+        message: "skin asset is incoherent",
+      });
     }
     const hasPortraitAsset = record.portraitAsset !== undefined;
     const hasPortraitSha256 = record.portraitSha256 !== undefined;
@@ -110,10 +116,14 @@ export const avatarModelRecordSchema = z
       context.addIssue({ code: "custom", message: "builtin appearance needs a portrait" });
     }
     if (
-      hasPortraitAsset &&
+      record.portraitAsset !== undefined &&
       !hasCoherentManagedPath(record.id, record.origin, record.portraitAsset)
     ) {
-      context.addIssue({ code: "custom", path: ["portraitAsset"], message: "portrait asset is incoherent" });
+      context.addIssue({
+        code: "custom",
+        path: ["portraitAsset"],
+        message: "portrait asset is incoherent",
+      });
     }
   });
 
@@ -214,7 +224,20 @@ export const avatarModelControlStateSchema = z
   });
 
 export function parseAvatarModelRecord(value: unknown): AvatarModelRecord {
-  return parseOrThrow(avatarModelRecordSchema, value, "invalid avatar model record");
+  const parsed = parseOrThrow(avatarModelRecordSchema, value, "invalid avatar model record");
+  return {
+    id: parsed.id,
+    displayName: parsed.displayName,
+    origin: parsed.origin,
+    worldRenderer: parsed.worldRenderer,
+    skinAsset: parsed.skinAsset,
+    skinSha256: parsed.skinSha256,
+    armModel: parsed.armModel,
+    ...(parsed.portraitAsset === undefined ? {} : { portraitAsset: parsed.portraitAsset }),
+    ...(parsed.portraitSha256 === undefined ? {} : { portraitSha256: parsed.portraitSha256 }),
+    importedAt: parsed.importedAt,
+    validation: parsed.validation,
+  };
 }
 
 export function parseAvatarModelId(value: unknown): AvatarModelId {
@@ -226,15 +249,37 @@ export function parseAvatarRuntimeDescriptor(value: unknown): AvatarRuntimeDescr
 }
 
 export function parseAvatarModelCatalogSnapshot(value: unknown): AvatarModelCatalogSnapshot {
-  return parseOrThrow(
+  const parsed = parseOrThrow(
     avatarModelCatalogSnapshotSchema,
     value,
     "invalid avatar model catalog snapshot",
   );
+  return {
+    revision: parsed.revision,
+    models: parsed.models.map(normalizeAppearanceListItem),
+    activeModelId: parsed.activeModelId,
+    ...(parsed.pendingModelId === undefined ? {} : { pendingModelId: parsed.pendingModelId }),
+  };
 }
 
 export function parseAvatarAppearanceListItem(value: unknown): AvatarAppearanceListItem {
-  return parseOrThrow(avatarAppearanceListItemSchema, value, "invalid avatar appearance list item");
+  return normalizeAppearanceListItem(
+    parseOrThrow(avatarAppearanceListItemSchema, value, "invalid avatar appearance list item"),
+  );
+}
+
+function normalizeAppearanceListItem(
+  parsed: z.infer<typeof avatarAppearanceListItemSchema>,
+): AvatarAppearanceListItem {
+  return {
+    id: parsed.id,
+    displayName: parsed.displayName,
+    origin: parsed.origin,
+    worldRenderer: parsed.worldRenderer,
+    armModel: parsed.armModel,
+    previewDataUrl: parsed.previewDataUrl,
+    ...(parsed.portraitDataUrl === undefined ? {} : { portraitDataUrl: parsed.portraitDataUrl }),
+  };
 }
 
 export function parseAvatarModelControlRequest(value: unknown): AvatarModelControlRequest {

@@ -3,7 +3,7 @@ import { readFile, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { BrowserWindowConstructorOptions } from "electron";
-import type { AvatarBoneMapping } from "../../../../src/avatar/avatarModelTypes.js";
+import type { AvatarBoneMapping } from "./avatarBoneMapper.js";
 import { MAX_AVATAR_SOURCE_BYTES } from "./glbContainer.js";
 
 const PREVIEW_PORT_CHANNEL = "whitelily:avatar-preview:port";

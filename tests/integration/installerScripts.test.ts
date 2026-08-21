@@ -887,6 +887,7 @@ async function createNsisComponentPreferenceFixture(): Promise<{
     [
       "param([string]$Phase,[string]$ModePath,[string]$TargetPath,[string]$TempPath,[string]$Root)",
       "$ErrorActionPreference='Stop'",
+      "Import-Module (Join-Path $PSHOME 'Modules/Microsoft.PowerShell.Security/Microsoft.PowerShell.Security.psd1') -ErrorAction Stop",
       "$mode=if(Test-Path -LiteralPath $ModePath){(Get-Content -LiteralPath $ModePath -Raw).Trim()}else{'fresh'}",
       '$valid=\'{"schemaVersion":1,"bridgeEnabled":false,"avatarEnabled":false}\'',
       '$pretty="{`r`n  `"avatarEnabled`": true,`r`n  `"schemaVersion`": 1,`r`n  `"bridgeEnabled`": false`r`n}`r`n"',

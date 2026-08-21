@@ -14,7 +14,26 @@ import {
   WebGLRenderer,
 } from "three";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
-import type { AvatarBoneMapping } from "../../../src/avatar/avatarModelTypes.js";
+
+/** Research-only legacy preview mapping; never crosses the production IPC boundary. */
+interface AvatarBoneMapping {
+  readonly head: string;
+  readonly neck: string;
+  readonly chest: string;
+  readonly hips: string;
+  readonly leftUpperArm: string;
+  readonly leftLowerArm: string;
+  readonly leftHand: string;
+  readonly rightUpperArm: string;
+  readonly rightLowerArm: string;
+  readonly rightHand: string;
+  readonly leftUpperLeg: string;
+  readonly leftLowerLeg: string;
+  readonly leftFoot: string;
+  readonly rightUpperLeg: string;
+  readonly rightLowerLeg: string;
+  readonly rightFoot: string;
+}
 
 const PREVIEW_SIZE = 512;
 

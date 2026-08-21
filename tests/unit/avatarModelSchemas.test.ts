@@ -27,19 +27,21 @@ function appearance(overrides: Record<string, unknown> = {}) {
 
 describe("avatar appearance schemas", () => {
   it("accepts the builtin native skin appearance", () => {
-    expect(parseAvatarModelRecord({
-      id: "builtin:whitelily",
-      displayName: "WhiteLily",
-      origin: "builtin",
-      worldRenderer: "minecraft-skin",
-      skinAsset: "builtin/whitelily/skin/base.png",
-      skinSha256: "a".repeat(64),
-      armModel: "slim",
-      portraitAsset: "builtin/whitelily/portrait.png",
-      portraitSha256: "b".repeat(64),
-      importedAt: "2026-08-21T00:00:00.000Z",
-      validation: { code: "AVATAR_VALID", validatedAt: "2026-08-21T00:00:00.000Z" },
-    }).id).toBe("builtin:whitelily");
+    expect(
+      parseAvatarModelRecord({
+        id: "builtin:whitelily",
+        displayName: "WhiteLily",
+        origin: "builtin",
+        worldRenderer: "minecraft-skin",
+        skinAsset: "builtin/whitelily/skin/base.png",
+        skinSha256: "a".repeat(64),
+        armModel: "slim",
+        portraitAsset: "builtin/whitelily/portrait.png",
+        portraitSha256: "b".repeat(64),
+        importedAt: "2026-08-21T00:00:00.000Z",
+        validation: { code: "AVATAR_VALID", validatedAt: "2026-08-21T00:00:00.000Z" },
+      }).id,
+    ).toBe("builtin:whitelily");
   });
 
   it("keeps the sole builtin id frozen", () => {
@@ -82,7 +84,9 @@ describe("avatar appearance schemas", () => {
   it("allows imported appearances without a portrait but rejects half portraits", () => {
     expect(parseAvatarModelRecord(appearance()).id).toBe(importedId);
     expect(() =>
-      parseAvatarModelRecord(appearance({ portraitAsset: "user/00000000-0000-4000-8000-000000000001/portrait.png" })),
+      parseAvatarModelRecord(
+        appearance({ portraitAsset: "user/00000000-0000-4000-8000-000000000001/portrait.png" }),
+      ),
     ).toThrow("invalid avatar model record");
   });
 
@@ -134,22 +138,23 @@ describe("avatar appearance schemas", () => {
   });
 
   it("accepts native skin prepare requests without asset paths", () => {
-    expect(
-      parseAvatarModelControlRequest({
-        schemaVersion: 1,
-        requestId: "switch-0001",
-        operation: "prepare",
+    const parsed = parseAvatarModelControlRequest({
+      schemaVersion: 1,
+      requestId: "switch-0001",
+      operation: "prepare",
+      modelId: "builtin:whitelily",
+      worldSessionId: "world-0001",
+      candidate: {
         modelId: "builtin:whitelily",
-        worldSessionId: "world-0001",
-        candidate: {
-          modelId: "builtin:whitelily",
-          origin: "builtin",
-          worldRenderer: "minecraft-skin",
-          armModel: "slim",
-        },
-        issuedAt: "2026-08-21T00:00:00.000Z",
-      }).candidate,
-    ).not.toHaveProperty("skinAsset");
+        origin: "builtin",
+        worldRenderer: "minecraft-skin",
+        armModel: "slim",
+      },
+      issuedAt: "2026-08-21T00:00:00.000Z",
+    });
+    expect(parsed.operation).toBe("prepare");
+    if (parsed.operation !== "prepare") throw new Error("expected prepare request");
+    expect(parsed.candidate).not.toHaveProperty("skinAsset");
   });
 
   it("parses renderer-safe native skin catalog snapshots", () => {

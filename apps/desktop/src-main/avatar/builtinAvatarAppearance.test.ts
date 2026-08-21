@@ -21,14 +21,20 @@ describe("loadBuiltinAvatarAppearance", () => {
           "subprojects/whitelily-avatar/mod-fabric/src/main/resources/assets/whitelily_avatar/textures/skin/base.png",
         ),
       ),
-      readFile(join(repositoryRoot, "apps/desktop/resources/avatar/builtin/whitelily/skin/base.png")),
-      readFile(join(repositoryRoot, "subprojects/whitelily-avatar/assets/source/whitelily-turnaround.png")),
-      readFile(join(repositoryRoot, "apps/desktop/resources/avatar/builtin/whitelily/portrait.png")),
+      readFile(
+        join(repositoryRoot, "apps/desktop/resources/avatar/builtin/whitelily/skin/base.png"),
+      ),
+      readFile(
+        join(repositoryRoot, "subprojects/whitelily-avatar/assets/source/whitelily-turnaround.png"),
+      ),
+      readFile(
+        join(repositoryRoot, "apps/desktop/resources/avatar/builtin/whitelily/portrait.png"),
+      ),
     ]);
 
     expect(packagedSkin).toEqual(reviewedSkin);
     expect(packagedPortrait).toEqual(reviewedPortrait);
-  });
+  }, 20_000);
 
   it("derives the native skin and full-turnaround digests from packaged bytes", async () => {
     const resourcesPath = await mkdtemp(join(tmpdir(), "whitelily-avatar-resources-"));

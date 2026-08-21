@@ -38,6 +38,7 @@ import {
   type TraySupervisorPort,
 } from "./tray.js";
 import { WHITE_LILY_IPC_CHANNELS } from "../src/desktopApi.js";
+import { createAvatarModelComposition } from "./avatar/avatarModelComposition.js";
 
 export function createMainWindowOptions(preloadPath: string): BrowserWindowConstructorOptions {
   return {
@@ -98,8 +99,8 @@ const DESKTOP_MINECRAFT_COMPONENT_MANIFEST: MinecraftComponentResourceManifest =
     Object.freeze({
       component: "avatar" as const,
       fileName: "whitelily-avatar-fabric-1.21.5-0.1.0.jar",
-      bytes: 239_985,
-      sha256: "1fdba2b89281d7dbfb96d8e2ab3637caf95b20452831377f46e5285d37531351",
+      bytes: 255_675,
+      sha256: "426225094514c0fc2752e7beaab256322a0612a75b564bf509c64ae52d4c636f",
       modId: "whitelily_avatar",
       version: "0.1.0",
       prior: Object.freeze([]),
@@ -629,99 +630,147 @@ export async function runElectronMain(): Promise<void> {
                 return { revision: closeToTray.revision, enabled: closeToTray.value.closeToTray };
               },
             };
-            await startElectronComposition({
-              app,
-              supervisor: primary.supervisor,
-              createWindow: () => new BrowserWindow(createMainWindowOptions(primary.preloadPath)),
-              configureWindow: (window) => {
-                const externalUrlHandlers = createExternalUrlHandlers(externalUrlPolicy, (url) =>
-                  shell.openExternal(url),
-                );
-                window.webContents.setWindowOpenHandler(externalUrlHandlers.openWindow);
-                window.webContents.on("will-navigate", externalUrlHandlers.navigate);
-              },
-              registerIpc: (window, lifecycle) =>
-                registerIpcHandlers({
-                  ipcMain,
-                  supervisor: primary.supervisor,
-                  publishRuntime: (event) => {
-                    if (!window.isDestroyed()) {
-                      window.webContents.send(WHITE_LILY_IPC_CHANNELS.runtimeEvent, event);
-                    }
-                  },
-                  publishOwnerIdentity: (owner) => {
-                    if (!window.isDestroyed()) {
-                      window.webContents.send(WHITE_LILY_IPC_CHANNELS.ownerIdentityEvent, owner);
-                    }
-                  },
-                  publishAvatarModels: (snapshot) => {
-                    if (!window.isDestroyed()) {
-                      window.webContents.send(WHITE_LILY_IPC_CHANNELS.avatarModelsEvent, snapshot);
-                    }
-                  },
-                  externalUrlPolicy,
-                  openExternal: (url) => shell.openExternal(url),
-                  pcl2Discovery,
-                  lanDetector,
-                  worldAuthority,
-                  minecraftComponentManager,
-                  startupSettings,
-                  closeToTraySettings,
-                  requestApplicationQuit: createApplicationQuitRequest(lifecycle),
-                  exportSerialized: (serialized) =>
-                    exportSerializedJson({
-                      chooseDestination: () =>
-                        dialog.showSaveDialog(window, {
-                          title: "Export WhiteLily memories",
-                          defaultPath: "whitelily-memories.json",
-                          filters: [{ name: "JSON", extensions: ["json"] }],
-                          properties: ["createDirectory"],
-                        }),
-                      serialized,
-                    }),
-                  exportDiagnostic: (exportId, prepareArchive) =>
-                    saveDiagnosticArchive({
-                      dataRoot: prepared.paths.dataRoot,
-                      exportId,
-                      chooseDestination: () =>
-                        dialog.showSaveDialog(window, {
-                          title: "Export WhiteLily diagnostics",
-                          defaultPath: "whitelily-diagnostics.zip",
-                          filters: [{ name: "ZIP", extensions: ["zip"] }],
-                          properties: ["createDirectory"],
-                        }),
-                      prepareArchive,
-                    }),
+            const avatarModels = await createAvatarModelComposition({
+              dataRoot: prepared.paths.dataRoot,
+              resourcesPath: primary.development
+                ? resolve(primary.appPath, "resources")
+                : process.resourcesPath,
+              showOpenDialog: (options) =>
+                dialog.showOpenDialog({
+                  title: options.title,
+                  properties: [...options.properties],
+                  filters: options.filters.map((filter) => ({
+                    name: filter.name,
+                    extensions: [...filter.extensions],
+                  })),
                 }),
-              createTray: (window, lifecycle) =>
-                createNativeTray({
-                  buildMenu: (template) => Menu.buildFromTemplate(template),
-                  createTray: (icon) => new Tray(icon),
-                  lifecycle,
-                  nativeImage,
-                  showWindow: () => showExistingWindow(window),
-                  supervisor: primary.supervisor,
-                }),
-              loadWindow: async (window) => {
-                if (primary.development) {
-                  await window.loadURL("http://127.0.0.1:5173");
-                } else {
-                  await window.loadFile(resolve(primary.appPath, "dist-renderer", "index.html"));
-                }
-                await waitForRendererReady({
-                  probe: () =>
-                    window.webContents.executeJavaScript(
-                      'document.querySelector("#root")?.childElementCount > 0',
-                    ),
+              choosePortrait: async () => {
+                const choice = await dialog.showMessageBox({
+                  type: "question",
+                  title: "Optional portrait",
+                  message: "Choose an optional full portrait for this Minecraft skin?",
+                  buttons: ["Choose portrait", "Skip", "Cancel"],
+                  defaultId: 1,
+                  cancelId: 2,
+                  noLink: true,
                 });
+                return choice.response === 0 ? "pick" : choice.response === 1 ? "skip" : "cancel";
               },
-              diagnostic: (message) => console.error(message),
-              closeToTray: () => closeToTray.value.closeToTray,
-              onLifecycleOwned: transferOwnership,
-              onRendererReady: (window) => {
-                mainWindow = window;
-              },
+              subscribeRuntime: (listener) =>
+                primary.supervisor.subscribe((event) => listener(event)),
+              diagnostic: (code, modelId) =>
+                console.error(modelId === undefined ? code : `${code}:${modelId}`),
             });
+            try {
+              await startElectronComposition({
+                app,
+                supervisor: primary.supervisor,
+                createWindow: () => new BrowserWindow(createMainWindowOptions(primary.preloadPath)),
+                configureWindow: (window) => {
+                  const externalUrlHandlers = createExternalUrlHandlers(externalUrlPolicy, (url) =>
+                    shell.openExternal(url),
+                  );
+                  window.webContents.setWindowOpenHandler(externalUrlHandlers.openWindow);
+                  window.webContents.on("will-navigate", externalUrlHandlers.navigate);
+                },
+                registerIpc: (window, lifecycle) => {
+                  const cleanupIpc = registerIpcHandlers({
+                    ipcMain,
+                    supervisor: primary.supervisor,
+                    publishRuntime: (event) => {
+                      if (!window.isDestroyed()) {
+                        window.webContents.send(WHITE_LILY_IPC_CHANNELS.runtimeEvent, event);
+                      }
+                    },
+                    publishOwnerIdentity: (owner) => {
+                      if (!window.isDestroyed()) {
+                        window.webContents.send(WHITE_LILY_IPC_CHANNELS.ownerIdentityEvent, owner);
+                      }
+                    },
+                    publishAvatarModels: (snapshot) => {
+                      if (!window.isDestroyed()) {
+                        window.webContents.send(
+                          WHITE_LILY_IPC_CHANNELS.avatarModelsEvent,
+                          snapshot,
+                        );
+                      }
+                    },
+                    externalUrlPolicy,
+                    openExternal: (url) => shell.openExternal(url),
+                    pcl2Discovery,
+                    lanDetector,
+                    worldAuthority,
+                    minecraftComponentManager,
+                    startupSettings,
+                    closeToTraySettings,
+                    avatarModels,
+                    requestApplicationQuit: createApplicationQuitRequest(lifecycle),
+                    exportSerialized: (serialized) =>
+                      exportSerializedJson({
+                        chooseDestination: () =>
+                          dialog.showSaveDialog(window, {
+                            title: "Export WhiteLily memories",
+                            defaultPath: "whitelily-memories.json",
+                            filters: [{ name: "JSON", extensions: ["json"] }],
+                            properties: ["createDirectory"],
+                          }),
+                        serialized,
+                      }),
+                    exportDiagnostic: (exportId, prepareArchive) =>
+                      saveDiagnosticArchive({
+                        dataRoot: prepared.paths.dataRoot,
+                        exportId,
+                        chooseDestination: () =>
+                          dialog.showSaveDialog(window, {
+                            title: "Export WhiteLily diagnostics",
+                            defaultPath: "whitelily-diagnostics.zip",
+                            filters: [{ name: "ZIP", extensions: ["zip"] }],
+                            properties: ["createDirectory"],
+                          }),
+                        prepareArchive,
+                      }),
+                  });
+                  return () => {
+                    try {
+                      cleanupIpc();
+                    } finally {
+                      avatarModels.dispose();
+                    }
+                  };
+                },
+                createTray: (window, lifecycle) =>
+                  createNativeTray({
+                    buildMenu: (template) => Menu.buildFromTemplate(template),
+                    createTray: (icon) => new Tray(icon),
+                    lifecycle,
+                    nativeImage,
+                    showWindow: () => showExistingWindow(window),
+                    supervisor: primary.supervisor,
+                  }),
+                loadWindow: async (window) => {
+                  if (primary.development) {
+                    await window.loadURL("http://127.0.0.1:5173");
+                  } else {
+                    await window.loadFile(resolve(primary.appPath, "dist-renderer", "index.html"));
+                  }
+                  await waitForRendererReady({
+                    probe: () =>
+                      window.webContents.executeJavaScript(
+                        'document.querySelector("#root")?.childElementCount > 0',
+                      ),
+                  });
+                },
+                diagnostic: (message) => console.error(message),
+                closeToTray: () => closeToTray.value.closeToTray,
+                onLifecycleOwned: transferOwnership,
+                onRendererReady: (window) => {
+                  mainWindow = window;
+                },
+              });
+            } catch (error) {
+              avatarModels.dispose();
+              throw error;
+            }
           },
         },
         prepared,

@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { AvatarBoneMapping } from "../../../../src/avatar/avatarModelTypes.js";
+import type { AvatarBoneMapping } from "./avatarBoneMapper.js";
 import {
   AvatarPreviewRenderer,
   type AvatarPreviewMessagePort,

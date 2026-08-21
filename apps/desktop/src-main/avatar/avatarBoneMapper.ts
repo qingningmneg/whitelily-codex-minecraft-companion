@@ -1,13 +1,31 @@
-import type {
-  AvatarBoneMapping,
-  AvatarExpressionCapability,
-} from "../../../../src/avatar/avatarModelTypes.js";
 import {
   AvatarFileValidationError,
   type GltfDocument,
   type GltfNode,
   type ParsedGlbContainer,
 } from "./glbContainer.js";
+
+/** Research-only legacy GLB mapping; it is not part of the appearance/IPC contract. */
+export interface AvatarBoneMapping {
+  readonly head: string;
+  readonly neck: string;
+  readonly chest: string;
+  readonly hips: string;
+  readonly leftUpperArm: string;
+  readonly leftLowerArm: string;
+  readonly leftHand: string;
+  readonly rightUpperArm: string;
+  readonly rightLowerArm: string;
+  readonly rightHand: string;
+  readonly leftUpperLeg: string;
+  readonly leftLowerLeg: string;
+  readonly leftFoot: string;
+  readonly rightUpperLeg: string;
+  readonly rightLowerLeg: string;
+  readonly rightFoot: string;
+}
+
+type AvatarExpressionCapability = "full" | "neutral-only";
 
 const boneSemantics = [
   "head",
