@@ -93,11 +93,14 @@ describe("desktop style safety invariants", () => {
     const track = css.match(/\.avatar-model-track\s*\{([^}]+)\}/su)?.[1];
     const card = css.match(/\.avatar-model-card\s*\{([^}]+)\}/su)?.[1];
 
-    expect(viewport).toMatch(/overflow-x:\s*scroll/u);
+    expect(viewport).toMatch(/overflow-x:\s*auto/u);
     expect(viewport).toMatch(/scrollbar-gutter:\s*stable/u);
+    expect(track).toMatch(/display:\s*flex/u);
     expect(track).toMatch(/flex-wrap:\s*nowrap/u);
     expect(track).toMatch(/width:\s*max-content/u);
     expect(card).toMatch(/flex:\s*0\s+0\s+220px/u);
+    expect(css).toMatch(/\.avatar-model-card__preview\s*\{[^}]*object-fit:\s*contain/su);
+    expect(css).not.toMatch(/\.avatar-model-page\s*\{[^}]*overflow-x:\s*auto/su);
   });
 });
 

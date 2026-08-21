@@ -69,4 +69,13 @@ describe("desktop message catalogs", () => {
     expect(en["nav.avatarModels"]).toBe("Models & appearance");
     expect(en["model.title"]).toBe("AI model settings");
   });
+
+  it("uses Minecraft skin copy without legacy 3D model capability labels", () => {
+    expect(zhCN["avatarModels.title"]).toBe("模型与外观");
+    expect(zhCN["avatarModels.import"]).toBe("导入皮肤");
+    expect(zhCN["avatarModels.error.skinInvalid"]).toBe("皮肤不是 64×64 RGBA PNG。");
+    expect(zhCN["avatarModels.error.portraitInvalid"]).toBe("立绘文件无效。");
+    expect(en["avatarModels.armModel.slim"]).toBe("Slim arms");
+    expect(en["avatarModels.armModel.wide"]).toBe("Classic arms");
+  });
 });

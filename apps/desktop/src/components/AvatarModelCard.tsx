@@ -1,10 +1,11 @@
-import type { AvatarModelListItem } from "../../../../src/avatar/avatarModelSchemas.js";
+import { useState } from "react";
+import type { AvatarAppearanceListItem } from "../../../../src/avatar/avatarModelSchemas.js";
 import type { Locale } from "../i18n/messageKeys.js";
 import { translate } from "../i18n/translator.js";
 
 interface AvatarModelCardProps {
   locale: Locale;
-  model: AvatarModelListItem;
+  model: AvatarAppearanceListItem;
   active: boolean;
   pending: boolean;
   onSelect(modelId: string): void;
@@ -19,11 +20,12 @@ export function AvatarModelCard({
   onSelect,
   onKeyDown,
 }: AvatarModelCardProps) {
-  const builtinHd = model.format === "builtin-hd";
+  const [previewUnavailable, setPreviewUnavailable] = useState(false);
+  const preview = model.portraitDataUrl ?? model.previewDataUrl;
 
   return (
     <button
-      className={`avatar-model-card${builtinHd ? " avatar-model-card--builtin-hd" : ""}`}
+      className="avatar-model-card"
       type="button"
       data-avatar-model-id={model.id}
       aria-label={model.displayName}
@@ -38,16 +40,29 @@ export function AvatarModelCard({
       }}
     >
       <span className="avatar-model-card__preview-frame">
-        <img
-          className="avatar-model-card__preview"
-          src={model.previewDataUrl}
-          alt={model.displayName}
-        />
+        {previewUnavailable ? (
+          <span
+            className="avatar-preview-fallback"
+            data-testid="avatar-preview-fallback"
+            aria-hidden="true"
+          />
+        ) : (
+          <img
+            className="avatar-model-card__preview"
+            src={preview}
+            alt={model.displayName}
+            onError={() => setPreviewUnavailable(true)}
+          />
+        )}
       </span>
       <span className="avatar-model-card__details">
         <strong>{model.displayName}</strong>
-        <span>{model.format.toUpperCase()}</span>
-        {active ? <span className="avatar-model-card__active">{translate(locale, "avatarModels.active")}</span> : null}
+        <span>{translate(locale, `avatarModels.armModel.${model.armModel}`)}</span>
+        {active ? (
+          <span className="avatar-model-card__active">
+            {translate(locale, "avatarModels.active")}
+          </span>
+        ) : null}
         {pending ? (
           <span className="avatar-model-card__pending" role="status">
             {translate(locale, "avatarModels.pending")}

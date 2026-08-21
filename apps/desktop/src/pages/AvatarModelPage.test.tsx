@@ -4,8 +4,8 @@ import { act, cleanup, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import type {
+  AvatarAppearanceListItem,
   AvatarModelCatalogSnapshot,
-  AvatarModelListItem,
 } from "../../../../src/avatar/avatarModelSchemas.js";
 import type { WhiteLilyAvatarApi } from "../desktopApi.js";
 import { AvatarModelPage } from "./AvatarModelPage.js";
@@ -23,8 +23,8 @@ afterEach(() => {
 });
 
 describe("AvatarModelPage", () => {
-  it("keeps twelve cards in the fixed single-line rail without leaking page overflow", async () => {
-    const api = avatarApi(catalogWithTenImports());
+  it("keeps ten appearances in one horizontally scrollable row", async () => {
+    const api = avatarApi(catalogWithNineImports());
     render(
       <div className="app-shell" data-testid="app-shell">
         <AvatarModelPage api={api} locale="zh-CN" />
@@ -36,21 +36,21 @@ describe("AvatarModelPage", () => {
     const page = screen.getByRole("main");
     const shell = screen.getByTestId("app-shell");
     const cards = screen.getAllByRole("button").filter((button) => button.dataset.avatarModelId);
-    expect(track.children).toHaveLength(12);
+    expect(track.children).toHaveLength(10);
     expect(getComputedStyle(document.documentElement).minWidth).toBe("320px");
     expect(getComputedStyle(document.body).minWidth).toBe("320px");
     expect(getComputedStyle(shell).overflow).toBe("hidden");
     expect(getComputedStyle(page).minWidth).toBe("0px");
     expect(getComputedStyle(page).overflow).toBe("hidden");
-    expect(getComputedStyle(viewport).overflowX).toBe("scroll");
+    expect(viewport.className).toContain("avatar-model-track-viewport");
+    expect(track.className).toContain("avatar-model-track");
+    expect(getComputedStyle(viewport).overflowX).toBe("auto");
     expect(getComputedStyle(track).flexWrap).toBe("nowrap");
     expect(getComputedStyle(track).width).toBe("max-content");
     expect(getComputedStyle(track).height).toBe("430px");
-    expect(getComputedStyle(cards[0]!).flexBasis).toBe("300px");
+    expect(getComputedStyle(cards[0]!).flexBasis).toBe("220px");
     expect(getComputedStyle(cards[1]!).flexBasis).toBe("220px");
-    expect(getComputedStyle(screen.getByAltText("WhiteLily 高清动漫 3D 模型设定图")).height).toBe(
-      "320px",
-    );
+    expect(getComputedStyle(screen.getByAltText("WhiteLily")).height).toBe("100%");
   });
 
   it("loads and subscribes once, but a locale-only rerender preserves pending state", async () => {
@@ -76,10 +76,10 @@ describe("AvatarModelPage", () => {
     const user = userEvent.setup();
     render(<AvatarModelPage api={api} locale="en" />);
 
-    await user.click(await screen.findByRole("button", { name: "Import model" }));
+    await user.click(await screen.findByRole("button", { name: "Import skin" }));
 
     expect(importAvatarModel).toHaveBeenCalledWith();
-    expect(screen.getByTestId("avatar-model-track").children).toHaveLength(12);
+    expect(screen.getByTestId("avatar-model-track").children).toHaveLength(11);
     expect(screen.queryByRole("alert")).toBeNull();
   });
 
@@ -100,35 +100,32 @@ describe("AvatarModelPage", () => {
 
     await user.click(await screen.findByRole("button", { name: "Imported 1" }));
     expect((await screen.findByRole("alert")).textContent).toBe(
-      "The avatar model could not be switched. Try again.",
+      "The skin appearance could not be switched. Try again.",
     );
     act(() =>
       publish({
         revision: 2,
         models: catalogWithTenImports(),
-        activeModelId: "builtin:whitelily-hd",
+        activeModelId: "builtin:whitelily",
         pendingModelId: "user:00000000-0000-4000-8000-000000000001",
       }),
     );
     const originalTrack = screen.getByTestId("avatar-model-track");
 
-    await user.click(screen.getByRole("button", { name: "Import model" }));
+    await user.click(screen.getByRole("button", { name: "Import skin" }));
 
     expect(screen.getByRole("alert").textContent).toBe(
-      "The avatar model could not be switched. Try again.",
+      "The skin appearance could not be switched. Try again.",
     );
     expect(screen.getByTestId("avatar-model-track")).toBe(originalTrack);
     expect(screen.getByRole("status").textContent).toBe("Switching…");
   });
 
   it.each([
-    ["AVATAR_FORMAT_UNSUPPORTED", "This avatar model format is not supported."],
-    ["AVATAR_GLB_INVALID", "The avatar model file is invalid."],
-    ["AVATAR_EXTERNAL_RESOURCE", "The avatar model must not use external resources."],
-    ["AVATAR_REQUIRED_BONE_MISSING", "The avatar model is missing required bones."],
-    ["AVATAR_PREVIEW_FAILED", "The avatar preview could not be created. Try again."],
-    ["AVATAR_DIGEST_MISMATCH", "The avatar model changed while it was being imported. Try again."],
-    ["AVATAR_IMPORT_FAILED", "The avatar model could not be imported. Try again."],
+    ["AVATAR_FORMAT_UNSUPPORTED", "This skin format is not supported."],
+    ["AVATAR_SKIN_INVALID", "The skin is not a 64×64 RGBA PNG."],
+    ["AVATAR_PORTRAIT_INVALID", "The portrait file is invalid."],
+    ["AVATAR_IMPORT_FAILED", "The skin could not be imported. Try again."],
   ])("shows the localized stable error for %s", async (code, message) => {
     const api = avatarApi(catalogWithTenImports(), {
       importAvatarModel: vi.fn(async () => {
@@ -138,7 +135,7 @@ describe("AvatarModelPage", () => {
     const user = userEvent.setup();
     render(<AvatarModelPage api={api} locale="en" />);
 
-    await user.click(await screen.findByRole("button", { name: "Import model" }));
+    await user.click(await screen.findByRole("button", { name: "Import skin" }));
 
     expect((await screen.findByRole("alert")).textContent).toBe(message);
   });
@@ -156,14 +153,12 @@ describe("AvatarModelPage", () => {
     await user.click(await screen.findByRole("button", { name: "Imported 1" }));
 
     expect((await screen.findByRole("alert")).textContent).toBe(
-      "The avatar model could not be switched. Try again.",
+      "The skin appearance could not be switched. Try again.",
     );
     expect(screen.getAllByText("In use")).toHaveLength(1);
-    expect(
-      screen.getByRole("button", { name: "WhiteLily 高清动漫 3D 模型设定图" }).getAttribute(
-        "aria-pressed",
-      ),
-    ).toBe("true");
+    expect(screen.getByRole("button", { name: "WhiteLily" }).getAttribute("aria-pressed")).toBe(
+      "true",
+    );
   });
 
   it("does not switch the already active card", async () => {
@@ -171,7 +166,7 @@ describe("AvatarModelPage", () => {
     const user = userEvent.setup();
     render(<AvatarModelPage api={api} locale="en" />);
 
-    await user.click(await screen.findByRole("button", { name: "WhiteLily 高清动漫 3D 模型设定图" }));
+    await user.click(await screen.findByRole("button", { name: "WhiteLily" }));
 
     expect(api.switchAvatarModel).not.toHaveBeenCalled();
   });
@@ -184,21 +179,17 @@ describe("AvatarModelPage", () => {
     render(<AvatarModelPage api={api} locale="en" />);
 
     const viewport = await screen.findByTestId("avatar-model-track-viewport");
-    expect(getComputedStyle(viewport).overflowX).toBe("scroll");
+    expect(getComputedStyle(viewport).overflowX).toBe("auto");
     await user.tab();
-    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Import model" }));
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Import skin" }));
     await user.tab();
-    expect(document.activeElement).toBe(
-      screen.getByRole("button", { name: "WhiteLily 高清动漫 3D 模型设定图" }),
-    );
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "WhiteLily" }));
     await user.keyboard("{End}");
     const lastCard = screen.getByRole("button", { name: "Imported 10" });
     expect(document.activeElement).toBe(lastCard);
     expect(scrollIntoView).toHaveBeenLastCalledWith({ block: "nearest", inline: "nearest" });
     await user.keyboard("{Home}");
-    expect(document.activeElement).toBe(
-      screen.getByRole("button", { name: "WhiteLily 高清动漫 3D 模型设定图" }),
-    );
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "WhiteLily" }));
   });
 
   it("unsubscribes when the page unmounts", async () => {
@@ -241,13 +232,13 @@ describe("AvatarModelPage", () => {
 });
 
 function avatarApi(
-  models: readonly AvatarModelListItem[],
+  models: readonly AvatarAppearanceListItem[],
   overrides: Partial<WhiteLilyAvatarApi> = {},
 ): WhiteLilyAvatarApi {
   const snapshot: AvatarModelCatalogSnapshot = {
     revision: 1,
     models,
-    activeModelId: "builtin:whitelily-hd",
+    activeModelId: "builtin:whitelily",
   };
   return {
     listAvatarModels: vi.fn(async () => snapshot),
@@ -258,35 +249,38 @@ function avatarApi(
   };
 }
 
-function catalogWithTenImports(): readonly AvatarModelListItem[] {
+function catalogWithTenImports(): readonly AvatarAppearanceListItem[] {
   return [
-    avatar("builtin:whitelily-hd", "WhiteLily 高清动漫 3D 模型设定图", "builtin", "builtin-hd"),
-    avatar("builtin:whitelily-classic", "WhiteLily Classic", "builtin", "builtin-classic"),
+    avatar("builtin:whitelily", "WhiteLily", "builtin", "slim"),
     ...Array.from({ length: 10 }, (_, index) =>
       avatar(
         `user:00000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`,
         `Imported ${index + 1}`,
         "imported",
-        "glb",
+        "wide",
       ),
     ),
   ];
 }
 
+function catalogWithNineImports(): readonly AvatarAppearanceListItem[] {
+  return catalogWithTenImports().slice(0, 10);
+}
+
 function avatar(
   id: string,
   displayName: string,
-  origin: AvatarModelListItem["origin"],
-  format: AvatarModelListItem["format"],
-): AvatarModelListItem {
+  origin: AvatarAppearanceListItem["origin"],
+  armModel: AvatarAppearanceListItem["armModel"],
+): AvatarAppearanceListItem {
   return {
     id,
     displayName,
     origin,
-    format,
+    worldRenderer: "minecraft-skin",
+    armModel,
     previewDataUrl: "data:image/png;base64,AA==",
-    bodyAnimation: "whitelily-humanoid-v1",
-    expressions: "full",
+    ...(origin === "builtin" ? { portraitDataUrl: "data:image/png;base64,BB==" } : {}),
   };
 }
 

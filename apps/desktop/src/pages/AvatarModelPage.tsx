@@ -95,7 +95,11 @@ export function AvatarModelPage({ api, locale }: AvatarModelPageProps) {
           {translate(locale, importing ? "avatarModels.importing" : "avatarModels.import")}
         </button>
       </header>
-      {errorKey ? <p className="page-message" role="alert">{translate(locale, errorKey)}</p> : null}
+      {errorKey ? (
+        <p className="page-message" role="alert">
+          {translate(locale, errorKey)}
+        </p>
+      ) : null}
       {!catalog ? (
         <p className="state-panel">{translate(locale, "page.loading")}</p>
       ) : (
@@ -133,20 +137,11 @@ function errorMessageKey(error: unknown, operation: "import" | "switch"): Messag
   if (operation === "import" && code === "AVATAR_FORMAT_UNSUPPORTED") {
     return "avatarModels.error.formatUnsupported";
   }
-  if (operation === "import" && code === "AVATAR_GLB_INVALID") {
-    return "avatarModels.error.invalidFile";
+  if (operation === "import" && code === "AVATAR_SKIN_INVALID") {
+    return "avatarModels.error.skinInvalid";
   }
-  if (operation === "import" && code === "AVATAR_EXTERNAL_RESOURCE") {
-    return "avatarModels.error.externalResource";
-  }
-  if (operation === "import" && code === "AVATAR_REQUIRED_BONE_MISSING") {
-    return "avatarModels.error.requiredBone";
-  }
-  if (operation === "import" && code === "AVATAR_PREVIEW_FAILED") {
-    return "avatarModels.error.preview";
-  }
-  if (operation === "import" && code === "AVATAR_DIGEST_MISMATCH") {
-    return "avatarModels.error.digestMismatch";
+  if (operation === "import" && code === "AVATAR_PORTRAIT_INVALID") {
+    return "avatarModels.error.portraitInvalid";
   }
   return operation === "import" ? "avatarModels.error.import" : "avatarModels.error.switch";
 }
