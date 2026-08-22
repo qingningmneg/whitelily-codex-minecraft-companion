@@ -497,7 +497,7 @@ describe("public release readiness", () => {
       const testCommand = runCommands.find((command) => command.startsWith("npm test"));
 
       expect(packageJson.scripts?.["minecraft-components:prepare"]).toBe(
-        "subprojects\\whitelily-avatar\\gradlew.bat -p subprojects\\whitelily-avatar :stageMinecraftComponents --no-daemon --max-workers=1",
+        "subprojects\\whitelily-avatar\\gradlew.bat -p subprojects\\whitelily-avatar --configure-on-demand :bridge-fabric:jar --no-daemon --max-workers=1 && subprojects\\whitelily-avatar\\gradlew.bat -p subprojects\\whitelily-avatar :stageMinecraftComponents --no-daemon --max-workers=1",
       );
       expect(workflow).toContain("- uses: actions/setup-java@v4");
       expect(workflow).toContain("distribution: temurin");

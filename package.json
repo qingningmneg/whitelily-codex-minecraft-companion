@@ -25,7 +25,7 @@
     "desktop:inspect-installer": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/inspect-installer.ps1",
     "desktop:test-installer": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/test-installer.ps1",
     "desktop:test": "npm run test --workspace @whitelily/desktop",
-    "minecraft-components:prepare": "subprojects\\whitelily-avatar\\gradlew.bat -p subprojects\\whitelily-avatar :stageMinecraftComponents --no-daemon --max-workers=1",
+    "minecraft-components:prepare": "subprojects\\whitelily-avatar\\gradlew.bat -p subprojects\\whitelily-avatar --configure-on-demand :bridge-fabric:jar --no-daemon --max-workers=1 && subprojects\\whitelily-avatar\\gradlew.bat -p subprojects\\whitelily-avatar :stageMinecraftComponents --no-daemon --max-workers=1",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc -p tsconfig.json --noEmit",
