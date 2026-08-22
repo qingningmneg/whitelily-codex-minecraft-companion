@@ -488,12 +488,22 @@ describe("public release readiness", () => {
     "%s prepares deterministic desktop resources before testing",
     async (path) => {
       const workflow = await readFile(path, "utf8");
+      const packageJson = JSON.parse(await readFile("package.json", "utf8")) as {
+        scripts?: Record<string, string>;
+      };
       const runCommands = [...workflow.matchAll(/^\s*-\s+run:\s+(.+)$/gmu)].map(
         (match) => match[1]?.trim() ?? "",
       );
       const testCommand = runCommands.find((command) => command.startsWith("npm test"));
 
+      expect(packageJson.scripts?.["minecraft-components:prepare"]).toBe(
+        "subprojects\\whitelily-avatar\\gradlew.bat -p subprojects\\whitelily-avatar :stageMinecraftComponents --no-daemon --max-workers=1",
+      );
+      expect(runCommands).toContain("npm run minecraft-components:prepare");
       expect(runCommands).toContain("npm run desktop:prepare");
+      expect(runCommands.indexOf("npm run minecraft-components:prepare")).toBeLessThan(
+        runCommands.indexOf("npm run desktop:prepare"),
+      );
       expect(runCommands.indexOf("npm run desktop:prepare")).toBeLessThan(
         runCommands.indexOf(testCommand ?? ""),
       );
