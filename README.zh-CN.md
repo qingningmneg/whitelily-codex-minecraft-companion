@@ -2,7 +2,7 @@
 
 默认 [README.md](README.md) 已经中文在前，请阅读[中文部分](README.md#中文)。
 
-## Windows 安装包（v0.2.0-beta.1）
+## Windows 安装包（v0.2.0-beta.2 候选）
 
 > `v0.2.0-beta.1` Public Beta 已通过 Windows Sandbox 七阶段安装生命周期和 Minecraft Java 1.21.5 同机 LAN 连接验收，并以 GitHub 预发布版提供。
 
@@ -11,6 +11,8 @@
 安装包内置 Electron、WhiteLily 运行时和 Codex CLI，不需要系统 Node.js、npm、Git 或 Codex CLI。首次打开后使用 ChatGPT 登录；不提供 Platform API 密钥回退。用户自行启动和操作 PCL2，并手动用 PCL2 启动 Minecraft Java 1.21.5、开放可丢弃世界到 LAN。WhiteLily 不会启动、控制、点击或修改 PCL2。
 
 当前版本仅支持同一台电脑上的 `127.0.0.1` 连接，不支持跨电脑部署。升级会保留本机设置、配置、记忆和数据；卸载时可选“保留 WhiteLily 数据（默认）”或“删除 WhiteLily 数据”。完整步骤见[中文 Windows 安装指南](docs/installation-windows.zh-CN.md)。
+
+beta.2 候选内置固定哈希的 WhiteLily Bridge、可选 Avatar、Fabric API `0.128.2+1.21.5` 与 GeckoLib `5.1.0`。安装器只保存 WhiteLily 当前用户偏好，不搜索或修改 PCL2/Minecraft；桌面应用只向当前已验证的 Fabric Loader `>=0.16.14`、Minecraft Java `1.21.5` 实例安装组件。Bridge 用于官方认证 LAN，Avatar 依赖 Bridge；写入后必须重启 Minecraft，旧世界不会改变。不要提供任何 PCL2、Microsoft 或 Minecraft 凭据。
 
 已发布的 `v0.1.1` ZIP 是需要开发工具的旧版开发者 CLI 预览，不是桌面安装包。
 

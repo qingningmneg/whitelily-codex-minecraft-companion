@@ -11,6 +11,29 @@
 - [ ] 将测试世界“对局域网开放”；核对并确认 WhiteLily 检测到的候选会话只使用本机回环地址 `127.0.0.1`。
 - [ ] 确认名为 `WhiteLily` 的机器人进入测试世界。
 
+## Bridge 与 Avatar 组件验收
+
+- [ ] 使用 PCL2 中当前已验证的 Fabric Loader `>=0.16.14`、Minecraft Java `1.21.5` 实例；不要使用正式存档。
+- [ ] 新安装时确认安装器中的 WhiteLily Bridge 与 WhiteLily Avatar 默认勾选；安装器本身没有启动 PCL2/Minecraft，也没有向实例或世界写文件。
+- [ ] 在 WhiteLily 中对该实例安装 Bridge，或安装 Bridge + Avatar（含固定 Fabric API `0.128.2+1.21.5` 与 GeckoLib `5.1.0`）；写入后确认界面要求重启 Minecraft，且旧世界数据未改变。
+- [ ] 仅安装 Bridge 时确认官方认证 LAN 可连接；安装 Avatar 时确认只有当前会话中经 Bridge 批准的远程 `WhiteLily` 显示基础外观与盔甲主题，本地玩家、错误 UUID、旧会话和计分板/队伍伪装均不触发。
+- [ ] 检查日志、诊断与截图，不得出现 nonce、请求路径、端口、PID、gameDir、哈希、原始踢出文本、真实用户目录或账户数据。
+
+## 安装版动作链路验收
+
+以下证据只记录“通过/失败”、版本和构建提交，不复制用户名、PID、用户目录、原始日志、提示词、租约或凭据。
+
+- [ ] 确认安装程序已自动部署并校验以下三个受管文件，无需用户手工创建或修改：
+  - `%LOCALAPPDATA%\WhiteLily\codex-workspace\AGENTS.md`
+  - `%LOCALAPPDATA%\WhiteLily\codex-workspace\.codex\config.toml`
+  - `%LOCALAPPDATA%\WhiteLily\codex-workspace\workspace-manifest.json`
+- [ ] 启动后核对 `127.0.0.1:32123` 只有本次 WhiteLily 核心进程监听；测试记录只写“端口所有者正确/错误”，不要记录实际 PID。
+- [ ] 在桌面诊断快照中确认动作能力为 `ready`，`workspaceVersion` 与已安装清单一致，`mcpListening = true`，`discoveredToolCount = 15`；任何字段不符都应阻止 Codex 线程和任务启动。
+- [ ] 在可丢弃 LAN 世界中发送 `查看一下你现在的位置`；确认产生 `minecraft_get_state` 调用，任务结束时审计计数满足 `toolCalls >= 1`，不要以自然语言回复措辞代替工具调用证据。
+- [ ] 发送 `走到我身边来`；确认产生 `minecraft_follow_owner`，或目标为主人附近且距离受限的 `minecraft_move_to`。WhiteLily 必须实际移动；预算与审计中的工具调用数、水平移动距离和执行器成功结果必须互相对应。
+- [ ] 完整退出并重启 WhiteLily；再次确认三个受管文件校验通过、端口所有者正确、动作能力恢复为 `ready`，并重复一次位置查询。
+- [ ] 回滚到上一安装版本；确认上一版本可正常启动，原有配置、记忆和世界数据仍在，受管工作区恢复为上一版本清单，且没有残留 staging/backup 目录。随后重新安装当前版本并再次验证动作能力。
+
 ## 自然聊天、任务路由与游戏内零披露
 
 以下检查只能在全新、可丢弃的测试世界中执行，绝不能使用无法替代或尚未验证备份可恢复的存档。

@@ -34,6 +34,23 @@ const reviewedExecutables = [
   "vendor/x86_64-pc-windows-msvc/codex-resources/codex-windows-sandbox-setup.exe",
 ] as const;
 
+const httpProviderArgs = [
+  "-c",
+  'model_provider="whitelily_openai_http"',
+  "-c",
+  'model_providers.whitelily_openai_http.name="WhiteLilyHTTP"',
+  "-c",
+  'model_providers.whitelily_openai_http.base_url="https://chatgpt.com/backend-api/codex"',
+  "-c",
+  'model_providers.whitelily_openai_http.wire_api="responses"',
+  "-c",
+  "model_providers.whitelily_openai_http.requires_openai_auth=true",
+  "-c",
+  "model_providers.whitelily_openai_http.supports_websockets=false",
+  "-c",
+  'mcp_servers.minecraft.url="http://127.0.0.1:32123/mcp"',
+] as const;
+
 function createPackagedCodexFixture(): {
   root: string;
   resources: string;
@@ -106,6 +123,68 @@ describe("JsonRpcProcess", () => {
     harness.receive({ method: "turn/completed", params: { threadId: "thread-1" } });
 
     expect(notifications).toEqual([{ method: "turn/completed", params: { threadId: "thread-1" } }]);
+  });
+
+  it("answers an app-server request with the same string request id", async () => {
+    const harness = createJsonRpcProcessHarness();
+    harness.process.onRequest(async (request) => {
+      expect(request).toEqual({
+        id: "tool-call-1",
+        method: "item/tool/call",
+        params: { tool: "minecraft_follow_owner" },
+      });
+      return { success: true, contentItems: [{ type: "inputText", text: "followed" }] };
+    });
+
+    harness.receive({
+      id: "tool-call-1",
+      method: "item/tool/call",
+      params: { tool: "minecraft_follow_owner" },
+    });
+
+    await expect(harness.nextSent()).resolves.toEqual({
+      id: "tool-call-1",
+      result: { success: true, contentItems: [{ type: "inputText", text: "followed" }] },
+    });
+  });
+
+  it("returns method-not-found when no app-server request handler is registered", async () => {
+    const harness = createJsonRpcProcessHarness();
+
+    harness.receive({ id: 91, method: "unknown/request", params: {} });
+
+    await expect(harness.nextSent()).resolves.toEqual({
+      id: 91,
+      error: { code: -32_601, message: "Method not found" },
+    });
+  });
+
+  it("sanitizes a failed app-server request handler", async () => {
+    const harness = createJsonRpcProcessHarness();
+    harness.process.onRequest(async () => {
+      throw new Error("private Minecraft coordinates");
+    });
+
+    harness.receive({ id: "tool-call-2", method: "item/tool/call", params: {} });
+
+    await expect(harness.nextSent()).resolves.toEqual({
+      id: "tool-call-2",
+      error: { code: -32_603, message: "Internal error" },
+    });
+    expect(JSON.stringify(harness.sent())).not.toContain("private Minecraft coordinates");
+  });
+
+  it("fatally closes when an app-server response cannot be written", async () => {
+    const harness = createJsonRpcProcessHarness();
+    harness.process.onRequest(async () => ({ success: true }));
+    harness.transport.writeLine = () => {
+      throw new Error("response pipe failed");
+    };
+
+    harness.receive({ id: "tool-call-3", method: "item/tool/call", params: {} });
+
+    await vi.waitFor(() => expect(harness.closed()).toBe(true));
+    await expect(harness.process.request("model/list", {})).rejects.toThrow("stopped");
   });
 
   it("rejects outstanding requests when the child process exits", async () => {
@@ -210,7 +289,7 @@ describe("JsonRpcProcess", () => {
     expect(terminate).toHaveBeenCalledWith(child);
   });
 
-  it("uses a hidden command processor on Windows and strips API credentials", () => {
+  it("forces HTTP through a hidden Windows command processor and strips API credentials", () => {
     const spec = createCodexAppServerSpawnSpec(
       "win32",
       "C:\\WhiteLily\\node_modules\\.bin\\codex.cmd",
@@ -230,7 +309,7 @@ describe("JsonRpcProcess", () => {
         "/d",
         "/s",
         "/c",
-        '""C:\\WhiteLily\\node_modules\\.bin\\codex.cmd" app-server --listen stdio://"',
+        `""C:\\WhiteLily\\node_modules\\.bin\\codex.cmd" ${httpProviderArgs.join(" ")} app-server --listen stdio://"`,
       ],
       env: { PATH: "C:\\Windows" },
       windowsHide: true,
@@ -253,7 +332,7 @@ describe("JsonRpcProcess", () => {
 
       expect(spec).toMatchObject({
         command: launch.executablePath,
-        args: ["app-server", "--listen", "stdio://"],
+        args: [...httpProviderArgs, "app-server", "--listen", "stdio://"],
         env: {
           CODEX_HOME: launch.codexHome,
           PATH: [

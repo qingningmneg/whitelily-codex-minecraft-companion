@@ -1,4 +1,5 @@
 import type { Bot } from "mineflayer";
+import type { BridgeAttemptProof } from "./bridgeProofIssuer.js";
 
 export type MineflayerConnectionState =
   "idle" | "connecting" | "connected" | "retrying" | "exhausted" | "stopped";
@@ -6,6 +7,7 @@ export type MineflayerConnectionState =
 export type MineflayerConnectionEvent =
   | { kind: "connected" }
   | { kind: "outage"; reason: string }
+  | { kind: "bridge_failed"; code: MineflayerBridgeErrorCode }
   | { kind: "world_changed" }
   | { kind: "chat"; username: string; message: string }
   | { kind: "owner_online" | "owner_offline"; username: string }
@@ -20,12 +22,15 @@ export interface MineflayerConnectionDependencies {
     port: number;
     botUsername: "WhiteLily";
   };
+  prepareAttempt(port: number): Promise<BridgeAttemptProof>;
   createBot(options: {
     host: "127.0.0.1";
     port: number;
     username: "WhiteLily";
     auth: "offline";
-    hideErrors: false;
+    hideErrors: true;
+    logErrors: false;
+    fakeHost: string;
   }): Bot;
   plugin: Parameters<Bot["loadPlugin"]>[0];
   retryDelaysMs: readonly number[];
@@ -38,6 +43,20 @@ export interface MineflayerSession {
   generation: number;
 }
 
+export type MineflayerBridgeErrorCode = "MINECRAFT_BRIDGE_REQUIRED" | "MINECRAFT_BRIDGE_REJECTED";
+
+const BRIDGE_ERROR_MESSAGES: Record<MineflayerBridgeErrorCode, string> = {
+  MINECRAFT_BRIDGE_REQUIRED: "Minecraft Bridge is required",
+  MINECRAFT_BRIDGE_REJECTED: "Minecraft Bridge rejected the connection",
+};
+
+export class MineflayerBridgeError extends Error {
+  constructor(readonly code: MineflayerBridgeErrorCode) {
+    super(BRIDGE_ERROR_MESSAGES[code]);
+    this.name = "MineflayerBridgeError";
+  }
+}
+
 export class MineflayerTransportFenceError extends Error {
   constructor(reason: string, cause: AggregateError) {
     super(`Minecraft physical transport fence failed: ${reason}`, { cause });
@@ -46,10 +65,12 @@ export class MineflayerTransportFenceError extends Error {
 }
 
 interface BotHandlers {
-  chat: (username: string, message: string) => void;
+  chat: (username: string, message: string, translate: string | null) => void;
   playerJoined: (player: { username: string }) => void;
   playerLeft: (player: { username: string }) => void;
   spawn: () => void;
+  error: (error: Error) => void;
+  kicked: (reason: string, loggedIn: boolean) => void;
   login: (packet: unknown) => void;
   respawn: (packet: unknown) => void;
   death: () => void;
@@ -69,6 +90,14 @@ function abortError(): Error {
   const error = new Error("operation aborted");
   error.name = "AbortError";
   return error;
+}
+
+function swallowLateBotError(): void {
+  // A detached Mineflayer bot may still forward a delayed client/plugin error.
+}
+
+function swallowLateBotKick(): void {
+  // Keep the protocol rejection payload private and absorb detached repeats.
 }
 
 function trustedResourceIdentity(value: unknown): string | undefined {
@@ -118,6 +147,7 @@ export class MineflayerConnection {
   private botHandlers: BotHandlers | undefined;
   private readonly listeners = new Set<(event: MineflayerConnectionEvent) => void>();
   private readonly activeOperations = new Set<() => void>();
+  private readonly failingBots = new WeakSet<Bot>();
   private retryTimer: unknown;
   private retryIndex = 0;
   private outageNotified = false;
@@ -126,7 +156,20 @@ export class MineflayerConnection {
   private rejectConnection: ((error: Error) => void) | undefined;
   private worldIdentity: WorldIdentity | undefined;
   private sessionGeneration = 0;
+  private attemptGeneration = 0;
+  private activeProof: BridgeAttemptProof | undefined;
+  private activeProofBot: Bot | undefined;
+  private readonly preparationOperations = new Set<Promise<void>>();
+  private readonly proofCloseOperations = new WeakMap<BridgeAttemptProof, Promise<boolean>>();
+  private readonly proofCloseByBot = new WeakMap<Bot, Promise<boolean>>();
+  private readonly pendingProofCloses = new Set<Promise<boolean>>();
+  private proofCloseFailed = false;
+  private readonly usedFakeHosts = new Set<string>();
+  private proofBackedLoginRejections = 0;
+  private hasConnected = false;
+  private terminalBridgeError: MineflayerBridgeError | undefined;
   private terminalFenceError: MineflayerTransportFenceError | undefined;
+  private disconnectPromise: Promise<void> | undefined;
 
   constructor(private readonly dependencies: MineflayerConnectionDependencies) {}
 
@@ -151,34 +194,46 @@ export class MineflayerConnection {
     }
   }
 
-  async disconnect(): Promise<void> {
-    if (this.lifecycleState === "stopped") return;
-    if (this.terminalFenceError) throw this.terminalFenceError;
-    const wasConnected = this.lifecycleState === "connected";
-    this.lifecycleState = "stopped";
-    this.clearRetryTimer();
+  disconnect(): Promise<void> {
+    this.disconnectPromise ??= this.disconnectInternal();
+    return this.disconnectPromise;
+  }
 
-    const bot = this.bot;
-    if (bot) {
-      this.safelyStopBot(bot);
-      const fenceErrors = this.establishTransportFence(bot, "adapter disconnect");
-      if (fenceErrors.length > 0) {
-        const error = this.createTransportFenceError("adapter disconnect", fenceErrors);
-        this.handleFenceFailure(bot, error);
-        throw error;
+  private async disconnectInternal(): Promise<void> {
+    const wasConnected = this.lifecycleState === "connected";
+    if (this.lifecycleState !== "stopped") {
+      this.lifecycleState = "stopped";
+      this.attemptGeneration += 1;
+      this.clearRetryTimer();
+      this.takeAndCloseProof();
+
+      const bot = this.bot;
+      if (bot) {
+        this.safelyStopBot(bot);
+        const fenceErrors = this.establishTransportFence(bot, "adapter disconnect");
+        if (fenceErrors.length > 0) {
+          this.handleFenceFailure(
+            bot,
+            this.createTransportFenceError("adapter disconnect", fenceErrors),
+          );
+        }
+        if (this.bot === bot) {
+          this.detach(bot);
+          this.bot = undefined;
+          this.worldIdentity = undefined;
+        }
       }
-      if (this.bot === bot) {
-        this.detach(bot);
-        this.bot = undefined;
-        this.worldIdentity = undefined;
+      this.rejectConnection?.(abortError());
+      this.clearConnectionPromise();
+      this.cancelActiveOperations();
+      if (wasConnected && !this.outageNotified) {
+        this.emit({ kind: "outage", reason: "adapter disconnect" });
       }
     }
-    this.rejectConnection?.(abortError());
-    this.clearConnectionPromise();
-    this.cancelActiveOperations();
-    if (wasConnected && !this.outageNotified) {
-      this.emit({ kind: "outage", reason: "adapter disconnect" });
-    }
+    await this.drainProofWork();
+    if (this.terminalFenceError) throw this.terminalFenceError;
+    if (this.proofCloseFailed)
+      throw this.terminalBridgeError ?? new MineflayerBridgeError("MINECRAFT_BRIDGE_REQUIRED");
   }
 
   state(): MineflayerConnectionState {
@@ -229,44 +284,127 @@ export class MineflayerConnection {
   private startAttempt(): void {
     if (this.lifecycleState !== "connecting" && this.lifecycleState !== "retrying") return;
     if (this.bot) return;
+    const generation = ++this.attemptGeneration;
+    const operation = this.prepareAndStartAttempt(generation).catch(() => {
+      if (this.isActiveAttempt(generation)) this.failBridge("MINECRAFT_BRIDGE_REQUIRED");
+    });
+    this.preparationOperations.add(operation);
+    void operation.then(() => this.preparationOperations.delete(operation));
+  }
+
+  private async prepareAndStartAttempt(generation: number): Promise<void> {
+    let proof: BridgeAttemptProof;
+    try {
+      proof = await this.dependencies.prepareAttempt(this.dependencies.config.port);
+    } catch {
+      if (!this.isActiveAttempt(generation)) return;
+      this.failBridge("MINECRAFT_BRIDGE_REQUIRED");
+      return;
+    }
+    if (!this.isActiveAttempt(generation)) {
+      const closed = await this.closeProof(proof);
+      if (!closed && this.lifecycleState !== "stopped") {
+        this.failBridge("MINECRAFT_BRIDGE_REQUIRED");
+      }
+      return;
+    }
+    if (this.proofCloseOperations.has(proof)) {
+      this.failBridge("MINECRAFT_BRIDGE_REQUIRED");
+      return;
+    }
+    if (this.usedFakeHosts.has(proof.fakeHost)) {
+      await this.closeProof(proof);
+      this.failBridge("MINECRAFT_BRIDGE_REQUIRED");
+      return;
+    }
+    this.usedFakeHosts.add(proof.fakeHost);
     try {
       const bot = this.dependencies.createBot({
         host: "127.0.0.1",
         port: this.dependencies.config.port,
         username: this.dependencies.config.botUsername,
         auth: "offline",
-        hideErrors: false,
+        hideErrors: true,
+        logErrors: false,
+        fakeHost: proof.fakeHost,
       });
       this.bot = bot;
+      this.activeProof = proof;
+      this.activeProofBot = bot;
       this.sessionGeneration += 1;
       this.worldIdentity = undefined;
-      bot.loadPlugin(this.dependencies.plugin);
       this.attach(bot);
-    } catch (error) {
-      const reason = error instanceof Error ? error.message : String(error);
+      bot.loadPlugin(this.dependencies.plugin);
+    } catch {
       if (this.bot) {
         try {
-          this.cleanupPartialBot(this.bot, reason);
+          this.cleanupPartialBot(this.bot, "Minecraft connection setup failed");
         } catch {
           return;
         }
+        this.handleEnd(this.bot, "Minecraft connection setup failed");
+      } else {
+        this.handleEnd(undefined, "Minecraft connection setup failed", this.closeProof(proof));
       }
-      this.handleEnd(undefined, reason);
     }
+  }
+
+  private isActiveAttempt(generation: number): boolean {
+    return (
+      generation === this.attemptGeneration &&
+      (this.lifecycleState === "connecting" || this.lifecycleState === "retrying") &&
+      this.bot === undefined
+    );
+  }
+
+  private failBridge(code: MineflayerBridgeErrorCode): void {
+    if (this.lifecycleState === "stopped" || this.terminalBridgeError) return;
+    this.attemptGeneration += 1;
+    this.clearRetryTimer();
+    const bot = this.bot;
+    if (bot) {
+      this.detach(bot);
+      this.safelyStopBot(bot);
+      const fenceErrors = this.establishTransportFence(bot, "Minecraft Bridge failure");
+      if (fenceErrors.length > 0) {
+        this.terminalFenceError = this.createTransportFenceError(
+          "Minecraft Bridge failure",
+          fenceErrors,
+        );
+      }
+      if (this.bot === bot) this.bot = undefined;
+    }
+    this.worldIdentity = undefined;
+    this.cancelActiveOperations();
+    this.lifecycleState = "exhausted";
+    const error = new MineflayerBridgeError(code);
+    this.terminalBridgeError = error;
+    if (!this.outageNotified) {
+      this.outageNotified = true;
+      this.emit({ kind: "outage", reason: error.code });
+    }
+    this.rejectConnection?.(error);
+    this.clearConnectionPromise();
+    if (this.hasConnected) this.emit({ kind: "bridge_failed", code: error.code });
   }
 
   private attach(bot: Bot): void {
     const handlers: BotHandlers = {
-      chat: (username, message) => this.emitForBot(bot, { kind: "chat", username, message }),
+      chat: (username, message, translate) => {
+        if (translate === "chat.type.admin") return;
+        this.emitForBot(bot, { kind: "chat", username, message });
+      },
       playerJoined: (player) =>
         this.emitForBot(bot, { kind: "owner_online", username: player.username }),
       playerLeft: (player) =>
         this.emitForBot(bot, { kind: "owner_offline", username: player.username }),
-      spawn: () => this.handleSpawn(bot),
+      spawn: () => void this.handleSpawn(bot),
+      error: () => this.handleError(bot),
+      kicked: (_reason, loggedIn) => this.handleKicked(bot, loggedIn),
       login: (packet) => this.handleLogin(bot, packet),
       respawn: (packet) => this.handleRespawn(bot, packet),
       death: () => this.emitForBot(bot, { kind: "death" }),
-      end: (reason) => this.handleEnd(bot, reason),
+      end: () => this.handleEnd(bot, "Minecraft connection ended"),
       entitySpawn: (entity) => this.emitForBot(bot, { kind: "entity_spawn", bot, entity }),
       entityMoved: (entity) => this.emitForBot(bot, { kind: "entity_moved", bot, entity }),
       entityGone: (entity) => this.emitForBot(bot, { kind: "entity_gone", bot, entity }),
@@ -275,6 +413,10 @@ export class MineflayerConnection {
       spawnPosition: (packet) => this.emitForBot(bot, { kind: "spawn_position", bot, packet }),
     };
     this.botHandlers = handlers;
+    bot.on("error", swallowLateBotError);
+    bot.once("error", handlers.error);
+    bot.on("kicked", swallowLateBotKick);
+    bot.once("kicked", handlers.kicked);
     bot.on("chat", handlers.chat);
     bot.on("playerJoined", handlers.playerJoined);
     bot.on("playerLeft", handlers.playerLeft);
@@ -298,6 +440,12 @@ export class MineflayerConnection {
     this.tryCleanup(() => bot.removeListener("playerJoined", handlers.playerJoined));
     this.tryCleanup(() => bot.removeListener("playerLeft", handlers.playerLeft));
     this.tryCleanup(() => bot.removeListener("spawn", handlers.spawn));
+    this.tryCleanup(() => bot.removeListener("error", handlers.error));
+    this.tryCleanup(() => bot.removeListener("kicked", handlers.kicked));
+    // Keep swallowLateBotError attached after lifecycle teardown. Mineflayer can
+    // forward a delayed client/plugin error after the transport begins closing,
+    // and Node throws an `error` event that has no listener. The kicked sink is
+    // likewise persistent so repeated or delayed rejection payloads stay inert.
     this.tryCleanup(() => bot.removeListener("death", handlers.death));
     this.tryCleanup(() => bot.removeListener("end", handlers.end));
     this.tryCleanup(() => bot.removeListener("entitySpawn", handlers.entitySpawn));
@@ -321,14 +469,25 @@ export class MineflayerConnection {
       this.handleFenceFailure(bot, error);
       throw error;
     }
-    if (this.bot === bot) {
-      this.bot = undefined;
-      this.worldIdentity = undefined;
-    }
   }
 
-  private handleSpawn(bot: Bot): void {
+  private async handleSpawn(bot: Bot): Promise<void> {
     if (
+      this.bot !== bot ||
+      (this.lifecycleState !== "connecting" && this.lifecycleState !== "retrying")
+    ) {
+      return;
+    }
+    const generation = this.attemptGeneration;
+    const proofClosed = await (this.takeAndCloseProof(bot) ?? Promise.resolve(true));
+    if (!proofClosed) {
+      if (generation === this.attemptGeneration && this.bot === bot) {
+        this.failBridge("MINECRAFT_BRIDGE_REQUIRED");
+      }
+      return;
+    }
+    if (
+      generation !== this.attemptGeneration ||
       this.bot !== bot ||
       (this.lifecycleState !== "connecting" && this.lifecycleState !== "retrying")
     ) {
@@ -336,8 +495,10 @@ export class MineflayerConnection {
     }
     this.clearRetryTimer();
     this.lifecycleState = "connected";
+    this.hasConnected = true;
     this.outageNotified = false;
     this.retryIndex = 0;
+    this.proofBackedLoginRejections = 0;
     if (this.worldIdentity === undefined) {
       const identity = trustedWorldIdentity(bot);
       this.worldIdentity =
@@ -348,6 +509,36 @@ export class MineflayerConnection {
     this.emit({ kind: "connected" });
     this.resolveConnection?.();
     this.clearConnectionPromise();
+  }
+
+  private handleError(bot: Bot): void {
+    this.handleConnectionFailure(bot, "Minecraft connection error");
+  }
+
+  private handleKicked(bot: Bot, loggedIn: boolean): void {
+    if (loggedIn === false && this.activeProofBot === bot) {
+      this.proofBackedLoginRejections += 1;
+    }
+    this.handleConnectionFailure(bot, "Minecraft connection rejected");
+  }
+
+  private handleConnectionFailure(bot: Bot, reason: string): void {
+    if (
+      this.bot !== bot ||
+      this.lifecycleState === "stopped" ||
+      this.lifecycleState === "exhausted" ||
+      this.failingBots.has(bot)
+    ) {
+      return;
+    }
+    this.failingBots.add(bot);
+    this.safelyStopBot(bot);
+    const fenceErrors = this.establishTransportFence(bot, reason);
+    if (fenceErrors.length > 0) {
+      this.handleFenceFailure(bot, this.createTransportFenceError(reason, fenceErrors));
+      return;
+    }
+    this.handleEnd(bot, reason);
   }
 
   private handleLogin(bot: Bot, packet: unknown): void {
@@ -385,8 +576,15 @@ export class MineflayerConnection {
     if (shouldNotify) this.emit({ kind: "world_changed" });
   }
 
-  private handleEnd(bot: Bot | undefined, reason: string): void {
+  private handleEnd(
+    bot: Bot | undefined,
+    reason: string,
+    detachedProofClose?: Promise<boolean>,
+  ): void {
     if (bot && this.bot !== bot) return;
+    this.attemptGeneration += 1;
+    const generation = this.attemptGeneration;
+    const proofClose = detachedProofClose ?? this.takeAndCloseProof(bot);
     if (bot) this.detach(bot);
     if (this.bot === bot) this.bot = undefined;
     this.worldIdentity = undefined;
@@ -396,6 +594,24 @@ export class MineflayerConnection {
     if (!this.outageNotified) {
       this.outageNotified = true;
       this.emit({ kind: "outage", reason });
+    }
+    void this.finishRetryTransition(generation, proofClose);
+  }
+
+  private async finishRetryTransition(
+    generation: number,
+    proofClose: Promise<boolean> | undefined,
+  ): Promise<void> {
+    if (proofClose !== undefined && !(await proofClose)) {
+      if (generation === this.attemptGeneration && this.lifecycleState !== "stopped") {
+        this.failBridge("MINECRAFT_BRIDGE_REQUIRED");
+      }
+      return;
+    }
+    if (generation !== this.attemptGeneration || this.lifecycleState !== "retrying") return;
+    if (this.proofBackedLoginRejections >= 5) {
+      this.failBridge("MINECRAFT_BRIDGE_REJECTED");
+      return;
     }
     this.scheduleRetry();
   }
@@ -533,6 +749,14 @@ export class MineflayerConnection {
   private handleFenceFailure(bot: Bot, error: MineflayerTransportFenceError): void {
     if (this.bot && this.bot !== bot) return;
     if (this.bot === bot) {
+      const proofClose = this.takeAndCloseProof(bot);
+      if (proofClose !== undefined) {
+        void proofClose.then((closed) => {
+          if (!closed && this.lifecycleState !== "stopped") {
+            this.failBridge("MINECRAFT_BRIDGE_REQUIRED");
+          }
+        });
+      }
       this.detach(bot);
       this.bot = undefined;
     }
@@ -554,6 +778,50 @@ export class MineflayerConnection {
       operation();
     } catch {
       // Connection teardown must continue after best-effort Mineflayer cleanup.
+    }
+  }
+
+  private takeAndCloseProof(bot?: Bot): Promise<boolean> | undefined {
+    if (!this.activeProof || (bot && this.activeProofBot !== bot)) {
+      return bot ? this.proofCloseByBot.get(bot) : undefined;
+    }
+    const proof = this.activeProof;
+    const proofBot = this.activeProofBot;
+    this.activeProof = undefined;
+    this.activeProofBot = undefined;
+    const operation = this.closeProof(proof);
+    if (proofBot) this.proofCloseByBot.set(proofBot, operation);
+    return operation;
+  }
+
+  private closeProof(proof: BridgeAttemptProof): Promise<boolean> {
+    const existing = this.proofCloseOperations.get(proof);
+    if (existing) return existing;
+    let closeOperation: Promise<void>;
+    try {
+      closeOperation = Promise.resolve(proof.close());
+    } catch {
+      closeOperation = Promise.reject(new Error("Minecraft Bridge proof close failed"));
+    }
+    const operation = closeOperation.then(
+      () => true,
+      () => {
+        this.proofCloseFailed = true;
+        return false;
+      },
+    );
+    this.proofCloseOperations.set(proof, operation);
+    this.pendingProofCloses.add(operation);
+    void operation.then(() => this.pendingProofCloses.delete(operation));
+    return operation;
+  }
+
+  private async drainProofWork(): Promise<void> {
+    while (this.preparationOperations.size > 0) {
+      await Promise.all([...this.preparationOperations]);
+    }
+    while (this.pendingProofCloses.size > 0) {
+      await Promise.all([...this.pendingProofCloses]);
     }
   }
 }

@@ -19,6 +19,13 @@ import {
   type OwnerIdentitySnapshot,
 } from "../../../src/identity/ownerIdentity.js";
 import type { RuntimeEvent, RuntimeSnapshot } from "../../../src/runtime/runtimeEvents.js";
+import {
+  parseAvatarAppearanceListItem,
+  parseAvatarModelCatalogSnapshot as parseSharedAvatarModelCatalogSnapshot,
+  parseAvatarModelId,
+  type AvatarAppearanceListItem,
+  type AvatarModelCatalogSnapshot,
+} from "../../../src/avatar/avatarModelSchemas.js";
 import type { BehaviorModeSettings, CompanionProfile } from "../../../src/profile/profileSchema.js";
 import type { CompanionMode } from "../../../src/domain/types.js";
 import type {
@@ -32,6 +39,11 @@ import type { DocumentEnvelope } from "../../../src/storage/documentStore.js";
 import type { SafetyPreset, WorldProfile } from "../../../src/world/worldProfileSchema.js";
 import type { Pcl2Candidate } from "../src-main/discovery/pcl2Discovery.js";
 import type { ConfirmedLanSession, LanCandidate } from "../src-main/discovery/lanDetector.js";
+import type {
+  MinecraftComponentId,
+  MinecraftComponentState,
+  MinecraftComponentStatus,
+} from "../src-main/minecraftComponents.js";
 
 export const WHITE_LILY_IPC_CHANNELS = {
   status: "whitelily:status",
@@ -45,10 +57,14 @@ export const WHITE_LILY_IPC_CHANNELS = {
   startChatGptLogin: "whitelily:start-chatgpt-login",
   cancelChatGptLogin: "whitelily:cancel-chatgpt-login",
   listModels: "whitelily:list-models",
+  migrateModelPreference: "whitelily:migrate-model-preference",
   selectModel: "whitelily:select-model",
   discoverPcl2: "whitelily:discover-pcl2",
   detectLanCandidates: "whitelily:detect-lan-candidates",
   confirmLanCandidate: "whitelily:confirm-lan-candidate",
+  getMinecraftComponentStatus: "whitelily:get-minecraft-component-status",
+  installMinecraftComponents: "whitelily:install-minecraft-components",
+  removeMinecraftComponents: "whitelily:remove-minecraft-components",
   bindConfirmedWorld: "whitelily:bind-confirmed-world",
   readProfile: "whitelily:read-profile",
   updateProfile: "whitelily:update-profile",
@@ -72,17 +88,55 @@ export const WHITE_LILY_IPC_CHANNELS = {
   setStartupSetting: "whitelily:set-startup-setting",
   readCloseToTraySetting: "whitelily:read-close-to-tray-setting",
   setCloseToTraySetting: "whitelily:set-close-to-tray-setting",
+  listAvatarModels: "whitelily:list-avatar-models",
+  importAvatarModel: "whitelily:import-avatar-model",
+  switchAvatarModel: "whitelily:switch-avatar-model",
+  quitApplication: "whitelily:quit-application",
   runtimeEvent: "whitelily:runtime-event",
   ownerIdentityEvent: "whitelily:owner-identity-event",
+  avatarModelsEvent: "whitelily:avatar-models-event",
 } as const;
 
 export type WhiteLilyEventChannel =
-  typeof WHITE_LILY_IPC_CHANNELS.runtimeEvent | typeof WHITE_LILY_IPC_CHANNELS.ownerIdentityEvent;
+  | typeof WHITE_LILY_IPC_CHANNELS.runtimeEvent
+  | typeof WHITE_LILY_IPC_CHANNELS.ownerIdentityEvent
+  | typeof WHITE_LILY_IPC_CHANNELS.avatarModelsEvent;
 
 export type WhiteLilyInvokeChannel = Exclude<
   (typeof WHITE_LILY_IPC_CHANNELS)[keyof typeof WHITE_LILY_IPC_CHANNELS],
   WhiteLilyEventChannel
 >;
+
+export const AVATAR_IPC_ERROR_CODES = [
+  "AVATAR_FORMAT_UNSUPPORTED",
+  "AVATAR_SKIN_INVALID",
+  "AVATAR_PORTRAIT_INVALID",
+  "AVATAR_GLB_INVALID",
+  "AVATAR_EXTERNAL_RESOURCE",
+  "AVATAR_REQUIRED_BONE_MISSING",
+  "AVATAR_PREVIEW_FAILED",
+  "AVATAR_DIGEST_MISMATCH",
+  "AVATAR_IMPORT_FAILED",
+  "AVATAR_CATALOG_INVALID",
+  "AVATAR_MODEL_DUPLICATE",
+  "AVATAR_MODEL_FILE_INVALID",
+  "AVATAR_MODEL_NOT_FOUND",
+  "AVATAR_SWITCH_SUPERSEDED",
+  "AVATAR_SWITCH_FAILED",
+  "AVATAR_SWITCH_RECOVERY_PENDING",
+  "AVATAR_WORLD_CHANGED",
+  "AVATAR_BRIDGE_DISCONNECTED",
+  "AVATAR_PREFERENCE_CONFLICT",
+] as const;
+
+export type AvatarIpcErrorCode = (typeof AVATAR_IPC_ERROR_CODES)[number];
+export type AvatarIpcResult<T> =
+  | { readonly status: "success"; readonly value: T }
+  | { readonly status: "error"; readonly code: AvatarIpcErrorCode };
+
+export function isAvatarIpcErrorCode(value: unknown): value is AvatarIpcErrorCode {
+  return typeof value === "string" && (AVATAR_IPC_ERROR_CODES as readonly string[]).includes(value);
+}
 
 export interface PreloadTransport {
   invoke(channel: WhiteLilyInvokeChannel, ...args: readonly unknown[]): Promise<unknown>;
@@ -104,6 +158,7 @@ export interface WhiteLilyDesktopApi {
   stop(): Promise<RuntimeSnapshot>;
   stopTask(): Promise<RuntimeSnapshot>;
   emergencyStop(): Promise<RuntimeSnapshot>;
+  quitApplication(): Promise<void>;
   readOwnerIdentity(): Promise<OwnerIdentitySnapshot>;
   updateOwnerIdentity(input: {
     expectedRevision: number;
@@ -114,10 +169,20 @@ export interface WhiteLilyDesktopApi {
   startChatGptLogin(): Promise<Extract<AccountSnapshot, { status: "pending" }>>;
   cancelChatGptLogin(attemptId: string): Promise<AccountSnapshot>;
   listModels(): Promise<ModelCatalogSnapshot>;
+  migrateModelPreference(candidate: ModelSelectionInput | null): Promise<ModelCatalogSnapshot>;
   selectModel(selection: ModelSelectionInput): Promise<ModelSelection>;
   discoverPcl2(): Promise<readonly Pcl2Candidate[]>;
   detectLanCandidates(): Promise<readonly LanCandidate[]>;
   confirmLanCandidate(candidateId: string): Promise<ConfirmedLanSession>;
+  getMinecraftComponentStatus(candidateId: string): Promise<MinecraftComponentStatus>;
+  installMinecraftComponents(
+    candidateId: string,
+    selection: readonly MinecraftComponentId[],
+  ): Promise<MinecraftComponentStatus>;
+  removeMinecraftComponents(
+    candidateId: string,
+    selection: readonly MinecraftComponentId[],
+  ): Promise<MinecraftComponentStatus>;
   bindConfirmedWorld?(input: {
     expectedRevision: number;
     label: string;
@@ -190,6 +255,16 @@ export interface WhiteLilyTask5Api {
   }): Promise<{ revision: number; enabled: boolean }>;
 }
 
+export interface WhiteLilyAvatarApi {
+  listAvatarModels(): Promise<AvatarModelCatalogSnapshot>;
+  importAvatarModel(): Promise<
+    | { readonly status: "cancelled" }
+    | { readonly status: "imported"; readonly model: AvatarAppearanceListItem }
+  >;
+  switchAvatarModel(modelId: string): Promise<AvatarModelCatalogSnapshot>;
+  subscribeAvatarModels(listener: (snapshot: AvatarModelCatalogSnapshot) => void): () => void;
+}
+
 export type RendererMemoryInput = Omit<ScopedMemoryInput, "source" | "worldId">;
 export type RendererMemoryPatch = Omit<ScopedMemoryPatch, "worldId">;
 export interface MemoryMigrationPreviewResult {
@@ -204,7 +279,7 @@ export interface MemoryMigrationMutationResult {
   status: "committed" | "rolled_back";
 }
 
-export type WhiteLilyAppApi = WhiteLilyDesktopApi & WhiteLilyTask5Api;
+export type WhiteLilyAppApi = WhiteLilyDesktopApi & WhiteLilyTask5Api & WhiteLilyAvatarApi;
 
 export type DesktopRendererEvent = RuntimeEvent | ConnectionInvalidatedEvent;
 export type OwnerIdentityAuthoritySnapshot = OwnerIdentitySnapshot & {
@@ -260,6 +335,10 @@ export function createWhiteLilyApi(transport: PreloadTransport): WhiteLilyAppApi
       return invoke(WHITE_LILY_IPC_CHANNELS.stopTask);
     },
     emergencyStop: () => invoke(WHITE_LILY_IPC_CHANNELS.emergencyStop),
+    quitApplication: async (...args: readonly unknown[]) => {
+      validateNoDesktopApiInput(args);
+      await transport.invoke(WHITE_LILY_IPC_CHANNELS.quitApplication);
+    },
     readOwnerIdentity: async (...args: readonly unknown[]) => {
       validateNoDesktopApiInput(args);
       return parseOwnerIdentityAuthoritySnapshot(
@@ -312,6 +391,20 @@ export function createWhiteLilyApi(transport: PreloadTransport): WhiteLilyAppApi
         { kind: "list_models" },
         await transport.invoke(WHITE_LILY_IPC_CHANNELS.listModels),
       ),
+    migrateModelPreference: async (candidate: ModelSelectionInput | null) => {
+      const command = parseDesktopRequest({
+        version: 1,
+        id: "preload",
+        command: { kind: "migrate_model_preference", candidate },
+      }).command;
+      if (command.kind !== "migrate_model_preference") {
+        throw new Error("invalid model migration candidate");
+      }
+      return parseDesktopCommandResult(
+        command,
+        await transport.invoke(WHITE_LILY_IPC_CHANNELS.migrateModelPreference, command.candidate),
+      );
+    },
     selectModel: async (selection: ModelSelectionInput) => {
       const command = parseDesktopRequest({
         version: 1,
@@ -332,6 +425,32 @@ export function createWhiteLilyApi(transport: PreloadTransport): WhiteLilyAppApi
       if (!isLanCandidateId(candidateId)) throw new Error("invalid LAN candidate");
       return parseConfirmedLanSession(
         await transport.invoke(WHITE_LILY_IPC_CHANNELS.confirmLanCandidate, candidateId),
+      );
+    },
+    getMinecraftComponentStatus: async (...args: readonly unknown[]) => {
+      const candidateId = parseMinecraftComponentCandidateInput(args);
+      return parseMinecraftComponentStatus(
+        await transport.invoke(WHITE_LILY_IPC_CHANNELS.getMinecraftComponentStatus, candidateId),
+      );
+    },
+    installMinecraftComponents: async (...args: readonly unknown[]) => {
+      const { candidateId, selection } = parseMinecraftComponentOperationInput(args);
+      return parseMinecraftComponentStatus(
+        await transport.invoke(
+          WHITE_LILY_IPC_CHANNELS.installMinecraftComponents,
+          candidateId,
+          selection,
+        ),
+      );
+    },
+    removeMinecraftComponents: async (...args: readonly unknown[]) => {
+      const { candidateId, selection } = parseMinecraftComponentOperationInput(args);
+      return parseMinecraftComponentStatus(
+        await transport.invoke(
+          WHITE_LILY_IPC_CHANNELS.removeMinecraftComponents,
+          candidateId,
+          selection,
+        ),
       );
     },
     bindConfirmedWorld: async (input: { expectedRevision: number; label: string }) =>
@@ -613,6 +732,46 @@ export function createWhiteLilyApi(transport: PreloadTransport): WhiteLilyAppApi
         await transport.invoke(WHITE_LILY_IPC_CHANNELS.setCloseToTraySetting, parsed),
       );
     },
+    listAvatarModels: async (...args: readonly unknown[]) => {
+      if (args.length !== 0) throw new Error("invalid avatar list input");
+      return parseAvatarIpcResult(
+        await transport.invoke(WHITE_LILY_IPC_CHANNELS.listAvatarModels),
+        parseAvatarCatalogSnapshot,
+      );
+    },
+    importAvatarModel: async (...args: readonly unknown[]) => {
+      if (args.length !== 0) throw new Error("invalid avatar import input");
+      return parseAvatarIpcResult(
+        await transport.invoke(WHITE_LILY_IPC_CHANNELS.importAvatarModel),
+        parseAvatarImportResult,
+      );
+    },
+    switchAvatarModel: async (...args: readonly unknown[]) => {
+      if (args.length !== 1) throw new Error("invalid avatar model selection");
+      let modelId: string;
+      try {
+        modelId = parseAvatarModelId(args[0]);
+      } catch {
+        throw new Error("invalid avatar model selection");
+      }
+      return parseAvatarIpcResult(
+        await transport.invoke(WHITE_LILY_IPC_CHANNELS.switchAvatarModel, modelId),
+        parseAvatarCatalogSnapshot,
+      );
+    },
+    subscribeAvatarModels: (...args: readonly unknown[]) => {
+      if (args.length !== 1 || typeof args[0] !== "function") {
+        throw new Error("invalid avatar model listener");
+      }
+      const listener = args[0] as (snapshot: AvatarModelCatalogSnapshot) => void;
+      return transport.subscribe(WHITE_LILY_IPC_CHANNELS.avatarModelsEvent, (value) => {
+        try {
+          listener(parseAvatarCatalogSnapshot(value));
+        } catch {
+          // Malformed avatar catalog events are stopped at the preload boundary.
+        }
+      });
+    },
     subscribeRuntime: (listener: (event: DesktopRendererEvent) => void) =>
       transport.subscribe(WHITE_LILY_IPC_CHANNELS.runtimeEvent, (value) => {
         try {
@@ -622,6 +781,98 @@ export function createWhiteLilyApi(transport: PreloadTransport): WhiteLilyAppApi
         }
       }),
   });
+}
+
+export function parseAvatarCatalogSnapshot(value: unknown): AvatarModelCatalogSnapshot {
+  try {
+    let record: Record<string, unknown>;
+    try {
+      record = readExactPlainDataObject(value, ["revision", "models", "activeModelId"]);
+    } catch {
+      record = readExactPlainDataObject(value, [
+        "revision",
+        "models",
+        "activeModelId",
+        "pendingModelId",
+      ]);
+    }
+    const models = readExactDataArray(record.models, 1_024, "invalid avatar model catalog").map(
+      (model) => parseAvatarAppearanceListItem(readAvatarAppearanceListItem(model)),
+    );
+    return parseSharedAvatarModelCatalogSnapshot({
+      revision: record.revision,
+      models,
+      activeModelId: record.activeModelId,
+      ...(Object.hasOwn(record, "pendingModelId") ? { pendingModelId: record.pendingModelId } : {}),
+    });
+  } catch {
+    throw new Error("invalid avatar model catalog");
+  }
+}
+
+export function parseAvatarImportResult(
+  value: unknown,
+):
+  | { readonly status: "cancelled" }
+  | { readonly status: "imported"; readonly model: AvatarAppearanceListItem } {
+  try {
+    try {
+      const cancelled = readExactPlainDataObject(value, ["status"]);
+      if (cancelled.status !== "cancelled") throw new Error("invalid avatar import result");
+      return Object.freeze({ status: "cancelled" });
+    } catch {
+      const imported = readExactPlainDataObject(value, ["status", "model"]);
+      if (imported.status !== "imported") throw new Error("invalid avatar import result");
+      return Object.freeze({
+        status: "imported",
+        model: parseAvatarAppearanceListItem(readAvatarAppearanceListItem(imported.model)),
+      });
+    }
+  } catch {
+    throw new Error("invalid avatar import result");
+  }
+}
+
+function readAvatarAppearanceListItem(value: unknown): Record<string, unknown> {
+  try {
+    return readExactPlainDataObject(value, [
+      "id",
+      "displayName",
+      "origin",
+      "worldRenderer",
+      "armModel",
+      "previewDataUrl",
+    ]);
+  } catch {
+    return readExactPlainDataObject(value, [
+      "id",
+      "displayName",
+      "origin",
+      "worldRenderer",
+      "armModel",
+      "previewDataUrl",
+      "portraitDataUrl",
+    ]);
+  }
+}
+
+function parseAvatarIpcResult<T>(value: unknown, parseValue: (value: unknown) => T): T {
+  try {
+    const success = readExactPlainDataObject(value, ["status", "value"]);
+    if (success.status !== "success") throw new Error("invalid avatar IPC result");
+    return parseValue(success.value);
+  } catch {
+    let failure: Record<string, unknown>;
+    try {
+      failure = readExactPlainDataObject(value, ["status", "code"]);
+    } catch {
+      throw new Error("invalid avatar IPC result");
+    }
+    if (failure.status !== "error" || !isAvatarIpcErrorCode(failure.code)) {
+      throw new Error("invalid avatar IPC result");
+    }
+    throw Object.assign(new Error("avatar operation failed"), { code: failure.code });
+  }
 }
 
 function parseExportResult(value: unknown): { status: "cancelled" | "saved" } {
@@ -820,7 +1071,7 @@ function readExactPlainDataObject(
   let descriptors: PropertyDescriptorMap;
   try {
     prototype = Object.getPrototypeOf(value);
-    descriptors = Object.getOwnPropertyDescriptors(value);
+    descriptors = Object.getOwnPropertyDescriptors(value) as unknown as PropertyDescriptorMap;
   } catch {
     throw new Error("invalid owner identity input");
   }
@@ -947,6 +1198,207 @@ export function parseConfirmedLanSession(value: unknown): ConfirmedLanSession {
     version: session.version,
     confirmedAt: session.confirmedAt,
   });
+}
+
+export function parseMinecraftComponentStatus(value: unknown): MinecraftComponentStatus {
+  const fields = [
+    "state",
+    "bridgeInstalled",
+    "bridgeActive",
+    "avatarInstalled",
+    "restartRequired",
+  ] as const;
+  const record = readExactDataRecord(value, fields, "invalid Minecraft component status");
+  const state = record.state;
+  if (
+    !isMinecraftComponentState(state) ||
+    typeof record.bridgeInstalled !== "boolean" ||
+    typeof record.bridgeActive !== "boolean" ||
+    typeof record.avatarInstalled !== "boolean" ||
+    typeof record.restartRequired !== "boolean"
+  ) {
+    throw new Error("invalid Minecraft component status");
+  }
+  const status = {
+    state,
+    bridgeInstalled: record.bridgeInstalled,
+    bridgeActive: record.bridgeActive,
+    avatarInstalled: record.avatarInstalled,
+    restartRequired: record.restartRequired,
+  } satisfies MinecraftComponentStatus;
+  if (!isConsistentMinecraftComponentStatus(status)) {
+    throw new Error("invalid Minecraft component status");
+  }
+  return Object.freeze(status);
+}
+
+function parseMinecraftComponentCandidateInput(args: readonly unknown[]): string {
+  if (args.length !== 1 || !isLanCandidateId(args[0])) {
+    throw new Error("invalid Minecraft component input");
+  }
+  return args[0];
+}
+
+function parseMinecraftComponentOperationInput(args: readonly unknown[]): {
+  candidateId: string;
+  selection: readonly MinecraftComponentId[];
+} {
+  if (args.length !== 2 || !isLanCandidateId(args[0])) {
+    throw new Error("invalid Minecraft component input");
+  }
+  const selection = parseMinecraftComponentSelection(args[1]);
+  return Object.freeze({ candidateId: args[0], selection });
+}
+
+function parseMinecraftComponentSelection(value: unknown): readonly MinecraftComponentId[] {
+  if (!Array.isArray(value) || value.length > 2) {
+    throw new Error("invalid Minecraft component input");
+  }
+  let prototype: object | null;
+  let descriptors: PropertyDescriptorMap;
+  try {
+    prototype = Object.getPrototypeOf(value) as object | null;
+    descriptors = Object.getOwnPropertyDescriptors(value) as unknown as PropertyDescriptorMap;
+  } catch {
+    throw new Error("invalid Minecraft component input");
+  }
+  const expectedKeys = [
+    ...Array.from({ length: value.length }, (_unused, index) => String(index)),
+    "length",
+  ];
+  const keys = Reflect.ownKeys(descriptors);
+  if (
+    prototype !== Array.prototype ||
+    keys.length !== expectedKeys.length ||
+    keys.some((key) => typeof key !== "string" || !expectedKeys.includes(key)) ||
+    descriptors.length?.value !== value.length
+  ) {
+    throw new Error("invalid Minecraft component input");
+  }
+  const selected = new Set<MinecraftComponentId>();
+  const result: MinecraftComponentId[] = [];
+  for (let index = 0; index < value.length; index += 1) {
+    const descriptor = descriptors[String(index)];
+    if (!descriptor || !Object.hasOwn(descriptor, "value") || descriptor.enumerable !== true) {
+      throw new Error("invalid Minecraft component input");
+    }
+    const component = descriptor.value;
+    if (
+      (component !== "bridge" && component !== "avatar") ||
+      selected.has(component as MinecraftComponentId)
+    ) {
+      throw new Error("invalid Minecraft component input");
+    }
+    selected.add(component);
+    result.push(component);
+  }
+  return Object.freeze(result);
+}
+
+function readExactDataRecord<const K extends readonly string[]>(
+  value: unknown,
+  fields: K,
+  message: string,
+): { [P in K[number]]: unknown } {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error(message);
+  }
+  let prototype: object | null;
+  let descriptors: PropertyDescriptorMap;
+  try {
+    prototype = Object.getPrototypeOf(value) as object | null;
+    descriptors = Object.getOwnPropertyDescriptors(value) as unknown as PropertyDescriptorMap;
+  } catch {
+    throw new Error(message);
+  }
+  const keys = Reflect.ownKeys(descriptors);
+  if (
+    prototype !== Object.prototype ||
+    keys.length !== fields.length ||
+    fields.some((field) => !Object.hasOwn(descriptors, field)) ||
+    keys.some((key) => typeof key !== "string" || !fields.includes(key))
+  ) {
+    throw new Error(message);
+  }
+  const result: Record<string, unknown> = {};
+  for (const field of fields) {
+    const descriptor = descriptors[field]!;
+    if (!Object.hasOwn(descriptor, "value") || descriptor.enumerable !== true) {
+      throw new Error(message);
+    }
+    result[field] = descriptor.value;
+  }
+  return result as { [P in K[number]]: unknown };
+}
+
+function readExactDataArray(value: unknown, maximum: number, message: string): readonly unknown[] {
+  if (!Array.isArray(value) || value.length > maximum) throw new Error(message);
+  let prototype: object | null;
+  let descriptors: PropertyDescriptorMap;
+  try {
+    prototype = Object.getPrototypeOf(value) as object | null;
+    descriptors = Object.getOwnPropertyDescriptors(value) as unknown as PropertyDescriptorMap;
+  } catch {
+    throw new Error(message);
+  }
+  const expectedKeys = [
+    ...Array.from({ length: value.length }, (_unused, index) => String(index)),
+    "length",
+  ];
+  const keys = Reflect.ownKeys(descriptors);
+  if (
+    prototype !== Array.prototype ||
+    keys.length !== expectedKeys.length ||
+    keys.some((key) => typeof key !== "string" || !expectedKeys.includes(key)) ||
+    descriptors.length?.value !== value.length
+  ) {
+    throw new Error(message);
+  }
+  const result: unknown[] = [];
+  for (let index = 0; index < value.length; index += 1) {
+    const descriptor = descriptors[String(index)];
+    if (!descriptor || !Object.hasOwn(descriptor, "value") || descriptor.enumerable !== true) {
+      throw new Error(message);
+    }
+    result.push(descriptor.value);
+  }
+  return Object.freeze(result);
+}
+
+function isMinecraftComponentState(value: unknown): value is MinecraftComponentState {
+  return (
+    value === "bridge_not_installed" ||
+    value === "bridge_restart_required" ||
+    value === "bridge_not_active" ||
+    value === "bridge_version_unsupported" ||
+    value === "bridge_file_conflict" ||
+    value === "avatar_not_installed" ||
+    value === "avatar_restart_required" ||
+    value === "ready"
+  );
+}
+
+function isConsistentMinecraftComponentStatus(value: MinecraftComponentStatus): boolean {
+  const flags = `${Number(value.bridgeInstalled)}${Number(value.bridgeActive)}${Number(
+    value.avatarInstalled,
+  )}${Number(value.restartRequired)}`;
+  switch (value.state) {
+    case "bridge_not_installed":
+    case "bridge_file_conflict":
+      return flags === "0000";
+    case "bridge_version_unsupported":
+      return flags === "0000" || flags === "1000";
+    case "bridge_restart_required":
+      return flags === "1001";
+    case "bridge_not_active":
+      return flags === "1000";
+    case "avatar_not_installed":
+      return flags === "1100";
+    case "avatar_restart_required":
+      return flags === "1111";
+    case "ready":
+      return flags === "1110";
+  }
 }
 
 function isLanCandidateId(value: unknown): value is string {

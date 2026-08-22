@@ -3,6 +3,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as nativeDelay } from "node:timers/promises";
 import { ActionExecutor } from "../../src/actions/actionExecutor.js";
+import { CompanionActionQueue } from "../../src/actions/actionQueue.js";
+import { QueuedActionRunner } from "../../src/actions/queuedActionRunner.js";
 import { parseLocalCommand } from "../../src/commands/commandParser.js";
 import { ChatRouter } from "../../src/companion/chatRouter.js";
 import { CompanionService } from "../../src/companion/companionService.js";
@@ -16,6 +18,7 @@ import { TurnToolBudget } from "../../src/mcp/toolBudget.js";
 import { createToolRegistry, type ToolResult } from "../../src/mcp/toolRegistry.js";
 import { FakeMinecraftPort } from "../../src/minecraft/fakeMinecraftPort.js";
 import type { OwnerIdentitySnapshot } from "../../src/identity/ownerIdentity.js";
+import type { FarmingPreferenceStatus } from "../../src/profile/farmingPreferenceStore.js";
 import { ConfirmationStore } from "../../src/safety/confirmationStore.js";
 import { SafetyEngine } from "../../src/safety/safetyEngine.js";
 import {
@@ -104,7 +107,14 @@ interface PendingTurn {
 class FakeCodexPort implements CodexPort {
   readonly turns: Array<{ threadId: string; text: string }> = [];
   readonly interruptions: Array<{ threadId: string; turnId: string }> = [];
-  readonly startedThreads: Array<{ cwd: string; model: string; reasoningEffort: string }> = [];
+  readonly startedThreads: Array<{
+    cwd: string;
+    model: string;
+    reasoningEffort: string;
+    toolAccess?: "none" | "minecraft";
+  }> = [];
+  readonly closedThreads: string[] = [];
+  readonly threadLifecycle: string[] = [];
   readonly pendingTurns: PendingTurn[] = [];
   startCalls = 0;
   stopCalls = 0;
@@ -142,6 +152,7 @@ class FakeCodexPort implements CodexPort {
   private readonly threadStartGates = new Map<number, Deferred<void>>();
   private readonly threadStartReached = new Map<number, Deferred<void>>();
   private readonly threadStartErrors: Array<Error | undefined>;
+  private readonly threadCloseErrors: Array<Error | undefined>;
   private readonly startGates = new Map<number, Deferred<void>>();
   private readonly startReached = new Map<number, Deferred<void>>();
   private readonly startErrors: Array<Error | undefined>;
@@ -175,6 +186,7 @@ class FakeCodexPort implements CodexPort {
     }
     this.startErrors = [...(options.codexStartErrors ?? [])];
     this.threadStartErrors = [...(options.codexThreadStartErrors ?? [])];
+    this.threadCloseErrors = [...(options.codexThreadCloseErrors ?? [])];
     this.modelResults = [...(options.modelResults ?? [])];
     this.selectionAvailability = [...(options.selectionAvailability ?? [])];
   }
@@ -244,6 +256,7 @@ class FakeCodexPort implements CodexPort {
     cwd: string;
     model: string;
     reasoningEffort: string;
+    toolAccess?: "none" | "minecraft";
   }): Promise<string> {
     const call = this.threadStartCalls++;
     const role = this.nextThreadRole;
@@ -265,6 +278,7 @@ class FakeCodexPort implements CodexPort {
     this.startedThreads.push(options);
     this.threadRoles.set(threadId, role);
     this.currentThreadIds[role] = threadId;
+    this.threadLifecycle.push(`start:${threadId}`);
     this.nextThreadRole = role === "intent" ? "execution" : "intent";
     return threadId;
   }
@@ -362,6 +376,16 @@ class FakeCodexPort implements CodexPort {
     this.interruptions.push({ threadId, turnId });
   }
 
+  async closeThread(threadId: string): Promise<void> {
+    this.closedThreads.push(threadId);
+    this.threadLifecycle.push(`close:${threadId}`);
+    const error = this.threadCloseErrors.shift();
+    if (error) throw error;
+    const role = this.threadRoles.get(threadId);
+    if (role && this.currentThreadIds[role] === threadId) this.currentThreadIds[role] = undefined;
+    this.threadRoles.delete(threadId);
+  }
+
   async stop(): Promise<void> {
     this.stopCalls += 1;
     this.threadPairRevision += 1;
@@ -436,6 +460,7 @@ export interface CompanionHarnessOptions {
   gatedThreadStarts?: number[];
   codexStartErrors?: Array<Error | undefined>;
   codexThreadStartErrors?: Array<Error | undefined>;
+  codexThreadCloseErrors?: Array<Error | undefined>;
   modelResults?: Array<string[] | Error>;
   selectionAvailability?: boolean[];
   persistedState?: StateToPersist;
@@ -453,6 +478,9 @@ export interface CompanionHarnessOptions {
   compatibilityVerified?: boolean;
   safetyPresetAllows?: boolean;
   ownerIdentitySnapshot?: OwnerIdentitySnapshot;
+  farmingPreferenceStatus?: FarmingPreferenceStatus;
+  gateFarmingPermissionSetAllowed?: boolean;
+  farmObservationNow?: number;
 }
 
 class FakeAutonomyScheduler {
@@ -592,6 +620,44 @@ export async function createCompanionHarness(options: CompanionHarnessOptions = 
         taskController.reserveAdditionalTravel(lease, horizontalTravel),
     },
   );
+  const actionQueue = new CompanionActionQueue({
+    createId: (() => {
+      let next = 0;
+      return () => `queue-${++next}`;
+    })(),
+    now: () => new Date(),
+  });
+  let farmingPreferenceStatus = options.farmingPreferenceStatus ?? "unknown";
+  const farmingPermissionSetAllowedReached = deferred<void>();
+  const farmingPermissionSetAllowedRelease = deferred<void>();
+  const farmingPreference = {
+    snapshot: () => Object.freeze({ status: farmingPreferenceStatus }),
+    setAllowed: async (guard?: () => boolean) => {
+      if (guard?.() === false) throw new Error("farming permission authority is stale");
+      if (options.gateFarmingPermissionSetAllowed) {
+        farmingPermissionSetAllowedReached.resolve();
+        await farmingPermissionSetAllowedRelease.promise;
+      }
+      if (guard?.() === false) throw new Error("farming permission authority is stale");
+      farmingPreferenceStatus = "allowed" as const;
+      return Object.freeze({ status: farmingPreferenceStatus });
+    },
+    setDenied: async () => {
+      farmingPreferenceStatus = "denied" as const;
+      return Object.freeze({ status: farmingPreferenceStatus });
+    },
+  };
+  let service!: CompanionService;
+  const actionRunner = new QueuedActionRunner({
+    queue: actionQueue,
+    executor,
+    executionContext: () => service?.queueExecutionContext() ?? null,
+    safetyContextProvider: async () => ({
+      spawn: { x: 0, y: 64, z: 0 },
+      owner: { x: 0, y: 64, z: 0 },
+      wheatFarmingAllowed: farmingPreferenceStatus === "allowed",
+    }),
+  });
   const autonomy = new FakeAutonomyScheduler(options.autonomyCanChat ?? true);
   let ownerIdentitySnapshot = options.ownerIdentitySnapshot
     ? { ...options.ownerIdentitySnapshot }
@@ -619,6 +685,7 @@ export async function createCompanionHarness(options: CompanionHarnessOptions = 
   const budgetLeases: Array<string | undefined> = [];
   const budgetTaskLeaseIds: Array<string | undefined> = [];
   const errors: string[] = [];
+  const diagnostics: Array<{ event: string; fields: Record<string, unknown> }> = [];
   const begin = budget.begin.bind(budget);
   const end = budget.end.bind(budget);
   budget.begin = (taskLease?: TaskLease, authorization = {}) => {
@@ -640,6 +707,17 @@ export async function createCompanionHarness(options: CompanionHarnessOptions = 
     number,
     { callback: () => void; milliseconds: number; cleared: boolean }
   >();
+  let nextFarmingPermissionTimerId = 20_000;
+  const farmingPermissionTimers = new Map<
+    number,
+    { callback: () => void; milliseconds: number; cleared: boolean }
+  >();
+  let farmObservationNow = options.farmObservationNow ?? 0;
+  let nextFarmObservationTimerId = 30_000;
+  const farmObservationTimers = new Map<
+    number,
+    { callback: () => void; milliseconds: number; cleared: boolean }
+  >();
   if (options.activeMinecraftWait) {
     minecraft.wait = async (_milliseconds, signal) => {
       activeWaitAbort = signal;
@@ -656,7 +734,7 @@ export async function createCompanionHarness(options: CompanionHarnessOptions = 
       });
     };
   }
-  const service = new CompanionService({
+  service = new CompanionService({
     minecraft,
     codex,
     mode,
@@ -664,17 +742,22 @@ export async function createCompanionHarness(options: CompanionHarnessOptions = 
     state,
     confirmations,
     executor,
+    actionQueue,
+    actionRunner,
+    farmingPreference,
     budget,
     taskController,
     autonomy,
     logger: {
-      error: async (_event: string, fields: Record<string, unknown>) => {
+      error: async (event: string, fields: Record<string, unknown>) => {
         errors.push(String(fields.code));
+        diagnostics.push({ event, fields: structuredClone(fields) });
       },
     },
     safetyContextProvider: async () => ({
       spawn: { x: 0, y: 64, z: 0 },
       owner: { x: 0, y: 64, z: 0 },
+      wheatFarmingAllowed: farmingPreferenceStatus === "allowed",
     }),
     ownerUsername: () => "TestOwner",
     ...(ownerIdentity === undefined ? {} : { ownerIdentity }),
@@ -703,6 +786,25 @@ export async function createCompanionHarness(options: CompanionHarnessOptions = 
     clearTimer: (timer) => {
       mergeTimers.delete(timer as unknown as number);
     },
+    setFarmingPermissionTimer: (callback, milliseconds) => {
+      const id = nextFarmingPermissionTimerId++;
+      farmingPermissionTimers.set(id, { callback, milliseconds, cleared: false });
+      return id as unknown as ReturnType<typeof setTimeout>;
+    },
+    clearFarmingPermissionTimer: (timer) => {
+      const record = farmingPermissionTimers.get(timer as unknown as number);
+      if (record) record.cleared = true;
+    },
+    setFarmObservationTimer: (callback, milliseconds) => {
+      const id = nextFarmObservationTimerId++;
+      farmObservationTimers.set(id, { callback, milliseconds, cleared: false });
+      return id as unknown as ReturnType<typeof setTimeout>;
+    },
+    clearFarmObservationTimer: (timer) => {
+      const record = farmObservationTimers.get(timer as unknown as number);
+      if (record) record.cleared = true;
+    },
+    farmObservationNow: () => farmObservationNow,
     ...(options.manualConfirmationTimers
       ? {
           confirmationNow: () => new Date(),
@@ -733,8 +835,12 @@ export async function createCompanionHarness(options: CompanionHarnessOptions = 
     safetyContextProvider: async () => ({
       spawn: { x: 0, y: 64, z: 0 },
       owner: { x: 0, y: 64, z: 0 },
+      wheatFarmingAllowed: farmingPreferenceStatus === "allowed",
     }),
     ownerUsername: () => "TestOwner",
+    latestSnapshot: () => minecraft.world,
+    actionQueue,
+    worldGeneration: () => service.queueExecutionContext()?.worldGeneration ?? 0,
   });
   return {
     directory,
@@ -746,6 +852,11 @@ export async function createCompanionHarness(options: CompanionHarnessOptions = 
     savedStates: state.savedStates,
     confirmations,
     executor,
+    actionQueue,
+    actionRunner,
+    currentFarmingPreferenceStatus: () => farmingPreferenceStatus,
+    untilFarmingPermissionSetAllowed: () => farmingPermissionSetAllowedReached.promise,
+    releaseFarmingPermissionSetAllowed: () => farmingPermissionSetAllowedRelease.resolve(),
     budget,
     taskController,
     taskAuditEvents,
@@ -757,6 +868,7 @@ export async function createCompanionHarness(options: CompanionHarnessOptions = 
     budgetTaskLeaseIds,
     autonomy,
     errors,
+    diagnostics,
     service,
     tools,
     setOwnerIdentitySnapshot: (snapshot: OwnerIdentitySnapshot) => {
@@ -849,6 +961,37 @@ export async function createCompanionHarness(options: CompanionHarnessOptions = 
       if (!callback) throw new Error("no task deadline is pending");
       taskDeadlineCallback = undefined;
       callback();
+    },
+    farmingPermissionTimerRecords: () =>
+      [...farmingPermissionTimers.entries()].map(([id, record]) => ({
+        id,
+        milliseconds: record.milliseconds,
+        cleared: record.cleared,
+      })),
+    fireFarmingPermissionTimer: (id: number, includeCleared = false) => {
+      const record = farmingPermissionTimers.get(id);
+      if (!record || (record.cleared && !includeCleared)) {
+        throw new Error("no matching farming permission timer is pending");
+      }
+      record.cleared = true;
+      record.callback();
+    },
+    farmObservationTimerRecords: () =>
+      [...farmObservationTimers.entries()].map(([id, record]) => ({
+        id,
+        milliseconds: record.milliseconds,
+        cleared: record.cleared,
+      })),
+    setFarmObservationNow: (now: number) => {
+      farmObservationNow = now;
+    },
+    fireFarmObservationTimer: (id: number, includeCleared = false) => {
+      const record = farmObservationTimers.get(id);
+      if (!record || (record.cleared && !includeCleared)) {
+        throw new Error("no matching farm observation timer is pending");
+      }
+      record.cleared = true;
+      record.callback();
     },
     confirmationTimerRecords: () =>
       [...confirmationTimers.entries()].map(([id, record]) => ({

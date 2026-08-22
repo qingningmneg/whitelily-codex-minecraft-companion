@@ -3,9 +3,11 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   createApplicationBeforeQuitHandler,
+  createApplicationQuitRequest,
   createCloseToTrayHandler,
   createNativeTray,
   prepareElectronPrimary,
+  runElectronMainWithFailureDisplay,
   runSingleInstanceApplication,
   showExistingWindow,
   startElectronPrimary,
@@ -13,6 +15,10 @@ import {
   waitForRendererReady,
 } from "./main.js";
 import { resolveAppPaths } from "./appPaths.js";
+import {
+  WorkspaceProvisionError,
+  type WorkspaceProvisionErrorCode,
+} from "./codexWorkspaceProvisioner.js";
 import type { RuntimeSnapshot } from "../../../src/runtime/runtimeEvents.js";
 
 class FakeWindow {
@@ -311,6 +317,7 @@ describe("Electron application ownership", () => {
         startPrimary: (prepared, ownership) =>
           startElectronPrimary(
             {
+              prepareSupervisor: async () => undefined,
               createSupervisor,
               startComposition,
             },
@@ -377,6 +384,7 @@ describe("Electron application ownership", () => {
         startPrimary: (prepared, ownership) =>
           startElectronPrimary(
             {
+              prepareSupervisor: async () => undefined,
               createSupervisor,
               startComposition,
             },
@@ -442,6 +450,7 @@ describe("Electron application ownership", () => {
         startPrimary: (prepared, ownership) =>
           startElectronPrimary(
             {
+              prepareSupervisor: async () => undefined,
               createSupervisor: () => {
                 throw new Error("supervisor failed");
               },
@@ -455,6 +464,129 @@ describe("Electron application ownership", () => {
 
     expect(startComposition).not.toHaveBeenCalled();
     expect(app.quit).toHaveBeenCalledOnce();
+  });
+
+  it("prepares the workspace before constructing and starting the child supervisor", async () => {
+    const order: string[] = [];
+
+    await startElectronPrimary(
+      {
+        prepareSupervisor: async (paths, localAppData) => {
+          expect(paths).toEqual({ dataRoot: String.raw`C:\LocalAppData\owner\WhiteLily` });
+          expect(localAppData).toBe(String.raw`C:\LocalAppData\owner`);
+          order.push("prepare workspace");
+        },
+        createSupervisor: () => {
+          order.push("create supervisor");
+          return { id: "supervisor" };
+        },
+        startComposition: async () => {
+          order.push("start composition");
+        },
+      },
+      {
+        localAppData: String.raw`C:\LocalAppData\owner`,
+        paths: { dataRoot: String.raw`C:\LocalAppData\owner\WhiteLily` },
+      },
+      { transferToComposition: vi.fn() },
+    );
+
+    expect(order).toEqual(["prepare workspace", "create supervisor", "start composition"]);
+  });
+
+  it("does not construct or start a child when workspace preparation fails", async () => {
+    const createSupervisor = vi.fn();
+    const startComposition = vi.fn();
+
+    await expect(
+      startElectronPrimary(
+        {
+          prepareSupervisor: async () => {
+            throw new Error("workspace provisioning failed");
+          },
+          createSupervisor,
+          startComposition,
+        },
+        {
+          localAppData: String.raw`C:\LocalAppData\owner`,
+          paths: { dataRoot: String.raw`C:\LocalAppData\owner\WhiteLily` },
+        },
+        { transferToComposition: vi.fn() },
+      ),
+    ).rejects.toThrow("workspace provisioning failed");
+    expect(createSupervisor).not.toHaveBeenCalled();
+    expect(startComposition).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [
+      "WORKSPACE_RESOURCE_INVALID",
+      "无法验证 WhiteLily 动作工作区（WORKSPACE_RESOURCE_INVALID）。请重新安装 WhiteLily 后重试。",
+    ],
+    [
+      "WORKSPACE_DEPLOY_FAILED",
+      "无法部署 WhiteLily 动作工作区（WORKSPACE_DEPLOY_FAILED）。请关闭 WhiteLily 后重试；如仍失败，请重新安装。",
+    ],
+    [
+      "WORKSPACE_ROLLBACK_FAILED",
+      "无法恢复 WhiteLily 动作工作区（WORKSPACE_ROLLBACK_FAILED）。请保留当前用户数据并重新安装 WhiteLily。",
+    ],
+  ] as const)(
+    "shows one stable local error for %s before any supervisor is created",
+    async (code, expectedMessage) => {
+      const createSupervisor = vi.fn();
+      const startComposition = vi.fn();
+      const displayError = vi.fn(async () => undefined);
+      const setExitCode = vi.fn();
+
+      await runElectronMainWithFailureDisplay({
+        run: () =>
+          startElectronPrimary(
+            {
+              prepareSupervisor: async () => {
+                throw new WorkspaceProvisionError(code as WorkspaceProvisionErrorCode);
+              },
+              createSupervisor,
+              startComposition,
+            },
+            {
+              localAppData: String.raw`C:\LocalAppData\owner`,
+              paths: { dataRoot: String.raw`C:\LocalAppData\owner\WhiteLily` },
+            },
+            { transferToComposition: vi.fn() },
+          ),
+        displayError,
+        setExitCode,
+      });
+
+      expect(createSupervisor).not.toHaveBeenCalled();
+      expect(startComposition).not.toHaveBeenCalled();
+      expect(displayError).toHaveBeenCalledOnce();
+      expect(displayError).toHaveBeenCalledWith("WhiteLily 启动失败", expectedMessage);
+      expect(setExitCode).toHaveBeenCalledOnce();
+      expect(setExitCode).toHaveBeenCalledWith(1);
+    },
+  );
+
+  it("redacts an unexpected startup failure before displaying it locally", async () => {
+    const displayError = vi.fn(async () => undefined);
+    const setExitCode = vi.fn();
+
+    await runElectronMainWithFailureDisplay({
+      run: async () => {
+        throw new Error(String.raw`failed at C:\private\owner\workspace`);
+      },
+      displayError,
+      setExitCode,
+    });
+
+    expect(displayError).toHaveBeenCalledOnce();
+    expect(displayError).toHaveBeenCalledWith(
+      "WhiteLily 启动失败",
+      "WhiteLily 无法启动（STARTUP_FAILED）。请重新启动；如仍失败，请重新安装。",
+    );
+    expect(JSON.stringify(displayError.mock.calls)).not.toContain("private");
+    expect(setExitCode).toHaveBeenCalledWith(1);
   });
 
   it("does not double quit after composition takes startup ownership", async () => {
@@ -474,6 +606,7 @@ describe("Electron application ownership", () => {
         startPrimary: (prepared, ownership) =>
           startElectronPrimary(
             {
+              prepareSupervisor: async () => undefined,
               createSupervisor: () => ({ id: "supervisor" }),
               startComposition: async (_supervisor, transferOwnership) => {
                 transferOwnership();
@@ -590,7 +723,9 @@ describe("native tray composition", () => {
       lifecycle: "stopped",
       minecraft: { state: "disconnected", sessionId: null },
       codex: { state: "stopped", model: null },
+      actions: null,
       task: null,
+      actionQueue: { goal: null, items: [] },
       lastError: null,
     };
     const request = vi.fn(async (command: { kind: string }) => {
@@ -599,12 +734,19 @@ describe("native tray composition", () => {
           ...snapshot,
           lifecycle: "running",
           minecraft: { state: "connected", sessionId: "session_7F2A" },
+          actions: {
+            state: "ready",
+            workspaceVersion: "workspace-1",
+            mcpListening: true,
+            discoveredToolCount: 15,
+          },
         };
       } else if (command.kind === "stop_runtime") {
         snapshot = {
           ...snapshot,
           lifecycle: "stopped",
           minecraft: { state: "disconnected", sessionId: null },
+          actions: null,
         };
       }
       return snapshot;
@@ -664,6 +806,55 @@ describe("native tray composition", () => {
 });
 
 describe("Electron startup composition", () => {
+  it("creates the production quit request from only the existing lifecycle", async () => {
+    const quit = vi.fn<() => Promise<void>>(async () => undefined);
+    const appQuit = vi.fn();
+    const processKill = vi.fn();
+    const forceTerminate = vi.fn();
+    const lifecycle = { quit, appQuit, processKill, forceTerminate };
+
+    const requestApplicationQuit = createApplicationQuitRequest(lifecycle);
+    await Promise.all([requestApplicationQuit(), requestApplicationQuit()]);
+
+    expect(quit).toHaveBeenCalledTimes(2);
+    expect(appQuit).not.toHaveBeenCalled();
+    expect(processKill).not.toHaveBeenCalled();
+    expect(forceTerminate).not.toHaveBeenCalled();
+  });
+
+  it("gives IPC registration the same lifecycle used by startup and tray", async () => {
+    const { app, diagnostic, supervisor } = createStartupHarness();
+    const mainWindow = new FakeWindow();
+    let requestApplicationQuit: (() => Promise<void>) | undefined;
+    let trayLifecycle: { quit(): Promise<void> } | undefined;
+
+    await startElectronComposition({
+      app,
+      supervisor,
+      createWindow: () => mainWindow,
+      configureWindow: vi.fn(),
+      registerIpc: (_window, lifecycle) => {
+        requestApplicationQuit = () => lifecycle.quit();
+        return () => undefined;
+      },
+      createTray: (_window, lifecycle) => {
+        trayLifecycle = lifecycle;
+        return { destroy: vi.fn() };
+      },
+      loadWindow: async () => undefined,
+      diagnostic,
+    });
+
+    expect(requestApplicationQuit).toBeTypeOf("function");
+    expect(trayLifecycle).toBeDefined();
+    const first = requestApplicationQuit!();
+    const second = trayLifecycle!.quit();
+    await Promise.all([first, second]);
+
+    expect(supervisor.shutdown).toHaveBeenCalledOnce();
+    expect(app.quit).toHaveBeenCalledOnce();
+  });
+
   it("keeps the main window hidden until the verified renderer load completes", async () => {
     const { app, diagnostic, supervisor } = createStartupHarness();
     const mainWindow = new FakeWindow();

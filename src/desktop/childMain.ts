@@ -1,17 +1,19 @@
 import type { Readable, Writable } from "node:stream";
-import { relative, resolve } from "node:path";
+import { dirname, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { createRuntimeFacade } from "../app.js";
 import { AccountService } from "../codex/accountService.js";
 import { CodexAppServerClient } from "../codex/appServerClient.js";
 import { ModelCatalog } from "../codex/modelCatalog.js";
+import { ModelPreferenceStore } from "../codex/modelPreferenceStore.js";
 import type { ResolvedModelSelection } from "../codex/modelCatalog.js";
 import type { RuntimeFacade } from "../runtime/runtimeFacade.js";
 import type { ConfirmedRuntimeConnection } from "../config/schema.js";
-import { resolveCoreAppPaths } from "../config/loadConfig.js";
+import { loadConfig, resolveCoreAppPaths } from "../config/loadConfig.js";
 import { arch, platform, release } from "node:os";
 import { DiagnosticExporter } from "../diagnostics/diagnosticExporter.js";
 import { ProfileStore } from "../profile/profileStore.js";
+import { FarmingPreferenceStore } from "../profile/farmingPreferenceStore.js";
 import { MemoryMigration } from "../memory/memoryMigration.js";
 import { MemoryStore } from "../memory/memoryStore.js";
 import { ScopedMemoryStore } from "../memory/scopedMemoryStore.js";
@@ -26,6 +28,10 @@ import {
   type DesktopChildProfileStore,
   type DesktopChildRuntime,
 } from "./childServer.js";
+
+const WORKSPACE_VERSION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u;
+const APPLICATION_VERSION_PATTERN =
+  /^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/u;
 
 export interface DesktopChildServices {
   ownerIdentity: OwnerIdentityAccess;
@@ -64,11 +70,13 @@ export interface DesktopChildMainDependencies {
     initialRevision: number,
     selection: ResolvedModelSelection,
     ownerIdentity: OwnerIdentityAccess,
+    farmingPreferenceStore: FarmingPreferenceStore,
   ) => Promise<RuntimeFacade>;
   createServices?: (
     context: DesktopChildServiceContext,
   ) => DesktopChildServices | Promise<DesktopChildServices>;
   cwd?: string;
+  appVersion?: string;
 }
 
 export async function runDesktopChild(
@@ -85,6 +93,10 @@ export async function runDesktopChild(
   let runtimeRevisionSeed: number;
   try {
     runtimeRevisionSeed = parseRuntimeRevisionSeed(args[1]);
+    assertPackagedWorkspaceVersion(
+      process.env.WHITELILY_CODEX_LAYOUT,
+      process.env.WHITELILY_WORKSPACE_VERSION,
+    );
     const dataRoot =
       process.env.WHITELILY_DATA_ROOT === undefined
         ? undefined
@@ -98,7 +110,11 @@ export async function runDesktopChild(
     services = await (
       dependencies.createServices ??
       ((context: DesktopChildServiceContext) =>
-        createDefaultDesktopChildServices(context, dependencies.createRuntime))
+        createDefaultDesktopChildServices(
+          context,
+          resolveApplicationVersion(dependencies.appVersion ?? process.env.WHITELILY_APP_VERSION),
+          dependencies.createRuntime,
+        ))
     )({
       configPath,
       cwd,
@@ -140,6 +156,15 @@ export async function runDesktopChild(
   await server.stop();
 }
 
+function assertPackagedWorkspaceVersion(
+  layout: string | undefined,
+  contentVersion: string | undefined,
+): void {
+  if (layout === "packaged" && !WORKSPACE_VERSION_PATTERN.test(contentVersion ?? "")) {
+    throw new Error("Packaged workspace version is invalid");
+  }
+}
+
 function parseRuntimeRevisionSeed(value: string | undefined): number {
   if (value === undefined) return 0;
   if (!/^(?:0|[1-9][0-9]*)$/u.test(value)) {
@@ -152,26 +177,48 @@ function parseRuntimeRevisionSeed(value: string | undefined): number {
   return seed;
 }
 
-async function createDefaultDesktopChildServices(
+function resolveApplicationVersion(value: string | undefined): string {
+  if (value === undefined || !APPLICATION_VERSION_PATTERN.test(value)) {
+    throw new Error("WhiteLily application version is invalid");
+  }
+  return value;
+}
+
+export async function createDefaultDesktopChildServices(
   context: DesktopChildServiceContext,
+  appVersion: string,
   injectedRuntimeFactory?: (
     configPath: string,
     connection: ConfirmedRuntimeConnection,
     initialRevision: number,
     selection: ResolvedModelSelection,
     ownerIdentity: OwnerIdentityAccess,
+    farmingPreferenceStore: FarmingPreferenceStore,
   ) => Promise<RuntimeFacade>,
 ): Promise<DesktopChildServices> {
-  const client = new CodexAppServerClient(undefined, {
-    workspacePath: resolve(context.cwd, "codex-workspace"),
-  });
-  const account = new AccountService(client);
-  const models = new ModelCatalog(client, account);
   const paths = resolveCoreAppPaths(context.configPath, {
     cwd: context.cwd,
     ...(context.dataRoot === undefined ? {} : { dataRoot: context.dataRoot }),
   });
+  const legacyConfig = await loadConfig(context.configPath);
+  const modelPreferenceStore = new ModelPreferenceStore({ rootDirectory: dirname(paths.config) });
+  const legacyConfigCandidate = {
+    mode: "explicit" as const,
+    modelId: legacyConfig.codex.preferredModel,
+    reasoningEffort: legacyConfig.codex.reasoningEffort,
+  };
+  const client = new CodexAppServerClient(undefined, {
+    workspacePath: resolve(context.cwd, "codex-workspace"),
+  });
+  const account = new AccountService(client);
+  const models = new ModelCatalog(client, account, {
+    store: modelPreferenceStore,
+    legacyConfigCandidate,
+  });
   const profiles = new ProfileStore({ rootDirectory: paths.profiles });
+  const farmingPreferenceStore = new FarmingPreferenceStore({
+    rootDirectory: dirname(paths.profiles),
+  });
   const ownerIdentity = await OwnerIdentityService.open(paths.config);
   let activePrivateWorldProof: string | undefined;
   const worldProfiles = new WorldProfileStore({
@@ -187,7 +234,7 @@ async function createDefaultDesktopChildServices(
   const memoryMigration = new MemoryMigration(memories, memories);
   const diagnostics = new DiagnosticExporter({
     dataRoot: paths.dataRoot,
-    appVersion: "0.2.0-beta.1",
+    appVersion,
     osSummary: { platform: platform(), release: release(), arch: arch() },
     dependencyVersions: {
       node: process.versions.node,
@@ -235,6 +282,7 @@ async function createDefaultDesktopChildServices(
               runtimeModelSelection: selection,
               worldSafety,
               ownerIdentity,
+              farmingPreferenceStore,
             })
         : (connection, initialRevision, selection) =>
             injectedRuntimeFactory(
@@ -243,6 +291,7 @@ async function createDefaultDesktopChildServices(
               initialRevision,
               selection,
               ownerIdentity,
+              farmingPreferenceStore,
             ),
   };
 }

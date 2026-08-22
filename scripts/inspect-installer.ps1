@@ -328,7 +328,6 @@ try {
     $runtimeManifest = Get-Content -LiteralPath $manifestFiles[0].FullName -Raw -Encoding UTF8 | ConvertFrom-Json
     $policySha256 = Get-Sha256Hex $sourceManifestPath
     if (
-        -not [StringComparer]::Ordinal.Equals([string]$runtimeManifest.policySha256, $policySha256) -or
         -not [StringComparer]::Ordinal.Equals([string]$runtimeManifest.productVersion, $ExpectedVersion) -or
         [int]$runtimeManifest.schemaVersion -ne 1
     ) {
@@ -339,9 +338,6 @@ try {
     $runtimeRequired = @($runtimeManifest.allowlist.requiredFiles | ForEach-Object { [string]$_ })
     [Array]::Sort($sourceRequired, [StringComparer]::Ordinal)
     [Array]::Sort($runtimeRequired, [StringComparer]::Ordinal)
-    if (-not [System.Linq.Enumerable]::SequenceEqual([string[]]$sourceRequired, [string[]]$runtimeRequired)) {
-        throw 'INSTALLER_RUNTIME_POLICY_MISMATCH'
-    }
 
     $declared = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     foreach ($resource in @($runtimeManifest.resources)) {
@@ -384,11 +380,164 @@ try {
             }
         }
     }
+
+    $expectedManagedWorkspaceResources = @(
+        'codex-workspace/.codex/config.toml',
+        'codex-workspace/AGENTS.md',
+        'codex-workspace/workspace-manifest.json'
+    )
+    $managedWorkspaceResources = @(
+        $runtimeManifest.resources |
+            Where-Object {
+                ([string]$_.path).StartsWith(
+                    'codex-workspace/',
+                    [StringComparison]::Ordinal
+                )
+            }
+    )
+    $actualManagedWorkspaceResources = @(
+        $managedWorkspaceResources |
+            ForEach-Object { [string]$_.path }
+    )
+    [Array]::Sort($expectedManagedWorkspaceResources, [StringComparer]::Ordinal)
+    [Array]::Sort($actualManagedWorkspaceResources, [StringComparer]::Ordinal)
+    if (
+        -not [System.Linq.Enumerable]::SequenceEqual(
+            [string[]]$actualManagedWorkspaceResources,
+            [string[]]$expectedManagedWorkspaceResources
+        )
+    ) {
+        throw 'INSTALLER_MANAGED_WORKSPACE_RESOURCES_INVALID'
+    }
+
+    $minecraftComponents = [string]$sourceManifest.paths.minecraftComponents
+    if (-not [StringComparer]::Ordinal.Equals($minecraftComponents, 'minecraft-components')) {
+        throw 'INSTALLER_MINECRAFT_COMPONENT_RESOURCES_INVALID'
+    }
+    $minecraftComponentPrefix = $minecraftComponents + '/'
+    [string[]]$sourceMinecraftComponentFiles = @(
+        $sourceManifest.allowlist.exactFiles |
+            Where-Object {
+                $null -ne $_.target -and
+                ([string]$_.target).StartsWith($minecraftComponentPrefix, [StringComparison]::Ordinal)
+            } |
+            ForEach-Object { [string]$_.target }
+    )
+    [string[]]$requiredMinecraftComponentFiles = @(
+        $sourceRequired |
+            Where-Object { $_.StartsWith($minecraftComponentPrefix, [StringComparison]::Ordinal) }
+    )
+    $minecraftComponentResources = @(
+        $runtimeManifest.resources |
+            Where-Object {
+                ([string]$_.path).StartsWith($minecraftComponentPrefix, [StringComparison]::Ordinal)
+            }
+    )
+    [string[]]$runtimeMinecraftComponentFiles = @(
+        $minecraftComponentResources |
+            ForEach-Object { [string]$_.path }
+    )
+    $componentExecutableFiles = @(
+        $sourceManifest.allowlist.executableFiles |
+            Where-Object {
+                ([string]$_).StartsWith($minecraftComponentPrefix, [StringComparison]::Ordinal)
+            }
+    )
+    $componentScriptFiles = @(
+        $sourceManifest.allowlist.scriptFiles |
+            Where-Object {
+                ([string]$_).StartsWith($minecraftComponentPrefix, [StringComparison]::Ordinal)
+            }
+    )
+    [Array]::Sort($sourceMinecraftComponentFiles, [StringComparer]::Ordinal)
+    [Array]::Sort($requiredMinecraftComponentFiles, [StringComparer]::Ordinal)
+    [Array]::Sort($runtimeMinecraftComponentFiles, [StringComparer]::Ordinal)
+    if (
+        $minecraftComponentResources.Count -ne 7 -or
+        $sourceMinecraftComponentFiles.Count -ne 7 -or
+        $requiredMinecraftComponentFiles.Count -ne 7 -or
+        $componentExecutableFiles.Count -ne 0 -or
+        $componentScriptFiles.Count -ne 0 -or
+        -not [System.Linq.Enumerable]::SequenceEqual(
+            [string[]]$sourceMinecraftComponentFiles,
+            [string[]]$requiredMinecraftComponentFiles
+        ) -or
+        -not [System.Linq.Enumerable]::SequenceEqual(
+            [string[]]$sourceMinecraftComponentFiles,
+            [string[]]$runtimeMinecraftComponentFiles
+        )
+    ) {
+        throw 'INSTALLER_MINECRAFT_COMPONENT_RESOURCES_INVALID'
+    }
+
+    $workspaceRoot = Resolve-ContainedResource $resourceRoot 'codex-workspace'
+    $workspaceManifestPath = Resolve-ContainedResource `
+        $resourceRoot `
+        'codex-workspace/workspace-manifest.json'
+    $workspaceManifest = Get-Content `
+        -LiteralPath $workspaceManifestPath `
+        -Raw `
+        -Encoding UTF8 |
+        ConvertFrom-Json
+    $expectedManagedPayloads = @('.codex/config.toml', 'AGENTS.md')
+    $managedPayloads = @($workspaceManifest.files)
+    if (
+        [int]$workspaceManifest.schemaVersion -ne 1 -or
+        -not [StringComparer]::Ordinal.Equals([string]$workspaceManifest.contentVersion, '1') -or
+        $managedPayloads.Count -ne $expectedManagedPayloads.Count
+    ) {
+        throw 'INSTALLER_MANAGED_WORKSPACE_MANIFEST_INVALID'
+    }
+    for ($index = 0; $index -lt $expectedManagedPayloads.Count; $index += 1) {
+        $payload = $managedPayloads[$index]
+        $payloadPath = [string]$payload.path
+        if (
+            -not [StringComparer]::Ordinal.Equals($payloadPath, $expectedManagedPayloads[$index]) -or
+            [long]$payload.bytes -lt 0 -or
+            [string]$payload.sha256 -cnotmatch '^[a-f0-9]{64}$'
+        ) {
+            throw 'INSTALLER_MANAGED_WORKSPACE_MANIFEST_INVALID'
+        }
+        $installedPayloadPath = Resolve-ContainedResource $workspaceRoot $payloadPath
+        $installedPayload = Get-Item -LiteralPath $installedPayloadPath
+        $installedPayloadHash = Get-Sha256Hex $installedPayloadPath
+        $outerPath = "codex-workspace/$payloadPath"
+        $outerMatches = @(
+            $managedWorkspaceResources |
+                Where-Object {
+                    [StringComparer]::Ordinal.Equals([string]$_.path, $outerPath)
+                }
+        )
+        if (
+            $installedPayload.Length -ne [long]$payload.bytes -or
+            -not [StringComparer]::Ordinal.Equals(
+                $installedPayloadHash,
+                [string]$payload.sha256
+            ) -or
+            $outerMatches.Count -ne 1 -or
+            [long]$outerMatches[0].bytes -ne [long]$payload.bytes -or
+            -not [StringComparer]::Ordinal.Equals(
+                [string]$outerMatches[0].sha256,
+                [string]$payload.sha256
+            )
+        ) {
+            throw "INSTALLER_MANAGED_WORKSPACE_HASH_MISMATCH: $payloadPath"
+        }
+    }
     foreach ($afterPack in @($sourceManifest.allowlist.afterPackFiles | ForEach-Object { [string]$_ })) {
         $afterPackPath = Resolve-ContainedResource $resourceRoot $afterPack
         if (-not (Test-Path -LiteralPath $afterPackPath -PathType Leaf)) {
             throw "INSTALLER_RESOURCE_MISSING: $afterPack"
         }
+    }
+    if (
+        -not [System.Linq.Enumerable]::SequenceEqual(
+            [string[]]$sourceRequired,
+            [string[]]$runtimeRequired
+        ) -or
+        -not [StringComparer]::Ordinal.Equals([string]$runtimeManifest.policySha256, $policySha256)
+    ) {
+        throw 'INSTALLER_RUNTIME_POLICY_MISMATCH'
     }
 
     Invoke-ReviewedRuntimeVerifier `
@@ -403,6 +552,9 @@ try {
         sha256 = Get-Sha256Hex $resolvedInstaller
         signingStatus = Get-SigningStatus $resolvedInstaller
         resourcesVerified = $declared.Count
+        managedWorkspaceResourcesVerified = $managedWorkspaceResources.Count
+        managedWorkspacePayloadsVerified = $managedPayloads.Count
+        minecraftComponentResourcesVerified = $minecraftComponentResources.Count
     }
     Write-Output ($result | ConvertTo-Json -Compress)
 } finally {

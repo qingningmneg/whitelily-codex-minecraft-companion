@@ -1,7 +1,14 @@
 import { describe, expect, it } from "vitest";
+import { McpLifecycle, WhiteLilyAppLifecycle, type AppRuntime } from "../../src/app.js";
 import type { ActiveTask } from "../../src/companion/taskController.js";
+import type { ResolvedModelSelection } from "../../src/codex/modelCatalog.js";
+import { snapshotDiagnosticActionCapability } from "../../src/diagnostics/diagnosticManifest.js";
+import type { McpReadinessSnapshot } from "../../src/mcp/mcpReadiness.js";
+import type { RunningMcpServer } from "../../src/mcp/mcpServer.js";
+import { MineflayerBridgeError } from "../../src/minecraft/mineflayerConnection.js";
 import { RuntimeFacade } from "../../src/runtime/runtimeFacade.js";
 import type { RuntimeEvent } from "../../src/runtime/runtimeEvents.js";
+import type { ActionCapabilitySnapshot } from "../../src/runtime/runtimeEvents.js";
 import type { TaskBudgetSnapshot, TaskStopReason } from "../../src/safety/taskBudget.js";
 
 function deferred<T = void>() {
@@ -55,6 +62,78 @@ function activeBudgetFixture(): TaskBudgetSnapshot {
   };
 }
 
+const readyActionAccess = {
+  snapshot: () => ({
+    state: "ready" as const,
+    workspaceVersion: "workspace-1",
+    mcpListening: true as const,
+    discoveredToolCount: 15,
+  }),
+  subscribe: () => () => undefined,
+};
+
+function realActionRuntime(readiness: McpReadinessSnapshot) {
+  let closeServer!: () => void;
+  const closed = new Promise<void>((resolve) => {
+    closeServer = resolve;
+  });
+  let serverStops = 0;
+  const server: RunningMcpServer = {
+    host: "127.0.0.1",
+    port: 32123,
+    url: "http://127.0.0.1:32123/mcp",
+    closed,
+    stop: async () => {
+      serverStops += 1;
+      closeServer();
+    },
+  };
+  const mcp = new McpLifecycle({} as never, {
+    workspaceVersion: "workspace-1",
+    startServer: async () => server,
+    verify: async () => readiness,
+  });
+  let modelSwitches = 0;
+  const appRuntime: AppRuntime = {
+    preferredModel: "gpt-5.6-terra",
+    minecraft: { connect: async () => undefined, disconnect: async () => undefined },
+    mcp,
+    codex: {
+      assertChatGptLogin: async () => undefined,
+      start: async () => undefined,
+      listModels: async () => ["gpt-5.6-terra"],
+      stop: async () => undefined,
+    },
+    selectModel: () => "gpt-5.6-terra",
+    switchModel: async (_selection, commitPreference) => {
+      modelSwitches += 1;
+      await commitPreference();
+    },
+    companion: {
+      start: async () => undefined,
+      switchModel: async (_selection, commitPreference) => commitPreference(),
+      stop: async () => undefined,
+    },
+    executor: { stopAll: () => undefined },
+  };
+  const lifecycle = new WhiteLilyAppLifecycle(appRuntime);
+  const runtime = new RuntimeFacade({
+    lifecycle,
+    actions: {
+      snapshot: () => mcp.snapshot(),
+      subscribe: (listener) => mcp.subscribe(listener),
+    },
+    codex: { model: () => "gpt-5.6-terra" },
+    switchModel: (selection, commitPreference) =>
+      appRuntime.switchModel(selection, commitPreference),
+  });
+  return {
+    runtime,
+    serverStops: () => serverStops,
+    modelSwitches: () => modelSwitches,
+  };
+}
+
 let minecraftAccessorReads = 0;
 const accessorBackedOwnerOffline = { kind: "owner_offline" };
 Object.defineProperty(accessorBackedOwnerOffline, "username", {
@@ -77,6 +156,12 @@ const malformedMinecraftCases: ReadonlyArray<readonly [string, unknown]> = [
   ["connected reason has the wrong type", { kind: "connected", reason: 42 }],
   ["connected reason exceeds its bound", { kind: "connected", reason: "r".repeat(257) }],
   ["disconnected has an extra field", { kind: "disconnected", extra: true }],
+  ["bridge_failed is missing its code", { kind: "bridge_failed" }],
+  ["bridge_failed has an unknown code", { kind: "bridge_failed", code: "PRIVATE_BRIDGE_ERROR" }],
+  [
+    "bridge_failed has an extra field",
+    { kind: "bridge_failed", code: "MINECRAFT_BRIDGE_REQUIRED", privatePath: "C:\\private" },
+  ],
   ["world_changed has a symbol field", { kind: "world_changed", [Symbol("private")]: true }],
   ["chat has a non-string message", { kind: "chat", username: "owner", message: 42 }],
   ["chat username exceeds its bound", { kind: "chat", username: "u".repeat(65), message: "hi" }],
@@ -139,6 +224,369 @@ function createRuntimeFacadeHarness() {
 }
 
 describe("RuntimeFacade", () => {
+  it("publishes a sanitized queue projection and updates its public task goal", () => {
+    const listeners = new Set<() => void>();
+    let items: Array<{
+      id: string;
+      index: number;
+      kind: "jump";
+      summary: string;
+      status: "waiting" | "cancelled";
+      retryCount: number;
+      enqueuedAt: string;
+      reason?: string;
+    }> = [
+      {
+        id: "private-queue-id",
+        index: 1,
+        kind: "jump" as const,
+        summary: "跳一下",
+        status: "waiting" as const,
+        retryCount: 0,
+        enqueuedAt: "2026-08-15T00:00:00.000Z",
+      },
+    ];
+    const task = activeTaskFixture();
+    const events: RuntimeEvent[] = [];
+    const runtime = new RuntimeFacade({
+      lifecycle: { start: async () => undefined, stop: async () => undefined },
+      task: {
+        current: () => task,
+        budget: activeBudgetFixture,
+        stop: () => undefined,
+      },
+      actionQueue: {
+        snapshot: () => ({ items }),
+        subscribe: (listener) => {
+          listeners.add(listener);
+          return () => listeners.delete(listener);
+        },
+      },
+      createPublicTaskId: () => "task_public",
+    });
+    runtime.subscribe((event) => events.push(event));
+
+    expect(runtime.snapshot().actionQueue).toEqual({
+      goal: "Build safely",
+      items: [
+        {
+          index: 1,
+          kind: "jump",
+          summary: "跳一下",
+          status: "waiting",
+          retryCount: 0,
+          enqueuedAt: "2026-08-15T00:00:00.000Z",
+        },
+      ],
+    });
+    expect(JSON.stringify(runtime.snapshot().actionQueue)).not.toContain("private-queue-id");
+
+    items = [{ ...items[0]!, status: "cancelled", reason: "owner_stop" }];
+    for (const listener of listeners) listener();
+
+    expect(events.at(-1)).toMatchObject({
+      kind: "action_queue",
+      actionQueue: { items: [{ status: "cancelled", reason: "owner_stop" }] },
+    });
+  });
+
+  it("retains a real MCP readiness failure for diagnostics until a fresh runtime starts", async () => {
+    const failed = realActionRuntime({
+      state: "failed",
+      listening: true,
+      discoveredToolCount: 14,
+      errorCode: "missing_tools",
+    });
+    const events: RuntimeEvent[] = [];
+    failed.runtime.subscribe((event) => events.push(event));
+
+    await expect(failed.runtime.start()).rejects.toMatchObject({
+      name: "ActionCapabilityError",
+      code: "missing_tools",
+    });
+
+    const failedSnapshot = failed.runtime.snapshot();
+    expect(failedSnapshot).toMatchObject({
+      lifecycle: "failed",
+      minecraft: { state: "disconnected", sessionId: null },
+      codex: { state: "failed", model: null },
+      actions: {
+        state: "failed",
+        workspaceVersion: "workspace-1",
+        mcpListening: false,
+        discoveredToolCount: 14,
+        errorCode: "missing_tools",
+      },
+      task: null,
+      lastError: { code: "MCP_TOOL_CATALOG_INVALID" },
+    });
+    expect(snapshotDiagnosticActionCapability(failedSnapshot.actions)).toEqual({
+      workspaceVersion: "workspace-1",
+      state: "failed",
+      mcpListening: false,
+      discoveredToolCount: 14,
+      errorCode: "missing_tools",
+    });
+    const actionEvents = events.filter((event) => event.kind === "actions");
+    expect(actionEvents.map((event) => event.state?.state ?? null)).toEqual(["starting", "failed"]);
+    expect(actionEvents.map((event) => event.revision)).toEqual(
+      actionEvents.map((_event, index) => actionEvents[0]!.revision + index),
+    );
+    await failed.runtime.stop("process_exit");
+    expect(failed.runtime.snapshot().actions).toEqual(failedSnapshot.actions);
+    await expect(
+      failed.runtime.switchModel(
+        { modelId: "gpt-5.6-luna", reasoningEffort: "medium" },
+        async () => undefined,
+      ),
+    ).rejects.toThrow("Runtime is not running");
+    expect(failed.modelSwitches()).toBe(0);
+    expect(failed.serverStops()).toBe(1);
+
+    const fresh = realActionRuntime({
+      state: "ready",
+      listening: true,
+      discoveredToolCount: 15,
+      errorCode: null,
+    });
+    const freshEvents: RuntimeEvent[] = [];
+    fresh.runtime.subscribe((event) => freshEvents.push(event));
+    expect(fresh.runtime.snapshot().actions).toBeNull();
+
+    await fresh.runtime.start();
+    expect(
+      freshEvents.filter((event) => event.kind === "actions").map((event) => event.state?.state),
+    ).toEqual(["starting", "ready"]);
+    await fresh.runtime.stop("process_exit");
+    expect(fresh.runtime.snapshot()).toMatchObject({ lifecycle: "stopped", actions: null });
+    expect(fresh.serverStops()).toBe(1);
+  });
+
+  it("publishes starting and ready action capability transitions while starting", async () => {
+    let actions: ActionCapabilitySnapshot | null = null;
+    let publishActions: ((snapshot: ActionCapabilitySnapshot | null) => void) | undefined;
+    const runtime = new RuntimeFacade({
+      lifecycle: {
+        start: async () => {
+          actions = { state: "starting", workspaceVersion: "workspace-1" };
+          publishActions?.(actions);
+          actions = {
+            state: "ready",
+            workspaceVersion: "workspace-1",
+            mcpListening: true,
+            discoveredToolCount: 15,
+          };
+          publishActions?.(actions);
+        },
+        stop: async () => undefined,
+      },
+      actions: {
+        snapshot: () => actions,
+        subscribe: (listener) => {
+          publishActions = listener;
+          return () => {
+            publishActions = undefined;
+          };
+        },
+      },
+    });
+    const events: RuntimeEvent[] = [];
+    runtime.subscribe((event) => events.push(event));
+
+    expect(runtime.snapshot().actions).toBeNull();
+    await runtime.start();
+
+    expect(runtime.snapshot().actions).toEqual({
+      state: "ready",
+      workspaceVersion: "workspace-1",
+      mcpListening: true,
+      discoveredToolCount: 15,
+    });
+    expect(events.filter((event) => event.kind === "actions")).toEqual([
+      expect.objectContaining({
+        kind: "actions",
+        state: { state: "starting", workspaceVersion: "workspace-1" },
+      }),
+      expect.objectContaining({
+        kind: "actions",
+        state: {
+          state: "ready",
+          workspaceVersion: "workspace-1",
+          mcpListening: true,
+          discoveredToolCount: 15,
+        },
+      }),
+    ]);
+  });
+
+  it("keeps a pre-existing action source hidden while idle and adopts it on start", async () => {
+    const runtime = new RuntimeFacade({
+      lifecycle: { start: async () => undefined, stop: async () => undefined },
+      actions: readyActionAccess,
+    });
+
+    expect(runtime.snapshot().actions).toBeNull();
+    await runtime.start();
+    expect(runtime.snapshot().actions).toEqual(readyActionAccess.snapshot());
+  });
+
+  it("requires ready actions for a model switch and preserves the ready snapshot", async () => {
+    let actions: ActionCapabilitySnapshot | null = null;
+    let publishActions: ((snapshot: ActionCapabilitySnapshot | null) => void) | undefined;
+    let delegated = 0;
+    const runtime = new RuntimeFacade({
+      lifecycle: { start: async () => undefined, stop: async () => undefined },
+      actions: {
+        snapshot: () => actions,
+        subscribe: (listener) => {
+          publishActions = listener;
+          return () => {
+            publishActions = undefined;
+          };
+        },
+      },
+      switchModel: async (_selection, commitPreference) => {
+        delegated += 1;
+        await commitPreference();
+      },
+    });
+    await runtime.start();
+
+    await expect(
+      runtime.switchModel(
+        { modelId: "gpt-5.6-luna", reasoningEffort: "medium" },
+        async () => undefined,
+      ),
+    ).rejects.toThrow("Minecraft actions are unavailable");
+    expect(delegated).toBe(0);
+
+    actions = {
+      state: "ready",
+      workspaceVersion: "workspace-1",
+      mcpListening: true,
+      discoveredToolCount: 15,
+    };
+    publishActions?.(actions);
+    const before = runtime.snapshot().actions;
+    await runtime.switchModel(
+      { modelId: "gpt-5.6-luna", reasoningEffort: "medium" },
+      async () => undefined,
+    );
+
+    expect(delegated).toBe(1);
+    expect(runtime.snapshot().actions).toEqual(before);
+  });
+
+  it("accepts a bounded provider-qualified model ID during startup", async () => {
+    const events: RuntimeEvent[] = [];
+    const runtime = new RuntimeFacade({
+      initialRevision: 40,
+      lifecycle: { start: async () => undefined, stop: async () => undefined },
+      codex: { model: () => "provider:model" },
+    });
+    runtime.subscribe((event) => events.push(event));
+
+    await runtime.start();
+
+    expect(runtime.snapshot()).toMatchObject({
+      lifecycle: "running",
+      codex: { state: "ready", model: "provider:model" },
+    });
+    const revisions = events.map((event) => event.revision);
+    expect(revisions).toEqual(revisions.map((_revision, index) => 41 + index));
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        kind: "codex",
+        state: { state: "ready", model: "provider:model" },
+      }),
+    );
+  });
+
+  it("publishes only the committed model after a live companion switch", async () => {
+    const order: string[] = [];
+    const selection: ResolvedModelSelection = {
+      modelId: "gpt-5.6-luna",
+      reasoningEffort: "high",
+    };
+    const runtime = new RuntimeFacade({
+      lifecycle: { start: async () => undefined, stop: async () => undefined },
+      codex: { model: () => "gpt-5.6-terra" },
+      actions: readyActionAccess,
+      switchModel: async (next, commitPreference) => {
+        order.push(`switch:${next.modelId}:${next.reasoningEffort}`);
+        await commitPreference();
+        order.push("switched");
+      },
+    });
+    const events: RuntimeEvent[] = [];
+    runtime.subscribe((event) => events.push(event));
+    await runtime.start();
+    const before = runtime.snapshot();
+    events.length = 0;
+
+    await runtime.switchModel(selection, async () => {
+      order.push("commit");
+    });
+
+    expect(order).toEqual(["switch:gpt-5.6-luna:high", "commit", "switched"]);
+    expect(runtime.snapshot()).toEqual({
+      ...before,
+      revision: before.revision + 1,
+      codex: { state: "ready", model: "gpt-5.6-luna" },
+    });
+    expect(events).toEqual([
+      {
+        kind: "codex",
+        revision: before.revision + 1,
+        state: { state: "ready", model: "gpt-5.6-luna" },
+      },
+    ]);
+  });
+
+  it("keeps the running snapshot unchanged when live model preference commit fails", async () => {
+    const runtime = new RuntimeFacade({
+      lifecycle: { start: async () => undefined, stop: async () => undefined },
+      codex: { model: () => "gpt-5.6-terra" },
+      actions: readyActionAccess,
+      switchModel: async (_selection, commitPreference) => commitPreference(),
+    });
+    await runtime.start();
+    const before = runtime.snapshot();
+    const events: RuntimeEvent[] = [];
+    runtime.subscribe((event) => events.push(event));
+
+    await expect(
+      runtime.switchModel({ modelId: "gpt-5.6-luna", reasoningEffort: "medium" }, async () => {
+        throw new Error("stale preference");
+      }),
+    ).rejects.toThrow("stale preference");
+
+    expect(runtime.snapshot()).toEqual(before);
+    expect(events).toEqual([]);
+  });
+
+  it("rejects model switching unless the runtime is running", async () => {
+    let delegated = false;
+    const runtime = new RuntimeFacade({
+      lifecycle: { start: async () => undefined, stop: async () => undefined },
+      switchModel: async (_selection, commitPreference) => {
+        delegated = true;
+        await commitPreference();
+      },
+    });
+    const before = runtime.snapshot();
+
+    await expect(
+      runtime.switchModel(
+        { modelId: "gpt-5.6-luna", reasoningEffort: "medium" },
+        async () => undefined,
+      ),
+    ).rejects.toThrow("Runtime is not running");
+
+    expect(delegated).toBe(false);
+    expect(runtime.snapshot()).toEqual(before);
+  });
+
   it("forwards a memory-scope change without changing the Minecraft lifecycle", () => {
     const scopes: unknown[] = [];
     const runtime = new RuntimeFacade({
@@ -276,18 +724,21 @@ describe("RuntimeFacade", () => {
     expect(harness.stopReasons).toEqual(["emergency_stop"]);
   });
 
-  it("accepts owner_changed as a terminal task-budget reason", () => {
-    const runtime = new RuntimeFacade({
-      lifecycle: { start: async () => undefined, stop: async () => undefined },
-      task: {
-        current: () => null,
-        budget: () => ({ ...inactiveBudget(), stopReason: "owner_changed" }),
-        stop: () => undefined,
-      },
-    });
+  it.each(["owner_changed", "model_changed"] as const)(
+    "accepts %s as a terminal task-budget reason",
+    (reason) => {
+      const runtime = new RuntimeFacade({
+        lifecycle: { start: async () => undefined, stop: async () => undefined },
+        task: {
+          current: () => null,
+          budget: () => ({ ...inactiveBudget(), stopReason: reason }),
+          stop: () => undefined,
+        },
+      });
 
-    expect(runtime.snapshot()).toMatchObject({ task: null, lastError: null });
-  });
+      expect(runtime.snapshot()).toMatchObject({ task: null, lastError: null });
+    },
+  );
 
   it("shares a concurrent start and emits one startup transition", async () => {
     const gate = deferred();
@@ -476,6 +927,111 @@ describe("RuntimeFacade", () => {
     expect(serialized).not.toContain("lease-super-secret");
     await expect(runtime.start()).rejects.toThrow("create a new runtime");
   });
+
+  it.each([
+    ["MINECRAFT_BRIDGE_REQUIRED", "Minecraft Bridge is required"],
+    ["MINECRAFT_BRIDGE_REJECTED", "Minecraft Bridge rejected the connection"],
+  ] as const)(
+    "preserves the stable %s startup failure in snapshots, events, and diagnostics",
+    async (code, message) => {
+      const runtime = new RuntimeFacade({
+        lifecycle: {
+          start: async () => {
+            throw new MineflayerBridgeError(code);
+          },
+          stop: async () => undefined,
+        },
+      });
+      const events: RuntimeEvent[] = [];
+      runtime.subscribe((event) => events.push(event));
+
+      await expect(runtime.start()).rejects.toMatchObject({ code, message });
+      const snapshot = runtime.snapshot();
+
+      expect(snapshot).toMatchObject({
+        lifecycle: "failed",
+        minecraft: { state: "disconnected", sessionId: null },
+        lastError: { code, message },
+      });
+      expect(events).toContainEqual({
+        kind: "error",
+        revision: expect.any(Number),
+        error: { code, message },
+      });
+      expect(snapshotDiagnosticActionCapability(snapshot.actions, snapshot.lastError)).toEqual({
+        workspaceVersion: null,
+        state: "failed",
+        mcpListening: false,
+        discoveredToolCount: 0,
+        errorCode: code,
+      });
+      expect(JSON.stringify({ snapshot, events })).not.toMatch(
+        /nonce|fakeHost|bridge-requests|25565|C:\\Users/iu,
+      );
+    },
+  );
+
+  it.each([
+    ["MINECRAFT_BRIDGE_REQUIRED", "Minecraft Bridge is required"],
+    ["MINECRAFT_BRIDGE_REJECTED", "Minecraft Bridge rejected the connection"],
+  ] as const)(
+    "fails a running runtime and diagnostics on one post-connect %s event",
+    async (code, message) => {
+      let minecraftListener:
+        ((event: { kind: string; code?: string; reason?: string }) => void) | undefined;
+      let lifecycleStops = 0;
+      const runtime = new RuntimeFacade({
+        lifecycle: {
+          start: async () => undefined,
+          stop: async () => {
+            lifecycleStops += 1;
+          },
+        },
+        minecraft: {
+          subscribe: (listener) => {
+            minecraftListener = listener as typeof minecraftListener;
+            return () => {
+              minecraftListener = undefined;
+            };
+          },
+        },
+      });
+      const events: RuntimeEvent[] = [];
+      runtime.subscribe((event) => events.push(event));
+      await runtime.start();
+      minecraftListener?.({ kind: "connected" });
+      minecraftListener?.({ kind: "disconnected", reason: "Minecraft connection rejected" });
+
+      minecraftListener?.({ kind: "bridge_failed", code });
+      minecraftListener?.({ kind: "bridge_failed", code });
+      await runtime.stop("process_exit");
+      const snapshot = runtime.snapshot();
+
+      expect(snapshot).toMatchObject({
+        lifecycle: "failed",
+        minecraft: { state: "disconnected", sessionId: null },
+        lastError: { code, message },
+      });
+      expect(lifecycleStops).toBe(1);
+      expect(events.filter((event) => event.kind === "error")).toEqual([
+        {
+          kind: "error",
+          revision: expect.any(Number),
+          error: { code, message },
+        },
+      ]);
+      expect(snapshotDiagnosticActionCapability(snapshot.actions, snapshot.lastError)).toEqual({
+        workspaceVersion: null,
+        state: "failed",
+        mcpListening: false,
+        discoveredToolCount: 0,
+        errorCode: code,
+      });
+      expect(JSON.stringify({ snapshot, events })).not.toMatch(
+        /nonce|fakeHost|bridge-requests|25565|C:\\Users/iu,
+      );
+    },
+  );
 
   it("shares concurrent stop, preserves the first exact reason, and rejects restart", async () => {
     const gate = deferred();

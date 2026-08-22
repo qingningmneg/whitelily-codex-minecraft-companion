@@ -34,6 +34,7 @@ function isDangerousItemAction(action: GameAction): boolean {
 
 export function classifyActionRisk(action: GameAction, context: SafetyContext): ActionRisk {
   if (
+    action.kind === "till_soil" ||
     isDangerousItemAction(action) ||
     (action.kind === "attack_hostile" && context.protectedTarget !== undefined)
   ) {

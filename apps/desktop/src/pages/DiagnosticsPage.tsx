@@ -1,11 +1,15 @@
 import { useCallback, useEffect, useState } from "react";
 import type { DiagnosticPreview } from "../../../../src/desktop/desktopProtocol.js";
-import type { WhiteLilyTask5Api } from "../desktopApi.js";
+import type { RuntimeActionQueueProjection } from "../../../../src/runtime/runtimeEvents.js";
+import type { WhiteLilyAppApi } from "../desktopApi.js";
 import type { Locale, MessageKey } from "../i18n/messageKeys.js";
 import { translate } from "../i18n/translator.js";
 
 interface DiagnosticsPageProps {
-  api: Pick<WhiteLilyTask5Api, "previewDiagnostics" | "exportDiagnostics">;
+  api: Pick<
+    WhiteLilyAppApi,
+    "previewDiagnostics" | "exportDiagnostics" | "status" | "subscribeRuntime"
+  >;
   locale: Locale;
 }
 
@@ -13,6 +17,7 @@ export function DiagnosticsPage({ api, locale }: DiagnosticsPageProps) {
   const [preview, setPreview] = useState<DiagnosticPreview | null>(null);
   const [pending, setPending] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
+  const [actionQueue, setActionQueue] = useState<RuntimeActionQueueProjection | null>(null);
 
   const load = useCallback(async () => {
     setMessage(null);
@@ -27,6 +32,29 @@ export function DiagnosticsPage({ api, locale }: DiagnosticsPageProps) {
   useEffect(() => {
     void load();
   }, [load]);
+
+  useEffect(() => {
+    let active = true;
+    let revision = -1;
+    const applyQueue = (nextRevision: number, next: RuntimeActionQueueProjection): void => {
+      if (!active || nextRevision < revision) return;
+      revision = nextRevision;
+      setActionQueue(next);
+    };
+    const unsubscribe = api.subscribeRuntime((event) => {
+      if (event.kind === "action_queue") applyQueue(event.revision, event.actionQueue);
+    });
+    void api.status().then(
+      (snapshot) => applyQueue(snapshot.revision, snapshot.actionQueue),
+      () => {
+        if (active && revision < 0) setActionQueue({ goal: null, items: [] });
+      },
+    );
+    return () => {
+      active = false;
+      unsubscribe();
+    };
+  }, [api]);
 
   const exportArchive = async (): Promise<void> => {
     if (!preview || pending) return;
@@ -48,6 +76,9 @@ export function DiagnosticsPage({ api, locale }: DiagnosticsPageProps) {
       setPending(false);
     }
   };
+  const actionDiagnosticError = preview
+    ? actionDiagnosticRecovery(preview.actionCapability.errorCode)
+    : null;
 
   return (
     <main className="content-page">
@@ -57,6 +88,7 @@ export function DiagnosticsPage({ api, locale }: DiagnosticsPageProps) {
         <p>{translate(locale, "diagnostics.subtitle")}</p>
       </header>
       <p className="page-message">{translate(locale, "diagnostics.localOnly")}</p>
+      <ActionQueueSection actionQueue={actionQueue} locale={locale} />
       {message ? (
         <p className="page-message" role="status">
           {message}
@@ -64,6 +96,37 @@ export function DiagnosticsPage({ api, locale }: DiagnosticsPageProps) {
       ) : null}
       {preview ? (
         <>
+          <section className="settings-card">
+            <h2>{translate(locale, "diagnostics.action.title")}</h2>
+            <dl>
+              <dt>{translate(locale, "diagnostics.action.workspaceVersion")}</dt>
+              <dd>
+                {preview.actionCapability.workspaceVersion ??
+                  translate(locale, "diagnostics.action.unavailable")}
+              </dd>
+              <dt>{translate(locale, "diagnostics.action.state")}</dt>
+              <dd>
+                {translate(locale, `diagnostics.action.state.${preview.actionCapability.state}`)}
+              </dd>
+              <dt>{translate(locale, "diagnostics.action.listening")}</dt>
+              <dd>
+                {translate(
+                  locale,
+                  preview.actionCapability.mcpListening
+                    ? "diagnostics.action.yes"
+                    : "diagnostics.action.no",
+                )}
+              </dd>
+              <dt>{translate(locale, "diagnostics.action.toolCount")}</dt>
+              <dd>{preview.actionCapability.discoveredToolCount}</dd>
+            </dl>
+            {actionDiagnosticError ? (
+              <p className="page-message">
+                <code>{actionDiagnosticError.code}</code>{" "}
+                {translate(locale, actionDiagnosticError.messageKey)}
+              </p>
+            ) : null}
+          </section>
           <section className="settings-card">
             <h2>{translate(locale, "diagnostics.files")}</h2>
             <ul className="memory-list">
@@ -106,7 +169,119 @@ export function DiagnosticsPage({ api, locale }: DiagnosticsPageProps) {
   );
 }
 
+function ActionQueueSection({
+  actionQueue,
+  locale,
+}: {
+  actionQueue: RuntimeActionQueueProjection | null;
+  locale: Locale;
+}) {
+  return (
+    <section className="settings-card">
+      <h2>{translate(locale, "diagnostics.queue.title")}</h2>
+      {actionQueue === null ? (
+        <p>{translate(locale, "diagnostics.queue.loading")}</p>
+      ) : actionQueue.items.length === 0 ? (
+        <p>{translate(locale, "diagnostics.queue.empty")}</p>
+      ) : (
+        <>
+          <p>
+            <strong>{translate(locale, "diagnostics.queue.goal")}: </strong>
+            {actionQueue.goal ?? translate(locale, "diagnostics.queue.unavailable")}
+          </p>
+          <div className="table-scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th>{translate(locale, "diagnostics.queue.order")}</th>
+                  <th>{translate(locale, "diagnostics.queue.action")}</th>
+                  <th>{translate(locale, "diagnostics.queue.summary")}</th>
+                  <th>{translate(locale, "diagnostics.queue.status")}</th>
+                  <th>{translate(locale, "diagnostics.queue.enqueuedAt")}</th>
+                  <th>{translate(locale, "diagnostics.queue.startedAt")}</th>
+                  <th>{translate(locale, "diagnostics.queue.endedAt")}</th>
+                  <th>{translate(locale, "diagnostics.queue.retries")}</th>
+                  <th>{translate(locale, "diagnostics.queue.reason")}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {actionQueue.items.map((item) => (
+                  <tr key={`${item.index}-${item.enqueuedAt}`}>
+                    <td>{item.index}</td>
+                    <td>{item.kind}</td>
+                    <td>{item.summary}</td>
+                    <td>
+                      {translate(locale, `diagnostics.queue.status.${item.status}` as MessageKey)}
+                    </td>
+                    <td>{item.enqueuedAt}</td>
+                    <td>{item.startedAt ?? translate(locale, "diagnostics.queue.unavailable")}</td>
+                    <td>{item.endedAt ?? translate(locale, "diagnostics.queue.unavailable")}</td>
+                    <td>{item.retryCount}</td>
+                    <td>{item.reason ?? translate(locale, "diagnostics.queue.unavailable")}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </>
+      )}
+    </section>
+  );
+}
+
 function omissionLabel(locale: Locale, value: string): string {
   const key = `diagnostics.omission.${value}` as MessageKey;
   return translate(locale, key);
+}
+
+interface ActionDiagnosticRecovery {
+  readonly code:
+    | "MCP_PORT_UNAVAILABLE"
+    | "MCP_TOOL_CATALOG_INVALID"
+    | "MCP_READINESS_TIMEOUT"
+    | "MINECRAFT_BRIDGE_REQUIRED"
+    | "MINECRAFT_BRIDGE_REJECTED";
+  readonly messageKey: MessageKey;
+}
+
+function actionDiagnosticRecovery(errorCode: string | null): ActionDiagnosticRecovery | null {
+  switch (errorCode) {
+    case "port_conflict":
+    case "server_start_failed":
+      return {
+        code: "MCP_PORT_UNAVAILABLE",
+        messageKey: "diagnostics.action.error.MCP_PORT_UNAVAILABLE",
+      };
+    case "missing_tools":
+    case "extra_tools":
+    case "duplicate_tools":
+    case "invalid_tool_name":
+      return {
+        code: "MCP_TOOL_CATALOG_INVALID",
+        messageKey: "diagnostics.action.error.MCP_TOOL_CATALOG_INVALID",
+      };
+    case "invalid_url":
+    case "invalid_timeout":
+    case "connection_failed":
+    case "timeout":
+    case "aborted":
+    case "server_closed":
+    case "startup_stopped":
+      return {
+        code: "MCP_READINESS_TIMEOUT",
+        messageKey: "diagnostics.action.error.MCP_READINESS_TIMEOUT",
+      };
+    case "MINECRAFT_BRIDGE_REQUIRED":
+      return {
+        code: errorCode,
+        messageKey: "diagnostics.action.error.MINECRAFT_BRIDGE_REQUIRED",
+      };
+    case "MINECRAFT_BRIDGE_REJECTED":
+      return {
+        code: errorCode,
+        messageKey: "diagnostics.action.error.MINECRAFT_BRIDGE_REJECTED",
+      };
+    default:
+      return null;
+  }
 }

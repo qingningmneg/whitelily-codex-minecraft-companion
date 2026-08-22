@@ -8,6 +8,11 @@ import {
   type DesktopEvent,
 } from "../../../src/desktop/desktopProtocol.js";
 import type { RuntimeSnapshot } from "../../../src/runtime/runtimeEvents.js";
+import { parseAvatarModelId } from "../../../src/avatar/avatarModelSchemas.js";
+import type {
+  AvatarAppearanceListItem,
+  AvatarModelCatalogSnapshot,
+} from "../../../src/avatar/avatarModelTypes.js";
 import {
   parseMinecraftJavaUsername,
   type OwnerIdentitySnapshot,
@@ -16,6 +21,7 @@ import { DocumentStoreError } from "../../../src/storage/documentStore.js";
 import type { ConfirmedWorldBinding } from "../../../src/world/worldProfileStore.js";
 import type { ExternalUrlPolicy } from "./externalUrlPolicy.js";
 import type { Pcl2Candidate } from "./discovery/pcl2Discovery.js";
+import { isOpaqueLanId } from "./discovery/lanCandidateStore.js";
 import type {
   ConfirmedConnectionProof,
   ConfirmedLanSession,
@@ -24,16 +30,23 @@ import type {
 } from "./discovery/lanDetector.js";
 import {
   parseConfirmedLanSession,
+  parseAvatarCatalogSnapshot,
+  parseAvatarImportResult,
   parseDesktopRendererEvent,
   parseLanCandidates,
+  parseMinecraftComponentStatus,
   parseOwnerIdentityAuthoritySnapshot,
   parseOwnerIdentitySnapshot,
   parsePcl2Candidates,
   parseRuntimeSnapshot,
+  isAvatarIpcErrorCode,
   WHITE_LILY_IPC_CHANNELS,
+  type AvatarIpcErrorCode,
+  type AvatarIpcResult,
   type DesktopRendererEvent,
   type OwnerIdentityAuthoritySnapshot,
 } from "../src/desktopApi.js";
+import type { MinecraftComponentId, MinecraftComponentManager } from "./minecraftComponents.js";
 
 type IpcHandler = (event: unknown, ...args: unknown[]) => unknown;
 
@@ -61,6 +74,7 @@ export interface IpcRegistryOptions {
   supervisor: IpcSupervisor;
   publishRuntime: (event: DesktopRendererEvent) => void;
   publishOwnerIdentity: (owner: OwnerIdentityAuthoritySnapshot) => void;
+  publishAvatarModels?: (snapshot: AvatarModelCatalogSnapshot) => void;
   externalUrlPolicy: ExternalUrlPolicy;
   openExternal(url: string): Promise<unknown>;
   pcl2Discovery: {
@@ -78,6 +92,7 @@ export interface IpcRegistryOptions {
   worldAuthority?: {
     redeem(proof: ConfirmedConnectionProof): Promise<ConfirmedWorldBinding>;
   };
+  minecraftComponentManager?: MinecraftComponentManager;
   startupSettings?: {
     read(): { enabled: boolean; available: boolean };
     set(enabled: boolean): { enabled: boolean; available: boolean };
@@ -88,6 +103,16 @@ export interface IpcRegistryOptions {
       expectedRevision: number,
       enabled: boolean,
     ): Promise<{ revision: number; enabled: boolean }>;
+  };
+  requestApplicationQuit?: () => Promise<void>;
+  avatarModels?: {
+    list(): Promise<AvatarModelCatalogSnapshot>;
+    importFromPicker(): Promise<
+      | { readonly status: "cancelled" }
+      | { readonly status: "imported"; readonly model: AvatarAppearanceListItem }
+    >;
+    switchTo(modelId: string): Promise<AvatarModelCatalogSnapshot>;
+    subscribe(listener: (snapshot: AvatarModelCatalogSnapshot) => void): () => void;
   };
   exportSerialized?(serialized: string): Promise<{ status: "cancelled" | "saved" }>;
   exportDiagnostic?(
@@ -126,6 +151,7 @@ export function registerIpcHandlers(options: IpcRegistryOptions): () => void {
   >;
   const registeredChannels: string[] = [];
   let unsubscribe = (): void => undefined;
+  let unsubscribeAvatarModels = (): void => undefined;
   const inFlightOpens = new Map<string, LoginOpenOperation>();
   let activeLogin: LoginOpenOperation | undefined;
   let loginGeneration = 0;
@@ -254,6 +280,7 @@ export function registerIpcHandlers(options: IpcRegistryOptions): () => void {
     if (cleaned) return;
     cleaned = true;
     unsubscribe();
+    unsubscribeAvatarModels();
     stopLanMonitor();
     invalidateActiveLogin();
     inFlightOpens.clear();
@@ -284,6 +311,17 @@ export function registerIpcHandlers(options: IpcRegistryOptions): () => void {
       return parseRuntimeSnapshot(await options.supervisor.emergencyStop());
     });
     registeredChannels.push(WHITE_LILY_IPC_CHANNELS.emergencyStop);
+    if (options.requestApplicationQuit) {
+      options.ipcMain.handle(WHITE_LILY_IPC_CHANNELS.quitApplication, async (_event, ...args) => {
+        validateNoIpcInput(args);
+        try {
+          await options.requestApplicationQuit?.();
+        } catch {
+          throw new Error("WhiteLily application quit failed");
+        }
+      });
+      registeredChannels.push(WHITE_LILY_IPC_CHANNELS.quitApplication);
+    }
     options.ipcMain.handle(WHITE_LILY_IPC_CHANNELS.readOwnerIdentity, async (_event, ...args) => {
       validateNoIpcInput(args);
       const command = { kind: "read_owner_identity" } as const;
@@ -354,6 +392,20 @@ export function registerIpcHandlers(options: IpcRegistryOptions): () => void {
       return parseDesktopCommandResult(command, await options.supervisor.request(command));
     });
     registeredChannels.push(WHITE_LILY_IPC_CHANNELS.listModels);
+    options.ipcMain.handle(
+      WHITE_LILY_IPC_CHANNELS.migrateModelPreference,
+      async (_event, ...args) => {
+        if (args.length !== 1) throw new Error("invalid IPC input");
+        const command = parseDesktopRequest({
+          version: 1,
+          id: "ipc",
+          command: { kind: "migrate_model_preference", candidate: args[0] },
+        }).command;
+        if (command.kind !== "migrate_model_preference") throw new Error("invalid IPC input");
+        return parseDesktopCommandResult(command, await options.supervisor.request(command));
+      },
+    );
+    registeredChannels.push(WHITE_LILY_IPC_CHANNELS.migrateModelPreference);
     options.ipcMain.handle(WHITE_LILY_IPC_CHANNELS.selectModel, async (_event, ...args) => {
       if (args.length !== 1) throw new Error("invalid IPC input");
       const command = parseDesktopRequest({
@@ -375,6 +427,45 @@ export function registerIpcHandlers(options: IpcRegistryOptions): () => void {
       return parseLanCandidates(await options.lanDetector.detectLanCandidates());
     });
     registeredChannels.push(WHITE_LILY_IPC_CHANNELS.detectLanCandidates);
+    options.ipcMain.handle(
+      WHITE_LILY_IPC_CHANNELS.getMinecraftComponentStatus,
+      async (_event, ...args) => {
+        const candidateId = parseMinecraftComponentCandidateArgs(args);
+        if (!options.minecraftComponentManager) {
+          throw new Error("Minecraft component manager is unavailable");
+        }
+        return parseMinecraftComponentStatus(
+          await options.minecraftComponentManager.status(candidateId),
+        );
+      },
+    );
+    registeredChannels.push(WHITE_LILY_IPC_CHANNELS.getMinecraftComponentStatus);
+    options.ipcMain.handle(
+      WHITE_LILY_IPC_CHANNELS.installMinecraftComponents,
+      async (_event, ...args) => {
+        const { candidateId, selection } = parseMinecraftComponentOperationArgs(args);
+        if (!options.minecraftComponentManager) {
+          throw new Error("Minecraft component manager is unavailable");
+        }
+        return parseMinecraftComponentStatus(
+          await options.minecraftComponentManager.install(candidateId, selection),
+        );
+      },
+    );
+    registeredChannels.push(WHITE_LILY_IPC_CHANNELS.installMinecraftComponents);
+    options.ipcMain.handle(
+      WHITE_LILY_IPC_CHANNELS.removeMinecraftComponents,
+      async (_event, ...args) => {
+        const { candidateId, selection } = parseMinecraftComponentOperationArgs(args);
+        if (!options.minecraftComponentManager) {
+          throw new Error("Minecraft component manager is unavailable");
+        }
+        return parseMinecraftComponentStatus(
+          await options.minecraftComponentManager.remove(candidateId, selection),
+        );
+      },
+    );
+    registeredChannels.push(WHITE_LILY_IPC_CHANNELS.removeMinecraftComponents);
     options.ipcMain.handle(WHITE_LILY_IPC_CHANNELS.confirmLanCandidate, async (_event, ...args) => {
       if (
         args.length !== 1 ||
@@ -619,6 +710,52 @@ export function registerIpcHandlers(options: IpcRegistryOptions): () => void {
       },
     );
     registeredChannels.push(WHITE_LILY_IPC_CHANNELS.setCloseToTraySetting);
+    if (options.avatarModels) {
+      options.ipcMain.handle(WHITE_LILY_IPC_CHANNELS.listAvatarModels, async (_event, ...args) => {
+        validateNoIpcInput(args);
+        try {
+          return avatarIpcSuccess(parseAvatarCatalogSnapshot(await options.avatarModels?.list()));
+        } catch (error) {
+          return avatarIpcFailure(error, "AVATAR_CATALOG_INVALID");
+        }
+      });
+      registeredChannels.push(WHITE_LILY_IPC_CHANNELS.listAvatarModels);
+      options.ipcMain.handle(WHITE_LILY_IPC_CHANNELS.importAvatarModel, async (_event, ...args) => {
+        validateNoIpcInput(args);
+        try {
+          return avatarIpcSuccess(
+            parseAvatarImportResult(await options.avatarModels?.importFromPicker()),
+          );
+        } catch (error) {
+          return avatarIpcFailure(error, "AVATAR_IMPORT_FAILED");
+        }
+      });
+      registeredChannels.push(WHITE_LILY_IPC_CHANNELS.importAvatarModel);
+      options.ipcMain.handle(WHITE_LILY_IPC_CHANNELS.switchAvatarModel, async (_event, ...args) => {
+        if (args.length !== 1) throw new Error("invalid avatar model selection");
+        let modelId: string;
+        try {
+          modelId = parseAvatarModelId(args[0]);
+        } catch {
+          throw new Error("invalid avatar model selection");
+        }
+        try {
+          return avatarIpcSuccess(
+            parseAvatarCatalogSnapshot(await options.avatarModels?.switchTo(modelId)),
+          );
+        } catch (error) {
+          return avatarIpcFailure(error, "AVATAR_SWITCH_FAILED");
+        }
+      });
+      registeredChannels.push(WHITE_LILY_IPC_CHANNELS.switchAvatarModel);
+      unsubscribeAvatarModels = options.avatarModels.subscribe((snapshot) => {
+        try {
+          options.publishAvatarModels?.(parseAvatarCatalogSnapshot(snapshot));
+        } catch {
+          // Invalid avatar catalog events remain private to the main process.
+        }
+      });
+    }
     unsubscribe = options.supervisor.subscribe((value, context) => {
       let event: DesktopEvent["event"];
       try {
@@ -665,8 +802,82 @@ export function registerIpcHandlers(options: IpcRegistryOptions): () => void {
   }
 }
 
+function avatarIpcSuccess<T>(value: T): AvatarIpcResult<T> {
+  return { status: "success", value };
+}
+
+function avatarIpcFailure(error: unknown, fallback: AvatarIpcErrorCode): AvatarIpcResult<never> {
+  let code = fallback;
+  if (error && typeof error === "object") {
+    try {
+      const candidate = Reflect.get(error, "code");
+      if (isAvatarIpcErrorCode(candidate)) code = candidate;
+    } catch {
+      // Error details stay in the main process; the renderer receives only the fallback code.
+    }
+  }
+  return { status: "error", code };
+}
+
 function validateNoIpcInput(args: readonly unknown[]): void {
   if (args.length !== 0) throw new Error("invalid IPC input");
+}
+
+function parseMinecraftComponentCandidateArgs(args: readonly unknown[]): string {
+  if (args.length !== 1 || !isOpaqueLanId(args[0])) throw new Error("invalid IPC input");
+  return args[0];
+}
+
+function parseMinecraftComponentOperationArgs(args: readonly unknown[]): {
+  readonly candidateId: string;
+  readonly selection: readonly MinecraftComponentId[];
+} {
+  if (args.length !== 2 || !isOpaqueLanId(args[0])) throw new Error("invalid IPC input");
+  const selection = readMinecraftComponentSelection(args[1]);
+  return Object.freeze({ candidateId: args[0], selection });
+}
+
+function readMinecraftComponentSelection(value: unknown): readonly MinecraftComponentId[] {
+  if (!Array.isArray(value) || value.length > 2) throw new Error("invalid IPC input");
+  let prototype: object | null;
+  let descriptors: PropertyDescriptorMap;
+  try {
+    prototype = Object.getPrototypeOf(value) as object | null;
+    descriptors = Object.getOwnPropertyDescriptors(value) as unknown as PropertyDescriptorMap;
+  } catch {
+    throw new Error("invalid IPC input");
+  }
+  const expectedKeys = [
+    ...Array.from({ length: value.length }, (_unused, index) => String(index)),
+    "length",
+  ];
+  const keys = Reflect.ownKeys(descriptors);
+  if (
+    prototype !== Array.prototype ||
+    keys.length !== expectedKeys.length ||
+    keys.some((key) => typeof key !== "string" || !expectedKeys.includes(key)) ||
+    descriptors.length?.value !== value.length
+  ) {
+    throw new Error("invalid IPC input");
+  }
+  const result: MinecraftComponentId[] = [];
+  const selected = new Set<MinecraftComponentId>();
+  for (let index = 0; index < value.length; index += 1) {
+    const descriptor = descriptors[String(index)];
+    if (!descriptor || !Object.hasOwn(descriptor, "value") || descriptor.enumerable !== true) {
+      throw new Error("invalid IPC input");
+    }
+    const component = descriptor.value;
+    if (
+      (component !== "bridge" && component !== "avatar") ||
+      selected.has(component as MinecraftComponentId)
+    ) {
+      throw new Error("invalid IPC input");
+    }
+    selected.add(component);
+    result.push(component);
+  }
+  return Object.freeze(result);
 }
 
 function parseSingleObjectCommand<

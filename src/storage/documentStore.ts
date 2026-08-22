@@ -38,7 +38,12 @@ export interface DocumentStoreOptions<T> {
   defaultValue(): T;
   clock?: () => Date;
   fileIo?: AtomicJsonFileIo;
+  recoverFromBackup?: boolean;
   recoverFrom?: (error: AtomicJsonFileError) => boolean;
+}
+
+export interface DocumentStoreUpdateOptions {
+  readonly beforeCommit?: () => void;
 }
 
 const documentQueues = new Map<string, Promise<unknown>>();
@@ -85,6 +90,9 @@ export class DocumentStore<T> {
       rootDirectory: options.rootDirectory,
       validate: (value) => this.#validateEnvelope(value),
       ...(options.fileIo === undefined ? {} : { io: options.fileIo }),
+      ...(options.recoverFromBackup === undefined
+        ? {}
+        : { recoverFromBackup: options.recoverFromBackup }),
       recoverFrom:
         options.recoverFrom ??
         ((error) =>
@@ -118,6 +126,7 @@ export class DocumentStore<T> {
   update(
     expectedRevision: number,
     updater: (current: Readonly<T>) => T | Promise<T>,
+    options: DocumentStoreUpdateOptions = {},
   ): Promise<DocumentEnvelope<T>> {
     return this.#coordinate(async () => {
       const current =
@@ -131,7 +140,12 @@ export class DocumentStore<T> {
         );
       }
       const value = this.#validateValue(await updater(this.#clone(current.value)));
-      return this.#clone(await this.#file.write(this.#newEnvelope(current.revision + 1, value)));
+      return this.#clone(
+        await this.#file.write(
+          this.#newEnvelope(current.revision + 1, value),
+          options.beforeCommit,
+        ),
+      );
     });
   }
 

@@ -164,6 +164,7 @@ describe("TaskControllerBudget", () => {
     "disconnect",
     "world_changed",
     "model_unavailable",
+    "model_changed",
     "process_exit",
   ] as const)("records the %s stop reason", (reason: TaskStopReason) => {
     const budget = new TaskControllerBudget({ now: () => 0 });

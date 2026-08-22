@@ -1,6 +1,6 @@
 {
   "name": "whitelily-codex-minecraft-companion",
-  "version": "0.2.0-beta.1",
+  "version": "0.2.0-beta.2",
   "private": true,
   "license": "Apache-2.0",
   "type": "module",
@@ -16,6 +16,7 @@
     "start": "node dist/src/index.js",
     "dev": "tsx src/index.ts",
     "build:desktop-child": "node scripts/build-desktop-child.mjs",
+    "build:desktop-dev-workspace": "node scripts/prepare-development-codex-workspace.mjs",
     "desktop:dev": "npm run dev --workspace @whitelily/desktop",
     "desktop:build": "npm run build --workspace @whitelily/desktop",
     "desktop:prepare": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/prepare-electron-bundle.ps1",
@@ -24,13 +25,16 @@
     "desktop:inspect-installer": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/inspect-installer.ps1",
     "desktop:test-installer": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/test-installer.ps1",
     "desktop:test": "npm run test --workspace @whitelily/desktop",
+    "minecraft-components:prepare": "subprojects\\whitelily-avatar\\gradlew.bat -p subprojects\\whitelily-avatar --configure-on-demand :bridge-fabric:jar --no-daemon --max-workers=1 && subprojects\\whitelily-avatar\\gradlew.bat -p subprojects\\whitelily-avatar :stageMinecraftComponents --no-daemon --max-workers=1",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "avatar:test": "subprojects\\whitelily-avatar\\gradlew.bat -p subprojects\\whitelily-avatar :mod-fabric:test",
-    "avatar:check": "node subprojects/whitelily-avatar/tools/validate-assets.mjs && subprojects\\whitelily-avatar\\gradlew.bat -p subprojects\\whitelily-avatar :mod-fabric:check"
+    "avatar:check": "node subprojects/whitelily-avatar/tools/validate-assets.mjs && subprojects\\whitelily-avatar\\gradlew.bat -p subprojects\\whitelily-avatar :mod-fabric:check",
+    "avatar:anime:build": "node subprojects/whitelily-avatar/tools/build-anime-avatar.mjs --export --render-previews",
+    "avatar:anime:check": "node subprojects/whitelily-avatar/tools/build-anime-avatar.mjs --verify"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.29.0",

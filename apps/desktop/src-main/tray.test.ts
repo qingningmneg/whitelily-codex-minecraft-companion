@@ -9,7 +9,14 @@ const runningSnapshot: RuntimeSnapshot = {
   lifecycle: "running",
   minecraft: { state: "connected", sessionId: "session_7F2A" },
   codex: { state: "ready", model: "gpt-5" },
+  actions: {
+    state: "ready",
+    workspaceVersion: "workspace-1",
+    mcpListening: true,
+    discoveredToolCount: 15,
+  },
   task: null,
+  actionQueue: { goal: null, items: [] },
   lastError: null,
 };
 
@@ -18,7 +25,9 @@ const stoppedSnapshot: RuntimeSnapshot = {
   lifecycle: "stopped",
   minecraft: { state: "disconnected", sessionId: null },
   codex: { state: "stopped", model: null },
+  actions: null,
   task: null,
+  actionQueue: { goal: null, items: [] },
   lastError: null,
 };
 

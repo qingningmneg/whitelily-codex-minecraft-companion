@@ -1,0 +1,40 @@
+{
+  "schemaVersion": 1,
+  "files": [
+    {
+      "name": "fabric-api-0.128.2+1.21.5.jar",
+      "bytes": 2248994,
+      "sha256": "a82fd00827206e911936ed1e0ceaec6eb55d061ca5d3c5d63c7f0031426d29ae"
+    },
+    {
+      "name": "Fabric-API-LICENSE.txt",
+      "bytes": 11357,
+      "sha256": "b40930bbcf80744c86c46a12bc9da056641d722716c378f5659b9e555ef833e1"
+    },
+    {
+      "name": "minecraft-components-manifest.json",
+      "bytes": 1824,
+      "sha256": "351ec06b27422e7afb719f42a2c8821806aaf8a6864ca7c6192f7b93a2905e87"
+    },
+    {
+      "name": "whitelily-avatar-fabric-1.21.5-0.1.1.jar",
+      "bytes": 257936,
+      "sha256": "11a4375fada69928a4d1e0d8f6d330bc35ba23ab99c8b8e4c444eaa69f3a9271"
+    },
+    {
+      "name": "whitelily-bridge-fabric-1.21.5-0.1.2.jar",
+      "bytes": 53984,
+      "sha256": "ac5bfab545b723b2346aeb017b3a6ea3186a6cbced370e16097f3836b128746d"
+    },
+    {
+      "name": "WhiteLily-LICENSE.txt",
+      "bytes": 11123,
+      "sha256": "226d0e41f61309952c27fcc11a5140c4e735115f702ff0484ff0c25cfbbeee16"
+    },
+    {
+      "name": "WhiteLily-NOTICE.txt",
+      "bytes": 795,
+      "sha256": "bc5ab24ff5624664bc3ef3d5b850ac3c820dddf3b2f15a4125b355f1c65a2c2a"
+    }
+  ]
+}

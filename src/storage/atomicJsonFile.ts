@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { Stats } from "node:fs";
-import { lstat, mkdir, open, realpath, rename, rm, type FileHandle } from "node:fs/promises";
+import { link, lstat, mkdir, open, realpath, rename, rm, type FileHandle } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
 
 export type AtomicJsonFileErrorCode =
@@ -36,6 +36,7 @@ export interface AtomicJsonFileIo {
   mkdir(path: string): Promise<void>;
   openRead(path: string): Promise<AtomicJsonReadable>;
   open(path: string, flags: "wx"): Promise<AtomicJsonWritable>;
+  link?(source: string, destination: string): Promise<void>;
   rename(source: string, destination: string): Promise<void>;
   rm(path: string): Promise<void>;
 }
@@ -69,6 +70,7 @@ export const nodeAtomicJsonFileIo: AtomicJsonFileIo = {
   },
   openRead: async (path) => wrapReadableHandle(await open(path, "r")),
   open: async (path, flags) => wrapWritableHandle(await open(path, flags, 0o600)),
+  link,
   rename,
   rm: async (path) => {
     await rm(path, { force: true });
@@ -78,6 +80,7 @@ export const nodeAtomicJsonFileIo: AtomicJsonFileIo = {
 export type AtomicJsonBoundaryContext =
   | { operation: "open-read"; path: string }
   | { operation: "open-temp"; path: string }
+  | { operation: "link"; source: string; destination: string }
   | { operation: "rename"; source: string; destination: string };
 
 export interface AtomicJsonFileOptions<T> {
@@ -86,6 +89,7 @@ export interface AtomicJsonFileOptions<T> {
   validate(value: unknown): T;
   io?: AtomicJsonFileIo;
   randomId?: () => string;
+  recoverFromBackup?: boolean;
   recoverFrom?: (error: AtomicJsonFileError) => boolean;
   beforeBoundary?: (context: AtomicJsonBoundaryContext) => void | Promise<void>;
 }
@@ -154,6 +158,7 @@ export class AtomicJsonFile<T> {
   readonly #validate: (value: unknown) => T;
   readonly #io: AtomicJsonFileIo;
   readonly #randomId: () => string;
+  readonly #recoverFromBackup: boolean;
   readonly #recoverFrom: (error: AtomicJsonFileError) => boolean;
   readonly #beforeBoundary: (context: AtomicJsonBoundaryContext) => Promise<void>;
 
@@ -180,6 +185,7 @@ export class AtomicJsonFile<T> {
     this.#validate = options.validate;
     this.#io = options.io ?? nodeAtomicJsonFileIo;
     this.#randomId = options.randomId ?? randomUUID;
+    this.#recoverFromBackup = options.recoverFromBackup ?? true;
     this.#recoverFrom = options.recoverFrom ?? (() => true);
     this.#beforeBoundary = async (context) => {
       await options.beforeBoundary?.(context);
@@ -209,11 +215,23 @@ export class AtomicJsonFile<T> {
       if (
         !(error instanceof AtomicJsonFileError) ||
         error.code !== "ATOMIC_JSON_INVALID" ||
+        !this.#recoverFromBackup ||
         !this.#recoverFrom(error)
       ) {
         throw error;
       }
       primaryError = error;
+    }
+
+    if (!this.#recoverFromBackup) {
+      const backup = await this.#resolveFile(this.#backupPath, true);
+      if (backup !== undefined) {
+        throw new AtomicJsonFileError(
+          "ATOMIC_JSON_RECOVERY_FAILED",
+          "atomic JSON backup recovery is disabled",
+        );
+      }
+      return undefined;
     }
 
     let backup: T;
@@ -242,7 +260,7 @@ export class AtomicJsonFile<T> {
     return this.#clone(backup);
   }
 
-  async write(value: T): Promise<T> {
+  async write(value: T, beforeCommit?: () => void): Promise<T> {
     const normalized = this.#normalize(value);
     const directory = await this.#trustedDirectory(true);
     let targetTemp: PreparedTemp | undefined;
@@ -255,7 +273,7 @@ export class AtomicJsonFile<T> {
         await this.#renameTemp(backupTemp, this.#backupPath, directory);
         backupTemp = undefined;
       }
-      await this.#renameTemp(targetTemp, this.#path, directory);
+      await this.#renameTemp(targetTemp, this.#path, directory, beforeCommit);
       targetTemp = undefined;
       return this.#clone(normalized);
     } finally {
@@ -265,6 +283,23 @@ export class AtomicJsonFile<T> {
           .map((temp) => this.#removeTemp(temp)),
       );
     }
+  }
+
+  async writeIfAbsent(value: T): Promise<T> {
+    const normalized = this.#normalize(value);
+    const directory = await this.#trustedDirectory(true);
+    let targetTemp: PreparedTemp | undefined;
+    try {
+      targetTemp = await this.#prepareTemp(this.#serialize(normalized), directory);
+      await this.#linkTempIfMissing(targetTemp, this.#path, directory);
+    } finally {
+      if (targetTemp !== undefined) await this.#removeTemp(targetTemp).catch(() => undefined);
+    }
+    const winner = await this.read();
+    if (winner === undefined) {
+      throw this.#pathError("atomic JSON create-if-absent winner is missing");
+    }
+    return winner;
   }
 
   async #readPrimary(): Promise<T | undefined> {
@@ -365,6 +400,7 @@ export class AtomicJsonFile<T> {
     temp: PreparedTemp,
     destination: string,
     directory: TrustedDirectory,
+    beforeCommit?: () => void,
   ): Promise<void> {
     await this.#beforeBoundary({
       operation: "rename",
@@ -389,10 +425,54 @@ export class AtomicJsonFile<T> {
       );
     }
     const trustedDestination = join(directory.operationPath, basename(destination));
+    beforeCommit?.();
     await this.#io.rename(source.operationPath, trustedDestination);
     const published = await this.#requireFile(trustedDestination);
     this.#assertSameIdentity(directory, published.parent, "atomic JSON publish escaped its parent");
     this.#assertFileIdentity(temp, published, "atomic JSON published file changed after rename");
+  }
+
+  async #linkTempIfMissing(
+    temp: PreparedTemp,
+    destination: string,
+    directory: TrustedDirectory,
+  ): Promise<void> {
+    const linkFile = this.#io.link;
+    if (linkFile === undefined) {
+      throw this.#pathError("atomic JSON no-clobber publication is unavailable");
+    }
+    await this.#beforeBoundary({
+      operation: "link",
+      source: temp.operationPath,
+      destination,
+    });
+    const source = await this.#requireFile(temp.operationPath);
+    this.#assertSameIdentity(temp, source, "atomic JSON temp changed at no-clobber publish");
+    this.#assertSameIdentity(
+      directory,
+      source.parent,
+      "atomic JSON parent changed at no-clobber publish",
+    );
+    const destinationParent = await this.#trustedDirectory(false);
+    this.#assertSameIdentity(
+      directory,
+      destinationParent,
+      "atomic JSON destination parent changed at no-clobber publish",
+    );
+    const trustedDestination = join(directory.operationPath, basename(destination));
+    try {
+      await linkFile(source.operationPath, trustedDestination);
+    } catch (error) {
+      if (isAlreadyExists(error)) return;
+      throw error;
+    }
+    const published = await this.#requireFile(trustedDestination);
+    this.#assertSameIdentity(
+      directory,
+      published.parent,
+      "atomic JSON no-clobber publish escaped its parent",
+    );
+    this.#assertFileIdentity(temp, published, "atomic JSON no-clobber target changed after link");
   }
 
   async #removeCreatedTemp(

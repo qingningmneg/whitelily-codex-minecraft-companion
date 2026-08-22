@@ -8,12 +8,21 @@ import { ONBOARDING_STORAGE_KEY, persistOnboardingLocale } from "./pages/Onboard
 
 type OwnerAuthoritySnapshot = OwnerIdentitySnapshot & { childGeneration: number };
 
+const readyActions = {
+  state: "ready" as const,
+  workspaceVersion: "workspace-1",
+  mcpListening: true as const,
+  discoveredToolCount: 15,
+};
+
 const runningSnapshot = {
   revision: 1,
   lifecycle: "running" as const,
   minecraft: { state: "connected" as const, sessionId: "session" },
   codex: { state: "ready" as const, model: "live-model" },
+  actions: readyActions,
   task: null,
+  actionQueue: { goal: null, items: [] },
   lastError: null,
 };
 
@@ -37,14 +46,33 @@ function createAppApi(
     start: vi.fn(async () => runningSnapshot),
     stop: vi.fn(async () => runningSnapshot),
     emergencyStop: vi.fn(async () => runningSnapshot),
+    quitApplication: vi.fn(async () => undefined),
     getAccount: vi.fn(async () => ({ status: "signed_out" as const })),
     startChatGptLogin: vi.fn(),
     cancelChatGptLogin: vi.fn(),
-    listModels: vi.fn(async () => ({ models: [], selection: { mode: "automatic" as const } })),
+    listModels: vi.fn(async () => ({
+      models: [],
+      selection: { mode: "automatic" as const },
+      legacyMigrationCompleted: true,
+    })),
+    migrateModelPreference: vi.fn(async () => ({
+      models: [],
+      selection: { mode: "automatic" as const },
+      legacyMigrationCompleted: true,
+    })),
     selectModel: vi.fn(),
     discoverPcl2: vi.fn(async () => []),
     detectLanCandidates: vi.fn(async () => []),
     confirmLanCandidate: vi.fn(),
+    getMinecraftComponentStatus: vi.fn(async () => ({
+      state: "ready" as const,
+      bridgeInstalled: true,
+      bridgeActive: true,
+      avatarInstalled: true,
+      restartRequired: false,
+    })),
+    installMinecraftComponents: vi.fn(),
+    removeMinecraftComponents: vi.fn(),
     subscribeRuntime: vi.fn((listener) => {
       runtimeListeners.add(listener);
       return () => runtimeListeners.delete(listener);
@@ -108,6 +136,32 @@ function createAppApi(
       revision: expectedRevision + 1,
       enabled,
     })),
+    listAvatarModels: vi.fn(async () => ({
+      revision: 1,
+      models: [
+        {
+          id: "builtin:whitelily",
+          displayName: "WhiteLily",
+          origin: "builtin" as const,
+          worldRenderer: "minecraft-skin" as const,
+          armModel: "slim" as const,
+          previewDataUrl: "data:image/png;base64,AA==",
+          portraitDataUrl: "data:image/png;base64,AA==",
+        },
+        {
+          id: "user:00000000-0000-4000-8000-000000000001",
+          displayName: "Imported skin",
+          origin: "imported" as const,
+          worldRenderer: "minecraft-skin" as const,
+          armModel: "wide" as const,
+          previewDataUrl: "data:image/png;base64,AA==",
+        },
+      ],
+      activeModelId: "builtin:whitelily",
+    })),
+    importAvatarModel: vi.fn(async () => ({ status: "cancelled" as const })),
+    switchAvatarModel: vi.fn(),
+    subscribeAvatarModels: vi.fn(() => vi.fn()),
     readWorldProfile: vi.fn(async () => ({
       schemaVersion: 1 as const,
       revision: 0,
@@ -147,6 +201,60 @@ describe("Task 5 application routing", () => {
     window.localStorage.clear();
   });
 
+  it("keeps one accessible application exit control while runtime status is checking", () => {
+    persistOnboardingLocale("en");
+    const harness = createAppApi();
+    harness.api.status = vi.fn(() => new Promise<never>(() => undefined));
+
+    render(<App api={harness.api} />);
+
+    expect(screen.getAllByRole("button", { name: "Quit WhiteLily" })).toHaveLength(1);
+  });
+
+  it("keeps avatar models separate from AI model settings and routes to the avatar library", async () => {
+    persistOnboardingLocale("en");
+    const harness = createAppApi();
+    render(<App api={harness.api} />);
+    const user = userEvent.setup();
+
+    await screen.findByRole("heading", { name: "Runtime overview" });
+    await user.click(screen.getByRole("link", { name: "Models & appearance" }));
+
+    expect(await screen.findByRole("heading", { name: "Models & appearance" })).toBeTruthy();
+    expect(screen.getByRole("link", { name: "AI model" }).getAttribute("aria-current")).toBeNull();
+    expect(
+      screen.getByRole("link", { name: "Models & appearance" }).getAttribute("aria-current"),
+    ).toBe("page");
+    await waitFor(() => expect(harness.api.listAvatarModels).toHaveBeenCalledOnce());
+  });
+
+  it("keeps one accessible application exit control across onboarding and main routes", async () => {
+    persistOnboardingLocale("en");
+    const harness = createAppApi();
+    harness.api.status = vi
+      .fn()
+      .mockResolvedValueOnce({ ...runningSnapshot, lifecycle: "stopped" })
+      .mockResolvedValue(runningSnapshot);
+    render(<App api={harness.api} />);
+    const user = userEvent.setup();
+
+    await screen.findByRole("heading", { name: "Sign in to ChatGPT" });
+    const onboardingQuit = screen.getByRole("button", { name: "Quit WhiteLily" });
+    expect(screen.getAllByRole("button", { name: "Quit WhiteLily" })).toHaveLength(1);
+    expect(onboardingQuit.closest(".onboarding-topbar")).not.toBeNull();
+
+    cleanup();
+    const mainHarness = createAppApi();
+    render(<App api={mainHarness.api} />);
+    await screen.findByRole("heading", { name: "Runtime overview" });
+    const mainQuit = screen.getByRole("button", { name: "Quit WhiteLily" });
+    expect(screen.getAllByRole("button", { name: "Quit WhiteLily" })).toHaveLength(1);
+    expect(mainQuit.closest(".application-exit-control")).not.toBeNull();
+    await user.click(screen.getByRole("link", { name: "Settings" }));
+    await screen.findByRole("heading", { name: "Settings" });
+    expect(screen.getAllByRole("button", { name: "Quit WhiteLily" })).toHaveLength(1);
+  });
+
   it("routes fixed sidebar destinations and returns to onboarding after connection invalidation", async () => {
     const listeners = new Set<(event: DesktopRendererEvent) => void>();
     const api = {
@@ -155,7 +263,9 @@ describe("Task 5 application routing", () => {
         lifecycle: "running",
         minecraft: { state: "connected", sessionId: "session" },
         codex: { state: "ready", model: "live-model" },
+        actions: readyActions,
         task: null,
+        actionQueue: { goal: null, items: [] },
         lastError: null,
       })),
       start: vi.fn(),
@@ -169,6 +279,15 @@ describe("Task 5 application routing", () => {
       discoverPcl2: vi.fn(async () => []),
       detectLanCandidates: vi.fn(async () => []),
       confirmLanCandidate: vi.fn(),
+      getMinecraftComponentStatus: vi.fn(async () => ({
+        state: "ready" as const,
+        bridgeInstalled: true,
+        bridgeActive: true,
+        avatarInstalled: true,
+        restartRequired: false,
+      })),
+      installMinecraftComponents: vi.fn(),
+      removeMinecraftComponents: vi.fn(),
       readOwnerIdentity: vi.fn(async () => owner("OldOwner")),
       updateOwnerIdentity: vi.fn(),
       subscribeOwnerIdentity: vi.fn(() => vi.fn()),
@@ -234,7 +353,9 @@ describe("Task 5 application routing", () => {
         lifecycle: "stopped",
         minecraft: { state: "disconnected", sessionId: null },
         codex: { state: "stopped", model: null },
+        actions: null,
         task: null,
+        actionQueue: { goal: null, items: [] },
         lastError: null,
       },
     };
@@ -568,6 +689,7 @@ describe("Task 5 application routing", () => {
         },
       ],
       selection: { mode: "automatic" },
+      legacyMigrationCompleted: true,
     });
     vi.mocked(harness.api.selectModel).mockResolvedValue({ mode: "automatic" });
     vi.mocked(harness.api.discoverPcl2).mockResolvedValue([
@@ -578,20 +700,21 @@ describe("Task 5 application routing", () => {
         running: true,
       },
     ]);
+    const candidateObservedAt = Date.now();
     vi.mocked(harness.api.detectLanCandidates).mockResolvedValue([
       {
         id: "lan_candidate_0001",
         port: 51_321,
         version: "1.21.5",
-        observedAt: 1_753_603_200_000,
-        expiresAt: 1_753_603_260_000,
+        observedAt: candidateObservedAt,
+        expiresAt: candidateObservedAt + 60_000,
       },
     ]);
     vi.mocked(harness.api.confirmLanCandidate).mockResolvedValue({
       status: "confirmed",
       port: 51_321,
       version: "1.21.5",
-      confirmedAt: 1_753_603_200_100,
+      confirmedAt: candidateObservedAt + 100,
     });
     render(<App api={harness.api} />);
 
@@ -606,7 +729,9 @@ describe("Task 5 application routing", () => {
           lifecycle: "stopped",
           minecraft: { state: "disconnected", sessionId: null },
           codex: { state: "stopped", model: null },
+          actions: null,
           task: null,
+          actionQueue: { goal: null, items: [] },
           lastError: null,
         },
       }),
@@ -614,7 +739,7 @@ describe("Task 5 application routing", () => {
 
     await userEvent.click(
       await screen.findByRole("button", {
-        name: "Confirm and connect: port 51321, Minecraft 1.21.5",
+        name: "Confirm and connect to this candidate",
       }),
     );
     await screen.findByRole("heading", { name: "Runtime overview" });

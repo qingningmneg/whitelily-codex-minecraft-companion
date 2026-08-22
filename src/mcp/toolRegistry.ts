@@ -1,10 +1,62 @@
+import { createHash } from "node:crypto";
 import * as z from "zod/v4";
 import type { ActionExecutor, ActionResult } from "../actions/actionExecutor.js";
+import type { CompanionActionQueue, QueueAdmission } from "../actions/actionQueue.js";
 import type { GameAction, Vec3, WorldSnapshot } from "../domain/types.js";
-import type { MinecraftPort } from "../minecraft/minecraftPort.js";
+import type {
+  BlockSearchResult,
+  FurnaceSnapshot,
+  InspectedBlock,
+  MinecraftPort,
+} from "../minecraft/minecraftPort.js";
 import { classifyActionRisk } from "../safety/actionRisk.js";
 import type { SafetyContext } from "../safety/safetyEngine.js";
+import {
+  queuedActionSpecSchema,
+  queuedActionSpecToGameAction,
+  type QueuedActionSpec,
+} from "./queuedActionSchema.js";
 import { TurnToolBudget, type ToolActionKind, type TrustedToolConsumption } from "./toolBudget.js";
+
+export const MINECRAFT_TOOL_NAMES = Object.freeze([
+  "minecraft_get_state",
+  "minecraft_find_block",
+  "minecraft_inspect_block",
+  "minecraft_find_blocks",
+  "minecraft_get_furnace_state",
+  "minecraft_say",
+  "minecraft_move_to",
+  "minecraft_follow_owner",
+  "minecraft_look_at",
+  "minecraft_jump",
+  "minecraft_dig_block",
+  "minecraft_place_block",
+  "minecraft_craft_item",
+  "minecraft_smelt_item",
+  "minecraft_collect_dropped",
+  "minecraft_equip_item",
+  "minecraft_attack_hostile",
+  "minecraft_wait",
+  "minecraft_enqueue_actions",
+  "minecraft_get_action_queue",
+  "minecraft_cancel_queued_actions",
+] as const);
+
+export type MinecraftToolName = (typeof MINECRAFT_TOOL_NAMES)[number];
+
+export const MINECRAFT_EXECUTION_TOOL_NAMES = Object.freeze([
+  "minecraft_get_state",
+  "minecraft_find_block",
+  "minecraft_inspect_block",
+  "minecraft_find_blocks",
+  "minecraft_get_furnace_state",
+  "minecraft_say",
+  "minecraft_enqueue_actions",
+  "minecraft_get_action_queue",
+  "minecraft_cancel_queued_actions",
+] as const satisfies readonly MinecraftToolName[]);
+
+export type MinecraftExecutionToolName = (typeof MINECRAFT_EXECUTION_TOOL_NAMES)[number];
 
 export interface ToolResult {
   text: string;
@@ -25,6 +77,8 @@ export interface ToolRegistryDependencies {
   ownerUsername: () => string;
   latestSnapshot?: () => WorldSnapshot | undefined;
   observeSnapshot?: (snapshot: WorldSnapshot) => void;
+  actionQueue: CompanionActionQueue;
+  worldGeneration: () => number;
 }
 
 export interface TrustedSnapshotStore {
@@ -57,6 +111,27 @@ const turnLease = z
 const leaseShape = { turnLease };
 const positionSchema = z.object({ ...positionShape, ...leaseShape }).strict();
 const emptySchema = z.object(leaseShape).strict();
+const enqueueActionsSchema = z
+  .object({ actions: z.array(queuedActionSpecSchema).min(1).max(64), ...leaseShape })
+  .strict();
+const findBlocksSchema = z.union([
+  z
+    .object({
+      names: z.array(identifier).min(1).max(8),
+      maxDistance: z.number().int().min(1).max(64),
+      maxResults: z.number().int().min(1).max(32),
+      ...leaseShape,
+    })
+    .strict(),
+  z
+    .object({
+      tag: z.enum(["bed", "water", "mature_wheat"]),
+      maxDistance: z.number().int().min(1).max(64),
+      maxResults: z.number().int().min(1).max(32),
+      ...leaseShape,
+    })
+    .strict(),
+]);
 const entityId = z.number().int().positive().safe();
 const count = z.number().int().min(1).max(64);
 
@@ -137,8 +212,168 @@ function isTrustedPosition(position: unknown): position is Vec3 {
   );
 }
 
+function positionKey(position: Vec3): string {
+  return `${position.x},${position.y},${position.z}`;
+}
+
+function samePosition(left: Vec3, right: Vec3): boolean {
+  return left.x === right.x && left.y === right.y && left.z === right.z;
+}
+
+function hasExactlyKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {
+  const keys = Object.keys(value);
+  return keys.length === expected.length && keys.every((key) => expected.includes(key));
+}
+
+function isBoundedIdentifier(value: unknown): value is string {
+  return identifier.safeParse(value).success;
+}
+
+function parseStrictPosition(value: unknown): Vec3 | undefined {
+  if (!isRecord(value) || !hasExactlyKeys(value, ["x", "y", "z"])) return undefined;
+  if (!Number.isFinite(value.x) || !Number.isFinite(value.y) || !Number.isFinite(value.z)) {
+    return undefined;
+  }
+  return { x: value.x as number, y: value.y as number, z: value.z as number };
+}
+
+function parseInspectedBlock(value: unknown): InspectedBlock | undefined {
+  if (!isRecord(value) || !hasExactlyKeys(value, ["name", "position", "properties"])) {
+    return undefined;
+  }
+  const position = parseStrictPosition(value.position);
+  if (!isBoundedIdentifier(value.name) || !position) return undefined;
+  if (!isRecord(value.properties) || Object.keys(value.properties).length > 32) return undefined;
+  const properties: Record<string, string | number | boolean> = {};
+  for (const [key, property] of Object.entries(value.properties)) {
+    if (
+      !isBoundedIdentifier(key) ||
+      !(
+        (typeof property === "string" && property.length <= 64) ||
+        (typeof property === "number" && Number.isFinite(property)) ||
+        typeof property === "boolean"
+      )
+    ) {
+      return undefined;
+    }
+    properties[key] = property as string | number | boolean;
+  }
+  return { name: value.name, position, properties };
+}
+
+function parseBlockSearchResult(value: unknown, maxResults: number): BlockSearchResult | undefined {
+  if (
+    !isRecord(value) ||
+    !hasExactlyKeys(value, ["blocks", "truncated"]) ||
+    !Array.isArray(value.blocks) ||
+    value.blocks.length > maxResults ||
+    typeof value.truncated !== "boolean"
+  ) {
+    return undefined;
+  }
+  const blocks: InspectedBlock[] = [];
+  for (const valueBlock of value.blocks) {
+    const block = parseInspectedBlock(valueBlock);
+    if (!block) return undefined;
+    blocks.push(block);
+  }
+  return { blocks, truncated: value.truncated };
+}
+
+function parseFurnaceItem(
+  value: unknown,
+): { readonly name: string; readonly count: number } | null | undefined {
+  if (value === null) return null;
+  if (
+    !isRecord(value) ||
+    !hasExactlyKeys(value, ["name", "count"]) ||
+    !isBoundedIdentifier(value.name) ||
+    !Number.isSafeInteger(value.count) ||
+    (value.count as number) < 1 ||
+    (value.count as number) > 64
+  ) {
+    return undefined;
+  }
+  return { name: value.name, count: value.count as number };
+}
+
+function parseFurnaceSnapshot(value: unknown): FurnaceSnapshot | undefined {
+  if (
+    !isRecord(value) ||
+    !hasExactlyKeys(value, ["position", "input", "fuel", "output", "progress"])
+  ) {
+    return undefined;
+  }
+  const position = parseStrictPosition(value.position);
+  const input = parseFurnaceItem(value.input);
+  const fuel = parseFurnaceItem(value.fuel);
+  const output = parseFurnaceItem(value.output);
+  if (
+    !position ||
+    input === undefined ||
+    fuel === undefined ||
+    output === undefined ||
+    typeof value.progress !== "number" ||
+    !Number.isFinite(value.progress) ||
+    value.progress < 0 ||
+    value.progress > 1
+  ) {
+    return undefined;
+  }
+  return { position, input, fuel, output, progress: value.progress };
+}
+
+function canonicalIdentifier(value: string): string {
+  return value.replace(/^minecraft:/, "");
+}
+
+function blockMatchesSearch(
+  block: InspectedBlock,
+  query: z.infer<typeof findBlocksSchema>,
+): boolean {
+  const name = canonicalIdentifier(block.name);
+  if ("names" in query) {
+    return query.names.some((candidate) => canonicalIdentifier(candidate) === name);
+  }
+  switch (query.tag) {
+    case "bed":
+      return name === "bed" || name.endsWith("_bed");
+    case "water":
+      return name === "water";
+    case "mature_wheat":
+      return name === "wheat" && block.properties.age === 7;
+  }
+}
+
+function blockIsWithinDistance(block: InspectedBlock, origin: Vec3, maxDistance: number): boolean {
+  return (
+    Math.hypot(
+      block.position.x - origin.x,
+      block.position.y - origin.y,
+      block.position.z - origin.z,
+    ) <= maxDistance
+  );
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function canonicalValue(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalValue).join(",")}]`;
+  if (isRecord(value)) {
+    return `{${Object.keys(value)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalValue(value[key])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function observationKey(snapshot: WorldSnapshot, worldGeneration: number): string {
+  return createHash("sha256")
+    .update(canonicalValue({ snapshot, worldGeneration }), "utf8")
+    .digest("base64url");
 }
 
 function isTrustedWorldSnapshot(snapshot: unknown): snapshot is WorldSnapshot {
@@ -168,7 +403,10 @@ function isTrustedWorldSnapshot(snapshot: unknown): snapshot is WorldSnapshot {
     ) ||
     snapshot.nearbyHostiles.some(
       (entry) =>
-        !isRecord(entry) || typeof entry.kind !== "string" || !isTrustedPosition(entry.position),
+        !isRecord(entry) ||
+        !Number.isSafeInteger(entry.entityId) ||
+        typeof entry.kind !== "string" ||
+        !isTrustedPosition(entry.position),
     )
   ) {
     return false;
@@ -205,20 +443,50 @@ function snapshotPosition(snapshot: unknown, key: "botPosition" | "ownerPosition
 
 export function createToolRegistry(dependencies: ToolRegistryDependencies) {
   let observedSnapshot: WorldSnapshot | undefined;
+  let observedBlockGeneration: number | undefined;
+  const observedBlockPositions = new Set<string>();
+  const currentWorldGeneration = (): number => {
+    const generation = dependencies.worldGeneration();
+    if (!Number.isSafeInteger(generation) || generation < 0) {
+      throw new Error("trusted world generation is unavailable");
+    }
+    if (observedBlockGeneration !== generation) {
+      observedBlockGeneration = generation;
+      observedBlockPositions.clear();
+      observedSnapshot = undefined;
+    }
+    return generation;
+  };
+  const rememberObservedBlocks = (
+    blocks: readonly { readonly position: Vec3 }[] | undefined,
+  ): void => {
+    currentWorldGeneration();
+    for (const block of blocks ?? []) observedBlockPositions.add(positionKey(block.position));
+  };
   const observeSnapshot = (snapshot: WorldSnapshot): WorldSnapshot => {
     const trusted = structuredClone(snapshot);
     observedSnapshot = trusted;
+    rememberObservedBlocks(trusted.nearbyBlocks);
     dependencies.observeSnapshot?.(structuredClone(trusted));
     return trusted;
   };
   const takeSnapshot = async (): Promise<WorldSnapshot> => {
+    const generation = currentWorldGeneration();
     const snapshot: unknown = await dependencies.minecraft.snapshot(dependencies.ownerUsername());
+    if (currentWorldGeneration() !== generation) {
+      throw new Error("world changed during trusted snapshot");
+    }
     if (!isTrustedWorldSnapshot(snapshot)) throw new Error("trusted snapshot is unavailable");
     return observeSnapshot(snapshot);
   };
   const currentSnapshot = (): WorldSnapshot | undefined => {
     const snapshot = dependencies.latestSnapshot?.() ?? observedSnapshot;
-    return snapshot === undefined ? undefined : structuredClone(snapshot);
+    if (snapshot === undefined) return undefined;
+    return structuredClone(snapshot);
+  };
+  const isObservedBlockPosition = (position: Vec3): boolean => {
+    currentWorldGeneration();
+    return observedBlockPositions.has(positionKey(position));
   };
 
   const consume = (
@@ -288,6 +556,100 @@ export function createToolRegistry(dependencies: ToolRegistryDependencies) {
     }
   };
 
+  const enqueueActions = async (
+    specs: readonly QueuedActionSpec[],
+    lease: string,
+  ): Promise<ToolResult> => {
+    const invalidLease = checkLease(lease);
+    if (invalidLease) return invalidLease;
+    const taskLease = dependencies.budget.currentTaskLease(lease);
+    if (!taskLease) return errorResult("tool turn lease is invalid");
+    const failAttempt = (message: string): ToolResult => {
+      const consumed = dependencies.budget.consumeQueueControl(lease);
+      return consumed.ok ? errorResult(message) : errorResult(consumed.reason);
+    };
+    let snapshot: WorldSnapshot;
+    let baseContext: SafetyContext;
+    let worldGeneration: number;
+    try {
+      snapshot = await takeSnapshot();
+      baseContext = await dependencies.safetyContextProvider();
+      worldGeneration = dependencies.worldGeneration();
+      if (!Number.isSafeInteger(worldGeneration) || worldGeneration < 0) {
+        throw new Error("trusted world generation is unavailable");
+      }
+    } catch (error) {
+      return failAttempt(safeMessage(error));
+    }
+    const trustedObservationKey = observationKey(snapshot, worldGeneration);
+    const actions = specs.map(queuedActionSpecToGameAction);
+    if (
+      baseContext.wheatFarmingAllowed !== true &&
+      actions.some((action) => action.kind === "till_soil" || action.kind === "plant_crop")
+    ) {
+      return failAttempt("Wheat farming permission is required");
+    }
+    const admissions: QueueAdmission[] = actions.map((action, index) => ({
+      taskLease,
+      worldGeneration,
+      action,
+      summary: specs[index]!.summary,
+      trustedObservationKey,
+    }));
+    try {
+      dependencies.actionQueue.assertBatchCanEnqueue(admissions);
+    } catch (error) {
+      return errorResult(safeMessage(error));
+    }
+
+    let simulatedPosition = structuredClone(snapshot.botPosition);
+    let horizontalTravel = 0;
+    let blockChanges = 0;
+    let dangerousOperations = 0;
+    for (const action of actions) {
+      if (
+        action.kind === "dig_block" ||
+        action.kind === "place_block" ||
+        action.kind === "till_soil" ||
+        action.kind === "plant_crop" ||
+        action.kind === "harvest_crop"
+      )
+        blockChanges += 1;
+      if (action.kind === "move_to" || action.kind === "follow_owner") {
+        const destination =
+          action.kind === "move_to" ? action.position : snapshotPosition(snapshot, "ownerPosition");
+        if (!isTrustedPosition(destination)) {
+          return failAttempt("trusted movement distance is unavailable");
+        }
+        const distance = trustedTravel(simulatedPosition, destination);
+        if (!Number.isFinite(distance)) {
+          return failAttempt("trusted movement distance is unavailable");
+        }
+        horizontalTravel += distance;
+        simulatedPosition = { ...destination };
+      }
+      if (action.kind === "collect_dropped" && !hasDroppedItem(snapshot, action.entityId)) {
+        return failAttempt("dropped entity ID is not present in the latest snapshot");
+      }
+      dangerousOperations += classifyActionRisk(
+        action,
+        actionContext(baseContext, action, dependencies.budget),
+      ).dangerousOperations;
+    }
+    const reserved = dependencies.budget.consumeQueuedActions(
+      actions.map((action) => action.kind),
+      lease,
+      { blockChanges, horizontalTravel, dangerousOperations },
+    );
+    if (!reserved.ok) return errorResult(reserved.reason);
+    try {
+      const queued = dependencies.actionQueue.enqueueBatch(admissions);
+      return { text: stringify({ status: "queued", count: queued.length }) };
+    } catch (error) {
+      return errorResult(safeMessage(error));
+    }
+  };
+
   const registry = {
     minecraft_get_state: {
       description: "Read the current bounded Minecraft state.",
@@ -334,6 +696,117 @@ export function createToolRegistry(dependencies: ToolRegistryDependencies) {
         }
       },
     },
+    minecraft_inspect_block: {
+      description: "Inspect one exact block position already present in trusted observations.",
+      schema: positionSchema,
+      execute: async ({
+        x,
+        y,
+        z,
+        turnLease: lease,
+      }: Vec3 & { turnLease: string }): Promise<ToolResult> => {
+        const exhausted = consume("inspect_block", lease);
+        if (exhausted) return exhausted;
+        const position = { x, y, z };
+        try {
+          const generation = currentWorldGeneration();
+          await takeSnapshot();
+          if (currentWorldGeneration() !== generation) {
+            return errorResult("world changed during block observation");
+          }
+          if (!isObservedBlockPosition(position)) {
+            return errorResult("block position was not observed");
+          }
+          const rawBlock: unknown = await dependencies.minecraft.inspectBlock(position);
+          if (currentWorldGeneration() !== generation) {
+            return errorResult("world changed during block observation");
+          }
+          const block = rawBlock === null ? null : parseInspectedBlock(rawBlock);
+          if (block === undefined || (block !== null && !samePosition(block.position, position))) {
+            return errorResult("trusted block inspection is unavailable");
+          }
+          if (block !== null) rememberObservedBlocks([block]);
+          return { text: stringify({ block }) };
+        } catch (error) {
+          return errorResult(safeMessage(error));
+        }
+      },
+    },
+    minecraft_find_blocks: {
+      description:
+        "Find 1 to 32 nearby blocks by 1 to 8 exact identifiers or one supported narrow tag.",
+      schema: findBlocksSchema,
+      execute: async (input: z.infer<typeof findBlocksSchema>): Promise<ToolResult> => {
+        const { maxDistance, maxResults, turnLease: lease } = input;
+        const exhausted = consume("find_blocks", lease);
+        if (exhausted) return exhausted;
+        const query =
+          "names" in input
+            ? { names: input.names, maxDistance, maxResults }
+            : { tag: input.tag, maxDistance, maxResults };
+        try {
+          const generation = currentWorldGeneration();
+          const snapshot = await takeSnapshot();
+          if (currentWorldGeneration() !== generation) {
+            return errorResult("world changed during block observation");
+          }
+          const rawResult: unknown = await dependencies.minecraft.findBlocks(query);
+          if (currentWorldGeneration() !== generation) {
+            return errorResult("world changed during block observation");
+          }
+          const result = parseBlockSearchResult(rawResult, maxResults);
+          if (
+            !result ||
+            result.blocks.some(
+              (block) =>
+                !blockMatchesSearch(block, input) ||
+                !blockIsWithinDistance(block, snapshot.botPosition, maxDistance),
+            )
+          ) {
+            return errorResult("trusted block search is unavailable");
+          }
+          rememberObservedBlocks(result.blocks);
+          return { text: stringify(result) };
+        } catch (error) {
+          return errorResult(safeMessage(error));
+        }
+      },
+    },
+    minecraft_get_furnace_state: {
+      description: "Read one observed furnace's bounded input, fuel, output, and progress state.",
+      schema: positionSchema,
+      execute: async ({
+        x,
+        y,
+        z,
+        turnLease: lease,
+      }: Vec3 & { turnLease: string }): Promise<ToolResult> => {
+        const exhausted = consume("get_furnace_state", lease);
+        if (exhausted) return exhausted;
+        const position = { x, y, z };
+        try {
+          const generation = currentWorldGeneration();
+          await takeSnapshot();
+          if (currentWorldGeneration() !== generation) {
+            return errorResult("world changed during block observation");
+          }
+          if (!isObservedBlockPosition(position)) {
+            return errorResult("block position was not observed");
+          }
+          const rawFurnace: unknown = await dependencies.minecraft.furnaceSnapshot(position);
+          if (currentWorldGeneration() !== generation) {
+            return errorResult("world changed during block observation");
+          }
+          const furnace = parseFurnaceSnapshot(rawFurnace);
+          if (!furnace || !samePosition(furnace.position, position)) {
+            return errorResult("trusted furnace state is unavailable");
+          }
+          return { text: stringify({ furnace }) };
+        } catch (error) {
+          return errorResult(safeMessage(error));
+        }
+      },
+    },
     minecraft_say: {
       description: "Send a short non-command chat message.",
       schema: z
@@ -361,6 +834,39 @@ export function createToolRegistry(dependencies: ToolRegistryDependencies) {
         turnLease: string;
       }): Promise<ToolResult> => runAction({ kind: "say", message }, lease),
     },
+    minecraft_enqueue_actions: {
+      description:
+        "Atomically append 1 to 64 explicit physical actions to the current private task queue.",
+      schema: enqueueActionsSchema,
+      execute: async ({
+        actions,
+        turnLease: lease,
+      }: {
+        actions: QueuedActionSpec[];
+        turnLease: string;
+      }): Promise<ToolResult> => enqueueActions(actions, lease),
+    },
+    minecraft_get_action_queue: {
+      description: "Read the redacted private action queue projection for planning.",
+      schema: emptySchema,
+      execute: async ({ turnLease: lease }: { turnLease: string }): Promise<ToolResult> => {
+        const consumed = dependencies.budget.consumeQueueControl(lease);
+        if (!consumed.ok) return errorResult(consumed.reason);
+        return { text: stringify(dependencies.actionQueue.snapshot()) };
+      },
+    },
+    minecraft_cancel_queued_actions: {
+      description: "Cancel only not-yet-started actions owned by the current task lease.",
+      schema: emptySchema,
+      execute: async ({ turnLease: lease }: { turnLease: string }): Promise<ToolResult> => {
+        const consumed = dependencies.budget.consumeQueueControl(lease);
+        if (!consumed.ok) return errorResult(consumed.reason);
+        const taskLease = dependencies.budget.currentTaskLease(lease);
+        if (!taskLease) return errorResult("tool turn lease is invalid");
+        const cancelled = dependencies.actionQueue.cancelWaiting(taskLease, "model_replanned");
+        return { text: stringify({ status: "cancelled", count: cancelled }) };
+      },
+    },
     minecraft_move_to: {
       description: "Move WhiteLily to exact coordinates through the local safety gate.",
       schema: positionSchema,
@@ -373,7 +879,8 @@ export function createToolRegistry(dependencies: ToolRegistryDependencies) {
         runAction({ kind: "move_to", position: { x, y, z } }, lease),
     },
     minecraft_follow_owner: {
-      description: "Follow the configured owner at a bounded distance.",
+      description:
+        "Follow the configured owner with a gap of 2 to 16 blocks. The distance is the owner gap, not a travel budget. Use 2 when the owner asks WhiteLily to come beside them without specifying a gap.",
       schema: z.object({ distance: z.number().int().min(2).max(16), ...leaseShape }).strict(),
       execute: async ({
         distance,
@@ -556,6 +1063,8 @@ export function createToolRegistry(dependencies: ToolRegistryDependencies) {
         turnLease: string;
       }): Promise<ToolResult> => runAction({ kind: "wait", milliseconds }, lease),
     },
+  } satisfies Record<MinecraftToolName, unknown>;
+  return Object.fromEntries(MINECRAFT_TOOL_NAMES.map((name) => [name, registry[name]])) as {
+    [Name in MinecraftToolName]: (typeof registry)[Name];
   };
-  return registry;
 }

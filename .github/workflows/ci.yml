@@ -18,9 +18,15 @@ jobs:
         with:
           node-version: "24"
           cache: npm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: gradle
       - run: npm ci
       - run: npm run format:check
       - run: npm run typecheck
+      - run: npm run minecraft-components:prepare
       - run: npm run desktop:prepare
       - run: npm test -- --no-file-parallelism
       - run: npm run build

@@ -23,7 +23,7 @@ describe("desktop message catalogs", () => {
     );
     expect(() =>
       translate("en", "minecraft.connected", {
-        leakedPath: String.raw`C:\Users\private`,
+        leakedPath: String.raw`C:\Users\Other`,
       }),
     ).toThrow("unexpected interpolation parameter: leakedPath");
   });
@@ -59,5 +59,23 @@ describe("desktop message catalogs", () => {
     for (const value of [...Object.values(zhCN), ...Object.values(en)]) {
       expect(value).not.toContain("\ufffd");
     }
+  });
+
+  it("keeps AI model settings separate from avatar model appearance copy", () => {
+    expect(zhCN["nav.models"]).toBe("AI 模型");
+    expect(zhCN["nav.avatarModels"]).toBe("模型与外观");
+    expect(zhCN["model.title"]).toBe("AI 模型设置");
+    expect(en["nav.models"]).toBe("AI model");
+    expect(en["nav.avatarModels"]).toBe("Models & appearance");
+    expect(en["model.title"]).toBe("AI model settings");
+  });
+
+  it("uses Minecraft skin copy without legacy 3D model capability labels", () => {
+    expect(zhCN["avatarModels.title"]).toBe("模型与外观");
+    expect(zhCN["avatarModels.import"]).toBe("导入皮肤");
+    expect(zhCN["avatarModels.error.skinInvalid"]).toBe("皮肤不是 64×64 RGBA PNG。");
+    expect(zhCN["avatarModels.error.portraitInvalid"]).toBe("立绘文件无效。");
+    expect(en["avatarModels.armModel.slim"]).toBe("Slim arms");
+    expect(en["avatarModels.armModel.wide"]).toBe("Classic arms");
   });
 });

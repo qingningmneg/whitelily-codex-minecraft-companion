@@ -1,6 +1,7 @@
 import { z } from "zod";
 import type { AccountSnapshot } from "../codex/accountService.js";
 import type { ModelCatalogSnapshot, ModelSelection } from "../codex/modelCatalog.js";
+import { MODEL_ID_PATTERN } from "../codex/modelId.js";
 import type { RuntimeEvent, RuntimeSnapshot } from "../runtime/runtimeEvents.js";
 import type { OwnerIdentitySnapshot } from "../identity/ownerIdentity.js";
 import {
@@ -17,6 +18,7 @@ import {
   worldProfileSchema,
   type WorldProfile,
 } from "../world/worldProfileSchema.js";
+import { DIAGNOSTIC_ACTION_ERROR_CODES } from "../diagnostics/diagnosticManifest.js";
 
 export const DESKTOP_PROTOCOL_VERSION = 1 as const;
 export const MAX_DESKTOP_LINE_BYTES = 1_048_576;
@@ -42,7 +44,7 @@ const ownerUsernameSchema = z
   .string()
   .regex(/^[A-Za-z0-9_]{3,16}$/u)
   .refine((value) => value !== "YourMcName");
-const modelTokenSchema = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u);
+const modelTokenSchema = z.string().regex(MODEL_ID_PATTERN);
 const reasoningEffortSchema = z.string().regex(/^[A-Za-z][A-Za-z0-9_-]{0,63}$/u);
 const attemptIdSchema = z.string().regex(/^[A-Za-z0-9_-]{16,128}$/u);
 const connectionNonceSchema = z.string().regex(/^[A-Za-z0-9_-]{16,64}$/u);
@@ -60,6 +62,7 @@ const taskStopReasonSchema = z.enum([
   "world_changed",
   "owner_changed",
   "model_unavailable",
+  "model_changed",
   "process_exit",
 ]);
 
@@ -103,6 +106,40 @@ const publicTaskSnapshotSchema = z
   })
   .strict();
 
+const canonicalIsoTimeSchema = boundedPublicString(64).refine((value) => {
+  const parsed = new Date(value);
+  return !Number.isNaN(parsed.getTime()) && parsed.toISOString() === value;
+});
+
+const runtimeActionQueueItemSchema = z
+  .object({
+    index: z.number().int().positive().safe(),
+    kind: boundedPublicString(64).refine((value) => value.trim().length > 0),
+    summary: boundedPublicString(160),
+    status: z.enum([
+      "waiting",
+      "running",
+      "suspended",
+      "waiting_permission",
+      "completed",
+      "failed",
+      "cancelled",
+    ]),
+    retryCount: finiteNonnegativeInteger,
+    enqueuedAt: canonicalIsoTimeSchema,
+    startedAt: canonicalIsoTimeSchema.optional(),
+    endedAt: canonicalIsoTimeSchema.optional(),
+    reason: boundedPublicString(240).optional(),
+  })
+  .strict();
+
+const runtimeActionQueueProjectionSchema = z
+  .object({
+    goal: boundedPublicString(160).nullable(),
+    items: z.array(runtimeActionQueueItemSchema).max(256),
+  })
+  .strict();
+
 const minecraftStateSchema = z
   .object({
     state: z.enum(["disconnected", "connecting", "connected", "reconnecting"]),
@@ -113,9 +150,36 @@ const minecraftStateSchema = z
 const codexStateSchema = z
   .object({
     state: z.enum(["stopped", "starting", "ready", "failed"]),
-    model: safeTokenSchema.nullable(),
+    model: modelTokenSchema.nullable(),
   })
   .strict();
+
+const workspaceVersionSchema = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u);
+const actionCapabilitySnapshotSchema = z.discriminatedUnion("state", [
+  z
+    .object({
+      state: z.literal("starting"),
+      workspaceVersion: workspaceVersionSchema,
+    })
+    .strict(),
+  z
+    .object({
+      state: z.literal("ready"),
+      workspaceVersion: workspaceVersionSchema,
+      mcpListening: z.literal(true),
+      discoveredToolCount: finiteNonnegativeInteger,
+    })
+    .strict(),
+  z
+    .object({
+      state: z.literal("failed"),
+      workspaceVersion: workspaceVersionSchema.nullable(),
+      mcpListening: z.boolean(),
+      discoveredToolCount: finiteNonnegativeInteger,
+      errorCode: z.string().regex(/^[a-z][a-z0-9_]{0,63}$/u),
+    })
+    .strict(),
+]);
 
 const publicErrorSchema = z
   .object({
@@ -130,7 +194,9 @@ const runtimeSnapshotSchema = z
     lifecycle: z.enum(["idle", "starting", "running", "stopping", "stopped", "failed"]),
     minecraft: minecraftStateSchema,
     codex: codexStateSchema,
+    actions: actionCapabilitySnapshotSchema.nullable(),
     task: publicTaskSnapshotSchema.nullable(),
+    actionQueue: runtimeActionQueueProjectionSchema,
     lastError: publicErrorSchema.nullable(),
   })
   .strict();
@@ -173,9 +239,23 @@ const runtimeEventSchema = z.discriminatedUnion("kind", [
     .strict(),
   z
     .object({
+      kind: z.literal("actions"),
+      revision: runtimeRevisionSchema,
+      state: actionCapabilitySnapshotSchema.nullable(),
+    })
+    .strict(),
+  z
+    .object({
       kind: z.literal("task"),
       revision: runtimeRevisionSchema,
       task: publicTaskSnapshotSchema.nullable(),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("action_queue"),
+      revision: runtimeRevisionSchema,
+      actionQueue: runtimeActionQueueProjectionSchema,
     })
     .strict(),
   z
@@ -253,6 +333,7 @@ const modelCatalogSnapshotSchema = z
   .object({
     models: z.array(availableModelSchema).max(256),
     selection: modelSelectionSchema,
+    legacyMigrationCompleted: z.boolean(),
   })
   .strict();
 
@@ -394,9 +475,19 @@ const diagnosticOmissions = [
   "raw-chat",
 ] as const;
 const diagnosticSha256Schema = z.string().regex(/^[a-f0-9]{64}$/u);
+const diagnosticActionCapabilitySchema = z
+  .object({
+    workspaceVersion: workspaceVersionSchema.nullable(),
+    state: z.enum(["starting", "ready", "failed"]),
+    mcpListening: z.boolean(),
+    discoveredToolCount: finiteNonnegativeInteger,
+    errorCode: z.enum(DIAGNOSTIC_ACTION_ERROR_CODES).nullable(),
+  })
+  .strict();
 export const diagnosticPreviewSchema = z
   .object({
     exportId: z.string().regex(/^[A-Za-z0-9_-]{16,64}$/u),
+    actionCapability: diagnosticActionCapabilitySchema,
     files: z
       .array(
         z
@@ -525,6 +616,12 @@ const desktopCommandSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("list_models") }).strict(),
   z
     .object({
+      kind: z.literal("migrate_model_preference"),
+      candidate: modelSelectionInputSchema.nullable(),
+    })
+    .strict(),
+  z
+    .object({
       kind: z.literal("select_model"),
       selection: modelSelectionInputSchema,
     })
@@ -648,6 +745,11 @@ const desktopErrorSchema = z.union([
       code: z.enum([
         "INVALID_REQUEST",
         "RUNTIME_START_FAILED",
+        "MINECRAFT_BRIDGE_REQUIRED",
+        "MINECRAFT_BRIDGE_REJECTED",
+        "MCP_PORT_UNAVAILABLE",
+        "MCP_TOOL_CATALOG_INVALID",
+        "MCP_READINESS_TIMEOUT",
         "RUNTIME_STOP_FAILED",
         "EMERGENCY_STOP_FAILED",
         "ACCOUNT_OPERATION_FAILED",
@@ -696,6 +798,7 @@ const connectionInvalidatedEventSchema = z
     reason: z.enum([
       "account_lost",
       "model_unavailable",
+      "action_unavailable",
       "lan_changed",
       "minecraft_disconnect",
       "world_changed",
@@ -717,7 +820,9 @@ export function isAuthorityFreeTerminalRuntimeSnapshot(snapshot: RuntimeSnapshot
     snapshot.minecraft.sessionId === null &&
     (snapshot.codex.state === "stopped" || snapshot.codex.state === "failed") &&
     snapshot.codex.model === null &&
-    snapshot.task === null
+    snapshot.actions === null &&
+    snapshot.task === null &&
+    snapshot.actionQueue.goal === null
   );
 }
 
@@ -776,7 +881,7 @@ export type DesktopCommandResult<C extends DesktopCommand> = C["kind"] extends
       ? AccountSnapshot
       : C["kind"] extends "start_chatgpt_login"
         ? StartChatGptLoginResult
-        : C["kind"] extends "list_models"
+        : C["kind"] extends "list_models" | "migrate_model_preference"
           ? ModelCatalogSnapshot
           : C["kind"] extends "select_model"
             ? ModelSelection
@@ -847,6 +952,11 @@ export type DesktopResponse =
             code:
               | "INVALID_REQUEST"
               | "RUNTIME_START_FAILED"
+              | "MINECRAFT_BRIDGE_REQUIRED"
+              | "MINECRAFT_BRIDGE_REJECTED"
+              | "MCP_PORT_UNAVAILABLE"
+              | "MCP_TOOL_CATALOG_INVALID"
+              | "MCP_READINESS_TIMEOUT"
               | "RUNTIME_STOP_FAILED"
               | "EMERGENCY_STOP_FAILED"
               | "ACCOUNT_OPERATION_FAILED"
@@ -921,6 +1031,7 @@ export function parseDesktopCommandResult<C extends DesktopCommand>(
       schema = startChatGptLoginResultSchema;
       break;
     case "list_models":
+    case "migrate_model_preference":
       schema = modelCatalogSnapshotSchema;
       break;
     case "select_model":

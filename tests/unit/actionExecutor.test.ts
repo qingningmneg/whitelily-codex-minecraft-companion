@@ -2,6 +2,13 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { ActionExecutor, type ActionSafety } from "../../src/actions/actionExecutor.js";
 import type { GameAction, SafetyDecision } from "../../src/domain/types.js";
 import { FakeMinecraftPort } from "../../src/minecraft/fakeMinecraftPort.js";
+import type {
+  BlockSearchResult,
+  FoodDelta,
+  FurnaceSnapshot,
+  InspectedBlock,
+  InventoryDelta,
+} from "../../src/minecraft/minecraftPort.js";
 import { ConfirmationStore } from "../../src/safety/confirmationStore.js";
 import { SafetyEngine, type SafetyContext } from "../../src/safety/safetyEngine.js";
 import type { TaskLease } from "../../src/safety/taskBudget.js";
@@ -35,6 +42,84 @@ function abortError(): Error {
 function waitsForAbort(signal: AbortSignal): Promise<void> {
   return new Promise((_, reject) => signal.addEventListener("abort", () => reject(abortError())));
 }
+
+const livingActions = [
+  {
+    label: "fish",
+    action: { kind: "fish" } as const,
+    timeout: 60_000,
+    install: (minecraft: FakeMinecraftPort) => {
+      minecraft.fish = async (signal) => {
+        await waitsForAbort(signal);
+        return { added: [], removed: [] };
+      };
+    },
+  },
+  {
+    label: "consume_item",
+    action: { kind: "consume_item", itemName: "bread" } as const,
+    timeout: 10_000,
+    install: (minecraft: FakeMinecraftPort) => {
+      minecraft.consumeItem = async (_itemName, signal) => {
+        await waitsForAbort(signal);
+        return { healthBefore: 20, healthAfter: 20, foodBefore: 10, foodAfter: 15 };
+      };
+    },
+  },
+  {
+    label: "sleep_in_bed",
+    action: { kind: "sleep_in_bed", position: { x: 1, y: 64, z: 1 } } as const,
+    timeout: 20_000,
+    install: (minecraft: FakeMinecraftPort) => {
+      minecraft.sleepInBed = (_position, signal) => waitsForAbort(signal);
+    },
+  },
+  {
+    label: "wake_up",
+    action: { kind: "wake_up" } as const,
+    timeout: 10_000,
+    install: (minecraft: FakeMinecraftPort) => {
+      minecraft.wakeUp = (signal) => waitsForAbort(signal);
+    },
+  },
+  {
+    label: "till_soil",
+    action: { kind: "till_soil", position: { x: 2, y: 64, z: 2 } } as const,
+    timeout: 15_000,
+    install: (minecraft: FakeMinecraftPort) => {
+      minecraft.tillSoil = (_position, signal) => waitsForAbort(signal);
+    },
+  },
+  {
+    label: "plant_crop",
+    action: {
+      kind: "plant_crop",
+      position: { x: 2, y: 64, z: 2 },
+      seedName: "wheat_seeds",
+    } as const,
+    timeout: 15_000,
+    install: (minecraft: FakeMinecraftPort) => {
+      minecraft.plantCrop = (_position, _seedName, signal) => waitsForAbort(signal);
+    },
+  },
+  {
+    label: "harvest_crop",
+    action: {
+      kind: "harvest_crop",
+      position: { x: 3, y: 64, z: 3 },
+      cropName: "wheat",
+    } as const,
+    timeout: 15_000,
+    install: (minecraft: FakeMinecraftPort) => {
+      minecraft.harvestCrop = (_position, _cropName, signal) => waitsForAbort(signal);
+    },
+  },
+] satisfies readonly {
+  label: string;
+  action: GameAction;
+  timeout: number;
+  install(minecraft: FakeMinecraftPort): void;
+}[];
 
 afterEach(() => vi.useRealTimers());
 
@@ -83,6 +168,32 @@ describe("ActionExecutor", () => {
     executor.stopAll();
 
     expect(order).toEqual(["task_invalidated", "action_aborted"]);
+    await expect(running).resolves.toEqual({ status: "cancelled" });
+  });
+
+  it("can abort physical work while preserving the active task authority", async () => {
+    const minecraft = new FakeMinecraftPort();
+    const order: string[] = [];
+    let waitStarted = false;
+    minecraft.wait = (_milliseconds, signal) => {
+      waitStarted = true;
+      signal.addEventListener("abort", () => order.push("action_aborted"), { once: true });
+      return waitsForAbort(signal);
+    };
+    const confirmations = new ConfirmationStore();
+    const executor = new ActionExecutor(
+      minecraft,
+      new SafetyEngine(confirmations),
+      confirmations,
+      () => "TestOwner",
+      () => order.push("task_invalidated"),
+    );
+    const running = executor.execute({ kind: "wait", milliseconds: 60_000 }, context);
+    await vi.waitFor(() => expect(waitStarted).toBe(true));
+
+    executor.stopAll({ preserveTask: true });
+
+    expect(order).toEqual(["action_aborted"]);
     await expect(running).resolves.toEqual({ status: "cancelled" });
   });
 
@@ -343,6 +454,66 @@ describe("ActionExecutor", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
+  it.each(livingActions)("times out $label with conservative mutation evidence", async (entry) => {
+    vi.useFakeTimers();
+    const minecraft = new FakeMinecraftPort();
+    entry.install(minecraft);
+    const executor = createActionExecutorHarness(minecraft, { kind: "allow" });
+    const result = executor.execute(entry.action, {
+      ...context,
+      wheatFarmingAllowed: true,
+    });
+
+    await vi.advanceTimersByTimeAsync(entry.timeout);
+
+    await expect(result).resolves.toEqual({
+      status: "failed",
+      reason: "action timed out",
+      worldMutated: true,
+    });
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each(livingActions)("cancels $label when the owner preempts the queue", async (entry) => {
+    const minecraft = new FakeMinecraftPort();
+    entry.install(minecraft);
+    const executor = createActionExecutorHarness(minecraft, { kind: "allow" });
+    const result = executor.execute(entry.action, {
+      ...context,
+      wheatFarmingAllowed: true,
+    });
+    await vi.waitFor(() => expect(executor.pendingCount()).toBe(1));
+
+    executor.stopAll({ preserveTask: true });
+
+    await expect(result).resolves.toEqual({ status: "cancelled" });
+  });
+
+  it("defaults living failures to mutated and accepts only explicit adapter no-mutation evidence", async () => {
+    const minecraft = new FakeMinecraftPort();
+    const unchanged = Object.assign(new Error("cast was never sent"), { worldMutated: false });
+    minecraft.fish = async () => {
+      throw unchanged;
+    };
+    minecraft.consumeItem = async () => {
+      throw new Error("consume status is unknown");
+    };
+    const executor = createActionExecutorHarness(minecraft, { kind: "allow" });
+
+    await expect(executor.execute({ kind: "fish" }, context)).resolves.toEqual({
+      status: "failed",
+      reason: "Error: cast was never sent",
+      worldMutated: false,
+    });
+    await expect(
+      executor.execute({ kind: "consume_item", itemName: "bread" }, context),
+    ).resolves.toEqual({
+      status: "failed",
+      reason: "Error: consume status is unknown",
+      worldMutated: true,
+    });
+  });
+
   it("does not publish a smelt timeout until physical cancellation settles", async () => {
     vi.useFakeTimers();
     const minecraft = new FakeMinecraftPort();
@@ -397,7 +568,7 @@ describe("ActionExecutor", () => {
     );
   });
 
-  it("retries only navigation and never retries irreversible actions", async () => {
+  it("never retries actions inside ActionExecutor", async () => {
     const minecraft = new FakeMinecraftPort();
     let moves = 0;
     minecraft.moveTo = async () => {
@@ -429,7 +600,7 @@ describe("ActionExecutor", () => {
     await executor.execute({ kind: "craft_item", itemName: "stick", count: 1 }, context);
     await executor.execute({ kind: "smelt_item", itemName: "iron_ingot", count: 1 }, context);
 
-    expect(moves).toBe(2);
+    expect(moves).toBe(1);
     expect(places).toBe(1);
     expect(crafts).toBe(1);
     expect(smelts).toBe(1);
@@ -452,6 +623,17 @@ describe("ActionExecutor", () => {
       { kind: "equip_item", itemName: "iron_helmet", destination: "head" },
       { kind: "attack_hostile", entityId: 5 },
       { kind: "wait", milliseconds: 6 },
+      { kind: "fish" },
+      { kind: "consume_item", itemName: "bread" },
+      { kind: "sleep_in_bed", position: { x: 14, y: 15, z: 16 } },
+      { kind: "wake_up" },
+      { kind: "till_soil", position: { x: 17, y: 18, z: 19 } },
+      {
+        kind: "plant_crop",
+        position: { x: 20, y: 21, z: 22 },
+        seedName: "wheat_seeds",
+      },
+      { kind: "harvest_crop", position: { x: 23, y: 24, z: 25 }, cropName: "wheat" },
     ];
 
     for (const action of actions)
@@ -471,6 +653,13 @@ describe("ActionExecutor", () => {
       { method: "equipItem", args: ["iron_helmet", "head"] },
       { method: "attackHostile", args: [5] },
       { method: "wait", args: [6] },
+      { method: "fish", args: [] },
+      { method: "consumeItem", args: ["bread"] },
+      { method: "sleepInBed", args: [{ x: 14, y: 15, z: 16 }] },
+      { method: "wakeUp", args: [] },
+      { method: "tillSoil", args: [{ x: 17, y: 18, z: 19 }] },
+      { method: "plantCrop", args: [{ x: 20, y: 21, z: 22 }, "wheat_seeds"] },
+      { method: "harvestCrop", args: [{ x: 23, y: 24, z: 25 }, "wheat"] },
     ]);
   });
 
@@ -753,5 +942,66 @@ describe("ActionExecutor", () => {
     expect(Object.isFrozen(laterView)).toBe(true);
     expect(firstView).not.toBe(laterView);
     expect(laterView).not.toBe(callerResult);
+  });
+
+  it("does not expose mutable fake-port read model state", async () => {
+    const minecraft = new FakeMinecraftPort();
+    const inspected: InspectedBlock = {
+      name: "wheat",
+      position: { x: 1, y: 64, z: 2 },
+      properties: { age: 7 },
+    };
+    const furnace: FurnaceSnapshot = {
+      position: { x: 3, y: 64, z: 4 },
+      input: { name: "raw_cod", count: 1 },
+      fuel: { name: "coal", count: 1 },
+      output: null,
+      progress: 0.5,
+    };
+    minecraft.inspectBlockResult = inspected;
+    minecraft.findBlocksResult = { blocks: [inspected], truncated: false };
+    minecraft.furnaceSnapshotResult = furnace;
+
+    const firstBlock = await minecraft.inspectBlock(inspected.position);
+    const firstSearch = await minecraft.findBlocks({
+      names: ["wheat"],
+      maxDistance: 16,
+      maxResults: 8,
+    });
+    const firstFurnace = await minecraft.furnaceSnapshot(furnace.position);
+    (firstBlock as { position: { x: number } }).position.x = 99;
+    (firstSearch as unknown as { blocks: Array<{ name: string }> }).blocks[0]!.name = "stone";
+    (firstFurnace as { progress: number }).progress = 1;
+
+    expect(await minecraft.inspectBlock(inspected.position)).toEqual(inspected);
+    expect(
+      await minecraft.findBlocks({ names: ["wheat"], maxDistance: 16, maxResults: 8 }),
+    ).toEqual({ blocks: [inspected], truncated: false } satisfies BlockSearchResult);
+    expect(await minecraft.furnaceSnapshot(furnace.position)).toEqual(furnace);
+  });
+
+  it("does not expose mutable fake-port living action deltas", async () => {
+    const minecraft = new FakeMinecraftPort();
+    const fishResult: InventoryDelta = {
+      added: [{ name: "cod", count: 1 }],
+      removed: [],
+    };
+    const consumeResult: FoodDelta = {
+      healthBefore: 18,
+      healthAfter: 18,
+      foodBefore: 12,
+      foodAfter: 17,
+    };
+    minecraft.fishResult = fishResult;
+    minecraft.consumeItemResult = consumeResult;
+    const signal = new AbortController().signal;
+
+    const firstFish = await minecraft.fish(signal);
+    const firstConsume = await minecraft.consumeItem("bread", signal);
+    (firstFish as unknown as { added: Array<{ count: number }> }).added[0]!.count = 99;
+    (firstConsume as { foodAfter: number }).foodAfter = 0;
+
+    expect(await minecraft.fish(signal)).toEqual(fishResult);
+    expect(await minecraft.consumeItem("bread", signal)).toEqual(consumeResult);
   });
 });

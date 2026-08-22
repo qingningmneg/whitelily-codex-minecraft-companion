@@ -1,4 +1,5 @@
 import { redactPublicTextWithCount } from "../memory/redaction.js";
+import type { RuntimeSnapshot } from "../runtime/runtimeEvents.js";
 
 export const DIAGNOSTIC_ENTRY_NAMES = [
   "app-version.json",
@@ -19,12 +20,112 @@ export const DIAGNOSTIC_OMISSIONS = [
   "raw-chat",
 ] as const;
 
+export const DIAGNOSTIC_ACTION_ERROR_CODES = Object.freeze([
+  "invalid_url",
+  "invalid_timeout",
+  "connection_failed",
+  "timeout",
+  "aborted",
+  "missing_tools",
+  "extra_tools",
+  "duplicate_tools",
+  "invalid_tool_name",
+  "port_conflict",
+  "server_start_failed",
+  "server_closed",
+  "startup_stopped",
+  "MINECRAFT_BRIDGE_REQUIRED",
+  "MINECRAFT_BRIDGE_REJECTED",
+] as const);
+
 export type DiagnosticLogicalName = (typeof DIAGNOSTIC_ENTRY_NAMES)[number];
+export type DiagnosticActionErrorCode = (typeof DIAGNOSTIC_ACTION_ERROR_CODES)[number];
 
 export interface DiagnosticPreview {
   exportId: string;
+  actionCapability: DiagnosticActionCapability;
   files: Array<{ logicalName: DiagnosticLogicalName; size: number; redactions: number }>;
   omitted: Array<(typeof DIAGNOSTIC_OMISSIONS)[number]>;
+}
+
+export interface DiagnosticActionCapability {
+  workspaceVersion: string | null;
+  state: "starting" | "ready" | "failed";
+  mcpListening: boolean;
+  discoveredToolCount: number;
+  errorCode: DiagnosticActionErrorCode | null;
+}
+
+const workspaceVersionPattern = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u;
+
+export function snapshotDiagnosticActionCapability(
+  actions: RuntimeSnapshot["actions"],
+  lastError: RuntimeSnapshot["lastError"] = null,
+): DiagnosticActionCapability {
+  const bridgeErrorCode = diagnosticBridgeErrorCode(lastError?.code);
+  if (bridgeErrorCode !== null) {
+    return Object.freeze({
+      workspaceVersion: null,
+      state: "failed",
+      mcpListening: false,
+      discoveredToolCount: 0,
+      errorCode: bridgeErrorCode,
+    });
+  }
+  if (actions === null) {
+    return Object.freeze({
+      workspaceVersion: null,
+      state: "starting",
+      mcpListening: false,
+      discoveredToolCount: 0,
+      errorCode: null,
+    });
+  }
+  const workspaceVersion = workspaceVersionPattern.test(actions.workspaceVersion ?? "")
+    ? actions.workspaceVersion
+    : null;
+  if (actions.state === "starting") {
+    return Object.freeze({
+      workspaceVersion,
+      state: "starting",
+      mcpListening: false,
+      discoveredToolCount: 0,
+      errorCode: null,
+    });
+  }
+  if (actions.state === "ready") {
+    return Object.freeze({
+      workspaceVersion,
+      state: "ready",
+      mcpListening: true,
+      discoveredToolCount: boundedToolCount(actions.discoveredToolCount),
+      errorCode: null,
+    });
+  }
+  return Object.freeze({
+    workspaceVersion,
+    state: "failed",
+    mcpListening: actions.mcpListening === true,
+    discoveredToolCount: boundedToolCount(actions.discoveredToolCount),
+    errorCode: diagnosticActionErrorCode(actions.errorCode),
+  });
+}
+
+function diagnosticBridgeErrorCode(value: unknown): DiagnosticActionErrorCode | null {
+  return value === "MINECRAFT_BRIDGE_REQUIRED" || value === "MINECRAFT_BRIDGE_REJECTED"
+    ? value
+    : null;
+}
+
+function diagnosticActionErrorCode(value: unknown): DiagnosticActionErrorCode | null {
+  if (typeof value !== "string") return null;
+  return DIAGNOSTIC_ACTION_ERROR_CODES.includes(value as DiagnosticActionErrorCode)
+    ? (value as DiagnosticActionErrorCode)
+    : null;
+}
+
+function boundedToolCount(value: number): number {
+  return Number.isSafeInteger(value) && value >= 0 ? value : 0;
 }
 
 export interface DiagnosticManifestValues {

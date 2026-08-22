@@ -14,11 +14,109 @@ const idleSnapshot = {
   lifecycle: "idle",
   minecraft: { state: "disconnected", sessionId: null },
   codex: { state: "stopped", model: null },
+  actions: null,
   task: null,
+  actionQueue: { goal: null, items: [] },
   lastError: null,
 } as const;
 
 describe("desktop protocol v1", () => {
+  it("round-trips a bounded queue projection without authority fields", () => {
+    const actionQueue = {
+      goal: "制作面包",
+      items: [
+        {
+          index: 1,
+          kind: "find_blocks",
+          summary: "寻找成熟小麦",
+          status: "waiting",
+          retryCount: 0,
+          enqueuedAt: "2026-08-15T00:00:00.000Z",
+        },
+      ],
+    } as const;
+    const snapshot = { ...idleSnapshot, actionQueue };
+
+    expect(parseDesktopCommandResult({ kind: "get_status" }, snapshot)).toEqual(snapshot);
+    expect(
+      parseDesktopEvent({
+        version: DESKTOP_PROTOCOL_VERSION,
+        event: { kind: "action_queue", revision: 1, actionQueue },
+      }),
+    ).toEqual({
+      version: DESKTOP_PROTOCOL_VERSION,
+      event: { kind: "action_queue", revision: 1, actionQueue },
+    });
+    expect(JSON.stringify(snapshot.actionQueue)).not.toMatch(/lease|observation|position|"x"/iu);
+
+    for (const invalid of [
+      { ...actionQueue, goal: "花".repeat(161) },
+      { ...actionQueue, authority: "private" },
+      {
+        ...actionQueue,
+        items: [{ ...actionQueue.items[0], enqueuedAt: "2026-08-15 00:00:00" }],
+      },
+      {
+        ...actionQueue,
+        items: [{ ...actionQueue.items[0], leaseId: "private" }],
+      },
+      {
+        ...actionQueue,
+        items: Array.from({ length: 257 }, (_, index) => ({
+          ...actionQueue.items[0],
+          index: index + 1,
+        })),
+      },
+    ]) {
+      expect(() =>
+        parseDesktopCommandResult(
+          { kind: "get_status" },
+          { ...idleSnapshot, actionQueue: invalid },
+        ),
+      ).toThrow("invalid desktop command result");
+    }
+  });
+
+  it("parses only exact action capability snapshots and events", () => {
+    const ready = {
+      state: "ready",
+      workspaceVersion: "workspace-1",
+      mcpListening: true,
+      discoveredToolCount: 15,
+    } as const;
+    const snapshot = {
+      ...idleSnapshot,
+      revision: 4,
+      lifecycle: "running",
+      actions: ready,
+    } as const;
+    const event = { kind: "actions", revision: 5, state: ready } as const;
+
+    expect(parseDesktopCommandResult({ kind: "get_status" }, snapshot)).toEqual(snapshot);
+    expect(parseDesktopEvent({ version: DESKTOP_PROTOCOL_VERSION, event })).toEqual({
+      version: DESKTOP_PROTOCOL_VERSION,
+      event,
+    });
+
+    for (const actions of [
+      { ...ready, mcpListening: false },
+      { ...ready, discoveredToolCount: -1 },
+      { ...ready, workspaceVersion: "../private" },
+      {
+        state: "failed",
+        workspaceVersion: "workspace-1",
+        mcpListening: false,
+        discoveredToolCount: 15,
+        errorCode: "SERVER CLOSED",
+      },
+      { state: "starting", workspaceVersion: "workspace-1", listening: true },
+    ]) {
+      expect(() =>
+        parseDesktopCommandResult({ kind: "get_status" }, { ...idleSnapshot, actions }),
+      ).toThrow("invalid desktop command result");
+    }
+  });
+
   it("parses only strict owner identity read and revision-checked update commands", () => {
     const read = { kind: "read_owner_identity" as const };
     const update = {
@@ -511,6 +609,13 @@ describe("desktop protocol v1", () => {
 
     const preview = {
       exportId: "diagnostic_1234567890",
+      actionCapability: {
+        workspaceVersion: "workspace-1",
+        state: "ready" as const,
+        mcpListening: true,
+        discoveredToolCount: 16,
+        errorCode: null,
+      },
       files: [
         { logicalName: "app-version.json", size: 20, redactions: 0 },
         { logicalName: "os-summary.json", size: 20, redactions: 0 },
@@ -530,6 +635,18 @@ describe("desktop protocol v1", () => {
       ],
     };
     expect(parseDesktopCommandResult(previewCommand, preview)).toEqual(preview);
+    for (const errorCode of [
+      "bearer_private_token",
+      "users_private_codex_workspace",
+      "raw_mcp_response_body",
+    ]) {
+      expect(() =>
+        parseDesktopCommandResult(previewCommand, {
+          ...preview,
+          actionCapability: { ...preview.actionCapability, state: "failed", errorCode },
+        }),
+      ).toThrow("invalid desktop command result");
+    }
     expect(() =>
       parseDesktopCommandResult(previewCommand, {
         exportId: preview.exportId,
@@ -1218,6 +1335,12 @@ describe("desktop protocol v1", () => {
         event: { ...signal, snapshot: { ...signal.snapshot, revision: 7 } },
       }),
     ).toThrow("invalid desktop event");
+    expect(
+      parseDesktopEvent({
+        version: DESKTOP_PROTOCOL_VERSION,
+        event: { ...signal, reason: "action_unavailable" },
+      }),
+    ).toMatchObject({ event: { reason: "action_unavailable" } });
     expect(() =>
       parseDesktopEvent({
         version: DESKTOP_PROTOCOL_VERSION,
@@ -1321,6 +1444,16 @@ describe("desktop protocol v1", () => {
     const snapshot = { ...idleSnapshot, revision: 7, lifecycle: "running", task } as const;
 
     expect(parseDesktopCommandResult({ kind: "get_status" }, snapshot)).toEqual(snapshot);
+    const modelChangedSnapshot = {
+      ...snapshot,
+      task: {
+        ...task,
+        budget: { ...budget, active: false, stopReason: "model_changed", startedAt: null },
+      },
+    } as const;
+    expect(parseDesktopCommandResult({ kind: "get_status" }, modelChangedSnapshot)).toEqual(
+      modelChangedSnapshot,
+    );
     expect(JSON.stringify(snapshot.task)).not.toContain("lease");
     expect(JSON.stringify(snapshot.task)).not.toContain("ownerUsername");
     expect(JSON.stringify(snapshot.task)).not.toContain("prompt");
@@ -1409,9 +1542,22 @@ describe("desktop protocol v1", () => {
             },
           ],
           selection: { mode: "automatic" },
+          legacyMigrationCompleted: true,
         },
       ),
-    ).toMatchObject({ models: [{ id: "live-model" }] });
+    ).toMatchObject({
+      models: [{ id: "live-model" }],
+      legacyMigrationCompleted: true,
+    });
+    expect(() =>
+      parseDesktopCommandResult(
+        { kind: "list_models" },
+        {
+          models: [],
+          selection: { mode: "automatic" },
+        },
+      ),
+    ).toThrow("invalid desktop command result");
     expect(
       parseDesktopCommandResult(
         {
@@ -1464,6 +1610,52 @@ describe("desktop protocol v1", () => {
     expect(() =>
       parseDesktopCommandResult({ kind: "get_status" }, { status: "signed_out" }),
     ).toThrow("invalid desktop command result");
+  });
+
+  it("parses model preference migration with the same bounded selection schema", () => {
+    const explicitRequest = {
+      version: DESKTOP_PROTOCOL_VERSION,
+      id: "migration-explicit",
+      command: {
+        kind: "migrate_model_preference",
+        candidate: {
+          mode: "explicit",
+          modelId: "gpt-live",
+          reasoningEffort: "high",
+        },
+      },
+    } as const;
+    expect(parseDesktopRequest(explicitRequest)).toEqual(explicitRequest);
+
+    const nullRequest = {
+      version: DESKTOP_PROTOCOL_VERSION,
+      id: "migration-null",
+      command: { kind: "migrate_model_preference", candidate: null },
+    } as const;
+    expect(parseDesktopRequest(nullRequest)).toEqual(nullRequest);
+
+    expect(() =>
+      parseDesktopRequest({
+        ...explicitRequest,
+        command: {
+          ...explicitRequest.command,
+          candidate: { ...explicitRequest.command.candidate, modelId: "../private" },
+        },
+      }),
+    ).toThrow("invalid desktop request");
+    expect(() =>
+      parseDesktopRequest({
+        ...nullRequest,
+        command: { ...nullRequest.command, localStorage: "raw-private-json" },
+      }),
+    ).toThrow("invalid desktop request");
+
+    const snapshot = {
+      models: [],
+      selection: { mode: "automatic" as const },
+      legacyMigrationCompleted: true,
+    };
+    expect(parseDesktopCommandResult(explicitRequest.command, snapshot)).toEqual(snapshot);
   });
 
   it("accepts account state events without ever including the login URL", () => {

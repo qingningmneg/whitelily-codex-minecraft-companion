@@ -9,8 +9,10 @@ import { parseDesktopEvent, parseDesktopResponse } from "../../src/desktop/deskt
 import type { AccountSnapshot, LoginAttempt } from "../../src/codex/accountService.js";
 import type {
   ModelCatalogSnapshot,
+  ModelCatalogEvent,
   ModelSelection,
   ModelSelectionInput,
+  PreparedModelSelection,
   ResolvedModelSelection,
 } from "../../src/codex/modelCatalog.js";
 import { RuntimeFacade } from "../../src/runtime/runtimeFacade.js";
@@ -41,6 +43,10 @@ import {
 
 export interface DesktopRuntime {
   start(): Promise<void>;
+  switchModel?(
+    selection: ResolvedModelSelection,
+    commitPreference: () => Promise<void>,
+  ): Promise<void>;
   stop(reason: TaskStopReason): Promise<void>;
   stopTask(): Promise<void>;
   snapshot(): RuntimeSnapshot;
@@ -90,9 +96,12 @@ export function createDesktopChildHarness(
     lazyRuntime?: boolean;
     models?: Partial<{
       listModels(): Promise<ModelCatalogSnapshot>;
+      migrateLegacyPreference(candidate: ModelSelectionInput | null): Promise<ModelCatalogSnapshot>;
       selectModel(selection: ModelSelectionInput): Promise<ModelSelection>;
+      prepareSelection(selection: ModelSelectionInput): Promise<PreparedModelSelection>;
+      commitSelection(prepared: PreparedModelSelection): Promise<ModelSelection>;
       resolveRuntimeSelection(options?: { signal?: AbortSignal }): Promise<ResolvedModelSelection>;
-      subscribeInvalidation(listener: () => void): () => void;
+      subscribe(listener: (event: ModelCatalogEvent) => void): () => void;
       stop(): void;
     }>;
     profiles?: Partial<{
@@ -236,14 +245,35 @@ export function createDesktopChildHarness(
     listModels: async (): Promise<ModelCatalogSnapshot> => ({
       models: [],
       selection: { mode: "automatic" },
+      legacyMigrationCompleted: false,
+    }),
+    migrateLegacyPreference: async (
+      candidate: ModelSelectionInput | null,
+    ): Promise<ModelCatalogSnapshot> => ({
+      models: [],
+      selection:
+        candidate?.mode === "explicit" ? { ...candidate, available: true } : { mode: "automatic" },
+      legacyMigrationCompleted: true,
     }),
     selectModel: async (selection: ModelSelectionInput): Promise<ModelSelection> =>
       selection.mode === "automatic" ? { mode: "automatic" } : { ...selection, available: true },
+    prepareSelection: async (selection: ModelSelectionInput): Promise<PreparedModelSelection> => ({
+      preferenceRevision: 0,
+      requested: selection,
+      resolved:
+        selection.mode === "automatic"
+          ? { modelId: "harness-live-model", reasoningEffort: "medium" }
+          : { modelId: selection.modelId, reasoningEffort: selection.reasoningEffort },
+    }),
+    commitSelection: async (prepared: PreparedModelSelection): Promise<ModelSelection> =>
+      prepared.requested.mode === "automatic"
+        ? { mode: "automatic" }
+        : { ...prepared.requested, available: true },
     resolveRuntimeSelection: async (): Promise<ResolvedModelSelection> => ({
       modelId: "harness-live-model",
       reasoningEffort: "medium",
     }),
-    subscribeInvalidation: (_listener: () => void) => () => undefined,
+    subscribe: (_listener: (event: ModelCatalogEvent) => void) => () => undefined,
     stop: () => undefined,
     ...options.models,
   };

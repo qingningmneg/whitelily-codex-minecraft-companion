@@ -1,12 +1,12 @@
 {
   "name": "@whitelily/desktop",
-  "version": "0.2.0-beta.1",
+  "version": "0.2.0-beta.2",
   "productName": "WhiteLily",
   "private": true,
   "type": "module",
   "main": "dist/main/main.js",
   "scripts": {
-    "predev": "npm run build:desktop-child --prefix ../..",
+    "predev": "npm run build:desktop-child --prefix ../.. && npm run build:desktop-dev-workspace --prefix ../..",
     "dev": "npm run build:main && npm run build:preload && concurrently --kill-others \"vite\" \"wait-on http://127.0.0.1:5173 && electron .\"",
     "build": "npm run build:renderer && npm run build:main && npm run build:preload",
     "build:renderer": "vite build",
@@ -52,6 +52,13 @@
     ],
     "extraResources": [
       {
+        "from": "resources/avatar",
+        "to": "avatar",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
         "from": "../../build/electron-bundle/core",
         "to": "core",
         "filter": [
@@ -66,8 +73,22 @@
         ]
       },
       {
+        "from": "../../build/electron-bundle/codex-workspace",
+        "to": "codex-workspace",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
         "from": "../../build/electron-bundle/licenses",
         "to": "licenses",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "../../build/electron-bundle/minecraft-components",
+        "to": "minecraft-components",
         "filter": [
           "**/*"
         ]
@@ -111,13 +132,15 @@
   },
   "dependencies": {
     "react": "19.2.8",
-    "react-dom": "19.2.8"
+    "react-dom": "19.2.8",
+    "three": "0.180.0"
   },
   "devDependencies": {
     "@testing-library/react": "16.3.2",
     "@testing-library/user-event": "14.6.1",
     "@types/react": "19.2.17",
     "@types/react-dom": "19.2.3",
+    "@types/three": "0.180.0",
     "@vitejs/plugin-react": "6.0.4",
     "concurrently": "10.0.4",
     "electron": "43.2.0",

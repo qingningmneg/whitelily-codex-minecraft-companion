@@ -27,6 +27,7 @@ export type TaskStopReason =
   | "world_changed"
   | "owner_changed"
   | "model_unavailable"
+  | "model_changed"
   | "process_exit";
 
 export interface TaskLease {

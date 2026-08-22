@@ -1,8 +1,21 @@
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
-import { resolveDesktopCodexResources } from "./main.js";
+import {
+  createWorkspaceVersionEnvironment,
+  resolveDesktopCodexWorkspaceResources,
+} from "./codexWorkspaceProvisioner.js";
+import { createDesktopAppVersionEnvironment, resolveDesktopCodexResources } from "./main.js";
 
 describe("resolveDesktopCodexResources", () => {
+  it("passes only a bounded Electron application version to the child", () => {
+    expect(createDesktopAppVersionEnvironment("0.2.0-beta.2")).toEqual({
+      WHITELILY_APP_VERSION: "0.2.0-beta.2",
+    });
+    expect(() => createDesktopAppVersionEnvironment("../private")).toThrow(
+      "WhiteLily application version is invalid",
+    );
+  });
+
   it("uses the reviewed node_modules native package explicitly during development", () => {
     const appPath = String.raw`C:\source\whitelily\apps\desktop`;
 
@@ -43,5 +56,70 @@ describe("resolveDesktopCodexResources", () => {
       manifestPath: resolve(resourcesPath, "runtime-manifest.json"),
       layout: "packaged",
     });
+  });
+});
+
+describe("resolveDesktopCodexWorkspaceResources", () => {
+  it("resolves the generated attested workspace during development", () => {
+    const appPath = String.raw`C:\source\whitelily\apps\desktop`;
+
+    expect(
+      resolveDesktopCodexWorkspaceResources({
+        appPath,
+        resourcesPath: String.raw`C:\untrusted\electron\resources`,
+        development: true,
+      }),
+    ).toEqual({
+      resourceDirectory: resolve(
+        String.raw`C:\source\whitelily`,
+        "build",
+        "desktop-development",
+        "codex-workspace",
+      ),
+      manifestPath: resolve(
+        String.raw`C:\source\whitelily`,
+        "build",
+        "desktop-development",
+        "codex-workspace",
+        "workspace-manifest.json",
+      ),
+    });
+  });
+
+  it("resolves only Electron's packaged codex-workspace resource", () => {
+    const resourcesPath = String.raw`C:\Program Files\WhiteLily\resources`;
+
+    expect(
+      resolveDesktopCodexWorkspaceResources({
+        appPath: String.raw`C:\Program Files\WhiteLily\resources\app.asar`,
+        resourcesPath,
+        development: false,
+      }),
+    ).toEqual({
+      resourceDirectory: resolve(resourcesPath, "codex-workspace"),
+      manifestPath: resolve(resourcesPath, "codex-workspace", "workspace-manifest.json"),
+    });
+  });
+
+  it("passes only the bounded verified content version to the child environment", () => {
+    expect(
+      createWorkspaceVersionEnvironment({
+        contentVersion: "release-1.2_3",
+        installed: true,
+        repaired: false,
+        targetDirectory: String.raw`C:\Users\Owner\AppData\Local\WhiteLily\codex-workspace`,
+      }),
+    ).toEqual({ WHITELILY_WORKSPACE_VERSION: "release-1.2_3" });
+  });
+
+  it("rejects an unbounded workspace version before supervisor construction", () => {
+    expect(() =>
+      createWorkspaceVersionEnvironment({
+        contentVersion: "../not-attested",
+        installed: true,
+        repaired: false,
+        targetDirectory: String.raw`C:\Users\Owner\AppData\Local\WhiteLily\codex-workspace`,
+      }),
+    ).toThrow("WhiteLily workspace version is invalid");
   });
 });

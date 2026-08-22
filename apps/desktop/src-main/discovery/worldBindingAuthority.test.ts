@@ -1,8 +1,18 @@
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { execFile as nodeExecFile, spawn } from "node:child_process";
+import { once } from "node:events";
+import { copyFile, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
-import { WorldBindingAuthority, type JavaProcessSnapshot } from "./worldBindingAuthority.js";
+import {
+  assertWindowsPathsAreOrdinary,
+  parseJavaProcessSnapshotOutput,
+  WorldBindingAuthority,
+  type JavaProcessSnapshot,
+} from "./worldBindingAuthority.js";
+
+const execFile = promisify(nodeExecFile);
 
 const config = `[minecraft]
 host = "127.0.0.1"
@@ -42,7 +52,207 @@ async function configPath(): Promise<string> {
   return path;
 }
 
+async function resolveWithRealPowerShellSnapshotCommand(
+  command: string,
+): Promise<JavaProcessSnapshot> {
+  const authority = new WorldBindingAuthority({
+    configPath: "unused-by-direct-resolution",
+    lanDetector: { redeemConfirmedProof: async () => session },
+    resolveInstancePath: async () => "C:/Minecraft/Instance",
+    snapshotExecFile: async (_file, _args, options) =>
+      execFile("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", command], options),
+  });
+  return (await authority.resolveJavaInstance(session)).snapshot;
+}
+
 describe("WorldBindingAuthority", () => {
+  it.skipIf(process.platform !== "win32")(
+    "rejects a real junction through the handle-bound Windows reparse attribute check",
+    async () => {
+      const root = await mkdtemp(join(tmpdir(), "whitelily-reparse-attributes-"));
+      const ordinary = join(root, "ordinary");
+      const junction = join(root, "junction");
+      try {
+        await mkdir(ordinary);
+        await symlink(ordinary, junction, "junction");
+        await expect(assertWindowsPathsAreOrdinary([ordinary])).resolves.toBeUndefined();
+        await expect(assertWindowsPathsAreOrdinary([junction])).rejects.toThrow(
+          "Windows reparse boundary",
+        );
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("fails closed when the PowerShell snapshot is not valid UTF-8", () => {
+    expect(() => parseJavaProcessSnapshotOutput(Buffer.from([0xc3, 0x28]))).toThrow(
+      "invalid Java process snapshot encoding",
+    );
+  });
+
+  it("rejects a UTF-8 BOM instead of silently accepting a prefixed snapshot", () => {
+    const encoded = Buffer.from(JSON.stringify(snapshot), "utf8");
+    expect(() =>
+      parseJavaProcessSnapshotOutput(Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), encoded])),
+    ).toThrow("invalid Java process snapshot encoding");
+  });
+
+  it("accepts a bounded valid JSON snapshot above the legacy 64 KiB limit", () => {
+    const encoded = Buffer.from(
+      JSON.stringify({ ...snapshot, commandLine: "x".repeat(131_072) }),
+      "utf8",
+    );
+    expect(encoded.byteLength).toBeGreaterThan(65_536);
+    expect(encoded.byteLength).toBeLessThan(1_048_576);
+
+    expect(parseJavaProcessSnapshotOutput(encoded).commandLine).toHaveLength(131_072);
+  });
+
+  it.skipIf(process.platform !== "win32")(
+    "accepts a bounded real PowerShell child snapshot above the legacy 64 KiB limit",
+    async () => {
+      const command = [
+        "$utf8 = [Text.UTF8Encoding]::new($false)",
+        "[Console]::OutputEncoding = $utf8",
+        "$payload = [pscustomobject]@{pid=1234;processStartedAt=100;executablePath='C:/Java/bin/javaw.exe';commandLine=('x' * 131072)} | ConvertTo-Json -Compress",
+        "[Console]::Out.Write($payload)",
+      ].join("; ");
+
+      const received = await resolveWithRealPowerShellSnapshotCommand(command);
+
+      expect(received.commandLine).toHaveLength(131_072);
+    },
+    15_000,
+  );
+
+  it.skipIf(process.platform !== "win32")(
+    "accepts one real PowerShell snapshot child that succeeds after five seconds",
+    async () => {
+      const command = [
+        "$utf8 = [Text.UTF8Encoding]::new($false)",
+        "[Console]::OutputEncoding = $utf8",
+        "Start-Sleep -Milliseconds 5500",
+        "$payload = [pscustomobject]@{pid=1234;processStartedAt=100;executablePath='C:/Java/bin/javaw.exe';commandLine='javaw.exe --gameDir \"C:/Minecraft/Instance\"'} | ConvertTo-Json -Compress",
+        "[Console]::Out.Write($payload)",
+      ].join("; ");
+
+      await expect(resolveWithRealPowerShellSnapshotCommand(command)).resolves.toMatchObject(
+        snapshot,
+      );
+    },
+    25_000,
+  );
+
+  it.skipIf(process.platform !== "win32")(
+    "rejects one real PowerShell snapshot child above the 1 MiB output limit",
+    async () => {
+      const command = [
+        "$utf8 = [Text.UTF8Encoding]::new($false)",
+        "[Console]::OutputEncoding = $utf8",
+        "$payload = [pscustomobject]@{pid=1234;processStartedAt=100;executablePath='C:/Java/bin/javaw.exe';commandLine=('x' * 1048577)} | ConvertTo-Json -Compress",
+        "[Console]::Out.Write($payload)",
+      ].join("; ");
+
+      await expect(resolveWithRealPowerShellSnapshotCommand(command)).rejects.toThrow();
+    },
+    15_000,
+  );
+
+  it("replaces raw snapshot child failures with one fixed opaque error", async () => {
+    const sentinel = "SENSITIVE_STDERR ProcessId = 98765 Get-CimInstance";
+    const authority = new WorldBindingAuthority({
+      configPath: "unused-by-direct-resolution",
+      lanDetector: { redeemConfirmedProof: async () => session },
+      resolveInstancePath: async () => "C:/Minecraft/Instance",
+      snapshotExecFile: async () => {
+        throw new Error(sentinel);
+      },
+    });
+
+    const failure = await authority.resolveJavaInstance(session).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toBe("Java process snapshot unavailable");
+    expect((failure as Error).message).not.toContain(sentinel);
+    expect((failure as Error).cause).toBeUndefined();
+  });
+
+  it("accepts a valid snapshot at the exact 1 MiB PowerShell stdout byte limit", () => {
+    const emptyCommandLine = Buffer.from(JSON.stringify({ ...snapshot, commandLine: "" }), "utf8");
+    const commandLine = "x".repeat(1_048_576 - emptyCommandLine.byteLength);
+    const encoded = Buffer.from(JSON.stringify({ ...snapshot, commandLine }), "utf8");
+    expect(encoded.byteLength).toBe(1_048_576);
+
+    expect(parseJavaProcessSnapshotOutput(encoded).commandLine).toBe(commandLine);
+  });
+
+  it("rejects a valid snapshot one byte above the 1 MiB limit", () => {
+    const emptyCommandLine = Buffer.from(JSON.stringify({ ...snapshot, commandLine: "" }), "utf8");
+    const commandLine = "x".repeat(1_048_577 - emptyCommandLine.byteLength);
+    const encoded = Buffer.from(JSON.stringify({ ...snapshot, commandLine }), "utf8");
+    expect(encoded.byteLength).toBe(1_048_577);
+
+    expect(() => parseJavaProcessSnapshotOutput(encoded)).toThrow("invalid Java process snapshot");
+  });
+
+  it.each([
+    ["empty output", Buffer.alloc(0)],
+    [
+      "mixed JSON and diagnostic output",
+      Buffer.concat([Buffer.from(JSON.stringify(snapshot), "utf8"), Buffer.from("\r\ndiagnostic")]),
+    ],
+  ])("rejects %s", (_label, output) => {
+    expect(() => parseJavaProcessSnapshotOutput(output)).toThrow("invalid Java process snapshot");
+  });
+
+  it.skipIf(process.platform !== "win32")(
+    "round-trips a real CJK --gameDir through Windows PowerShell before canonicalizing it",
+    async () => {
+      const root = await mkdtemp(join(tmpdir(), "WhiteLily-白百合-"));
+      const gameDirectory = join(root, "我的世界");
+      const javaExecutable = join(root, "javaw.exe");
+      const testConfigPath = join(root, "config.toml");
+      await mkdir(gameDirectory);
+      await copyFile(process.execPath, javaExecutable);
+      await writeFile(testConfigPath, config, "utf8");
+      const javaProcess = spawn(
+        javaExecutable,
+        ["-e", "setInterval(() => undefined, 1_000)", "--", "--gameDir", gameDirectory],
+        { stdio: "ignore", windowsHide: true },
+      );
+      await once(javaProcess, "spawn");
+
+      try {
+        const { stdout } = await execFile(
+          "powershell.exe",
+          [
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            `[DateTimeOffset](Get-Process -Id ${javaProcess.pid}).StartTime.ToUniversalTime() | ForEach-Object ToUnixTimeMilliseconds`,
+          ],
+          { windowsHide: true },
+        );
+        const processStartedAt = Number.parseInt(stdout.trim(), 10);
+        const liveSession = { ...session, pid: javaProcess.pid!, processStartedAt };
+        const authority = new WorldBindingAuthority({
+          configPath: testConfigPath,
+          lanDetector: { redeemConfirmedProof: async () => liveSession },
+        });
+
+        await expect(authority.redeem(proof)).resolves.toMatchObject({
+          canonicalInstancePath: await realpath(gameDirectory),
+          javaSession: liveSession,
+        });
+      } finally {
+        javaProcess.kill();
+        await once(javaProcess, "exit");
+        await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+      }
+    },
+  );
+
   it("fails closed when Java identity changes while resolving --gameDir", async () => {
     const snapshots = [snapshot, { ...snapshot, commandLine: "javaw.exe --gameDir C:/Other" }];
     const authority = new WorldBindingAuthority({
@@ -56,6 +266,64 @@ describe("WorldBindingAuthority", () => {
     });
 
     await expect(authority.redeem(proof)).rejects.toThrow("identity changed");
+  });
+
+  it("resolves one immutable Java instance through the same double-snapshot authority path", async () => {
+    const received: JavaProcessSnapshot[] = [];
+    const authority = new WorldBindingAuthority({
+      configPath: await configPath(),
+      lanDetector: { redeemConfirmedProof: async () => session },
+      readJavaProcessSnapshot: async () => snapshot,
+      resolveInstancePath: async (value) => {
+        received.push(value);
+        return "C:/Minecraft/Instance";
+      },
+    });
+
+    const resolved = await authority.resolveJavaInstance(session);
+
+    expect(resolved).toEqual({
+      canonicalInstancePath: "C:/Minecraft/Instance",
+      javaSession: session,
+      snapshot,
+    });
+    expect(received).toEqual([snapshot]);
+    expect(Object.isFrozen(resolved)).toBe(true);
+    expect(Object.isFrozen(resolved.javaSession)).toBe(true);
+    expect(Object.isFrozen(resolved.snapshot)).toBe(true);
+  });
+
+  it("rejects a linked --gameDir instead of silently canonicalizing through it", async () => {
+    const root = await mkdtemp(join(tmpdir(), "whitelily-linked-game-dir-"));
+    const target = join(root, "target");
+    const linked = join(root, "linked");
+    try {
+      await mkdir(target);
+      await symlink(target, linked, "junction");
+      const linkedSnapshot = { ...snapshot, commandLine: `javaw.exe --gameDir "${linked}"` };
+      const authority = new WorldBindingAuthority({
+        configPath: await configPath(),
+        lanDetector: { redeemConfirmedProof: async () => session },
+        readJavaProcessSnapshot: async () => linkedSnapshot,
+      });
+
+      await expect(authority.resolveJavaInstance(session)).rejects.toThrow(
+        "Minecraft instance path",
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects non-Java snapshots through direct component inspection authority", async () => {
+    const authority = new WorldBindingAuthority({
+      configPath: await configPath(),
+      lanDetector: { redeemConfirmedProof: async () => session },
+      readJavaProcessSnapshot: async () => ({ ...snapshot, executablePath: "C:/node.exe" }),
+      resolveInstancePath: async () => "C:/Minecraft/Instance",
+    });
+
+    await expect(authority.resolveJavaInstance(session)).rejects.toThrow("same Java process");
   });
 
   it("derives a binding only from a revalidated Java snapshot", async () => {

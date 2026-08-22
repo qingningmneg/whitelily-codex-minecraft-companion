@@ -1,5 +1,14 @@
 import type { Vec3, WorldSnapshot } from "../domain/types.js";
-import type { MinecraftEvent, MinecraftPort } from "./minecraftPort.js";
+import type {
+  BlockSearchQuery,
+  BlockSearchResult,
+  FoodDelta,
+  FurnaceSnapshot,
+  InspectedBlock,
+  InventoryDelta,
+  MinecraftEvent,
+  MinecraftPort,
+} from "./minecraftPort.js";
 
 function abortError(): Error {
   const error = new Error("aborted");
@@ -11,6 +20,22 @@ export class FakeMinecraftPort implements MinecraftPort {
   readonly chatLog: string[] = [];
   readonly calls: Array<{ method: string; args: unknown[] }> = [];
   ownerOnline = false;
+  inspectBlockResult: InspectedBlock | null = null;
+  findBlocksResult: BlockSearchResult = { blocks: [], truncated: false };
+  fishResult: InventoryDelta = { added: [], removed: [] };
+  consumeItemResult: FoodDelta = {
+    healthBefore: 20,
+    healthAfter: 20,
+    foodBefore: 20,
+    foodAfter: 20,
+  };
+  furnaceSnapshotResult: FurnaceSnapshot = {
+    position: { x: 0, y: 0, z: 0 },
+    input: null,
+    fuel: null,
+    output: null,
+    progress: 0,
+  };
   world: WorldSnapshot = {
     botPosition: { x: 0, y: 64, z: 0 },
     health: 20,
@@ -50,6 +75,21 @@ export class FakeMinecraftPort implements MinecraftPort {
   async findBlock(blockName: string, maxDistance: number): Promise<Vec3 | null> {
     this.calls.push({ method: "findBlock", args: [blockName, maxDistance] });
     return null;
+  }
+
+  async inspectBlock(position: Vec3): Promise<InspectedBlock | null> {
+    this.calls.push({ method: "inspectBlock", args: [structuredClone(position)] });
+    return structuredClone(this.inspectBlockResult);
+  }
+
+  async findBlocks(query: BlockSearchQuery): Promise<BlockSearchResult> {
+    this.calls.push({ method: "findBlocks", args: [structuredClone(query)] });
+    return structuredClone(this.findBlocksResult);
+  }
+
+  async furnaceSnapshot(position: Vec3): Promise<FurnaceSnapshot> {
+    this.calls.push({ method: "furnaceSnapshot", args: [structuredClone(position)] });
+    return structuredClone(this.furnaceSnapshotResult);
   }
 
   async say(message: string): Promise<void> {
@@ -106,6 +146,36 @@ export class FakeMinecraftPort implements MinecraftPort {
 
   async wait(milliseconds: number, signal: AbortSignal): Promise<void> {
     this.recordAbortable("wait", [milliseconds], signal);
+  }
+
+  async fish(signal: AbortSignal): Promise<InventoryDelta> {
+    this.recordAbortable("fish", [], signal);
+    return structuredClone(this.fishResult);
+  }
+
+  async consumeItem(itemName: string, signal: AbortSignal): Promise<FoodDelta> {
+    this.recordAbortable("consumeItem", [itemName], signal);
+    return structuredClone(this.consumeItemResult);
+  }
+
+  async sleepInBed(position: Vec3, signal: AbortSignal): Promise<void> {
+    this.recordAbortable("sleepInBed", [position], signal);
+  }
+
+  async wakeUp(signal: AbortSignal): Promise<void> {
+    this.recordAbortable("wakeUp", [], signal);
+  }
+
+  async tillSoil(position: Vec3, signal: AbortSignal): Promise<void> {
+    this.recordAbortable("tillSoil", [position], signal);
+  }
+
+  async plantCrop(position: Vec3, seedName: "wheat_seeds", signal: AbortSignal): Promise<void> {
+    this.recordAbortable("plantCrop", [position, seedName], signal);
+  }
+
+  async harvestCrop(position: Vec3, cropName: "wheat", signal: AbortSignal): Promise<void> {
+    this.recordAbortable("harvestCrop", [position, cropName], signal);
   }
 
   private recordAbortable(method: string, args: unknown[], signal: AbortSignal): void {

@@ -3,8 +3,11 @@
 import { describe, expect, it, vi } from "vitest";
 import type { OwnerIdentitySnapshot } from "../../../src/identity/ownerIdentity.js";
 import type { CompanionProfile } from "../../../src/profile/profileSchema.js";
+import type { MinecraftComponentStatus } from "../src-main/minecraftComponents.js";
 import {
   createWhiteLilyApi,
+  parseAvatarCatalogSnapshot,
+  parseAvatarImportResult,
   WHITE_LILY_IPC_CHANNELS,
   type PreloadTransport,
 } from "./desktopApi.js";
@@ -49,13 +52,234 @@ const ownerSnapshot: OwnerIdentitySnapshot = {
 };
 const ownerAuthoritySnapshot = { ...ownerSnapshot, childGeneration: 7 };
 
+const avatarSnapshot = {
+  revision: 2,
+  models: [
+    {
+      id: "builtin:whitelily",
+      displayName: "WhiteLily",
+      origin: "builtin",
+      worldRenderer: "minecraft-skin",
+      armModel: "slim",
+      previewDataUrl: "data:image/png;base64,iVBORw0KGgo=",
+      portraitDataUrl: "data:image/png;base64,iVBORw0KGgo=",
+    },
+    {
+      id: "user:00000000-0000-4000-8000-000000000001",
+      displayName: "Imported skin",
+      origin: "imported",
+      worldRenderer: "minecraft-skin",
+      armModel: "wide",
+      previewDataUrl: "data:image/png;base64,iVBORw0KGgo=",
+    },
+  ],
+  activeModelId: "builtin:whitelily",
+} as const;
+
 describe("Task 5 preload API", () => {
+  it("parses current Minecraft skin list items for catalog and import results", () => {
+    expect(parseAvatarCatalogSnapshot(avatarSnapshot)).toEqual(avatarSnapshot);
+    expect(
+      parseAvatarImportResult({ status: "imported", model: avatarSnapshot.models[1] }),
+    ).toEqual({ status: "imported", model: avatarSnapshot.models[1] });
+  });
+
+  it("exposes a path-free avatar model API over dedicated channels", async () => {
+    const subscriptions = new Map<string, (value: unknown) => void>();
+    const invoke = vi.fn(async (channel: string) => {
+      if (channel === WHITE_LILY_IPC_CHANNELS.importAvatarModel) {
+        return { status: "success", value: { status: "cancelled" } };
+      }
+      return { status: "success", value: structuredClone(avatarSnapshot) };
+    });
+    const api = createWhiteLilyApi({
+      invoke,
+      subscribe: (channel, listener) => {
+        subscriptions.set(channel, listener);
+        return () => subscriptions.delete(channel);
+      },
+    } as PreloadTransport);
+
+    await expect(api.listAvatarModels()).resolves.toEqual(avatarSnapshot);
+    await expect(api.importAvatarModel()).resolves.toEqual({ status: "cancelled" });
+    await expect(
+      api.switchAvatarModel("user:00000000-0000-4000-8000-000000000001"),
+    ).resolves.toEqual(avatarSnapshot);
+    expect(invoke.mock.calls).toEqual([
+      [WHITE_LILY_IPC_CHANNELS.listAvatarModels],
+      [WHITE_LILY_IPC_CHANNELS.importAvatarModel],
+      [WHITE_LILY_IPC_CHANNELS.switchAvatarModel, "user:00000000-0000-4000-8000-000000000001"],
+    ]);
+
+    await expect(
+      (api.importAvatarModel as (...args: unknown[]) => Promise<unknown>)(
+        String.raw`C:\secret.glb`,
+      ),
+    ).rejects.toThrow("invalid avatar import input");
+    await expect(api.switchAvatarModel(String.raw`C:\secret.glb`)).rejects.toThrow(
+      "invalid avatar model selection",
+    );
+    expect(invoke).toHaveBeenCalledTimes(3);
+
+    const listener = vi.fn();
+    const unsubscribe = api.subscribeAvatarModels(listener);
+    subscriptions.get(WHITE_LILY_IPC_CHANNELS.avatarModelsEvent)?.(structuredClone(avatarSnapshot));
+    expect(listener).toHaveBeenCalledWith(avatarSnapshot);
+    unsubscribe();
+    unsubscribe();
+    expect(subscriptions.has(WHITE_LILY_IPC_CHANNELS.avatarModelsEvent)).toBe(false);
+  });
+
+  it("rebuilds only allowlisted avatar error codes from the IPC transport", async () => {
+    const api = createWhiteLilyApi({
+      invoke: vi.fn(async () => ({ status: "error", code: "AVATAR_GLB_INVALID" })),
+      subscribe: vi.fn(),
+    });
+
+    const failure = await api.importAvatarModel().catch((error: unknown) => error);
+
+    expect(failure).toMatchObject({ code: "AVATAR_GLB_INVALID" });
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).not.toContain(String.raw`C:\Users\Other\avatar.glb`);
+  });
+
+  it("drops malformed avatar catalog events at the preload boundary", () => {
+    let emit: ((value: unknown) => void) | undefined;
+    const api = createWhiteLilyApi({
+      invoke: vi.fn(),
+      subscribe: (_channel, listener) => {
+        emit = listener;
+        return () => undefined;
+      },
+    } as PreloadTransport);
+    const listener = vi.fn();
+    api.subscribeAvatarModels(listener);
+
+    emit?.({ activeModelId: 9 });
+    emit?.({ ...avatarSnapshot, sourcePath: String.raw`C:\secret.glb` });
+
+    expect(listener).not.toHaveBeenCalled();
+  });
+
+  it("exposes a frozen zero-argument application quit operation", async () => {
+    const invoke = vi.fn(async () => undefined);
+    const api = createWhiteLilyApi({ invoke, subscribe: vi.fn() });
+
+    await expect(api.quitApplication()).resolves.toBeUndefined();
+    expect(invoke).toHaveBeenCalledWith(WHITE_LILY_IPC_CHANNELS.quitApplication);
+    expect(Object.isFrozen(api)).toBe(true);
+    await expect(
+      (api.quitApplication as (...args: unknown[]) => Promise<void>)("force"),
+    ).rejects.toThrow("invalid");
+    expect(invoke).toHaveBeenCalledTimes(1);
+  });
+
+  it("exposes only bounded opaque component operations and parses every result", async () => {
+    const status: MinecraftComponentStatus = {
+      state: "ready",
+      bridgeInstalled: true,
+      bridgeActive: true,
+      avatarInstalled: true,
+      restartRequired: false,
+    };
+    const invoke = vi.fn(async () => structuredClone(status));
+    const api = createWhiteLilyApi({ invoke, subscribe: vi.fn() });
+
+    await expect(api.getMinecraftComponentStatus("lan_candidate_1234")).resolves.toEqual(status);
+    await expect(
+      api.installMinecraftComponents("lan_candidate_1234", ["bridge", "avatar"]),
+    ).resolves.toEqual(status);
+    await expect(
+      api.removeMinecraftComponents("lan_candidate_1234", ["avatar", "bridge"]),
+    ).resolves.toEqual(status);
+    expect(invoke.mock.calls).toEqual([
+      [WHITE_LILY_IPC_CHANNELS.getMinecraftComponentStatus, "lan_candidate_1234"],
+      [
+        WHITE_LILY_IPC_CHANNELS.installMinecraftComponents,
+        "lan_candidate_1234",
+        ["bridge", "avatar"],
+      ],
+      [
+        WHITE_LILY_IPC_CHANNELS.removeMinecraftComponents,
+        "lan_candidate_1234",
+        ["avatar", "bridge"],
+      ],
+    ]);
+
+    for (const candidateId of ["", "short", "x".repeat(65), String.raw`C:\Private\mods`]) {
+      await expect(api.getMinecraftComponentStatus(candidateId)).rejects.toThrow("invalid");
+    }
+    let selectionGetterCalls = 0;
+    const accessorSelection: unknown[] = [];
+    Object.defineProperty(accessorSelection, "0", {
+      enumerable: true,
+      get: () => {
+        selectionGetterCalls += 1;
+        return "bridge";
+      },
+    });
+    for (const selection of [
+      ["bridge", "bridge"],
+      ["bridge", "avatar", "bridge"],
+      ["fabric-api"],
+      [{ path: String.raw`C:\Private\mods` }],
+      accessorSelection,
+      Object.setPrototypeOf(["bridge"], null),
+    ]) {
+      await expect(
+        api.installMinecraftComponents("lan_candidate_1234", selection as never),
+      ).rejects.toThrow("invalid");
+    }
+    await expect(
+      (
+        api.installMinecraftComponents as unknown as (
+          ...args: readonly unknown[]
+        ) => Promise<unknown>
+      )("lan_candidate_1234", ["bridge"], { manifest: "forged" }),
+    ).rejects.toThrow("invalid");
+    expect(selectionGetterCalls).toBe(0);
+    expect(invoke).toHaveBeenCalledTimes(3);
+  });
+
+  it("rejects malformed component results without exposing their extra authority", async () => {
+    const valid = {
+      state: "ready",
+      bridgeInstalled: true,
+      bridgeActive: true,
+      avatarInstalled: true,
+      restartRequired: false,
+    };
+    const invoke = vi
+      .fn()
+      .mockResolvedValueOnce({ ...valid, path: String.raw`C:\Private\mods` })
+      .mockResolvedValueOnce({ ...valid, state: "download_from_url" })
+      .mockResolvedValueOnce({ ...valid, restartRequired: true });
+    const api = createWhiteLilyApi({ invoke, subscribe: vi.fn() });
+
+    await expect(api.getMinecraftComponentStatus("lan_candidate_1234")).rejects.toThrow(
+      "invalid Minecraft component status",
+    );
+    await expect(api.installMinecraftComponents("lan_candidate_1234", ["bridge"])).rejects.toThrow(
+      "invalid Minecraft component status",
+    );
+    await expect(api.removeMinecraftComponents("lan_candidate_1234", ["avatar"])).rejects.toThrow(
+      "invalid Minecraft component status",
+    );
+  });
+
   it("stops only the current task over one fixed zero-argument channel", async () => {
     const stoppedTaskSnapshot = {
       revision: 9,
       lifecycle: "running",
       minecraft: { state: "connected", sessionId: null },
       codex: { state: "ready", model: "gpt-5.6" },
+      actions: {
+        state: "ready",
+        workspaceVersion: "workspace-1",
+        mcpListening: true,
+        discoveredToolCount: 15,
+      },
+      actionQueue: { goal: null, items: [] },
       task: null,
       lastError: null,
     } as const;

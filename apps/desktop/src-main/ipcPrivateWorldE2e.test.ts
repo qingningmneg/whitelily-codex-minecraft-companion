@@ -82,10 +82,28 @@ describe("private bound-world IPC", () => {
           stop: async () => undefined,
         },
         models: {
-          listModels: async () => ({ models: [], selection: { mode: "automatic" } }),
+          listModels: async () => ({
+            models: [],
+            selection: { mode: "automatic" },
+            legacyMigrationCompleted: true,
+          }),
+          migrateLegacyPreference: async () => ({
+            models: [],
+            selection: { mode: "automatic" },
+            legacyMigrationCompleted: true,
+          }),
           selectModel: async () => ({ mode: "automatic" }),
+          prepareSelection: async (selection) => ({
+            preferenceRevision: 0,
+            requested: selection,
+            resolved: { modelId: "test", reasoningEffort: "low" },
+          }),
+          commitSelection: async (prepared) =>
+            prepared.requested.mode === "automatic"
+              ? { mode: "automatic" }
+              : { ...prepared.requested, available: true },
           resolveRuntimeSelection: async () => ({ modelId: "test", reasoningEffort: "low" }),
-          subscribeInvalidation: () => () => undefined,
+          subscribe: () => () => undefined,
           stop: () => undefined,
         },
         createRuntime: async () => {

@@ -18,6 +18,12 @@ const activeSnapshot: RuntimeSnapshot = {
   lifecycle: "running",
   minecraft: { state: "connected", sessionId: "session_7F2A" },
   codex: { state: "ready", model: "gpt-5.6" },
+  actions: {
+    state: "ready",
+    workspaceVersion: "workspace-1",
+    mcpListening: true,
+    discoveredToolCount: 15,
+  },
   task: {
     id: "task_7",
     goal: "走到主人身边",
@@ -48,6 +54,7 @@ const activeSnapshot: RuntimeSnapshot = {
       startedAt: 1_753_603_200_000,
     },
   },
+  actionQueue: { goal: "走到主人身边", items: [] },
   lastError: null,
 };
 
@@ -56,7 +63,9 @@ const stoppedSnapshot: RuntimeSnapshot = {
   lifecycle: "stopped",
   minecraft: { state: "disconnected", sessionId: null },
   codex: { state: "stopped", model: null },
+  actions: null,
   task: null,
+  actionQueue: { goal: null, items: [] },
   lastError: null,
 };
 
@@ -101,6 +110,7 @@ function createApiHarness(
       stop: vi.fn(async () => stoppedSnapshot),
       stopTask,
       emergencyStop,
+      quitApplication: vi.fn(async () => undefined),
       readOwnerIdentity: vi.fn(async () => ({
         revision: 0,
         ownerUsername: null,
@@ -127,6 +137,12 @@ function createApiHarness(
       listModels: vi.fn(async () => ({
         models: [],
         selection: { mode: "automatic" as const },
+        legacyMigrationCompleted: true,
+      })),
+      migrateModelPreference: vi.fn(async () => ({
+        models: [],
+        selection: { mode: "automatic" as const },
+        legacyMigrationCompleted: true,
       })),
       selectModel: vi.fn(async () => ({ mode: "automatic" as const })),
       discoverPcl2: vi.fn(async () => []),
@@ -137,6 +153,15 @@ function createApiHarness(
         version: "unknown",
         confirmedAt: 1_000,
       })),
+      getMinecraftComponentStatus: vi.fn(async () => ({
+        state: "ready" as const,
+        bridgeInstalled: true,
+        bridgeActive: true,
+        avatarInstalled: true,
+        restartRequired: false,
+      })),
+      installMinecraftComponents: vi.fn(),
+      removeMinecraftComponents: vi.fn(),
       subscribeRuntime: (nextListener) => {
         listener = nextListener;
         return unsubscribe;
@@ -311,7 +336,7 @@ describe("bilingual control-center home", () => {
     harness.emit({
       kind: "connection_invalidated",
       revision: 11,
-      reason: "account_lost",
+      reason: "runtime_failed",
       snapshot: {
         ...stoppedSnapshot,
         revision: 11,
@@ -344,6 +369,53 @@ describe("bilingual control-center home", () => {
 
     expect(screen.getByRole("main").id).toBe("home");
     expect(document.querySelector(".onboarding")).toBeNull();
+  });
+
+  it("updates the model card from a runtime event without returning to onboarding", async () => {
+    const harness = createApiHarness({ snapshot: revisionedSnapshot(activeSnapshot, 10) });
+    render(renderApp(harness.api));
+    await screen.findByText("gpt-5.6");
+
+    act(() => {
+      harness.emit(
+        revisionedEvent({ kind: "codex", state: { state: "ready", model: "gpt-fast-live" } }, 11),
+      );
+    });
+
+    expect(await screen.findByText("gpt-fast-live")).toBeTruthy();
+    expect(screen.getByRole("main").id).toBe("home");
+    expect(document.querySelector(".onboarding")).toBeNull();
+  });
+
+  it("replays and describes the latest action-capability event", async () => {
+    const status = deferred<RuntimeSnapshot>();
+    const harness = createApiHarness({ status: status.promise });
+    const onInitialSnapshot = vi.fn();
+    render(<HomePage api={harness.api} locale="en" onInitialSnapshot={onInitialSnapshot} />);
+    const failedActions = {
+      state: "failed" as const,
+      workspaceVersion: "workspace-1",
+      mcpListening: false,
+      discoveredToolCount: 0,
+      errorCode: "server_closed",
+    };
+
+    act(() => {
+      harness.emit(revisionedEvent({ kind: "actions", state: failedActions }, 11));
+    });
+    await act(async () => {
+      status.resolve(revisionedSnapshot(activeSnapshot, 10));
+      await status.promise;
+    });
+
+    expect(onInitialSnapshot).toHaveBeenCalledWith(
+      expect.objectContaining({ revision: 11, actions: failedActions }),
+    );
+    expect(
+      within(screen.getByRole("region", { name: "Recent activity" })).getByText(
+        "Minecraft actions changed to “Failed”",
+      ),
+    ).toBeTruthy();
   });
 
   it("ignores an unsafe invalidation without advancing high-water or routing", async () => {
@@ -418,7 +490,8 @@ describe("bilingual control-center home", () => {
 
     const navigation = screen.getByRole("navigation", { name: "主导航" });
     expect(navigation).toBeTruthy();
-    expect(navigation.textContent).not.toMatch(/[A-Za-z]/u);
+    expect(navigation.textContent).toContain("AI 模型");
+    expect(navigation.textContent?.replace("AI", "")).not.toMatch(/[A-Za-z]/u);
     expect(screen.getByRole("heading", { name: "运行概览" })).toBeTruthy();
     expect(screen.getByRole("heading", { name: "当前世界" })).toBeTruthy();
     expect(screen.queryByText("session_7F2A")).toBeNull();
@@ -888,6 +961,7 @@ describe("bilingual control-center home", () => {
         stop: vi.fn(() => normalStop.promise),
         stopTask: vi.fn(async () => activeSnapshot),
         emergencyStop: vi.fn(() => emergency.promise),
+        quitApplication: vi.fn(async () => undefined),
         readOwnerIdentity: vi.fn(async () => ({
           revision: 0,
           ownerUsername: null,
@@ -914,6 +988,12 @@ describe("bilingual control-center home", () => {
         listModels: vi.fn(async () => ({
           models: [],
           selection: { mode: "automatic" as const },
+          legacyMigrationCompleted: true,
+        })),
+        migrateModelPreference: vi.fn(async () => ({
+          models: [],
+          selection: { mode: "automatic" as const },
+          legacyMigrationCompleted: true,
         })),
         selectModel: vi.fn(async () => ({ mode: "automatic" as const })),
         discoverPcl2: vi.fn(async () => []),
@@ -924,6 +1004,15 @@ describe("bilingual control-center home", () => {
           version: "unknown",
           confirmedAt: 1_000,
         })),
+        getMinecraftComponentStatus: vi.fn(async () => ({
+          state: "ready" as const,
+          bridgeInstalled: true,
+          bridgeActive: true,
+          avatarInstalled: true,
+          restartRequired: false,
+        })),
+        installMinecraftComponents: vi.fn(),
+        removeMinecraftComponents: vi.fn(),
         subscribeRuntime: () => {
           const unsubscribe = vi.fn();
           cleanups.push(unsubscribe);

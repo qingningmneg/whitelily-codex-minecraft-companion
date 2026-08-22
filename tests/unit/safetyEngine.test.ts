@@ -12,6 +12,45 @@ function createSafety() {
 }
 
 describe("SafetyEngine", () => {
+  it.each([
+    { kind: "till_soil" as const, position: outsideSpawn },
+    { kind: "plant_crop" as const, position: outsideSpawn, seedName: "wheat_seeds" as const },
+  ])("permanently denies $kind without wheat farming permission", (action) => {
+    const { engine } = createSafety();
+
+    expect(engine.evaluate(action, { spawn: origin, owner: outsideSpawn })).toEqual({
+      kind: "deny",
+      reason: "Wheat farming permission is required",
+    });
+    expect(
+      engine.evaluate(action, {
+        spawn: origin,
+        owner: outsideSpawn,
+        wheatFarmingAllowed: true,
+      }),
+    ).toEqual({ kind: "allow" });
+  });
+
+  it.each([
+    { kind: "till_soil" as const, position: outsideSpawn },
+    { kind: "plant_crop" as const, position: outsideSpawn, seedName: "wheat_seeds" as const },
+    { kind: "harvest_crop" as const, position: outsideSpawn, cropName: "wheat" as const },
+  ])("treats $kind as a protected block change", (action) => {
+    const { engine } = createSafety();
+    const permission = { wheatFarmingAllowed: true };
+
+    expect(engine.evaluate(action, { owner: outsideSpawn, ...permission })).toEqual({
+      kind: "deny",
+      reason: "World spawn is unknown; block changes are disabled",
+    });
+    expect(
+      engine.evaluate(
+        { ...action, position: { x: 16, y: 64, z: 0 } },
+        { spawn: origin, owner: outsideSpawn, ...permission },
+      ),
+    ).toEqual({ kind: "deny", reason: "Spawn protection radius is 16 blocks" });
+  });
+
   it("permanently denies TNT without creating a confirmation", () => {
     const { confirmations, engine } = createSafety();
 

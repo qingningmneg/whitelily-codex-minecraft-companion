@@ -1,15 +1,21 @@
 import { randomUUID } from "node:crypto";
+import type { ResolvedModelSelection } from "../codex/modelCatalog.js";
+import { isModelId } from "../codex/modelId.js";
 import type { ActiveTask, TaskDisclosure } from "../companion/taskController.js";
 import { redactPublicText } from "../memory/redaction.js";
 import type { MinecraftEvent } from "../minecraft/minecraftPort.js";
+import { MineflayerBridgeError } from "../minecraft/mineflayerConnection.js";
 import type { TaskBudgetSnapshot, TaskLimits, TaskStopReason } from "../safety/taskBudget.js";
 import type { CompanionProfile } from "../profile/profileSchema.js";
 import type { MemoryContextScope } from "../memory/scopedMemoryStore.js";
 import type {
   PublicTaskSnapshot,
+  ActionCapabilitySnapshot,
   RuntimeEvent,
   RuntimeEventPayload,
   RuntimeAuthorityLoss,
+  RuntimeActionQueueProjection,
+  RuntimeActionQueueStatus,
   RuntimeSnapshot,
 } from "./runtimeEvents.js";
 
@@ -34,6 +40,10 @@ interface RuntimeTaskAccess extends Omit<RuntimeTaskProjection, "status" | "subs
 
 export interface RuntimeFacadeDependencies {
   lifecycle: RuntimeLifecycle;
+  switchModel?: (
+    selection: ResolvedModelSelection,
+    commitPreference: () => Promise<void>,
+  ) => Promise<void>;
   task?: RuntimeTaskAccess;
   minecraft?: {
     subscribe(listener: (event: MinecraftEvent) => void): () => void;
@@ -43,6 +53,14 @@ export interface RuntimeFacadeDependencies {
   };
   authority?: {
     subscribe(listener: (event: RuntimeAuthorityLoss) => void): () => void;
+  };
+  actions?: {
+    snapshot(): ActionCapabilitySnapshot | null;
+    subscribe(listener: (snapshot: ActionCapabilitySnapshot | null) => void): () => void;
+  };
+  actionQueue?: {
+    snapshot(): unknown;
+    subscribe(listener: () => void): () => void;
   };
   profile?: {
     apply(profile: CompanionProfile): void;
@@ -79,6 +97,7 @@ const taskStopReasons = new Set<TaskStopReason>([
   "world_changed",
   "owner_changed",
   "model_unavailable",
+  "model_changed",
   "process_exit",
 ]);
 
@@ -113,13 +132,17 @@ export class RuntimeFacade {
   #unsubscribeTask: (() => void) | undefined;
   #unsubscribeMinecraft: (() => void) | undefined;
   #unsubscribeAuthority: (() => void) | undefined;
+  #unsubscribeActions: (() => void) | undefined;
+  #unsubscribeActionQueue: (() => void) | undefined;
   #taskEventsFenced = false;
   #snapshot: RuntimeSnapshot = {
     revision: 0,
     lifecycle: "idle",
     minecraft: { state: "disconnected", sessionId: null },
     codex: { state: "stopped", model: null },
+    actions: null,
     task: null,
+    actionQueue: { goal: null, items: [] },
     lastError: null,
   };
   #startPromise: Promise<void> | undefined;
@@ -138,12 +161,54 @@ export class RuntimeFacade {
     this.#refreshTask(false);
     if (this.#terminal) return;
     try {
+      this.#unsubscribeActions = dependencies.actions?.subscribe((snapshot) => {
+        if (this.#terminal) return;
+        if (this.#snapshot.lifecycle === "idle" && snapshot !== null) return;
+        if (
+          this.#snapshot.lifecycle === "starting" &&
+          this.#snapshot.actions?.state === "failed" &&
+          snapshot === null
+        ) {
+          return;
+        }
+        try {
+          this.#setActions(snapshot, true);
+        } catch {
+          this.#failOperationalState(
+            "ACTION_STATE_UNKNOWN",
+            "Minecraft action state is unavailable",
+            true,
+          );
+        }
+      });
+    } catch {
+      this.#failOperationalState(
+        "ACTION_STATE_UNKNOWN",
+        "Minecraft action state is unavailable",
+        false,
+      );
+    }
+    if (this.#terminal) return;
+    try {
       this.#unsubscribeTask = dependencies.task?.subscribe?.(() => {
         if (this.#taskEventsFenced) return;
         this.#refreshTask(true);
       });
     } catch {
       this.#failTaskState(false);
+    }
+    if (this.#terminal) return;
+    try {
+      this.#unsubscribeActionQueue = dependencies.actionQueue?.subscribe(() => {
+        if (this.#terminal) return;
+        this.#refreshActionQueue(true);
+      });
+    } catch {
+      this.#failOperationalState(
+        "ACTION_QUEUE_STATE_UNKNOWN",
+        "AI action queue state is unavailable",
+        false,
+      );
     }
     if (this.#terminal) return;
     try {
@@ -232,6 +297,7 @@ export class RuntimeFacade {
       this.#setLifecycle("stopping");
       this.#setMinecraft("disconnected");
       this.#setCodex("stopped", null);
+      this.#setActions(null, true);
     } catch (error) {
       beginOperation({ run: false, error });
       return operation;
@@ -258,6 +324,7 @@ export class RuntimeFacade {
     ) {
       this.#refreshTask(false);
     }
+    this.#refreshActionQueue(false);
     return cloneRuntimeSnapshot(this.#snapshot);
   }
 
@@ -287,6 +354,27 @@ export class RuntimeFacade {
     });
   }
 
+  switchModel(
+    selection: ResolvedModelSelection,
+    commitPreference: () => Promise<void>,
+  ): Promise<void> {
+    return Promise.resolve().then(async () => {
+      if (this.#terminal || this.#snapshot.lifecycle !== "running") {
+        throw new Error("Runtime is not running");
+      }
+      if (this.#snapshot.actions?.state !== "ready") {
+        throw new Error("Minecraft actions are unavailable");
+      }
+      const switchModel = this.#dependencies.switchModel;
+      if (!switchModel) throw new Error("Runtime model switching is unavailable");
+      await switchModel(selection, commitPreference);
+      if (this.#terminal || this.#snapshot.lifecycle !== "running") {
+        throw new Error("Runtime model switch was interrupted");
+      }
+      this.#setCodex("ready", selection.modelId);
+    });
+  }
+
   applyProfile(profile: CompanionProfile): void {
     if (this.#terminal) throw new Error("Runtime is terminal; create a new runtime instance");
     this.#dependencies.profile?.apply(profile);
@@ -302,12 +390,17 @@ export class RuntimeFacade {
     try {
       await this.#dependencies.lifecycle.start();
       if (this.#terminal || this.#snapshot.lifecycle !== "starting") return;
+      if (this.#snapshot.actions === null) {
+        const actions = this.#dependencies.actions?.snapshot() ?? null;
+        if (actions !== null) this.#setActions(actions, true);
+      }
+      if (this.#terminal || this.#snapshot.lifecycle !== "starting") return;
       const model = this.#readCodexModel();
       if (this.#terminal || this.#snapshot.lifecycle !== "starting") return;
       this.#setCodex("ready", model);
       if (this.#terminal || this.#snapshot.lifecycle !== "starting") return;
       this.#setLifecycle("running");
-    } catch {
+    } catch (error) {
       if (this.#terminal) throw new Error("Runtime startup was stopped");
       this.#terminal = true;
       try {
@@ -318,11 +411,21 @@ export class RuntimeFacade {
       this.#taskEventsFenced = true;
       this.#clearTask(false);
       await this.#dependencies.lifecycle.stop().catch(() => undefined);
+      const actionErrorCode = boundedActionRuntimeErrorCode(error);
+      const bridgeError = error instanceof MineflayerBridgeError ? error : undefined;
+      if (actionErrorCode !== undefined) {
+        this.#recordError(actionErrorCode, "Minecraft action capability is unavailable");
+      } else if (bridgeError !== undefined) {
+        this.#recordError(bridgeError.code, bridgeError.message);
+      }
       this.#setMinecraft("disconnected");
       this.#setCodex("failed", null);
-      this.#recordError("RUNTIME_START_FAILED", "Runtime failed to start");
+      if (actionErrorCode === undefined && bridgeError === undefined) {
+        this.#recordError("RUNTIME_START_FAILED", "Runtime failed to start");
+      }
       this.#setLifecycle("failed");
       this.#teardownObservers();
+      if (isBoundedActionCapabilityError(error) || bridgeError !== undefined) throw error;
       throw new Error("Runtime failed to start");
     }
   }
@@ -377,15 +480,15 @@ export class RuntimeFacade {
     this.#publish({ kind: "codex", state: codex });
   }
 
+  #setActions(snapshot: ActionCapabilitySnapshot | null, publish: boolean): void {
+    const actions = cloneActionCapabilitySnapshot(snapshot);
+    this.#snapshot = { ...this.#snapshot, actions };
+    if (publish) this.#publish({ kind: "actions", state: actions });
+  }
+
   #readCodexModel(): string | null {
     const model = this.#dependencies.codex?.model() ?? null;
-    if (
-      model !== null &&
-      (typeof model !== "string" ||
-        model.length === 0 ||
-        model.length > 128 ||
-        !/^[A-Za-z0-9._-]+$/.test(model))
-    ) {
+    if (model !== null && !isModelId(model)) {
       throw new Error("Codex model state is unavailable");
     }
     return model;
@@ -414,6 +517,15 @@ export class RuntimeFacade {
               : "disconnected",
           );
           return;
+        case "bridge_failed": {
+          if (event.kind !== "bridge_failed") {
+            this.#failMinecraftState();
+            return;
+          }
+          const bridgeError = new MineflayerBridgeError(event.code);
+          this.#failOperationalState(bridgeError.code, bridgeError.message, true);
+          return;
+        }
         case "chat":
         case "owner_online":
         case "owner_offline":
@@ -545,7 +657,9 @@ export class RuntimeFacade {
       lifecycle: "failed",
       minecraft: { state: "disconnected", sessionId: null },
       codex: { state: "stopped", model: null },
+      actions: null,
       task: null,
+      actionQueue: { goal: null, items: cloneActionQueue(this.#snapshot.actionQueue).items },
       lastError: error,
     };
     const cleanup = Promise.resolve()
@@ -587,6 +701,35 @@ export class RuntimeFacade {
         task: safeTask === null ? null : clonePublicTask(safeTask),
       });
     }
+    this.#refreshActionQueue(publish);
+  }
+
+  #refreshActionQueue(publish: boolean): void {
+    const source = this.#dependencies.actionQueue;
+    if (!source) return;
+    try {
+      const actionQueue = projectActionQueue(source.snapshot(), this.#snapshot.task?.goal ?? null);
+      if (sameActionQueue(this.#snapshot.actionQueue, actionQueue)) return;
+      this.#setActionQueue(actionQueue, publish);
+    } catch {
+      if (this.#terminal) {
+        this.#snapshot = { ...this.#snapshot, actionQueue: { goal: null, items: [] } };
+        return;
+      }
+      this.#failOperationalState(
+        "ACTION_QUEUE_STATE_UNKNOWN",
+        "AI action queue state is unavailable",
+        publish,
+      );
+    }
+  }
+
+  #setActionQueue(actionQueue: RuntimeActionQueueProjection, publish: boolean): void {
+    const safe = cloneActionQueue(actionQueue);
+    this.#snapshot = { ...this.#snapshot, actionQueue: safe };
+    if (publish) {
+      this.#publish({ kind: "action_queue", actionQueue: cloneActionQueue(safe) });
+    }
   }
 
   #recordError(code: string, message: string, publish = true): void {
@@ -622,9 +765,21 @@ export class RuntimeFacade {
     } catch {
       // Authority observer teardown cannot affect lifecycle cleanup.
     }
+    try {
+      this.#unsubscribeActions?.();
+    } catch {
+      // Action observer teardown cannot affect lifecycle cleanup.
+    }
+    try {
+      this.#unsubscribeActionQueue?.();
+    } catch {
+      // Queue observer teardown cannot affect lifecycle cleanup.
+    }
     this.#unsubscribeTask = undefined;
     this.#unsubscribeMinecraft = undefined;
     this.#unsubscribeAuthority = undefined;
+    this.#unsubscribeActions = undefined;
+    this.#unsubscribeActionQueue = undefined;
     this.#authorityLossListeners.clear();
   }
 
@@ -665,7 +820,9 @@ export class RuntimeFacade {
       lifecycle: "failed",
       minecraft: { state: "disconnected", sessionId: null },
       codex: { state: "stopped", model: null },
+      actions: null,
       task: null,
+      actionQueue: { goal: null, items: cloneActionQueue(this.#snapshot.actionQueue).items },
       lastError: {
         code: "RUNTIME_REVISION_EXHAUSTED",
         message: "Runtime revision is exhausted",
@@ -688,6 +845,49 @@ export class RuntimeFacade {
       .then(() => this.#dependencies.lifecycle.stop())
       .catch(() => undefined);
     this.#teardownObservers();
+  }
+}
+
+function isBoundedActionCapabilityError(
+  error: unknown,
+): error is Error & { readonly code: string } {
+  if (!(error instanceof Error) || error.name !== "ActionCapabilityError") return false;
+  const code = (error as Error & { readonly code?: unknown }).code;
+  return (
+    typeof code === "string" &&
+    [
+      "invalid_url",
+      "invalid_timeout",
+      "connection_failed",
+      "timeout",
+      "aborted",
+      "missing_tools",
+      "extra_tools",
+      "duplicate_tools",
+      "invalid_tool_name",
+      "port_conflict",
+      "server_start_failed",
+      "server_closed",
+      "startup_stopped",
+    ].includes(code)
+  );
+}
+
+function boundedActionRuntimeErrorCode(
+  error: unknown,
+): "MCP_PORT_UNAVAILABLE" | "MCP_TOOL_CATALOG_INVALID" | "MCP_READINESS_TIMEOUT" | undefined {
+  if (!isBoundedActionCapabilityError(error)) return undefined;
+  switch (error.code) {
+    case "port_conflict":
+    case "server_start_failed":
+      return "MCP_PORT_UNAVAILABLE";
+    case "missing_tools":
+    case "extra_tools":
+    case "duplicate_tools":
+    case "invalid_tool_name":
+      return "MCP_TOOL_CATALOG_INVALID";
+    default:
+      return "MCP_READINESS_TIMEOUT";
   }
 }
 
@@ -716,6 +916,11 @@ function validateMinecraftEvent(value: unknown): MinecraftEvent["kind"] | null {
       if (!isExactRecord(value, hasReason ? ["kind", "reason"] : ["kind"])) return null;
       return !hasReason || isBoundedMinecraftString(value.reason, 256, true) ? kind : null;
     }
+    case "bridge_failed":
+      return isExactRecord(value, ["kind", "code"]) &&
+        (value.code === "MINECRAFT_BRIDGE_REQUIRED" || value.code === "MINECRAFT_BRIDGE_REJECTED")
+        ? kind
+        : null;
     case "world_changed":
     case "death":
       return isExactRecord(value, ["kind"]) ? kind : null;
@@ -1096,11 +1301,23 @@ function cloneRuntimeEvent(event: RuntimeEvent): RuntimeEvent {
           model: event.state.model,
         },
       };
+    case "actions":
+      return {
+        kind: "actions",
+        revision: event.revision,
+        state: cloneActionCapabilitySnapshot(event.state),
+      };
     case "task":
       return {
         kind: "task",
         revision: event.revision,
         task: event.task === null ? null : clonePublicTask(event.task),
+      };
+    case "action_queue":
+      return {
+        kind: "action_queue",
+        revision: event.revision,
+        actionQueue: cloneActionQueue(event.actionQueue),
       };
     case "error":
       return {
@@ -1116,6 +1333,111 @@ function cloneRuntimeEvent(event: RuntimeEvent): RuntimeEvent {
   }
 }
 
+const queueStatuses = new Set<RuntimeActionQueueStatus>([
+  "waiting",
+  "running",
+  "suspended",
+  "waiting_permission",
+  "completed",
+  "failed",
+  "cancelled",
+]);
+
+function projectActionQueue(value: unknown, goal: string | null): RuntimeActionQueueProjection {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("AI action queue state is invalid");
+  }
+  const items = Reflect.get(value, "items");
+  if (!Array.isArray(items) || items.length > 256) {
+    throw new Error("AI action queue state is invalid");
+  }
+  return {
+    goal: goal === null ? null : serializePublicString(goal, 160, []),
+    items: items.map((item) => projectActionQueueItem(item)),
+  };
+}
+
+function projectActionQueueItem(value: unknown): RuntimeActionQueueProjection["items"][number] {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("AI action queue item is invalid");
+  }
+  const index = Reflect.get(value, "index");
+  const kindValue = Reflect.get(value, "kind");
+  const summaryValue = Reflect.get(value, "summary");
+  const status = Reflect.get(value, "status");
+  const retryCount = Reflect.get(value, "retryCount");
+  const enqueuedAt = Reflect.get(value, "enqueuedAt");
+  const startedAt = Reflect.get(value, "startedAt");
+  const endedAt = Reflect.get(value, "endedAt");
+  const reasonValue = Reflect.get(value, "reason");
+  const kind = typeof kindValue === "string" ? serializePublicString(kindValue, 64, []) : null;
+  const summary =
+    typeof summaryValue === "string" ? serializePublicString(summaryValue, 160, []) : null;
+  const reason =
+    reasonValue === undefined
+      ? undefined
+      : typeof reasonValue === "string"
+        ? serializePublicString(reasonValue, 240, [])
+        : null;
+  if (
+    !Number.isSafeInteger(index) ||
+    (index as number) <= 0 ||
+    kind === null ||
+    summary === null ||
+    typeof status !== "string" ||
+    !queueStatuses.has(status as RuntimeActionQueueStatus) ||
+    !Number.isSafeInteger(retryCount) ||
+    (retryCount as number) < 0 ||
+    !isCanonicalIsoTime(enqueuedAt) ||
+    (startedAt !== undefined && !isCanonicalIsoTime(startedAt)) ||
+    (endedAt !== undefined && !isCanonicalIsoTime(endedAt)) ||
+    reason === null
+  ) {
+    throw new Error("AI action queue item is invalid");
+  }
+  return {
+    index: index as number,
+    kind,
+    summary,
+    status: status as RuntimeActionQueueStatus,
+    retryCount: retryCount as number,
+    enqueuedAt,
+    ...(startedAt === undefined ? {} : { startedAt }),
+    ...(endedAt === undefined ? {} : { endedAt }),
+    ...(reason === undefined ? {} : { reason }),
+  };
+}
+
+function isCanonicalIsoTime(value: unknown): value is string {
+  if (typeof value !== "string" || value.length > 64) return false;
+  const parsed = new Date(value);
+  return !Number.isNaN(parsed.getTime()) && parsed.toISOString() === value;
+}
+
+function cloneActionQueue(value: RuntimeActionQueueProjection): RuntimeActionQueueProjection {
+  return {
+    goal: value.goal,
+    items: value.items.map((item) => ({
+      index: item.index,
+      kind: item.kind,
+      summary: item.summary,
+      status: item.status,
+      retryCount: item.retryCount,
+      enqueuedAt: item.enqueuedAt,
+      ...(item.startedAt === undefined ? {} : { startedAt: item.startedAt }),
+      ...(item.endedAt === undefined ? {} : { endedAt: item.endedAt }),
+      ...(item.reason === undefined ? {} : { reason: item.reason }),
+    })),
+  };
+}
+
+function sameActionQueue(
+  left: RuntimeActionQueueProjection,
+  right: RuntimeActionQueueProjection,
+): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
 function cloneRuntimeSnapshot(snapshot: RuntimeSnapshot): RuntimeSnapshot {
   return deepFreeze({
     revision: snapshot.revision,
@@ -1128,7 +1450,9 @@ function cloneRuntimeSnapshot(snapshot: RuntimeSnapshot): RuntimeSnapshot {
       state: snapshot.codex.state,
       model: snapshot.codex.model,
     },
+    actions: cloneActionCapabilitySnapshot(snapshot.actions),
     task: snapshot.task === null ? null : clonePublicTask(snapshot.task),
+    actionQueue: cloneActionQueue(snapshot.actionQueue),
     lastError:
       snapshot.lastError === null
         ? null
@@ -1137,6 +1461,54 @@ function cloneRuntimeSnapshot(snapshot: RuntimeSnapshot): RuntimeSnapshot {
             message: snapshot.lastError.message,
           },
   });
+}
+
+function cloneActionCapabilitySnapshot(
+  snapshot: ActionCapabilitySnapshot | null,
+): ActionCapabilitySnapshot | null {
+  if (snapshot === null) return null;
+  if (snapshot.state === "starting") {
+    if (!validWorkspaceVersion(snapshot.workspaceVersion)) {
+      throw new Error("Action capability state is invalid");
+    }
+    return { state: "starting", workspaceVersion: snapshot.workspaceVersion };
+  }
+  if (
+    (snapshot.state === "ready"
+      ? !validWorkspaceVersion(snapshot.workspaceVersion)
+      : snapshot.workspaceVersion !== null && !validWorkspaceVersion(snapshot.workspaceVersion)) ||
+    !Number.isSafeInteger(snapshot.discoveredToolCount) ||
+    snapshot.discoveredToolCount < 0
+  ) {
+    throw new Error("Action capability state is invalid");
+  }
+  if (snapshot.state === "ready") {
+    if (snapshot.mcpListening !== true) throw new Error("Action capability state is invalid");
+    return {
+      state: "ready",
+      workspaceVersion: snapshot.workspaceVersion,
+      mcpListening: true,
+      discoveredToolCount: snapshot.discoveredToolCount,
+    };
+  }
+  if (
+    snapshot.state !== "failed" ||
+    typeof snapshot.mcpListening !== "boolean" ||
+    !/^[a-z][a-z0-9_]{0,63}$/u.test(snapshot.errorCode)
+  ) {
+    throw new Error("Action capability state is invalid");
+  }
+  return {
+    state: "failed",
+    workspaceVersion: snapshot.workspaceVersion,
+    mcpListening: snapshot.mcpListening,
+    discoveredToolCount: snapshot.discoveredToolCount,
+    errorCode: snapshot.errorCode,
+  };
+}
+
+function validWorkspaceVersion(value: string | null): value is string {
+  return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u.test(value);
 }
 
 function assertNever(value: never): never {

@@ -110,6 +110,58 @@ describe("AtomicJsonFile", () => {
     expect(openedPaths[0]).toMatch(/\.settings\.json\.00000000-0000-4000-8000-000000000001\.tmp$/u);
   });
 
+  it("creates a missing document without clobbering an existing winner", async () => {
+    const { rootDirectory, path } = await fixture();
+    const file = createFile(path, rootDirectory);
+
+    await expect(file.writeIfAbsent({ nested: { count: 1 } })).resolves.toEqual({
+      nested: { count: 1 },
+    });
+    await expect(file.writeIfAbsent({ nested: { count: 2 } })).resolves.toEqual({
+      nested: { count: 1 },
+    });
+    await expect(file.read()).resolves.toEqual({ nested: { count: 1 } });
+    expect((await readdir(rootDirectory)).filter((name) => name.endsWith(".tmp"))).toEqual([]);
+  });
+
+  it("preserves and validates a document created at the no-clobber link boundary", async () => {
+    const { rootDirectory, path } = await fixture();
+    let inserted = false;
+    const file = createFile(path, rootDirectory, nodeAtomicJsonFileIo, async (context) => {
+      if (context.operation !== "link" || inserted) return;
+      inserted = true;
+      await writeFile(path, '{"nested":{"count":7}}\n', { encoding: "utf8", flag: "wx" });
+    });
+
+    await expect(file.writeIfAbsent({ nested: { count: 1 } })).resolves.toEqual({
+      nested: { count: 7 },
+    });
+    expect(inserted).toBe(true);
+    await expect(readFile(path, "utf8")).resolves.toBe('{"nested":{"count":7}}\n');
+    expect((await readdir(rootDirectory)).filter((name) => name.endsWith(".tmp"))).toEqual([]);
+  });
+
+  it("rejects a post-link target replacement without deleting it", async () => {
+    const { rootDirectory, path } = await fixture();
+    const unrelated = '{"nested":{"count":999}}\n';
+    const io: AtomicJsonFileIo = {
+      ...nodeAtomicJsonFileIo,
+      link: async (source, destination) => {
+        await nodeAtomicJsonFileIo.link!(source, destination);
+        await rm(destination);
+        await writeFile(destination, unrelated, "utf8");
+      },
+    };
+
+    await expect(
+      createFile(path, rootDirectory, io).writeIfAbsent({ nested: { count: 1 } }),
+    ).rejects.toEqual(
+      expect.objectContaining<Partial<AtomicJsonFileError>>({ code: "ATOMIC_JSON_PATH" }),
+    );
+    await expect(readFile(path, "utf8")).resolves.toBe(unrelated);
+    expect((await readdir(rootDirectory)).filter((name) => name.endsWith(".tmp"))).toEqual([]);
+  });
+
   it("rejects a target outside the verified root before touching the filesystem", async () => {
     const { rootDirectory } = await fixture();
 

@@ -25,37 +25,22 @@ final class WhiteLilyRenderDecisionTest {
   }
 
   @Test
-  void fullAndBasicNameOnlyUseTheCustomRenderer() {
+  void onlyFullIdentityUsesTheNativeSkin() {
     WhiteLilyRenderSessions sessions = new WhiteLilyRenderSessions();
     RenderSessionId session = sessions.beginSession();
 
     assertTrue(
         WhiteLilyRenderDecision.capture(
                 IdentityDecision.FULL, ArmorTheme.BASE, session, session)
-            .usesCustomRenderer());
-    assertTrue(
-        WhiteLilyRenderDecision.capture(
-                IdentityDecision.BASIC_NAME_ONLY, ArmorTheme.IRON, session, session)
-            .usesCustomRenderer());
-  }
-
-  @Test
-  void onlyFullIdentityCanReceiveLaterPrivateExpressions() {
-    WhiteLilyRenderSessions sessions = new WhiteLilyRenderSessions();
-    RenderSessionId session = sessions.beginSession();
-
+            .usesNativeSkin());
     assertTrue(
         WhiteLilyRenderDecision.capture(
                 IdentityDecision.FULL, ArmorTheme.BASE, session, session)
             .expressionCapable());
-    assertFalse(
-        WhiteLilyRenderDecision.capture(
-                IdentityDecision.BASIC_NAME_ONLY, ArmorTheme.BASE, session, session)
-            .expressionCapable());
   }
 
   @Test
-  void matchedCustomRenderHidesVanillaArmorAndKeepsHeldItems() {
+  void matchedNativeSkinPreservesVanillaArmorAndHeldItems() {
     WhiteLilyRenderSessions sessions = new WhiteLilyRenderSessions();
     RenderSessionId session = sessions.beginSession();
 
@@ -63,8 +48,9 @@ final class WhiteLilyRenderDecisionTest {
         WhiteLilyRenderDecision.capture(
             IdentityDecision.FULL, ArmorTheme.NETHERITE, session, session);
 
-    assertTrue(decision.hidesVanillaArmor());
-    assertTrue(decision.rendersHeldItem());
+    assertTrue(decision.usesNativeSkin());
+    assertFalse(decision.hidesVanillaArmor());
+    assertFalse(decision.rendersHeldItem());
   }
 
   @Test

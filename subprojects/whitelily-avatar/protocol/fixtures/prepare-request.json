@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "requestId": "switch-0001",
+  "operation": "prepare",
+  "modelId": "builtin:whitelily-hd",
+  "worldSessionId": "world-0001",
+  "candidate": {
+    "modelId": "builtin:whitelily-hd",
+    "origin": "builtin",
+    "format": "builtin-hd",
+    "resourcePath": "builtin/whitelily-hd/high.glb",
+    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "boneMapping": {
+      "head": "Head",
+      "neck": "Neck",
+      "chest": "Chest",
+      "hips": "Hips",
+      "leftUpperArm": "LeftUpperArm",
+      "leftLowerArm": "LeftLowerArm",
+      "leftHand": "LeftHand",
+      "rightUpperArm": "RightUpperArm",
+      "rightLowerArm": "RightLowerArm",
+      "rightHand": "RightHand",
+      "leftUpperLeg": "LeftUpperLeg",
+      "leftLowerLeg": "LeftLowerLeg",
+      "leftFoot": "LeftFoot",
+      "rightUpperLeg": "RightUpperLeg",
+      "rightLowerLeg": "RightLowerLeg",
+      "rightFoot": "RightFoot"
+    },
+    "bodyAnimation": "whitelily-humanoid-v1",
+    "expressions": "full"
+  },
+  "issuedAt": "2026-08-16T08:00:00.000Z"
+}

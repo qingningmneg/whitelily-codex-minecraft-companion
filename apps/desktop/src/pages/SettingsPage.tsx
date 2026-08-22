@@ -4,7 +4,11 @@ import {
   type OwnerIdentitySnapshot,
 } from "../../../../src/identity/ownerIdentity.js";
 import type { WhiteLilyAppApi } from "../desktopApi.js";
-import type { Locale } from "../i18n/messageKeys.js";
+import type {
+  MinecraftComponentId,
+  MinecraftComponentStatus,
+} from "../../src-main/minecraftComponents.js";
+import type { Locale, MessageKey } from "../i18n/messageKeys.js";
 import { translate } from "../i18n/translator.js";
 import { DocumentConflictNotice } from "../components/DocumentConflictNotice.js";
 
@@ -17,6 +21,10 @@ interface SettingsPageProps {
     | "setCloseToTraySetting"
     | "readOwnerIdentity"
     | "updateOwnerIdentity"
+    | "detectLanCandidates"
+    | "getMinecraftComponentStatus"
+    | "installMinecraftComponents"
+    | "removeMinecraftComponents"
   >;
   locale: Locale;
   ownerIdentity: OwnerIdentitySnapshot | null;
@@ -56,9 +64,15 @@ export function SettingsPage({
   const [closeConflict, setCloseConflict] = useState(false);
   const [pending, setPending] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
+  const [componentStatus, setComponentStatus] = useState<MinecraftComponentStatus | null>(null);
+  const [componentLoading, setComponentLoading] = useState(true);
+  const [componentPending, setComponentPending] = useState(false);
+  const [componentFailed, setComponentFailed] = useState(false);
   const [ownerDraft, setOwnerDraft] = useState(ownerIdentity?.ownerUsername ?? "");
   const [ownerTouched, setOwnerTouched] = useState(false);
   const [ownerReview, setOwnerReview] = useState<OwnerReview | null>(null);
+  const componentSupported =
+    componentStatus !== null && !isUnsupportedComponentStatus(componentStatus);
   const [ownerPending, setOwnerPending] = useState(false);
   const [ownerRefreshPending, setOwnerRefreshPending] = useState(false);
   const ownerPendingRef = useRef(false);
@@ -73,6 +87,7 @@ export function SettingsPage({
   const cancelOwnerButton = useRef<HTMLButtonElement>(null);
   const settingsHeading = useRef<HTMLHeadingElement>(null);
   const ownerReturnFocus = useRef<HTMLElement | null>(null);
+  const componentGeneration = useRef(0);
 
   const restoreOwnerFocus = useCallback((): void => {
     const requestedTarget = ownerReturnFocus.current;
@@ -157,6 +172,72 @@ export function SettingsPage({
   useEffect(() => {
     void load();
   }, [load]);
+
+  const freshComponentCandidate = useCallback(async () => {
+    const candidates = await api.detectLanCandidates();
+    const now = Date.now();
+    return candidates.find(
+      (candidate) =>
+        candidate.version === "1.21.5" && candidate.observedAt <= now && now < candidate.expiresAt,
+    );
+  }, [api]);
+
+  const refreshComponents = useCallback(async (): Promise<void> => {
+    const generation = ++componentGeneration.current;
+    setComponentLoading(true);
+    setComponentStatus(null);
+    setComponentFailed(false);
+    try {
+      const candidate = await freshComponentCandidate();
+      if (generation !== componentGeneration.current) return;
+      if (!candidate) {
+        setComponentStatus(null);
+        return;
+      }
+      const status = await api.getMinecraftComponentStatus(candidate.id);
+      if (generation !== componentGeneration.current) return;
+      setComponentStatus(status);
+    } catch {
+      if (generation !== componentGeneration.current) return;
+      setComponentStatus(null);
+      setComponentFailed(true);
+    } finally {
+      if (generation === componentGeneration.current) setComponentLoading(false);
+    }
+  }, [api, freshComponentCandidate]);
+
+  useEffect(() => {
+    void refreshComponents();
+    return () => {
+      componentGeneration.current += 1;
+    };
+  }, [refreshComponents]);
+
+  const mutateComponents = async (
+    operation: "install" | "remove",
+    selection: readonly MinecraftComponentId[],
+  ): Promise<void> => {
+    if (componentPending) return;
+    const generation = ++componentGeneration.current;
+    setComponentPending(true);
+    setComponentStatus(null);
+    setComponentFailed(false);
+    try {
+      const candidate = await freshComponentCandidate();
+      if (generation !== componentGeneration.current) return;
+      if (!candidate) throw new Error("candidate unavailable");
+      const status = await (operation === "install"
+        ? api.installMinecraftComponents(candidate.id, selection)
+        : api.removeMinecraftComponents(candidate.id, selection));
+      if (generation !== componentGeneration.current) return;
+      setComponentStatus(status);
+    } catch {
+      if (generation !== componentGeneration.current) return;
+      setComponentFailed(true);
+    } finally {
+      if (generation === componentGeneration.current) setComponentPending(false);
+    }
+  };
 
   const updateStartup = async (enabled: boolean): Promise<void> => {
     setPending(true);
@@ -464,6 +545,74 @@ export function SettingsPage({
             </button>
           </section>
         ) : null}
+        <section className="settings-card minecraft-component-settings">
+          <h2>{translate(locale, "minecraft.components.title")}</h2>
+          {componentSupported ? (
+            <>
+              <p>{translate(locale, "minecraft.components.verifiedInstance")}</p>
+              <p>{translate(locale, "minecraft.components.scope")}</p>
+              <p>{translate(locale, "minecraft.components.worldsUnchanged")}</p>
+            </>
+          ) : null}
+          {componentLoading || componentPending ? (
+            <p role="status">{translate(locale, "minecraft.components.checking")}</p>
+          ) : componentStatus ? (
+            <>
+              <p role="status">{translate(locale, componentStatusMessageKey(componentStatus))}</p>
+              {componentSupported ? (
+                <>
+                  <ul>
+                    <li>{translate(locale, "minecraft.components.bridge")}</li>
+                    <li>{translate(locale, "minecraft.components.avatar")}</li>
+                  </ul>
+                  <div className="inline-actions">
+                    <button
+                      type="button"
+                      disabled={componentPending}
+                      onClick={() => void mutateComponents("install", ["bridge"])}
+                    >
+                      {translate(locale, "minecraft.components.installBridge")}
+                    </button>
+                    <button
+                      type="button"
+                      disabled={componentPending}
+                      onClick={() => void mutateComponents("install", ["bridge", "avatar"])}
+                    >
+                      {translate(locale, "minecraft.components.installBridgeAvatar")}
+                    </button>
+                    <button
+                      type="button"
+                      disabled={componentPending || !componentStatus.avatarInstalled}
+                      onClick={() => void mutateComponents("remove", ["avatar"])}
+                    >
+                      {translate(locale, "minecraft.components.removeAvatar")}
+                    </button>
+                    <button
+                      type="button"
+                      disabled={componentPending || !componentStatus.bridgeInstalled}
+                      onClick={() => void mutateComponents("remove", ["avatar", "bridge"])}
+                    >
+                      {translate(locale, "minecraft.components.removeBridge")}
+                    </button>
+                  </div>
+                </>
+              ) : null}
+            </>
+          ) : (
+            <p role="status">{translate(locale, "minecraft.components.notDetected")}</p>
+          )}
+          {componentFailed ? (
+            <p role="alert">{translate(locale, "minecraft.components.operationFailed")}</p>
+          ) : null}
+          <button
+            className="secondary-button"
+            type="button"
+            disabled={componentPending || componentLoading}
+            onClick={() => void refreshComponents()}
+          >
+            {translate(locale, "minecraft.components.refresh")}
+          </button>
+        </section>
         <section className="settings-card">
           <h2>{translate(locale, "settings.language")}</h2>
           <div className="segmented-control">
@@ -558,6 +707,34 @@ export function SettingsPage({
       ) : null}
     </main>
   );
+}
+
+function componentStatusMessageKey(status: MinecraftComponentStatus): MessageKey {
+  if (isUnsupportedComponentStatus(status)) {
+    return "minecraft.components.state.instance_unsupported";
+  }
+  switch (status.state) {
+    case "bridge_not_installed":
+      return "minecraft.components.state.bridge_not_installed";
+    case "bridge_restart_required":
+      return "minecraft.components.state.bridge_restart_required";
+    case "bridge_not_active":
+      return "minecraft.components.state.bridge_not_active";
+    case "bridge_version_unsupported":
+      return "minecraft.components.state.bridge_version_unsupported";
+    case "bridge_file_conflict":
+      return "minecraft.components.state.bridge_file_conflict";
+    case "avatar_not_installed":
+      return "minecraft.components.state.avatar_not_installed";
+    case "avatar_restart_required":
+      return "minecraft.components.state.avatar_restart_required";
+    case "ready":
+      return "minecraft.components.state.ready";
+  }
+}
+
+function isUnsupportedComponentStatus(status: MinecraftComponentStatus): boolean {
+  return status.state === "bridge_version_unsupported" && !status.bridgeInstalled;
 }
 
 function isDocumentConflict(error: unknown): boolean {

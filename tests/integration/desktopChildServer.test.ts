@@ -1,5 +1,5 @@
 import { PassThrough } from "node:stream";
-import { mkdtemp, readFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -14,14 +14,30 @@ import {
   type DesktopCommand,
   type DesktopRequest,
 } from "../../src/desktop/desktopProtocol.js";
-import { runDesktopChild, type DesktopChildServices } from "../../src/desktop/childMain.js";
+import {
+  createDefaultDesktopChildServices,
+  runDesktopChild,
+  type DesktopChildServices,
+} from "../../src/desktop/childMain.js";
 import { RuntimeFacade } from "../../src/runtime/runtimeFacade.js";
+import { ActionCapabilityError } from "../../src/app.js";
+import { MineflayerBridgeError } from "../../src/minecraft/mineflayerConnection.js";
 import type { AccountSnapshot } from "../../src/codex/accountService.js";
 import type { Model } from "../../src/codex/generated/v2/Model.js";
-import { ModelCatalog } from "../../src/codex/modelCatalog.js";
+import {
+  ModelCatalog,
+  type ModelCatalogEvent,
+  type ModelSelection,
+  type ModelSelectionInput,
+  type PreparedModelSelection,
+  type ResolvedModelSelection,
+} from "../../src/codex/modelCatalog.js";
+import { ModelPreferenceStore } from "../../src/codex/modelPreferenceStore.js";
+import { FarmingPreferenceStore } from "../../src/profile/farmingPreferenceStore.js";
 import type { MinecraftEvent } from "../../src/minecraft/minecraftPort.js";
 import type { RuntimeEvent, RuntimeSnapshot } from "../../src/runtime/runtimeEvents.js";
 import type { TaskStopReason } from "../../src/safety/taskBudget.js";
+import type { RuntimeSafetyConfiguration } from "../../src/safety/safetyProfile.js";
 import { createDefaultCompanionProfile } from "../../src/profile/profileSchema.js";
 import { DocumentStoreError } from "../../src/storage/documentStore.js";
 import {
@@ -38,6 +54,7 @@ import {
   type DesktopChildHarness,
   type DesktopRuntime,
 } from "../support/desktopChildHarness.js";
+import { validConfig } from "../support/appHarness.js";
 import {
   OwnerIdentityError,
   type OwnerIdentityAccess,
@@ -50,13 +67,37 @@ const idleSnapshot: RuntimeSnapshot = {
   lifecycle: "idle",
   minecraft: { state: "disconnected", sessionId: null },
   codex: { state: "stopped", model: null },
+  actions: null,
   task: null,
+  actionQueue: { goal: null, items: [] },
   lastError: null,
+};
+
+const readyActions = {
+  state: "ready",
+  workspaceVersion: "workspace-1",
+  mcpListening: true,
+  discoveredToolCount: 15,
+} as const;
+
+const readyActionAccess = {
+  snapshot: () => readyActions,
+  subscribe: () => () => undefined,
 };
 
 const stopNoTask = async (): Promise<void> => undefined;
 
 const openHarnesses: DesktopChildHarness[] = [];
+
+function deferred<T = void>() {
+  let resolve!: (value: T) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
 
 function createHarness(
   options: Parameters<typeof createDesktopChildHarness>[0] = {},
@@ -144,13 +185,34 @@ function inertDesktopChildServices(): DesktopChildServices {
       stop: async () => undefined,
     },
     models: {
-      listModels: async () => ({ models: [], selection: { mode: "automatic" } }),
+      listModels: async () => ({
+        models: [],
+        selection: { mode: "automatic" },
+        legacyMigrationCompleted: false,
+      }),
+      migrateLegacyPreference: async (candidate) => ({
+        models: [],
+        selection:
+          candidate?.mode === "explicit"
+            ? { ...candidate, available: true }
+            : { mode: "automatic" },
+        legacyMigrationCompleted: true,
+      }),
       selectModel: async () => ({ mode: "automatic" }),
+      prepareSelection: async (selection) => ({
+        preferenceRevision: 0,
+        requested: selection,
+        resolved: { modelId: "inert-live-model", reasoningEffort: "medium" },
+      }),
+      commitSelection: async (prepared) =>
+        prepared.requested.mode === "automatic"
+          ? { mode: "automatic" }
+          : { ...prepared.requested, available: true },
       resolveRuntimeSelection: async () => ({
         modelId: "inert-live-model",
         reasoningEffort: "medium",
       }),
-      subscribeInvalidation: () => () => undefined,
+      subscribe: () => () => undefined,
       stop: () => undefined,
     },
     createRuntime: async (_connection, initialRevision) =>
@@ -264,6 +326,46 @@ afterEach(async () => {
 });
 
 describe("DesktopChildServer", () => {
+  it("passes the same config-scoped farming preference store into desktop runtimes", async () => {
+    const rootDirectory = await mkdtemp(join(tmpdir(), "whitelily-farming-child-"));
+    try {
+      const configPath = join(rootDirectory, "config.toml");
+      const preferenceRoot = join(rootDirectory, "config");
+      await Promise.all([
+        writeFile(configPath, validConfig, "utf8"),
+        mkdir(preferenceRoot, { recursive: true }),
+      ]);
+      const seeded = new FarmingPreferenceStore({ rootDirectory: preferenceRoot });
+      await seeded.setAllowed(0);
+      let runtimeStore: FarmingPreferenceStore | undefined;
+      const services = await createDefaultDesktopChildServices(
+        { configPath, cwd: rootDirectory },
+        "0.2.0-beta.2",
+        async (_configPath, _connection, _revision, _selection, _ownerIdentity, farmingStore) => {
+          runtimeStore = farmingStore;
+          return new RuntimeFacade({
+            lifecycle: { start: async () => undefined, stop: async () => undefined },
+          });
+        },
+      );
+
+      await services.createRuntime(
+        { host: "127.0.0.1", port: 25565 },
+        0,
+        { modelId: "gpt-5.6-terra", reasoningEffort: "low" },
+        { compatibilityVerified: true, requestedPreset: "standard" },
+      );
+
+      expect(runtimeStore).toBeDefined();
+      await expect(runtimeStore!.read()).resolves.toMatchObject({
+        revision: 1,
+        value: { status: "allowed" },
+      });
+    } finally {
+      await rm(rootDirectory, { recursive: true, force: true });
+    }
+  });
+
   it("reads and updates owner identity without exposing config input", async () => {
     const ownerIdentity = ownerHarness("OldOwner");
     const harness = createHarness({ ownerIdentity });
@@ -486,6 +588,16 @@ describe("DesktopChildServer", () => {
 
   it("uses one default owner service for child reads, updates, and events", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "whitelily-owner-child-"));
+    const productVersion = (
+      JSON.parse(await readFile(join(import.meta.dirname, "..", "..", "package.json"), "utf8")) as {
+        version: string;
+      }
+    ).version;
+    await writeFile(
+      join(cwd, "config.toml"),
+      validConfig.replace('owner_username = "TestOwner"', 'owner_username = "YourMcName"'),
+      "utf8",
+    );
     const input = new PassThrough();
     const output = new PassThrough();
     let rawOutput = "";
@@ -493,7 +605,7 @@ describe("DesktopChildServer", () => {
     output.on("data", (chunk: string) => {
       rawOutput += chunk;
     });
-    const running = runDesktopChild([], { input, output, cwd });
+    const running = runDesktopChild([], { input, output, cwd, appVersion: productVersion });
 
     input.write(
       `${JSON.stringify(commandRequest("default-owner-read", { kind: "read_owner_identity" }))}\n`,
@@ -546,6 +658,13 @@ describe("DesktopChildServer", () => {
   it("keeps diagnostic preview authority in the child and returns no archive path", async () => {
     const preview = vi.fn(async () => ({
       exportId: "diagnostic_1234567890",
+      actionCapability: {
+        workspaceVersion: "workspace-1",
+        state: "ready" as const,
+        mcpListening: true,
+        discoveredToolCount: 15,
+        errorCode: null,
+      },
       files: [
         { logicalName: "app-version.json" as const, size: 20, redactions: 0 },
         { logicalName: "os-summary.json" as const, size: 20, redactions: 0 },
@@ -572,6 +691,10 @@ describe("DesktopChildServer", () => {
     }));
     const harness = createHarness({
       diagnostics: { preview, createArchive, dispose: async () => undefined },
+    });
+    harness.runtime.snapshot = () => ({
+      ...idleSnapshot,
+      actions: readyActions,
     });
 
     harness.send(commandRequest("diagnostic-preview", { kind: "preview_diagnostics" }));
@@ -600,6 +723,7 @@ describe("DesktopChildServer", () => {
     });
     expect(JSON.stringify(response)).not.toContain("C:\\private");
     expect(preview).toHaveBeenCalledOnce();
+    expect(preview).toHaveBeenCalledWith(readyActions, null);
     expect(createArchive).toHaveBeenCalledWith("diagnostic_1234567890");
   });
 
@@ -616,6 +740,13 @@ describe("DesktopChildServer", () => {
     const diagnostics = {
       preview: async () => ({
         exportId: "diagnostic_1234567890",
+        actionCapability: {
+          workspaceVersion: null,
+          state: "starting" as const,
+          mcpListening: false,
+          discoveredToolCount: 0,
+          errorCode: null,
+        },
         files: [
           { logicalName: "app-version.json" as const, size: 20, redactions: 0 },
           { logicalName: "os-summary.json" as const, size: 20, redactions: 0 },
@@ -2322,6 +2453,7 @@ describe("DesktopChildServer", () => {
     const listModels = vi.fn(async () => ({
       models: [],
       selection: { mode: "automatic" as const },
+      legacyMigrationCompleted: false,
     }));
     const selectModel = vi.fn(async () => ({ mode: "automatic" as const }));
     const resolveRuntimeSelection = vi.fn(async () => ({
@@ -2497,6 +2629,7 @@ describe("DesktopChildServer", () => {
         lifecycle: "running",
         minecraft: { state: "connected", sessionId: "profile-runtime-session" },
         codex: { state: "ready", model: "live-authority-model" },
+        actions: readyActions,
         task: {
           id: "profile-runtime-task",
           goal: "stale authority",
@@ -2527,6 +2660,7 @@ describe("DesktopChildServer", () => {
             startedAt: 0,
           },
         },
+        actionQueue: { goal: "stale authority", items: [] },
         lastError: null,
       };
       const stop = vi.fn(async (_reason: TaskStopReason) => {
@@ -2535,7 +2669,9 @@ describe("DesktopChildServer", () => {
           lifecycle: "failed",
           minecraft: { state: "disconnected", sessionId: null },
           codex: { state: "failed", model: null },
+          actions: null,
           task: null,
+          actionQueue: { goal: null, items: [] },
           lastError: { code: "PROFILE_APPLY_FAILED", message: "Runtime contained" },
         };
       });
@@ -2643,7 +2779,9 @@ describe("DesktopChildServer", () => {
           lifecycle: "running",
           minecraft: { state: "connected", sessionId: "stale-runtime-session" },
           codex: { state: "ready", model: "stale-model" },
+          actions: readyActions,
           task: null,
+          actionQueue: { goal: null, items: [] },
           lastError: null,
         }),
         subscribe: () => () => undefined,
@@ -2749,6 +2887,86 @@ describe("DesktopChildServer", () => {
     }
   });
 
+  it.each([
+    ["a missing version", undefined],
+    ["an empty version", ""],
+    ["a path-shaped version", "../workspace"],
+    ["an overlong version", "x".repeat(65)],
+  ])("rejects %s in packaged mode before composing services", async (_label, version) => {
+    const previousLayout = process.env.WHITELILY_CODEX_LAYOUT;
+    const previousVersion = process.env.WHITELILY_WORKSPACE_VERSION;
+    const previousExitCode = process.exitCode;
+    process.env.WHITELILY_CODEX_LAYOUT = "packaged";
+    if (version === undefined) delete process.env.WHITELILY_WORKSPACE_VERSION;
+    else process.env.WHITELILY_WORKSPACE_VERSION = version;
+    process.exitCode = undefined;
+    const input = new PassThrough();
+    const output = new PassThrough();
+    const stderr: string[] = [];
+    let serviceCreations = 0;
+    try {
+      const running = runDesktopChild(["C:/WhiteLily/config.toml"], {
+        input,
+        output,
+        cwd: "C:/WhiteLily",
+        writeStderr: (message) => stderr.push(message),
+        createServices: async () => {
+          serviceCreations += 1;
+          return inertDesktopChildServices();
+        },
+      });
+      input.end(`${JSON.stringify(request("invalid-workspace-version", "get_status"))}\n`);
+      await running;
+
+      expect(serviceCreations).toBe(0);
+      expect(output.readableLength).toBe(0);
+      expect(stderr).toEqual(["WhiteLily desktop child failed to initialize"]);
+      expect(process.exitCode).toBe(1);
+    } finally {
+      if (previousLayout === undefined) delete process.env.WHITELILY_CODEX_LAYOUT;
+      else process.env.WHITELILY_CODEX_LAYOUT = previousLayout;
+      if (previousVersion === undefined) delete process.env.WHITELILY_WORKSPACE_VERSION;
+      else process.env.WHITELILY_WORKSPACE_VERSION = previousVersion;
+      process.exitCode = previousExitCode;
+    }
+  });
+
+  it("accepts a bounded supervisor-provided workspace version in packaged mode", async () => {
+    const previousLayout = process.env.WHITELILY_CODEX_LAYOUT;
+    const previousVersion = process.env.WHITELILY_WORKSPACE_VERSION;
+    process.env.WHITELILY_CODEX_LAYOUT = "packaged";
+    process.env.WHITELILY_WORKSPACE_VERSION = "release-1.2_3";
+    const input = new PassThrough();
+    const output = new PassThrough();
+    let outputText = "";
+    output.setEncoding("utf8");
+    output.on("data", (chunk: string) => {
+      outputText += chunk;
+    });
+    try {
+      const running = runDesktopChild(["C:/WhiteLily/config.toml"], {
+        input,
+        output,
+        cwd: "C:/WhiteLily",
+        createServices: async () => inertDesktopChildServices(),
+      });
+      input.write(`${JSON.stringify(request("valid-workspace-version", "get_status"))}\n`);
+      await vi.waitFor(() => expect(outputText).toContain("\n"));
+      input.end();
+      await running;
+
+      expect(parseDesktopResponse(JSON.parse(outputText.trim()))).toMatchObject({
+        id: "valid-workspace-version",
+        ok: true,
+      });
+    } finally {
+      if (previousLayout === undefined) delete process.env.WHITELILY_CODEX_LAYOUT;
+      else process.env.WHITELILY_CODEX_LAYOUT = previousLayout;
+      if (previousVersion === undefined) delete process.env.WHITELILY_WORKSPACE_VERSION;
+      else process.env.WHITELILY_WORKSPACE_VERSION = previousVersion;
+    }
+  });
+
   it("exits on initially empty stdin without composing a runtime or writing output", async () => {
     const input = new PassThrough();
     const output = new PassThrough();
@@ -2838,6 +3056,43 @@ describe("DesktopChildServer", () => {
       } finally {
         process.exitCode = priorExitCode;
       }
+    },
+  );
+
+  it.each([
+    ["MINECRAFT_BRIDGE_REQUIRED", "Minecraft Bridge is required"],
+    ["MINECRAFT_BRIDGE_REJECTED", "Minecraft Bridge rejected the connection"],
+  ] as const)(
+    "maps %s startup errors without exposing private Bridge data",
+    async (code, message) => {
+      const failure = new MineflayerBridgeError(code);
+      Object.defineProperty(failure, "cause", {
+        value: new Error(
+          "nonce-secret 127.0.0.1:25565 C:\\Users\\Owner\\WhiteLily\\bridge\\requests\\private.json",
+        ),
+      });
+      const harness = createHarness({
+        runtime: {
+          ...throwingRuntime("get_status"),
+          start: async () => {
+            throw failure;
+          },
+          snapshot: () => idleSnapshot,
+        },
+      });
+
+      harness.send(request(`bridge-${code}`, "start_runtime"));
+      const response = await harness.nextResponse();
+
+      expect(response).toEqual({
+        version: 1,
+        id: `bridge-${code}`,
+        ok: false,
+        error: { code, message },
+      });
+      expect(JSON.stringify({ response, lines: harness.lines() })).not.toMatch(
+        /nonce-secret|25565|bridge\\requests|C:\\Users/iu,
+      );
     },
   );
 
@@ -3088,13 +3343,31 @@ describe("DesktopChildServer", () => {
             stop: stopAccount,
           },
           models: {
-            listModels: async () => ({ models: [], selection: { mode: "automatic" } }),
+            listModels: async () => ({
+              models: [],
+              selection: { mode: "automatic" },
+              legacyMigrationCompleted: false,
+            }),
+            migrateLegacyPreference: async () => ({
+              models: [],
+              selection: { mode: "automatic" },
+              legacyMigrationCompleted: true,
+            }),
             selectModel: async () => ({ mode: "automatic" }),
+            prepareSelection: async (selection) => ({
+              preferenceRevision: 0,
+              requested: selection,
+              resolved: { modelId: "lazy-live-model", reasoningEffort: "medium" },
+            }),
+            commitSelection: async (prepared) =>
+              prepared.requested.mode === "automatic"
+                ? { mode: "automatic" }
+                : { ...prepared.requested, available: true },
             resolveRuntimeSelection: async () => ({
               modelId: "lazy-live-model",
               reasoningEffort: "medium",
             }),
-            subscribeInvalidation: () => () => undefined,
+            subscribe: () => () => undefined,
             stop: stopModels,
           },
           createRuntime: async () => {
@@ -3269,6 +3542,32 @@ describe("DesktopChildServer", () => {
     });
   });
 
+  it("forwards only the strict sanitized action queue runtime event", async () => {
+    const tracked = trackingRuntime();
+    const harness = createHarness({ runtime: tracked.runtime });
+    const actionQueue = {
+      goal: "制作面包",
+      items: [
+        {
+          index: 1,
+          kind: "harvest_crop",
+          summary: "寻找成熟小麦",
+          status: "waiting" as const,
+          retryCount: 0,
+          enqueuedAt: "2026-08-15T00:00:00.000Z",
+        },
+      ],
+    };
+
+    tracked.emit({ kind: "action_queue", revision: 1, actionQueue });
+
+    await expect(harness.nextEvent()).resolves.toEqual({
+      version: DESKTOP_PROTOCOL_VERSION,
+      event: { kind: "action_queue", revision: 1, actionQueue },
+    });
+    expect(JSON.stringify(harness.lines())).not.toMatch(/lease|observation|position/iu);
+  });
+
   it.each([
     {
       label: "normal stop",
@@ -3320,7 +3619,6 @@ describe("DesktopChildServer", () => {
       error: { code: "RUNTIME_START_FAILED" },
     });
     harness.send(request("start-retry", "start_runtime"));
-
     await expect(harness.nextResponse()).resolves.toMatchObject({
       id: "start-retry",
       ok: true,
@@ -3499,6 +3797,7 @@ describe("DesktopChildServer", () => {
       lifecycle: "running",
       minecraft: { state: "connected", sessionId: null },
       codex: { state: "ready", model: "gpt-5.6" },
+      actions: readyActions,
       task: {
         id: "task_urgent_stop",
         goal: "走到主人身边",
@@ -3517,6 +3816,7 @@ describe("DesktopChildServer", () => {
           startedAt: 1_785_369_600_000,
         },
       },
+      actionQueue: { goal: "走到主人身边", items: [] },
       lastError: null,
     };
     const stopTask = vi.fn(async () => {
@@ -3588,6 +3888,7 @@ describe("DesktopChildServer", () => {
       lifecycle: "running",
       minecraft: { state: "connected", sessionId: null },
       codex: { state: "ready", model: "gpt-5.6" },
+      actions: readyActions,
       task: {
         id: "task_missing_stop_capability",
         goal: "Keep the task contained",
@@ -3606,6 +3907,7 @@ describe("DesktopChildServer", () => {
           startedAt: 1_785_369_600_000,
         },
       },
+      actionQueue: { goal: "Keep the task contained", items: [] },
       lastError: null,
     };
     const stopRuntime = vi.fn(async () => undefined);
@@ -3931,7 +4233,7 @@ describe("DesktopChildServer", () => {
     "uses first-wins reason and one contained signal for $label against an in-flight replacement",
     async ({ first, second, stopReason, publicReason }) => {
       let accountListener: ((snapshot: AccountSnapshot) => void) | undefined;
-      let modelListener: (() => void) | undefined;
+      let modelListener: ((event: ModelCatalogEvent) => void) | undefined;
       let releaseFactory = (): void => undefined;
       const factoryGate = new Promise<void>((resolve) => {
         releaseFactory = resolve;
@@ -3972,7 +4274,7 @@ describe("DesktopChildServer", () => {
           },
         },
         models: {
-          subscribeInvalidation: (listener) => {
+          subscribe: (listener) => {
             modelListener = listener;
             return () => {
               modelListener = undefined;
@@ -4000,7 +4302,7 @@ describe("DesktopChildServer", () => {
             );
             break;
           case "model":
-            modelListener?.();
+            modelListener?.({ kind: "selection_invalidated", reason: "model_unavailable" });
             break;
           case "account":
             accountListener?.({ status: "signed_out" });
@@ -4255,8 +4557,28 @@ describe("DesktopChildServer", () => {
     }
   });
 
-  it("dispatches the five account and model commands through separate services", async () => {
+  it("dispatches account, model, and bounded model migration commands through separate services", async () => {
+    let modelListener: ((event: ModelCatalogEvent) => void) | undefined;
+    const migrateLegacyPreference = vi.fn(async (candidate: ModelSelectionInput | null) => ({
+      models: [
+        {
+          id: "live-model",
+          displayName: "Live Model",
+          supportedReasoningEfforts: ["medium"] as const,
+        },
+      ],
+      selection:
+        candidate?.mode === "explicit"
+          ? { ...candidate, available: true as const }
+          : ({ mode: "automatic" } as const),
+      legacyMigrationCompleted: true,
+    }));
     const harness = createHarness({
+      runtime: new RuntimeFacade({
+        lifecycle: { start: async () => undefined, stop: async () => undefined },
+        actions: readyActionAccess,
+        switchModel: async (_selection, commitPreference) => commitPreference(),
+      }),
       account: {
         getAccount: async () => ({ status: "signed_in", auth: "chatgpt" }),
         startChatGptLogin: async () => ({
@@ -4270,6 +4592,7 @@ describe("DesktopChildServer", () => {
         }),
       },
       models: {
+        migrateLegacyPreference,
         listModels: async () => ({
           models: [
             {
@@ -4279,11 +4602,34 @@ describe("DesktopChildServer", () => {
             },
           ],
           selection: { mode: "automatic" },
+          legacyMigrationCompleted: false,
         }),
-        selectModel: async (selection) =>
-          selection.mode === "automatic"
-            ? { mode: "automatic" }
-            : { ...selection, available: true as const },
+        selectModel: async () => {
+          throw new Error("legacy single-phase selection must not run");
+        },
+        prepareSelection: async (selection) => ({
+          preferenceRevision: 0,
+          requested: selection,
+          resolved:
+            selection.mode === "automatic"
+              ? { modelId: "live-model", reasoningEffort: "medium" }
+              : { modelId: selection.modelId, reasoningEffort: selection.reasoningEffort },
+        }),
+        commitSelection: async (prepared) => {
+          const selection = prepared.requested;
+          const selected =
+            selection.mode === "automatic"
+              ? ({ mode: "automatic" } as const)
+              : ({ ...selection, available: true as const } as const);
+          modelListener?.({ kind: "selection_changed", selection: selected });
+          return selected;
+        },
+        subscribe: (listener) => {
+          modelListener = listener;
+          return () => {
+            modelListener = undefined;
+          };
+        },
       },
     });
 
@@ -4313,11 +4659,40 @@ describe("DesktopChildServer", () => {
       ok: true,
       result: { status: "cancelled", attemptId: "opaque_attempt_1234" },
     });
+    harness.send(
+      commandRequest("model-migrate", {
+        kind: "migrate_model_preference",
+        candidate: {
+          mode: "explicit",
+          modelId: "live-model",
+          reasoningEffort: "medium",
+        },
+      }),
+    );
+    await expect(harness.nextResponse()).resolves.toMatchObject({
+      id: "model-migrate",
+      ok: true,
+      result: {
+        selection: { mode: "explicit", modelId: "live-model", reasoningEffort: "medium" },
+        legacyMigrationCompleted: true,
+      },
+    });
+    expect(migrateLegacyPreference).toHaveBeenCalledWith({
+      mode: "explicit",
+      modelId: "live-model",
+      reasoningEffort: "medium",
+    });
     harness.send(request("models-list", "list_models"));
     await expect(harness.nextResponse()).resolves.toMatchObject({
       id: "models-list",
       ok: true,
       result: { models: [{ id: "live-model" }], selection: { mode: "automatic" } },
+    });
+    harness.send(request("model-start", "start_runtime"));
+    await expect(harness.nextResponse()).resolves.toMatchObject({
+      id: "model-start",
+      ok: true,
+      result: { lifecycle: "running" },
     });
     harness.send(
       commandRequest("model-select", {
@@ -4333,6 +4708,695 @@ describe("DesktopChildServer", () => {
       id: "model-select",
       ok: true,
       result: { mode: "explicit", modelId: "live-model", available: true },
+    });
+    await Promise.resolve();
+    expect(connectionInvalidations(harness)).toEqual([]);
+    expect(harness.stopReasons).toEqual([]);
+  });
+
+  it("orders a running model selection through prepare, runtime commit, and response", async () => {
+    const order: string[] = [];
+    const requested: ModelSelectionInput = {
+      mode: "explicit",
+      modelId: "gpt-5.6-luna",
+      reasoningEffort: "high",
+    };
+    const prepared: PreparedModelSelection = {
+      preferenceRevision: 7,
+      requested,
+      resolved: { modelId: "gpt-5.6-luna", reasoningEffort: "high" },
+    };
+    let snapshot: RuntimeSnapshot = {
+      revision: 4,
+      lifecycle: "running",
+      minecraft: { state: "connected", sessionId: "lan-session-1" },
+      codex: { state: "ready", model: "gpt-5.6-terra" },
+      actions: readyActions,
+      task: null,
+      actionQueue: { goal: null, items: [] },
+      lastError: null,
+    };
+    const runtime = {
+      start: async () => undefined,
+      stop: async () => {
+        snapshot = {
+          ...snapshot,
+          lifecycle: "stopped",
+          minecraft: { state: "disconnected", sessionId: null },
+          codex: { state: "stopped", model: null },
+          actions: null,
+        };
+      },
+      stopTask: async () => undefined,
+      snapshot: () => structuredClone(snapshot),
+      subscribe: () => () => undefined,
+      switchModel: async (
+        selection: ResolvedModelSelection,
+        commitPreference: () => Promise<void>,
+      ) => {
+        order.push(`runtime:${selection.modelId}`);
+        await commitPreference();
+        snapshot = { ...snapshot, codex: { state: "ready", model: selection.modelId } };
+      },
+    };
+    const models = {
+      selectModel: async (): Promise<ModelSelection> => {
+        order.push("legacy-select");
+        return { ...requested, available: true };
+      },
+      prepareSelection: async (selection: ModelSelectionInput) => {
+        order.push(`prepare:${selection.mode}`);
+        return prepared;
+      },
+      commitSelection: async (candidate: PreparedModelSelection): Promise<ModelSelection> => {
+        expect(candidate).toBe(prepared);
+        order.push("commit");
+        return { ...requested, available: true };
+      },
+    };
+    const harness = createHarness({ runtime, models });
+
+    harness.send(
+      commandRequest("model-two-phase-running", { kind: "select_model", selection: requested }),
+    );
+    const response = await harness.nextResponse();
+    order.push("response");
+
+    expect(response).toMatchObject({
+      id: "model-two-phase-running",
+      ok: true,
+      result: { mode: "explicit", modelId: "gpt-5.6-luna", available: true },
+    });
+    expect(order).toEqual(["prepare:explicit", "runtime:gpt-5.6-luna", "commit", "response"]);
+    expect(snapshot).toMatchObject({
+      lifecycle: "running",
+      minecraft: { state: "connected", sessionId: "lan-session-1" },
+      codex: { state: "ready", model: "gpt-5.6-luna" },
+    });
+    expect(connectionInvalidations(harness)).toEqual([]);
+  });
+
+  it("publishes a provider-qualified live model through events, response, and later status", async () => {
+    const requested: ModelSelectionInput = {
+      mode: "explicit",
+      modelId: "provider:model",
+      reasoningEffort: "high",
+    };
+    const prepared: PreparedModelSelection = {
+      preferenceRevision: 14,
+      requested,
+      resolved: { modelId: "provider:model", reasoningEffort: "high" },
+    };
+    const runtime = new RuntimeFacade({
+      initialRevision: 25,
+      lifecycle: { start: async () => undefined, stop: async () => undefined },
+      codex: { model: () => "provider-old-model" },
+      actions: readyActionAccess,
+      switchModel: async (_selection, commitPreference) => commitPreference(),
+    });
+    await runtime.start();
+    const revisionBeforeSwitch = runtime.snapshot().revision;
+    const harness = createHarness({
+      runtime,
+      models: {
+        selectModel: async () => {
+          throw new Error("legacy single-phase selection must not run");
+        },
+        prepareSelection: async () => prepared,
+        commitSelection: async () => ({ ...requested, available: true }),
+      },
+    });
+
+    harness.send(
+      commandRequest("provider-model-select", { kind: "select_model", selection: requested }),
+    );
+    await expect(harness.nextResponse()).resolves.toMatchObject({
+      id: "provider-model-select",
+      ok: true,
+      result: { mode: "explicit", modelId: "provider:model", available: true },
+    });
+    const codexEventLine = harness
+      .lines()
+      .map((line) => JSON.parse(line) as unknown)
+      .find(
+        (line) =>
+          typeof line === "object" &&
+          line !== null &&
+          (line as { event?: { kind?: string; state?: { model?: string } } }).event?.kind ===
+            "codex" &&
+          (line as { event?: { state?: { model?: string } } }).event?.state?.model ===
+            "provider:model",
+      );
+    expect(codexEventLine).toBeDefined();
+    const codexEvent = parseDesktopEvent(codexEventLine!).event;
+    expect(codexEvent).toEqual({
+      kind: "codex",
+      revision: revisionBeforeSwitch + 1,
+      state: { state: "ready", model: "provider:model" },
+    });
+
+    harness.send(request("provider-model-status", "get_status"));
+    await expect(harness.nextResponse()).resolves.toMatchObject({
+      id: "provider-model-status",
+      ok: true,
+      result: {
+        revision: revisionBeforeSwitch + 1,
+        lifecycle: "running",
+        codex: { state: "ready", model: "provider:model" },
+      },
+    });
+    expect(connectionInvalidations(harness)).toEqual([]);
+  });
+
+  it("commits an idle model selection without asking the runtime to switch", async () => {
+    const order: string[] = [];
+    const requested: ModelSelectionInput = {
+      mode: "explicit",
+      modelId: "gpt-5.6-luna",
+      reasoningEffort: "medium",
+    };
+    const prepared: PreparedModelSelection = {
+      preferenceRevision: 3,
+      requested,
+      resolved: { modelId: "gpt-5.6-luna", reasoningEffort: "medium" },
+    };
+    const runtime = {
+      start: async () => undefined,
+      stop: async () => undefined,
+      stopTask: async () => undefined,
+      snapshot: () => idleSnapshot,
+      subscribe: () => () => undefined,
+      switchModel: async () => {
+        order.push("runtime-switch");
+      },
+    };
+    const models = {
+      selectModel: async (): Promise<ModelSelection> => {
+        order.push("legacy-select");
+        return { ...requested, available: true };
+      },
+      prepareSelection: async () => {
+        order.push("prepare");
+        return prepared;
+      },
+      commitSelection: async (): Promise<ModelSelection> => {
+        order.push("commit");
+        return { ...requested, available: true };
+      },
+    };
+    const harness = createHarness({ runtime, models });
+
+    harness.send(
+      commandRequest("model-two-phase-idle", { kind: "select_model", selection: requested }),
+    );
+    await expect(harness.nextResponse()).resolves.toMatchObject({
+      id: "model-two-phase-idle",
+      ok: true,
+      result: { modelId: "gpt-5.6-luna" },
+    });
+
+    expect(order).toEqual(["prepare", "commit"]);
+  });
+
+  it("maps a stale live model commit to the stable model operation error", async () => {
+    const requested: ModelSelectionInput = {
+      mode: "explicit",
+      modelId: "gpt-5.6-luna",
+      reasoningEffort: "medium",
+    };
+    const prepared: PreparedModelSelection = {
+      preferenceRevision: 9,
+      requested,
+      resolved: { modelId: "gpt-5.6-luna", reasoningEffort: "medium" },
+    };
+    const originalSnapshot: RuntimeSnapshot = {
+      revision: 10,
+      lifecycle: "running",
+      minecraft: { state: "connected", sessionId: "lan-session-stale" },
+      codex: { state: "ready", model: "gpt-5.6-terra" },
+      actions: readyActions,
+      task: null,
+      actionQueue: { goal: null, items: [] },
+      lastError: null,
+    };
+    let snapshot = structuredClone(originalSnapshot);
+    let catalogSelection: ModelSelection = { mode: "automatic" };
+    const runtime = {
+      start: async () => undefined,
+      stop: async () => {
+        snapshot = {
+          ...snapshot,
+          lifecycle: "stopped",
+          minecraft: { state: "disconnected", sessionId: null },
+          codex: { state: "stopped", model: null },
+          actions: null,
+        };
+      },
+      stopTask: async () => undefined,
+      snapshot: () => structuredClone(snapshot),
+      subscribe: () => () => undefined,
+      switchModel: async (
+        selection: ResolvedModelSelection,
+        commitPreference: () => Promise<void>,
+      ) => {
+        await commitPreference();
+        snapshot = { ...snapshot, codex: { state: "ready", model: selection.modelId } };
+      },
+    };
+    const models = {
+      selectModel: async (): Promise<ModelSelection> => {
+        catalogSelection = { ...requested, available: true };
+        return catalogSelection;
+      },
+      prepareSelection: async () => prepared,
+      commitSelection: async (): Promise<ModelSelection> => {
+        throw new DocumentStoreError("DOCUMENT_CONFLICT", "private stale revision");
+      },
+    };
+    const harness = createHarness({ runtime, models });
+
+    harness.send(
+      commandRequest("model-two-phase-stale", { kind: "select_model", selection: requested }),
+    );
+    await expect(harness.nextResponse()).resolves.toEqual({
+      version: DESKTOP_PROTOCOL_VERSION,
+      id: "model-two-phase-stale",
+      ok: false,
+      error: { code: "MODEL_OPERATION_FAILED", message: "Model operation failed" },
+    });
+
+    expect(snapshot).toEqual(originalSnapshot);
+    expect(catalogSelection).toEqual({ mode: "automatic" });
+  });
+
+  it("suppresses a live model result completed after its runtime was stopped", async () => {
+    const entered = deferred<void>();
+    const release = deferred<void>();
+    const requested: ModelSelectionInput = {
+      mode: "explicit",
+      modelId: "gpt-5.6-luna",
+      reasoningEffort: "medium",
+    };
+    const prepared: PreparedModelSelection = {
+      preferenceRevision: 11,
+      requested,
+      resolved: { modelId: "gpt-5.6-luna", reasoningEffort: "medium" },
+    };
+    let snapshot: RuntimeSnapshot = {
+      revision: 12,
+      lifecycle: "running",
+      minecraft: { state: "connected", sessionId: "lan-session-late" },
+      codex: { state: "ready", model: "gpt-5.6-terra" },
+      actions: readyActions,
+      task: null,
+      actionQueue: { goal: null, items: [] },
+      lastError: null,
+    };
+    const runtime = {
+      start: async () => undefined,
+      stop: async () => {
+        snapshot = {
+          ...snapshot,
+          lifecycle: "stopped",
+          minecraft: { state: "disconnected", sessionId: null },
+          codex: { state: "stopped", model: null },
+          actions: null,
+        };
+      },
+      stopTask: async () => undefined,
+      snapshot: () => structuredClone(snapshot),
+      subscribe: () => () => undefined,
+      switchModel: async (
+        _selection: ResolvedModelSelection,
+        commitPreference: () => Promise<void>,
+      ) => {
+        await commitPreference();
+        entered.resolve();
+        await release.promise;
+      },
+    };
+    const models = {
+      selectModel: async (): Promise<ModelSelection> => {
+        entered.resolve();
+        await release.promise;
+        return { ...requested, available: true };
+      },
+      prepareSelection: async () => prepared,
+      commitSelection: async (): Promise<ModelSelection> => ({ ...requested, available: true }),
+    };
+    const harness = createHarness({ runtime, models });
+
+    harness.send(
+      commandRequest("model-late-select", { kind: "select_model", selection: requested }),
+    );
+    await entered.promise;
+    harness.send(request("model-late-stop", "stop_runtime"));
+    await expect(harness.nextResponse()).resolves.toMatchObject({
+      id: "model-late-stop",
+      ok: true,
+      result: { lifecycle: "stopped" },
+    });
+    release.resolve();
+
+    await expect(harness.nextResponse()).resolves.toEqual({
+      version: DESKTOP_PROTOCOL_VERSION,
+      id: "model-late-select",
+      ok: false,
+      error: { code: "MODEL_OPERATION_FAILED", message: "Model operation failed" },
+    });
+  });
+
+  it("recovers from true model invalidation with the confirmed LAN and world binding", async () => {
+    let modelListener: ((event: ModelCatalogEvent) => void) | undefined;
+    let profile: WorldProfile | null = null;
+    let revision = 0;
+    let runtimeCreations = 0;
+    const safetyConfigurations: RuntimeSafetyConfiguration[] = [];
+    const proof: ConfirmedConnectionProof = {
+      nonce: "model_recovery_proof_0001",
+      port: 25565,
+      issuedAt: 10,
+      expiresAt: 9_999,
+    };
+    const binding: ConfirmedWorldBinding = {
+      canonicalInstancePath: "C:/Minecraft/ModelRecovery",
+      javaSession: {
+        pid: 2468,
+        processStartedAt: 20,
+        port: 25565,
+        version: "1.21.5",
+      },
+      ownerUsername: "HarnessOwner",
+      proof,
+    };
+    const worlds: DesktopChildWorldProfileStore = {
+      read: async () => ({
+        schemaVersion: 1,
+        revision,
+        updatedAt: "2026-08-03T00:00:00.000Z",
+        value: profile,
+      }),
+      bindConfirmedWorld: async (_expectedRevision, confirmed, label) => {
+        revision += 1;
+        profile = {
+          id: "be176ae1-a4b4-4fd6-b04c-89634cd74a99",
+          label,
+          instanceFingerprint: fingerprintConfirmedWorld(
+            confirmed.canonicalInstancePath,
+            confirmed.javaSession,
+          ),
+          ownerUsername: confirmed.ownerUsername,
+          safetyPreset: "standard",
+        };
+        return {
+          schemaVersion: 1,
+          revision,
+          updatedAt: "2026-08-03T00:00:01.000Z",
+          value: profile,
+        };
+      },
+      updateSafetyProfile: async () => {
+        throw new Error("unused");
+      },
+    };
+    const harness = createHarness({
+      lazyRuntime: true,
+      now: () => 100,
+      worldProfiles: worlds,
+      models: {
+        resolveRuntimeSelection: async () => ({
+          modelId: "gpt-5.6-terra",
+          reasoningEffort: "medium",
+        }),
+        subscribe: (listener) => {
+          modelListener = listener;
+          return () => {
+            modelListener = undefined;
+          };
+        },
+      },
+      createRuntime: async (_connection, initialRevision, _selection, safety) => {
+        runtimeCreations += 1;
+        safetyConfigurations.push(safety);
+        return new RuntimeFacade({
+          initialRevision,
+          lifecycle: { start: async () => undefined, stop: async () => undefined },
+        });
+      },
+    });
+    harness.send(
+      commandRequest("model-recovery-confirm", { kind: "set_confirmed_connection", proof }),
+    );
+    await expect(harness.nextResponse()).resolves.toMatchObject({
+      id: "model-recovery-confirm",
+      ok: true,
+    });
+    harness.sendRaw(privateWorldBindRequest("model-recovery-bind", binding));
+    await expect(harness.nextResponse()).resolves.toMatchObject({
+      id: "model-recovery-bind",
+      ok: true,
+    });
+    harness.send(request("model-recovery-start", "start_runtime"));
+    await expect(harness.nextResponse()).resolves.toMatchObject({
+      id: "model-recovery-start",
+      ok: true,
+    });
+    expect(safetyConfigurations).toEqual([
+      { requestedPreset: "standard", compatibilityVerified: true },
+    ]);
+
+    modelListener?.({ kind: "selection_invalidated", reason: "model_unavailable" });
+    await vi.waitFor(() => expect(connectionInvalidations(harness)).toContain("model_unavailable"));
+    harness.send(request("model-recovery-restart", "start_runtime"));
+
+    await expect(harness.nextResponse()).resolves.toMatchObject({
+      id: "model-recovery-restart",
+      ok: true,
+      result: { lifecycle: "running" },
+    });
+    expect(safetyConfigurations).toEqual([
+      { requestedPreset: "standard", compatibilityVerified: true },
+      { requestedPreset: "standard", compatibilityVerified: true },
+    ]);
+    expect(runtimeCreations).toBe(2);
+  });
+
+  it("retains explicit model recovery before connection consumption and beyond proof TTL", async () => {
+    let now = 100;
+    let modelAvailable = true;
+    let modelListener: ((event: ModelCatalogEvent) => void) | undefined;
+    const resolveEntered = deferred<void>();
+    const releaseResolve = deferred<void>();
+    let resolveCalls = 0;
+    let profile: WorldProfile | null = null;
+    let revision = 0;
+    const safetyConfigurations: RuntimeSafetyConfiguration[] = [];
+    const proof: ConfirmedConnectionProof = {
+      nonce: "preconsume_model_recovery_01",
+      port: 25565,
+      issuedAt: 100,
+      expiresAt: 10_100,
+    };
+    const binding: ConfirmedWorldBinding = {
+      canonicalInstancePath: "C:/Minecraft/PreconsumeRecovery",
+      javaSession: {
+        pid: 8642,
+        processStartedAt: 30,
+        port: 25565,
+        version: "1.21.5",
+      },
+      ownerUsername: "HarnessOwner",
+      proof,
+    };
+    const worlds: DesktopChildWorldProfileStore = {
+      read: async () => ({
+        schemaVersion: 1,
+        revision,
+        updatedAt: "2026-08-03T00:00:00.000Z",
+        value: profile,
+      }),
+      bindConfirmedWorld: async (_expectedRevision, confirmed, label) => {
+        revision += 1;
+        profile = {
+          id: "be176ae1-a4b4-4fd6-b04c-89634cd74a99",
+          label,
+          instanceFingerprint: fingerprintConfirmedWorld(
+            confirmed.canonicalInstancePath,
+            confirmed.javaSession,
+          ),
+          ownerUsername: confirmed.ownerUsername,
+          safetyPreset: "standard",
+        };
+        return {
+          schemaVersion: 1,
+          revision,
+          updatedAt: "2026-08-03T00:00:01.000Z",
+          value: profile,
+        };
+      },
+      updateSafetyProfile: async () => {
+        throw new Error("unused");
+      },
+    };
+    const harness = createHarness({
+      lazyRuntime: true,
+      now: () => now,
+      worldProfiles: worlds,
+      models: {
+        resolveRuntimeSelection: async () => {
+          resolveCalls += 1;
+          if (resolveCalls === 1) {
+            resolveEntered.resolve();
+            await releaseResolve.promise;
+          }
+          if (!modelAvailable) throw new Error("Selected model is unavailable");
+          return { modelId: "gpt-5.6-terra", reasoningEffort: "medium" };
+        },
+        subscribe: (listener) => {
+          modelListener = listener;
+          return () => {
+            modelListener = undefined;
+          };
+        },
+      },
+      createRuntime: async (_connection, initialRevision, _selection, safety) => {
+        safetyConfigurations.push(safety);
+        return new RuntimeFacade({
+          initialRevision,
+          lifecycle: { start: async () => undefined, stop: async () => undefined },
+        });
+      },
+    });
+    harness.send(
+      commandRequest("preconsume-recovery-confirm", {
+        kind: "set_confirmed_connection",
+        proof,
+      }),
+    );
+    await expect(harness.nextResponse()).resolves.toMatchObject({
+      id: "preconsume-recovery-confirm",
+      ok: true,
+    });
+    harness.sendRaw(privateWorldBindRequest("preconsume-recovery-bind", binding));
+    await expect(harness.nextResponse()).resolves.toMatchObject({
+      id: "preconsume-recovery-bind",
+      ok: true,
+    });
+
+    harness.send(request("preconsume-recovery-first-start", "start_runtime"));
+    await resolveEntered.promise;
+    modelAvailable = false;
+    modelListener?.({ kind: "selection_invalidated", reason: "model_unavailable" });
+    await vi.waitFor(() => expect(connectionInvalidations(harness)).toContain("model_unavailable"));
+    releaseResolve.resolve();
+    await expect(harness.nextResponse()).resolves.toMatchObject({
+      id: "preconsume-recovery-first-start",
+      ok: false,
+      error: { code: "RUNTIME_START_FAILED" },
+    });
+
+    now = 20_000;
+    modelAvailable = true;
+    harness.send(request("preconsume-recovery-restored", "start_runtime"));
+    await expect(harness.nextResponse()).resolves.toMatchObject({
+      id: "preconsume-recovery-restored",
+      ok: true,
+      result: { lifecycle: "running" },
+    });
+    expect(safetyConfigurations).toEqual([
+      { requestedPreset: "standard", compatibilityVerified: true },
+    ]);
+  });
+
+  it.each([
+    { name: "an expired", invalidationNow: 10_100 },
+    { name: "a clock-rewound future-issued", invalidationNow: 99 },
+  ])(
+    "does not upgrade $name accepted connection into explicit model recovery",
+    async (scenario) => {
+      let now = 100;
+      let modelListener: ((event: ModelCatalogEvent) => void) | undefined;
+      const harness = createHarness({
+        lazyRuntime: true,
+        now: () => now,
+        models: {
+          subscribe: (listener) => {
+            modelListener = listener;
+            return () => {
+              modelListener = undefined;
+            };
+          },
+        },
+      });
+      harness.send(
+        commandRequest("expired-recovery-confirm", {
+          kind: "set_confirmed_connection",
+          proof: {
+            nonce: "expired_model_recovery_01",
+            port: 25565,
+            issuedAt: 100,
+            expiresAt: 10_100,
+          },
+        }),
+      );
+      await expect(harness.nextResponse()).resolves.toMatchObject({
+        id: "expired-recovery-confirm",
+        ok: true,
+      });
+
+      now = scenario.invalidationNow;
+      modelListener?.({ kind: "selection_invalidated", reason: "model_unavailable" });
+      await vi.waitFor(() =>
+        expect(connectionInvalidations(harness)).toContain("model_unavailable"),
+      );
+      harness.send(request("expired-recovery-start", "start_runtime"));
+
+      await expect(harness.nextResponse()).resolves.toMatchObject({
+        id: "expired-recovery-start",
+        ok: false,
+        error: { code: "CONNECTION_OPERATION_FAILED" },
+      });
+      expect(harness.runtimeCreations()).toBe(0);
+    },
+  );
+
+  it("consumes one-shot confirmation after an ordinary pre-consumption resolve failure", async () => {
+    let resolveCalls = 0;
+    const harness = createHarness({
+      lazyRuntime: true,
+      now: () => 100,
+      models: {
+        resolveRuntimeSelection: async () => {
+          resolveCalls += 1;
+          if (resolveCalls === 1) throw new Error("ordinary model lookup failure");
+          return { modelId: "gpt-5.6-terra", reasoningEffort: "medium" };
+        },
+      },
+    });
+    harness.send(
+      commandRequest("ordinary-resolve-confirm", {
+        kind: "set_confirmed_connection",
+        proof: {
+          nonce: "ordinary_resolve_failure_01",
+          port: 25565,
+          issuedAt: 100,
+          expiresAt: 10_100,
+        },
+      }),
+    );
+    await harness.nextResponse();
+
+    harness.send(request("ordinary-resolve-first", "start_runtime"));
+    await expect(harness.nextResponse()).resolves.toMatchObject({
+      id: "ordinary-resolve-first",
+      ok: false,
+      error: { code: "RUNTIME_START_FAILED" },
+    });
+    harness.send(request("ordinary-resolve-retry", "start_runtime"));
+    await expect(harness.nextResponse()).resolves.toMatchObject({
+      id: "ordinary-resolve-retry",
+      ok: false,
+      error: { code: "CONNECTION_OPERATION_FAILED" },
     });
   });
 
@@ -4468,6 +5532,54 @@ describe("DesktopChildServer", () => {
       error: { code: "CONNECTION_OPERATION_FAILED" },
     });
     expect(createRuntime).not.toHaveBeenCalled();
+  });
+
+  it("keeps a connection accepted at start valid while cold model resolution finishes", async () => {
+    let now = 1_000;
+    const connections: unknown[] = [];
+    const harness = createHarness({
+      lazyRuntime: true,
+      now: () => now,
+      models: {
+        resolveRuntimeSelection: async () => {
+          now = 11_000;
+          return { modelId: "gpt-5.6-terra", reasoningEffort: "medium" };
+        },
+      },
+      createRuntime: async (connection) => {
+        connections.push(connection);
+        return new RuntimeFacade({
+          lifecycle: {
+            start: async () => undefined,
+            stop: async () => undefined,
+          },
+        });
+      },
+    });
+    harness.send(
+      commandRequest("cold-start-confirm", {
+        kind: "set_confirmed_connection",
+        proof: {
+          nonce: "proof_nonce_coldstart1",
+          port: 51_321,
+          issuedAt: 1_000,
+          expiresAt: 11_000,
+        },
+      }),
+    );
+    await expect(harness.nextResponse()).resolves.toMatchObject({
+      id: "cold-start-confirm",
+      ok: true,
+    });
+
+    harness.send(request("cold-start-runtime", "start_runtime"));
+
+    await expect(harness.nextResponse()).resolves.toMatchObject({
+      id: "cold-start-runtime",
+      ok: true,
+      result: { lifecycle: "running" },
+    });
+    expect(connections).toEqual([{ host: "127.0.0.1", port: 51_321 }]);
   });
 
   it("requires fresh confirmation after normal and emergency stops", async () => {
@@ -4784,7 +5896,7 @@ describe("DesktopChildServer", () => {
         listModels: () => catalog.listModels(),
         selectModel: (selection) => catalog.selectModel(selection),
         resolveRuntimeSelection: (options) => catalog.resolveRuntimeSelection(options),
-        subscribeInvalidation: (listener) => catalog.subscribeInvalidation(listener),
+        subscribe: (listener) => catalog.subscribe(listener),
         stop: () => catalog.stop(),
       },
     });
@@ -4814,6 +5926,58 @@ describe("DesktopChildServer", () => {
     expect(harness.stopReasons).toEqual(["model_unavailable"]);
     expect(harness.runtimeCreations()).toBe(2);
     expect(vi.getTimerCount()).toBe(1);
+  });
+
+  it("contains a running runtime when a completed migration refresh loses its selected model", async () => {
+    const rootDirectory = await mkdtemp(join(tmpdir(), "whitelily-model-migration-child-"));
+    try {
+      let records = [serviceModel("migration-live-model", "xhigh", true)];
+      const catalog = new ModelCatalog(
+        { listModelRecords: async () => records },
+        {
+          getAccount: async () => ({ status: "signed_in", auth: "chatgpt" }),
+          subscribe: () => () => undefined,
+        },
+        {
+          store: new ModelPreferenceStore({ rootDirectory }),
+          legacyConfigCandidate: {
+            mode: "explicit",
+            modelId: "legacy-config-model",
+            reasoningEffort: "medium",
+          },
+        },
+      );
+      await catalog.migrateLegacyPreference({
+        mode: "explicit",
+        modelId: "migration-live-model",
+        reasoningEffort: "xhigh",
+      });
+      const harness = createHarness({
+        models: {
+          listModels: () => catalog.listModels(),
+          selectModel: (selection) => catalog.selectModel(selection),
+          resolveRuntimeSelection: (options) => catalog.resolveRuntimeSelection(options),
+          subscribe: (listener) => catalog.subscribe(listener),
+          stop: () => catalog.stop(),
+        },
+      });
+      harness.send(request("migration-model-start", "start_runtime"));
+      await expect(harness.nextResponse()).resolves.toMatchObject({
+        id: "migration-model-start",
+        ok: true,
+        result: { lifecycle: "running" },
+      });
+      records = [serviceModel("migration-replacement-model", "medium", true)];
+
+      await catalog.migrateLegacyPreference(null);
+
+      await vi.waitFor(() => {
+        expect(harness.stopReasons).toEqual(["model_unavailable"]);
+        expect(connectionInvalidations(harness)).toEqual(["model_unavailable"]);
+      });
+    } finally {
+      await rm(rootDirectory, { recursive: true, force: true });
+    }
   });
 
   it("immediately contains typed recovery-time model authority loss from the exact live runtime", async () => {
@@ -4893,6 +6057,115 @@ describe("DesktopChildServer", () => {
     await Promise.resolve();
     expect(connectionInvalidations(harness)).toEqual(invalidationsBeforeLateOldSignal);
     expect(harness.runtimeCreations()).toBe(2);
+  });
+
+  it("preserves LAN authority and creates a fresh runtime after action authority loss", async () => {
+    let reportAuthorityLoss:
+      | ((event: import("../../src/runtime/runtimeEvents.js").RuntimeAuthorityLoss) => void)
+      | undefined;
+    const stopReasons: TaskStopReason[] = [];
+    const runtime = new RuntimeFacade({
+      lifecycle: {
+        start: async () => undefined,
+        stop: async () => undefined,
+      },
+      task: {
+        current: () => null,
+        budget: () => ({
+          active: false,
+          stopReason: null,
+          limits: {
+            maxToolCalls: 64,
+            maxBlockChanges: 256,
+            maxHorizontalTravel: 1_024,
+            maxDurationMs: 600_000,
+            maxDangerousOperations: 8,
+          },
+          toolCalls: 0,
+          blockChanges: 0,
+          horizontalTravel: 0,
+          dangerousOperations: 0,
+          startedAt: null,
+        }),
+        stop: (reason) => stopReasons.push(reason),
+      },
+      authority: {
+        subscribe: (listener) => {
+          reportAuthorityLoss = listener;
+          return () => {
+            reportAuthorityLoss = undefined;
+          };
+        },
+      },
+    });
+    const harness = createHarness({ runtime });
+    harness.send(request("action-loss-start", "start_runtime"));
+    await expect(harness.nextResponse()).resolves.toMatchObject({
+      id: "action-loss-start",
+      ok: true,
+    });
+
+    reportAuthorityLoss?.({ reason: "action_unavailable" });
+    await vi.waitFor(() =>
+      expect(connectionInvalidations(harness)).toEqual(["action_unavailable"]),
+    );
+
+    expect(stopReasons).toEqual(["process_exit"]);
+    harness.send(request("action-loss-fresh-start", "start_runtime"));
+    await expect(harness.nextResponse()).resolves.toMatchObject({
+      id: "action-loss-fresh-start",
+      ok: true,
+      result: { lifecycle: "running" },
+    });
+    expect(harness.runtimeCreations()).toBe(2);
+  });
+
+  it("preserves confirmed LAN authority and creates a fresh runtime after readiness timeout", async () => {
+    let creations = 0;
+    const harness = createHarness({
+      lazyRuntime: true,
+      now: () => 1_000,
+      createRuntime: async (_connection, initialRevision) => {
+        creations += 1;
+        const failReadiness = creations === 1;
+        return new RuntimeFacade({
+          initialRevision,
+          lifecycle: {
+            start: async () => {
+              if (failReadiness) throw new ActionCapabilityError("timeout");
+            },
+            stop: async () => undefined,
+          },
+        });
+      },
+    });
+    harness.send(
+      commandRequest("action-readiness-confirm", {
+        kind: "set_confirmed_connection",
+        proof: {
+          nonce: "proof_nonce_action_readiness",
+          port: 51_321,
+          issuedAt: 1_000,
+          expiresAt: 11_000,
+        },
+      }),
+    );
+    await expect(harness.nextResponse()).resolves.toMatchObject({ ok: true });
+
+    harness.send(request("action-readiness-first", "start_runtime"));
+    await expect(harness.nextResponse()).resolves.toMatchObject({
+      id: "action-readiness-first",
+      ok: false,
+      error: { code: "MCP_READINESS_TIMEOUT" },
+    });
+
+    harness.send(request("action-readiness-retry", "start_runtime"));
+    await expect(harness.nextResponse()).resolves.toMatchObject({
+      id: "action-readiness-retry",
+      ok: true,
+      result: { lifecycle: "running" },
+    });
+    expect(creations).toBe(2);
   });
 
   it("consumes authority even when terminal runtime startup fails", async () => {

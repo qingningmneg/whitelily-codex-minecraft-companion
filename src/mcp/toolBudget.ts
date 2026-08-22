@@ -2,7 +2,14 @@ import { randomBytes } from "node:crypto";
 import { GAME_ACTION_KINDS } from "../domain/types.js";
 import { TaskControllerBudget, type TaskLease } from "../safety/taskBudget.js";
 
-export const TOOL_ACTION_KINDS = [...GAME_ACTION_KINDS, "get_state", "find_block"] as const;
+export const TOOL_ACTION_KINDS = [
+  ...GAME_ACTION_KINDS,
+  "get_state",
+  "find_block",
+  "inspect_block",
+  "find_blocks",
+  "get_furnace_state",
+] as const;
 export type ToolActionKind = (typeof TOOL_ACTION_KINDS)[number];
 
 export interface TrustedToolConsumption {
@@ -134,6 +141,64 @@ export class TurnToolBudget {
     this.totalCalls += 1;
     if (kind === "dig_block") this.attemptedDigCount += 1;
     if (kind === "place_block") this.attemptedPlaceCount += 1;
+    return { ok: true, snapshot: this.snapshot() };
+  }
+
+  consumeQueuedActions(
+    kinds: readonly ToolActionKind[],
+    lease?: string,
+    trustedConsumption: {
+      blockChanges?: number;
+      horizontalTravel?: number;
+      dangerousOperations?: number;
+    } = {},
+  ): BudgetConsumeResult {
+    const authorization = this.checkLease(lease);
+    if (!authorization.ok) return authorization;
+    if (
+      this.allowedActions !== undefined &&
+      kinds.some((kind) => !this.allowedActions!.has(kind))
+    ) {
+      return { ok: false, reason: "tool action is not allowed" };
+    }
+    const taskLease = this.taskLease;
+    if (!taskLease) return { ok: false, reason: "tool turn lease is invalid" };
+    const taskResult = this.taskBudget.consume({
+      lease: taskLease,
+      kind: "enqueue_actions",
+      now: this.taskBudget.currentTime(),
+      ...(trustedConsumption.blockChanges === undefined
+        ? {}
+        : { blockChanges: trustedConsumption.blockChanges }),
+      ...(trustedConsumption.horizontalTravel === undefined
+        ? {}
+        : { horizontalTravel: trustedConsumption.horizontalTravel }),
+      ...(trustedConsumption.dangerousOperations === undefined
+        ? {}
+        : { dangerousOperations: trustedConsumption.dangerousOperations }),
+    });
+    if (!taskResult.ok) return { ok: false, reason: "tool call budget exhausted" };
+    this.totalCalls += 1;
+    this.attemptedDigCount += kinds.filter((kind) => kind === "dig_block").length;
+    this.attemptedPlaceCount += kinds.filter((kind) => kind === "place_block").length;
+    if (trustedConsumption.horizontalTravel !== undefined) {
+      this.recordHorizontalTravel(trustedConsumption.horizontalTravel);
+    }
+    return { ok: true, snapshot: this.snapshot() };
+  }
+
+  consumeQueueControl(lease?: string): BudgetConsumeResult {
+    const authorization = this.checkLease(lease);
+    if (!authorization.ok) return authorization;
+    const taskLease = this.taskLease;
+    if (!taskLease) return { ok: false, reason: "tool turn lease is invalid" };
+    const taskResult = this.taskBudget.consume({
+      lease: taskLease,
+      kind: "queue_control",
+      now: this.taskBudget.currentTime(),
+    });
+    if (!taskResult.ok) return { ok: false, reason: "tool call budget exhausted" };
+    this.totalCalls += 1;
     return { ok: true, snapshot: this.snapshot() };
   }
 

@@ -109,7 +109,7 @@ describe("WorldSafetyPage", () => {
 
     await userEvent.click(
       await screen.findByRole("button", {
-        name: /Confirm and connect: port 25565, Minecraft 1\.21\.5/,
+        name: "Confirm and connect to this candidate",
       }),
     );
     expect(confirmLanCandidate).toHaveBeenCalledWith("lan_candidate_1234");

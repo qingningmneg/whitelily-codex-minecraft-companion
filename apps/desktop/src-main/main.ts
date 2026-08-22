@@ -18,6 +18,18 @@ import { exportSerializedJson } from "./safeExportDestination.js";
 import { saveDiagnosticArchive } from "./diagnosticExport.js";
 import { createStartupSettings } from "./startupSettings.js";
 import { DesktopPreferences } from "./desktopPreferences.js";
+import { MinecraftComponentPreferences } from "./minecraftComponentPreferences.js";
+import {
+  createMinecraftComponentManager,
+  type MinecraftComponentResourceManifest,
+} from "./minecraftComponents.js";
+import {
+  createWorkspaceVersionEnvironment,
+  provisionCodexWorkspace,
+  resolveDesktopCodexWorkspaceResources,
+  WorkspaceProvisionError,
+  type WorkspaceProvisionResult,
+} from "./codexWorkspaceProvisioner.js";
 import {
   createSupervisorTrayRuntime,
   createTrayController,
@@ -26,6 +38,7 @@ import {
   type TraySupervisorPort,
 } from "./tray.js";
 import { WHITE_LILY_IPC_CHANNELS } from "../src/desktopApi.js";
+import { createAvatarModelComposition } from "./avatar/avatarModelComposition.js";
 
 export function createMainWindowOptions(preloadPath: string): BrowserWindowConstructorOptions {
   return {
@@ -47,6 +60,97 @@ export interface DesktopCodexResources {
   resourceRoot: string;
   manifestPath: string;
   layout: "development" | "packaged";
+}
+
+export interface DesktopMinecraftComponentResources {
+  readonly resourceDirectory: string;
+  readonly presenceDirectory: string;
+  readonly manifest: MinecraftComponentResourceManifest;
+}
+
+const DESKTOP_MINECRAFT_COMPONENT_MANIFEST: MinecraftComponentResourceManifest = Object.freeze({
+  schemaVersion: 1,
+  minecraftVersion: "1.21.5",
+  artifacts: Object.freeze([
+    Object.freeze({
+      component: "bridge" as const,
+      fileName: "whitelily-bridge-fabric-1.21.5-0.1.2.jar",
+      bytes: 53_984,
+      sha256: "ac5bfab545b723b2346aeb017b3a6ea3186a6cbced370e16097f3836b128746d",
+      modId: "whitelily_bridge",
+      version: "0.1.2",
+      prior: Object.freeze([
+        Object.freeze({
+          fileName: "whitelily-bridge-fabric-1.21.5-0.1.1.jar",
+          bytes: 52_087,
+          sha256: "8a6e00d47a28799798ffa5d561156ea7ceb0f697a0beb2cc7c55b34f6f81b514",
+          modId: "whitelily_bridge",
+          version: "0.1.1",
+        }),
+        Object.freeze({
+          fileName: "whitelily-bridge-fabric-1.21.5-0.1.0.jar",
+          bytes: 51_837,
+          sha256: "380721d28236f5ad8206fd8d69af1e5629d741e9d38ec27c26c052c95266b6ce",
+          modId: "whitelily_bridge",
+          version: "0.1.0",
+        }),
+      ]),
+    }),
+    Object.freeze({
+      component: "avatar" as const,
+      fileName: "whitelily-avatar-fabric-1.21.5-0.1.1.jar",
+      bytes: 257_936,
+      sha256: "11a4375fada69928a4d1e0d8f6d330bc35ba23ab99c8b8e4c444eaa69f3a9271",
+      modId: "whitelily_avatar",
+      version: "0.1.1",
+      prior: Object.freeze([
+        Object.freeze({
+          fileName: "whitelily-avatar-fabric-1.21.5-0.1.0.jar",
+          bytes: 239_985,
+          sha256: "1fdba2b89281d7dbfb96d8e2ab3637caf95b20452831377f46e5285d37531351",
+          modId: "whitelily_avatar",
+          version: "0.1.0",
+        }),
+      ]),
+    }),
+    Object.freeze({
+      component: "avatar" as const,
+      fileName: "fabric-api-0.128.2+1.21.5.jar",
+      bytes: 2_248_994,
+      sha256: "a82fd00827206e911936ed1e0ceaec6eb55d061ca5d3c5d63c7f0031426d29ae",
+      modId: "fabric-api",
+      version: "0.128.2+1.21.5",
+      prior: Object.freeze([]),
+    }),
+  ]),
+});
+
+export function resolveDesktopMinecraftComponentResources(options: {
+  appPath: string;
+  resourcesPath: string;
+  dataRoot: string;
+  development: boolean;
+}): DesktopMinecraftComponentResources {
+  const repositoryRoot = resolve(options.appPath, "..", "..");
+  return Object.freeze({
+    resourceDirectory: options.development
+      ? resolve(repositoryRoot, "build", "minecraft-components")
+      : resolve(options.resourcesPath, "minecraft-components"),
+    presenceDirectory: resolve(options.dataRoot, "bridge", "presence"),
+    manifest: DESKTOP_MINECRAFT_COMPONENT_MANIFEST,
+  });
+}
+
+const APPLICATION_VERSION_PATTERN =
+  /^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/u;
+
+export function createDesktopAppVersionEnvironment(
+  appVersion: string,
+): Readonly<{ WHITELILY_APP_VERSION: string }> {
+  if (!APPLICATION_VERSION_PATTERN.test(appVersion)) {
+    throw new Error("WhiteLily application version is invalid");
+  }
+  return Object.freeze({ WHITELILY_APP_VERSION: appVersion });
 }
 
 export function resolveDesktopCodexResources(options: {
@@ -201,6 +305,7 @@ export interface PreparedElectronPrimary<TPaths> {
 }
 
 export interface ElectronPrimaryOptions<TPaths, TSupervisor> {
+  prepareSupervisor(paths: TPaths, localAppData: string): Promise<void>;
   createSupervisor(paths: TPaths, localAppData: string): TSupervisor;
   startComposition(supervisor: TSupervisor, transferOwnership: () => void): Promise<void>;
 }
@@ -222,6 +327,7 @@ export async function startElectronPrimary<TPaths, TSupervisor>(
   ownership: PrimaryStartupOwnership,
 ): Promise<void> {
   const { localAppData, paths } = prepared;
+  await options.prepareSupervisor(paths, localAppData);
   const supervisor = options.createSupervisor(paths, localAppData);
   await options.startComposition(supervisor, ownership.transferToComposition);
 }
@@ -248,12 +354,18 @@ export interface StartupTrayPort {
   destroy(): void;
 }
 
+export function createApplicationQuitRequest(
+  lifecycle: Pick<ApplicationLifecycle, "quit">,
+): () => Promise<void> {
+  return () => lifecycle.quit();
+}
+
 export interface ElectronStartupOptions<TWindow extends StartupWindowPort> {
   app: StartupAppPort;
   supervisor: StartupSupervisorPort;
   createWindow(): TWindow;
   configureWindow(window: TWindow): void;
-  registerIpc(window: TWindow): () => void;
+  registerIpc(window: TWindow, lifecycle: ApplicationLifecycle): () => void;
   createTray(window: TWindow, lifecycle: ApplicationLifecycle): StartupTrayPort;
   loadWindow(window: TWindow): Promise<void>;
   diagnostic(message: string): void;
@@ -306,6 +418,47 @@ export async function waitForRendererReady(options: {
 }
 
 const STARTUP_FAILURE_MESSAGE = "WhiteLily Electron startup failed";
+const STARTUP_ERROR_TITLE = "WhiteLily 启动失败";
+
+export interface ElectronMainFailureDisplayOptions {
+  run(): Promise<void>;
+  displayError(title: string, message: string): void | Promise<void>;
+  setExitCode(code: number): void;
+}
+
+export async function runElectronMainWithFailureDisplay(
+  options: ElectronMainFailureDisplayOptions,
+): Promise<void> {
+  try {
+    await options.run();
+  } catch (error) {
+    const message = localStartupFailureMessage(error);
+    try {
+      await options.displayError(STARTUP_ERROR_TITLE, message);
+    } catch {
+      // Failure display is best effort; deterministic process failure still follows.
+    }
+    try {
+      options.setExitCode(1);
+    } catch {
+      // The outer Electron process has no additional trusted recovery path.
+    }
+  }
+}
+
+function localStartupFailureMessage(error: unknown): string {
+  if (error instanceof WorkspaceProvisionError) {
+    switch (error.code) {
+      case "WORKSPACE_RESOURCE_INVALID":
+        return "无法验证 WhiteLily 动作工作区（WORKSPACE_RESOURCE_INVALID）。请重新安装 WhiteLily 后重试。";
+      case "WORKSPACE_DEPLOY_FAILED":
+        return "无法部署 WhiteLily 动作工作区（WORKSPACE_DEPLOY_FAILED）。请关闭 WhiteLily 后重试；如仍失败，请重新安装。";
+      case "WORKSPACE_ROLLBACK_FAILED":
+        return "无法恢复 WhiteLily 动作工作区（WORKSPACE_ROLLBACK_FAILED）。请保留当前用户数据并重新安装 WhiteLily。";
+    }
+  }
+  return "WhiteLily 无法启动（STARTUP_FAILED）。请重新启动；如仍失败，请重新安装。";
+}
 
 export async function startElectronComposition<TWindow extends StartupWindowPort>(
   options: ElectronStartupOptions<TWindow>,
@@ -341,7 +494,7 @@ export async function startElectronComposition<TWindow extends StartupWindowPort
     options.supervisor.start();
     mainWindow = options.createWindow();
     options.configureWindow(mainWindow);
-    cleanupIpc = options.registerIpc(mainWindow);
+    cleanupIpc = options.registerIpc(mainWindow, lifecycle);
     mainWindow.on(
       "close",
       createCloseToTrayHandler({
@@ -370,6 +523,7 @@ export async function runElectronMain(): Promise<void> {
   const { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, shell, Tray } =
     await import("electron");
   let mainWindow: InstanceType<typeof BrowserWindow> | undefined;
+  let workspaceProvision: WorkspaceProvisionResult | undefined;
   await runSingleInstanceApplication({
     app,
     showWindow: () => showExistingWindow(mainWindow),
@@ -382,6 +536,9 @@ export async function runElectronMain(): Promise<void> {
             mkdir(paths.dataRoot, { recursive: true }),
             mkdir(dirname(paths.configPath), { recursive: true }),
             mkdir(paths.logRoot, { recursive: true }),
+            mkdir(paths.avatarModelRoot, { recursive: true }),
+            mkdir(paths.avatarModelStagingRoot, { recursive: true }),
+            mkdir(paths.avatarModelBridgeRoot, { recursive: true }),
           ]);
         },
         setPath: (name, path) => app.setPath(name, path),
@@ -389,7 +546,23 @@ export async function runElectronMain(): Promise<void> {
     startPrimary: (prepared, ownership) =>
       startElectronPrimary(
         {
+          prepareSupervisor: async (paths) => {
+            workspaceProvision = undefined;
+            const workspaceResources = resolveDesktopCodexWorkspaceResources({
+              appPath: app.getAppPath(),
+              resourcesPath: process.resourcesPath,
+              development: !app.isPackaged,
+            });
+            workspaceProvision = await provisionCodexWorkspace({
+              resourceDirectory: workspaceResources.resourceDirectory,
+              dataRoot: paths.dataRoot,
+              diagnostic: (code) => console.error(code),
+            });
+          },
           createSupervisor: (paths, localAppData) => {
+            if (workspaceProvision === undefined) {
+              throw new Error("WhiteLily workspace was not provisioned");
+            }
             const appPath = app.getAppPath();
             const development = !app.isPackaged;
             const childEntry = development
@@ -411,6 +584,8 @@ export async function runElectronMain(): Promise<void> {
                 WHITELILY_CODEX_RESOURCE_ROOT: codexResources.resourceRoot,
                 WHITELILY_CODEX_MANIFEST: codexResources.manifestPath,
                 WHITELILY_CODEX_LAYOUT: codexResources.layout,
+                ...createDesktopAppVersionEnvironment(app.getVersion()),
+                ...createWorkspaceVersionEnvironment(workspaceProvision),
               },
               development,
             });
@@ -429,6 +604,17 @@ export async function runElectronMain(): Promise<void> {
               configPath: prepared.paths.configPath,
               lanDetector,
             });
+            const minecraftComponentResources = resolveDesktopMinecraftComponentResources({
+              appPath: app.getAppPath(),
+              resourcesPath: process.resourcesPath,
+              dataRoot: prepared.paths.dataRoot,
+              development: !app.isPackaged,
+            });
+            const minecraftComponentManager = createMinecraftComponentManager({
+              lanDetector,
+              worldBindingAuthority: worldAuthority,
+              ...minecraftComponentResources,
+            });
             const startupSettings = createStartupSettings({
               isPackaged: app.isPackaged,
               executablePath: process.execPath,
@@ -438,6 +624,9 @@ export async function runElectronMain(): Promise<void> {
             const desktopPreferences = new DesktopPreferences({
               rootDirectory: prepared.paths.dataRoot,
             });
+            await new MinecraftComponentPreferences({
+              dataRoot: prepared.paths.dataRoot,
+            }).initializeDefaults();
             let closeToTray = await desktopPreferences.read();
             const closeToTraySettings = {
               read: async () => ({
@@ -449,92 +638,147 @@ export async function runElectronMain(): Promise<void> {
                 return { revision: closeToTray.revision, enabled: closeToTray.value.closeToTray };
               },
             };
-            await startElectronComposition({
-              app,
-              supervisor: primary.supervisor,
-              createWindow: () => new BrowserWindow(createMainWindowOptions(primary.preloadPath)),
-              configureWindow: (window) => {
-                const externalUrlHandlers = createExternalUrlHandlers(externalUrlPolicy, (url) =>
-                  shell.openExternal(url),
-                );
-                window.webContents.setWindowOpenHandler(externalUrlHandlers.openWindow);
-                window.webContents.on("will-navigate", externalUrlHandlers.navigate);
-              },
-              registerIpc: (window) =>
-                registerIpcHandlers({
-                  ipcMain,
-                  supervisor: primary.supervisor,
-                  publishRuntime: (event) => {
-                    if (!window.isDestroyed()) {
-                      window.webContents.send(WHITE_LILY_IPC_CHANNELS.runtimeEvent, event);
-                    }
-                  },
-                  publishOwnerIdentity: (owner) => {
-                    if (!window.isDestroyed()) {
-                      window.webContents.send(WHITE_LILY_IPC_CHANNELS.ownerIdentityEvent, owner);
-                    }
-                  },
-                  externalUrlPolicy,
-                  openExternal: (url) => shell.openExternal(url),
-                  pcl2Discovery,
-                  lanDetector,
-                  worldAuthority,
-                  startupSettings,
-                  closeToTraySettings,
-                  exportSerialized: (serialized) =>
-                    exportSerializedJson({
-                      chooseDestination: () =>
-                        dialog.showSaveDialog(window, {
-                          title: "Export WhiteLily memories",
-                          defaultPath: "whitelily-memories.json",
-                          filters: [{ name: "JSON", extensions: ["json"] }],
-                          properties: ["createDirectory"],
-                        }),
-                      serialized,
-                    }),
-                  exportDiagnostic: (exportId, prepareArchive) =>
-                    saveDiagnosticArchive({
-                      dataRoot: prepared.paths.dataRoot,
-                      exportId,
-                      chooseDestination: () =>
-                        dialog.showSaveDialog(window, {
-                          title: "Export WhiteLily diagnostics",
-                          defaultPath: "whitelily-diagnostics.zip",
-                          filters: [{ name: "ZIP", extensions: ["zip"] }],
-                          properties: ["createDirectory"],
-                        }),
-                      prepareArchive,
-                    }),
+            const avatarModels = await createAvatarModelComposition({
+              dataRoot: prepared.paths.dataRoot,
+              resourcesPath: primary.development
+                ? resolve(primary.appPath, "resources")
+                : process.resourcesPath,
+              showOpenDialog: (options) =>
+                dialog.showOpenDialog({
+                  title: options.title,
+                  properties: [...options.properties],
+                  filters: options.filters.map((filter) => ({
+                    name: filter.name,
+                    extensions: [...filter.extensions],
+                  })),
                 }),
-              createTray: (window, lifecycle) =>
-                createNativeTray({
-                  buildMenu: (template) => Menu.buildFromTemplate(template),
-                  createTray: (icon) => new Tray(icon),
-                  lifecycle,
-                  nativeImage,
-                  showWindow: () => showExistingWindow(window),
-                  supervisor: primary.supervisor,
-                }),
-              loadWindow: async (window) => {
-                if (primary.development) {
-                  await window.loadURL("http://127.0.0.1:5173");
-                } else {
-                  await window.loadFile(resolve(primary.appPath, "dist-renderer", "index.html"));
-                }
-                await waitForRendererReady({
-                  probe: () =>
-                    window.webContents.executeJavaScript(
-                      'document.querySelector("#root")?.childElementCount > 0',
-                    ),
+              choosePortrait: async () => {
+                const choice = await dialog.showMessageBox({
+                  type: "question",
+                  title: "Optional portrait",
+                  message: "Choose an optional full portrait for this Minecraft skin?",
+                  buttons: ["Choose portrait", "Skip", "Cancel"],
+                  defaultId: 1,
+                  cancelId: 2,
+                  noLink: true,
                 });
+                return choice.response === 0 ? "pick" : choice.response === 1 ? "skip" : "cancel";
               },
-              diagnostic: (message) => console.error(message),
-              closeToTray: () => closeToTray.value.closeToTray,
-              onLifecycleOwned: transferOwnership,
-              onRendererReady: (window) => {
-                mainWindow = window;
-              },
+              subscribeRuntime: (listener) =>
+                primary.supervisor.subscribe((event) => listener(event)),
+              diagnostic: (code, modelId) =>
+                console.error(modelId === undefined ? code : `${code}:${modelId}`),
             });
+            try {
+              await startElectronComposition({
+                app,
+                supervisor: primary.supervisor,
+                createWindow: () => new BrowserWindow(createMainWindowOptions(primary.preloadPath)),
+                configureWindow: (window) => {
+                  const externalUrlHandlers = createExternalUrlHandlers(externalUrlPolicy, (url) =>
+                    shell.openExternal(url),
+                  );
+                  window.webContents.setWindowOpenHandler(externalUrlHandlers.openWindow);
+                  window.webContents.on("will-navigate", externalUrlHandlers.navigate);
+                },
+                registerIpc: (window, lifecycle) => {
+                  const cleanupIpc = registerIpcHandlers({
+                    ipcMain,
+                    supervisor: primary.supervisor,
+                    publishRuntime: (event) => {
+                      if (!window.isDestroyed()) {
+                        window.webContents.send(WHITE_LILY_IPC_CHANNELS.runtimeEvent, event);
+                      }
+                    },
+                    publishOwnerIdentity: (owner) => {
+                      if (!window.isDestroyed()) {
+                        window.webContents.send(WHITE_LILY_IPC_CHANNELS.ownerIdentityEvent, owner);
+                      }
+                    },
+                    publishAvatarModels: (snapshot) => {
+                      if (!window.isDestroyed()) {
+                        window.webContents.send(
+                          WHITE_LILY_IPC_CHANNELS.avatarModelsEvent,
+                          snapshot,
+                        );
+                      }
+                    },
+                    externalUrlPolicy,
+                    openExternal: (url) => shell.openExternal(url),
+                    pcl2Discovery,
+                    lanDetector,
+                    worldAuthority,
+                    minecraftComponentManager,
+                    startupSettings,
+                    closeToTraySettings,
+                    avatarModels,
+                    requestApplicationQuit: createApplicationQuitRequest(lifecycle),
+                    exportSerialized: (serialized) =>
+                      exportSerializedJson({
+                        chooseDestination: () =>
+                          dialog.showSaveDialog(window, {
+                            title: "Export WhiteLily memories",
+                            defaultPath: "whitelily-memories.json",
+                            filters: [{ name: "JSON", extensions: ["json"] }],
+                            properties: ["createDirectory"],
+                          }),
+                        serialized,
+                      }),
+                    exportDiagnostic: (exportId, prepareArchive) =>
+                      saveDiagnosticArchive({
+                        dataRoot: prepared.paths.dataRoot,
+                        exportId,
+                        chooseDestination: () =>
+                          dialog.showSaveDialog(window, {
+                            title: "Export WhiteLily diagnostics",
+                            defaultPath: "whitelily-diagnostics.zip",
+                            filters: [{ name: "ZIP", extensions: ["zip"] }],
+                            properties: ["createDirectory"],
+                          }),
+                        prepareArchive,
+                      }),
+                  });
+                  return () => {
+                    try {
+                      cleanupIpc();
+                    } finally {
+                      avatarModels.dispose();
+                    }
+                  };
+                },
+                createTray: (window, lifecycle) =>
+                  createNativeTray({
+                    buildMenu: (template) => Menu.buildFromTemplate(template),
+                    createTray: (icon) => new Tray(icon),
+                    lifecycle,
+                    nativeImage,
+                    showWindow: () => showExistingWindow(window),
+                    supervisor: primary.supervisor,
+                  }),
+                loadWindow: async (window) => {
+                  if (primary.development) {
+                    await window.loadURL("http://127.0.0.1:5173");
+                  } else {
+                    await window.loadFile(resolve(primary.appPath, "dist-renderer", "index.html"));
+                  }
+                  await waitForRendererReady({
+                    probe: () =>
+                      window.webContents.executeJavaScript(
+                        'document.querySelector("#root")?.childElementCount > 0',
+                      ),
+                  });
+                },
+                diagnostic: (message) => console.error(message),
+                closeToTray: () => closeToTray.value.closeToTray,
+                onLifecycleOwned: transferOwnership,
+                onRendererReady: (window) => {
+                  mainWindow = window;
+                },
+              });
+            } catch (error) {
+              avatarModels.dispose();
+              throw error;
+            }
           },
         },
         prepared,
@@ -622,7 +866,14 @@ function createFallbackTrayIcon(nativeImage: {
 }
 
 if (process.versions.electron) {
-  void runElectronMain().catch(() => {
-    process.exitCode = 1;
+  void runElectronMainWithFailureDisplay({
+    run: runElectronMain,
+    displayError: async (title, message) => {
+      const { dialog } = await import("electron");
+      dialog.showErrorBox(title, message);
+    },
+    setExitCode: (code) => {
+      process.exitCode = code;
+    },
   });
 }

@@ -4,6 +4,7 @@ import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { OwnerIdentitySnapshot } from "../../../../src/identity/ownerIdentity.js";
 import type { WhiteLilyAppApi } from "../desktopApi.js";
+import type { MinecraftComponentStatus } from "../../src-main/minecraftComponents.js";
 import { SettingsPage } from "./SettingsPage.js";
 
 const oldOwner: OwnerIdentitySnapshot = {
@@ -29,6 +30,10 @@ function api(overrides: Partial<WhiteLilyAppApi> = {}): WhiteLilyAppApi {
       configured: true,
       presence: "offline" as const,
     })),
+    detectLanCandidates: vi.fn(async () => []),
+    getMinecraftComponentStatus: vi.fn(),
+    installMinecraftComponents: vi.fn(),
+    removeMinecraftComponents: vi.fn(),
     ...overrides,
   } as WhiteLilyAppApi;
 }
@@ -124,6 +129,176 @@ describe("SettingsPage", () => {
       });
     });
     expect("updateSettings" in desktopApi).toBe(false);
+  });
+
+  it("detects a fresh verified instance and displays only fixed component names and states", async () => {
+    const observedAt = Date.now();
+    const status: MinecraftComponentStatus = {
+      state: "ready",
+      bridgeInstalled: true,
+      bridgeActive: true,
+      avatarInstalled: true,
+      restartRequired: false,
+    };
+    const desktopApi = api({
+      detectLanCandidates: vi.fn(async () => [
+        {
+          id: "lan_candidate_1234",
+          port: 51_321,
+          version: "1.21.5",
+          observedAt,
+          expiresAt: observedAt + 60_000,
+        },
+      ]),
+      getMinecraftComponentStatus: vi.fn(async () => status),
+    });
+    renderSettings(desktopApi);
+
+    expect(await screen.findByText("Current verified PCL2 Fabric 1.21.5 instance")).toBeTruthy();
+    expect(screen.getByText("Ready")).toBeTruthy();
+    expect(screen.getByText("WhiteLily Bridge")).toBeTruthy();
+    expect(screen.getByText("WhiteLily Avatar")).toBeTruthy();
+    expect(desktopApi.getMinecraftComponentStatus).toHaveBeenCalledWith("lan_candidate_1234");
+    expect(document.body.textContent).not.toContain("51321");
+    expect(document.body.textContent).not.toContain("lan_candidate_1234");
+    expect(document.body.textContent).not.toContain(String.raw`C:\Private`);
+    expect(document.body.textContent).not.toMatch(/[a-f0-9]{64}/u);
+  });
+
+  it("does not claim an instance is verified when fresh detection finds none", async () => {
+    renderSettings(api());
+
+    expect(
+      await screen.findByText(/No current verified PCL2 Fabric 1\.21\.5 instance is available/u),
+    ).toBeTruthy();
+    expect(screen.queryByText("Current verified PCL2 Fabric 1.21.5 instance")).toBeNull();
+  });
+
+  it("renders an unsupported manager status as non-actionable and unverified", async () => {
+    const observedAt = Date.now();
+    renderSettings(
+      api({
+        detectLanCandidates: vi.fn(async () => [
+          {
+            id: "lan_candidate_1234",
+            port: 51_321,
+            version: "1.21.5",
+            observedAt,
+            expiresAt: observedAt + 60_000,
+          },
+        ]),
+        getMinecraftComponentStatus: vi.fn<WhiteLilyAppApi["getMinecraftComponentStatus"]>(
+          async () => ({
+            state: "bridge_version_unsupported",
+            bridgeInstalled: false,
+            bridgeActive: false,
+            avatarInstalled: false,
+            restartRequired: false,
+          }),
+        ),
+      }),
+    );
+
+    expect(
+      await screen.findByText(
+        "This candidate is not a verified PCL2 Fabric 1.21.5 instance. Component installation is unavailable.",
+      ),
+    ).toBeTruthy();
+    expect(screen.queryByText("Current verified PCL2 Fabric 1.21.5 instance")).toBeNull();
+    expect(screen.queryByRole("button", { name: /Install or update/u })).toBeNull();
+    expect(screen.queryByRole("button", { name: /Remove Bridge/u })).toBeNull();
+  });
+
+  it("uses a fresh candidate for Bridge-only and Bridge plus Avatar install or update", async () => {
+    const observedAt = Date.now();
+    let generation = 0;
+    const detectLanCandidates = vi.fn(async () => {
+      generation += 1;
+      return [
+        {
+          id: `lan_candidate_${String(generation).padStart(4, "0")}`,
+          port: 51_321,
+          version: "1.21.5" as const,
+          observedAt,
+          expiresAt: observedAt + 60_000,
+        },
+      ];
+    });
+    const status: MinecraftComponentStatus = {
+      state: "avatar_not_installed",
+      bridgeInstalled: true,
+      bridgeActive: true,
+      avatarInstalled: false,
+      restartRequired: false,
+    };
+    const installMinecraftComponents = vi.fn(async () => status);
+    const desktopApi = api({
+      detectLanCandidates,
+      getMinecraftComponentStatus: vi.fn(async () => status),
+      installMinecraftComponents,
+    });
+    renderSettings(desktopApi);
+    const user = userEvent.setup();
+
+    await screen.findByText("Current verified PCL2 Fabric 1.21.5 instance");
+    await user.click(screen.getByRole("button", { name: "Install or update Bridge only" }));
+    await waitFor(() =>
+      expect(installMinecraftComponents).toHaveBeenCalledWith("lan_candidate_0002", ["bridge"]),
+    );
+    await user.click(screen.getByRole("button", { name: "Install or update Bridge and Avatar" }));
+    await waitFor(() =>
+      expect(installMinecraftComponents).toHaveBeenLastCalledWith("lan_candidate_0003", [
+        "bridge",
+        "avatar",
+      ]),
+    );
+    expect(detectLanCandidates).toHaveBeenCalledTimes(3);
+  });
+
+  it("removes Avatar alone but closes Avatar before Bridge using a fresh candidate", async () => {
+    const observedAt = Date.now();
+    let generation = 0;
+    const detectLanCandidates = vi.fn(async () => {
+      generation += 1;
+      return [
+        {
+          id: `lan_candidate_${String(generation).padStart(4, "0")}`,
+          port: 51_321,
+          version: "1.21.5" as const,
+          observedAt,
+          expiresAt: observedAt + 60_000,
+        },
+      ];
+    });
+    const status: MinecraftComponentStatus = {
+      state: "ready",
+      bridgeInstalled: true,
+      bridgeActive: true,
+      avatarInstalled: true,
+      restartRequired: false,
+    };
+    const removeMinecraftComponents = vi.fn(async () => status);
+    const desktopApi = api({
+      detectLanCandidates,
+      getMinecraftComponentStatus: vi.fn(async () => status),
+      removeMinecraftComponents,
+    });
+    renderSettings(desktopApi);
+    const user = userEvent.setup();
+
+    await screen.findByText("Current verified PCL2 Fabric 1.21.5 instance");
+    await user.click(screen.getByRole("button", { name: "Remove Avatar" }));
+    await waitFor(() =>
+      expect(removeMinecraftComponents).toHaveBeenCalledWith("lan_candidate_0002", ["avatar"]),
+    );
+    await user.click(screen.getByRole("button", { name: "Remove Bridge and Avatar" }));
+    await waitFor(() =>
+      expect(removeMinecraftComponents).toHaveBeenLastCalledWith("lan_candidate_0003", [
+        "avatar",
+        "bridge",
+      ]),
+    );
+    expect(detectLanCandidates).toHaveBeenCalledTimes(3);
   });
 
   it("reloads a close-to-tray conflict, retains the desired value, and requires reapply", async () => {

@@ -1,6 +1,7 @@
 package io.github.whitelily.avatar;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -14,19 +15,20 @@ final class ModuleMetadataTest {
     assertTrue(json.contains("\"environment\": \"client\""));
     assertTrue(json.contains("\"minecraft\": \"=1.21.5\""));
     assertTrue(json.contains("\"fabricloader\": \">=0.16.14\""));
-    assertTrue(json.contains("\"geckolib\": \"=5.1.0\""));
+    assertTrue(json.contains("\"whitelily_bridge\": \">=0.1.0\""));
+    assertFalse(json.contains("\"geckolib\""));
   }
 
   @Test
   void publishesTheStableComponentVersion() {
-    assertEquals("0.1.0", WhiteLilyAvatarClient.COMPONENT_VERSION);
+    assertEquals("0.1.1", WhiteLilyAvatarClient.COMPONENT_VERSION);
   }
 
   @Test
   void expandsTheComponentVersionIntoProcessedFabricMetadata() throws Exception {
     String json = Files.readString(Path.of("build/resources/main/fabric.mod.json"));
 
-    assertTrue(json.contains("\"version\": \"0.1.0\""), () -> json);
+    assertTrue(json.contains("\"version\": \"0.1.1\""), () -> json);
   }
 
   @Test

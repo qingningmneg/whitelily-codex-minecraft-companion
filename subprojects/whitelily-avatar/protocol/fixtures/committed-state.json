@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "requestId": "switch-0001",
+  "phase": "committed",
+  "activeModelId": "builtin:whitelily-hd",
+  "candidateModelId": "builtin:whitelily-hd",
+  "worldSessionId": "world-0001",
+  "updatedAt": "2026-08-16T08:00:02.000Z"
+}

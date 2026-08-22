@@ -203,7 +203,7 @@ describe("CodexAppServerClient", () => {
       method: "initialize",
       params: {
         clientInfo: { name: "whitelily-companion", title: null, version: "0.1.1" },
-        capabilities: { experimentalApi: false, requestAttestation: false },
+        capabilities: { experimentalApi: true, requestAttestation: false },
       },
     });
     harness.receive({ id: 1, result: initialized });
@@ -297,6 +297,111 @@ describe("CodexAppServerClient", () => {
       text: "",
       status: "interrupted",
     });
+  });
+
+  it("grants dynamic Minecraft tools only to an explicitly tool-enabled thread", async () => {
+    const harness = createJsonRpcLineTransportHarness();
+    const client = new CodexAppServerClient(config, dependencies(harness));
+    const dynamicTools = {
+      specs: [
+        {
+          type: "function" as const,
+          name: "minecraft_follow_owner",
+          description: "Follow the configured owner.",
+          inputSchema: { type: "object" },
+          deferLoading: false,
+        },
+      ],
+      call: vi.fn(async () => ({
+        contentItems: [{ type: "inputText" as const, text: '{"status":"completed"}' }],
+        success: true,
+      })),
+    };
+    client.configureDynamicTools(dynamicTools);
+
+    const starting = client.start();
+    await expect(harness.nextSent()).resolves.toEqual({
+      id: 1,
+      method: "initialize",
+      params: {
+        clientInfo: { name: "whitelily-companion", title: null, version: "0.1.1" },
+        capabilities: { experimentalApi: true, requestAttestation: false },
+      },
+    });
+    harness.receive({ id: 1, result: initialized });
+    await starting;
+    await expect(harness.nextSent()).resolves.toEqual({ method: "initialized", params: {} });
+
+    const intent = client.startThread({
+      cwd: "C:/ignored",
+      model: "gpt-5.6-terra",
+      reasoningEffort: "medium",
+      toolAccess: "none",
+    });
+    await expect(harness.nextSent()).resolves.toEqual({
+      id: 2,
+      method: "thread/start",
+      params: {
+        model: "gpt-5.6-terra",
+        cwd: "C:/WhiteLily/codex-workspace",
+        sandbox: "read-only",
+        approvalPolicy: "never",
+      },
+    });
+    harness.receive({ id: 2, result: { thread: { id: "thread-intent" } } });
+    await expect(intent).resolves.toBe("thread-intent");
+
+    const execution = client.startThread({
+      cwd: "C:/ignored",
+      model: "gpt-5.6-terra",
+      reasoningEffort: "medium",
+      toolAccess: "minecraft",
+    });
+    await expect(harness.nextSent()).resolves.toEqual({
+      id: 3,
+      method: "thread/start",
+      params: {
+        model: "gpt-5.6-terra",
+        cwd: "C:/WhiteLily/codex-workspace",
+        sandbox: "read-only",
+        approvalPolicy: "never",
+        dynamicTools: dynamicTools.specs,
+      },
+    });
+    harness.receive({ id: 3, result: { thread: { id: "thread-execution" } } });
+    await expect(execution).resolves.toBe("thread-execution");
+
+    const params = {
+      threadId: "thread-execution",
+      turnId: "turn-1",
+      callId: "call-1",
+      namespace: null,
+      tool: "minecraft_follow_owner",
+      arguments: { distance: 3, turnLease: "a".repeat(43) },
+    };
+    harness.receive({ id: "server-tool-1", method: "item/tool/call", params });
+    await expect(harness.nextSent()).resolves.toEqual({
+      id: "server-tool-1",
+      result: {
+        contentItems: [{ type: "inputText", text: '{"status":"completed"}' }],
+        success: true,
+      },
+    });
+    expect(dynamicTools.call).toHaveBeenCalledWith(params);
+
+    harness.receive({
+      id: "server-tool-2",
+      method: "item/tool/call",
+      params: { ...params, threadId: "thread-intent" },
+    });
+    await expect(harness.nextSent()).resolves.toEqual({
+      id: "server-tool-2",
+      result: {
+        contentItems: [{ type: "inputText", text: '{"error":"Minecraft tool is unavailable"}' }],
+        success: false,
+      },
+    });
+    expect(dynamicTools.call).toHaveBeenCalledTimes(1);
   });
 
   it("refuses an API-key login before spawning the app server", async () => {
@@ -445,6 +550,112 @@ describe("CodexAppServerClient", () => {
     harness.receive({ id: 3, result: { thread: { id: "thread-2" } } });
     await expect(secondThread).resolves.toBe("thread-2");
 
+    await client.stop();
+  });
+
+  it("archives one thread without retiring the app server and clears its reasoning effort", async () => {
+    const harness = createJsonRpcLineTransportHarness();
+    const client = new CodexAppServerClient(config, dependencies(harness));
+    const starting = client.start();
+    await harness.nextSent();
+    harness.receive({ id: 1, result: initialized });
+    await starting;
+    await harness.nextSent();
+
+    const thread = client.startThread({
+      cwd: "C:/ignored",
+      model: "gpt-5.6-terra",
+      reasoningEffort: "high",
+    });
+    await expect(harness.nextSent()).resolves.toMatchObject({ id: 2, method: "thread/start" });
+    harness.receive({ id: 2, result: { thread: { id: "thread-2" } } });
+    await thread;
+
+    const closing = client.closeThread("thread-2");
+    await expect(harness.nextSent()).resolves.toEqual({
+      id: 3,
+      method: "thread/archive",
+      params: { threadId: "thread-2" },
+    });
+    harness.receive({ id: 3, result: {} });
+    await expect(closing).resolves.toBeUndefined();
+
+    expect(() =>
+      client.configureRuntime({ workspacePath: "C:/other-workspace", reasoningEffort: "low" }),
+    ).toThrow("active session");
+    expect(harness.closed()).toBe(false);
+
+    const turn = client.sendTurn("thread-2", "after archive");
+    await expect(harness.nextSent()).resolves.toEqual({
+      id: 4,
+      method: "turn/start",
+      params: {
+        threadId: "thread-2",
+        input: [{ type: "text", text: "after archive", text_elements: [] }],
+        effort: "medium",
+      },
+    });
+    harness.receive({ id: 4, result: { turn: { id: "turn-1" } } });
+    harness.receive({
+      method: "turn/completed",
+      params: { threadId: "thread-2", turn: { id: "turn-1", status: "completed" } },
+    });
+    await turn;
+    await client.stop();
+  });
+
+  it("retains thread effort when archiving fails so the archive can be retried", async () => {
+    const harness = createJsonRpcLineTransportHarness();
+    const client = new CodexAppServerClient(config, dependencies(harness));
+    const starting = client.start();
+    await harness.nextSent();
+    harness.receive({ id: 1, result: initialized });
+    await starting;
+    await harness.nextSent();
+
+    const thread = client.startThread({
+      cwd: "C:/ignored",
+      model: "gpt-5.6-terra",
+      reasoningEffort: "high",
+    });
+    await harness.nextSent();
+    harness.receive({ id: 2, result: { thread: { id: "thread-2" } } });
+    await thread;
+
+    const failedClosing = client.closeThread("thread-2");
+    await expect(harness.nextSent()).resolves.toEqual({
+      id: 3,
+      method: "thread/archive",
+      params: { threadId: "thread-2" },
+    });
+    harness.receive({ id: 3, error: { code: -32_000, message: "archive failed" } });
+    await expect(failedClosing).rejects.toThrow("Codex app-server request failed");
+
+    const turn = client.sendTurn("thread-2", "after failed archive");
+    await expect(harness.nextSent()).resolves.toEqual({
+      id: 4,
+      method: "turn/start",
+      params: {
+        threadId: "thread-2",
+        input: [{ type: "text", text: "after failed archive", text_elements: [] }],
+        effort: "high",
+      },
+    });
+    harness.receive({ id: 4, result: { turn: { id: "turn-1" } } });
+    harness.receive({
+      method: "turn/completed",
+      params: { threadId: "thread-2", turn: { id: "turn-1", status: "completed" } },
+    });
+    await turn;
+
+    const retry = client.closeThread("thread-2");
+    await expect(harness.nextSent()).resolves.toEqual({
+      id: 5,
+      method: "thread/archive",
+      params: { threadId: "thread-2" },
+    });
+    harness.receive({ id: 5, result: {} });
+    await expect(retry).resolves.toBeUndefined();
     await client.stop();
   });
 

@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "productVersion": "0.2.0-beta.1",
+  "productVersion": "0.2.0-beta.2",
   "target": {
     "platform": "win32",
     "arch": "x64"
@@ -16,7 +16,14 @@
     "codexPackage": "codex/package",
     "codexNativePackage": "codex/native",
     "codexExecutable": "codex/native/vendor/x86_64-pc-windows-msvc/bin/codex.exe",
-    "licenses": "licenses"
+    "licenses": "licenses",
+    "minecraftComponents": "minecraft-components"
+  },
+  "managedWorkspace": {
+    "root": "codex-workspace",
+    "manifest": "codex-workspace/workspace-manifest.json",
+    "payloads": [".codex/config.toml", "AGENTS.md"],
+    "mcpUrl": "http://127.0.0.1:32123/mcp"
   },
   "allowlist": {
     "generatedRoots": [
@@ -52,8 +59,8 @@
       {
         "source": "package-lock.json",
         "target": null,
-        "bytes": 327602,
-        "sha256": "c8d3f3480aeffbc416770889cd1f46879485b411681dc610c9783cc4da18bec8"
+        "bytes": 330765,
+        "sha256": "aaf8b7de5aa037d1c3b9dc2a8ab4860db9fb2583d8d72e9f24fb7bb6e5ac4dd1"
       },
       {
         "source": "node_modules/electron/package.json",
@@ -142,8 +149,50 @@
       {
         "source": "NOTICE",
         "target": "licenses/WhiteLily-NOTICE.txt",
-        "bytes": 459,
-        "sha256": "d14e84981ee7c7c43cb8ae0e3b22eea184c1f23cc05d68d73659dd8bf616a05c"
+        "bytes": 795,
+        "sha256": "bc5ab24ff5624664bc3ef3d5b850ac3c820dddf3b2f15a4125b355f1c65a2c2a"
+      },
+      {
+        "source": "build/minecraft-components/fabric-api-0.128.2+1.21.5.jar",
+        "target": "minecraft-components/fabric-api-0.128.2+1.21.5.jar",
+        "bytes": 2248994,
+        "sha256": "a82fd00827206e911936ed1e0ceaec6eb55d061ca5d3c5d63c7f0031426d29ae"
+      },
+      {
+        "source": "build/minecraft-components/Fabric-API-LICENSE.txt",
+        "target": "minecraft-components/Fabric-API-LICENSE.txt",
+        "bytes": 11357,
+        "sha256": "b40930bbcf80744c86c46a12bc9da056641d722716c378f5659b9e555ef833e1"
+      },
+      {
+        "source": "build/minecraft-components/minecraft-components-manifest.json",
+        "target": "minecraft-components/minecraft-components-manifest.json",
+        "bytes": 1824,
+        "sha256": "351ec06b27422e7afb719f42a2c8821806aaf8a6864ca7c6192f7b93a2905e87"
+      },
+      {
+        "source": "build/minecraft-components/whitelily-avatar-fabric-1.21.5-0.1.1.jar",
+        "target": "minecraft-components/whitelily-avatar-fabric-1.21.5-0.1.1.jar",
+        "bytes": 257936,
+        "sha256": "11a4375fada69928a4d1e0d8f6d330bc35ba23ab99c8b8e4c444eaa69f3a9271"
+      },
+      {
+        "source": "build/minecraft-components/whitelily-bridge-fabric-1.21.5-0.1.2.jar",
+        "target": "minecraft-components/whitelily-bridge-fabric-1.21.5-0.1.2.jar",
+        "bytes": 53984,
+        "sha256": "ac5bfab545b723b2346aeb017b3a6ea3186a6cbced370e16097f3836b128746d"
+      },
+      {
+        "source": "build/minecraft-components/WhiteLily-LICENSE.txt",
+        "target": "minecraft-components/WhiteLily-LICENSE.txt",
+        "bytes": 11123,
+        "sha256": "226d0e41f61309952c27fcc11a5140c4e735115f702ff0484ff0c25cfbbeee16"
+      },
+      {
+        "source": "build/minecraft-components/WhiteLily-NOTICE.txt",
+        "target": "minecraft-components/WhiteLily-NOTICE.txt",
+        "bytes": 795,
+        "sha256": "bc5ab24ff5624664bc3ef3d5b850ac3c820dddf3b2f15a4125b355f1c65a2c2a"
       }
     ],
     "generatedFiles": [
@@ -152,6 +201,9 @@
       "licenses/OpenAI-Codex-NOTICE.txt"
     ],
     "requiredFiles": [
+      "codex-workspace/.codex/config.toml",
+      "codex-workspace/AGENTS.md",
+      "codex-workspace/workspace-manifest.json",
       "core/childMain.js",
       "desktop/main/main.js",
       "desktop/preload/preload.cjs",
@@ -163,7 +215,14 @@
       "codex/native/vendor/x86_64-pc-windows-msvc/codex-resources/codex-windows-sandbox-setup.exe",
       "licenses/WhiteLily-LICENSE.txt",
       "licenses/WhiteLily-NOTICE.txt",
-      "licenses/OpenAI-Codex-NOTICE.txt"
+      "licenses/OpenAI-Codex-NOTICE.txt",
+      "minecraft-components/fabric-api-0.128.2+1.21.5.jar",
+      "minecraft-components/Fabric-API-LICENSE.txt",
+      "minecraft-components/minecraft-components-manifest.json",
+      "minecraft-components/whitelily-avatar-fabric-1.21.5-0.1.1.jar",
+      "minecraft-components/whitelily-bridge-fabric-1.21.5-0.1.2.jar",
+      "minecraft-components/WhiteLily-LICENSE.txt",
+      "minecraft-components/WhiteLily-NOTICE.txt"
     ],
     "executableFiles": [
       "codex/native/vendor/x86_64-pc-windows-msvc/bin/codex.exe",

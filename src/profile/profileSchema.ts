@@ -1,7 +1,7 @@
 import { z } from "zod";
+import { MODEL_ID_PATTERN } from "../codex/modelId.js";
 import type { CompanionMode } from "../domain/types.js";
 
-const MODEL_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const REASONING_EFFORT_PATTERN = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/u;
 
 function boundedWellFormedString(

@@ -36,6 +36,10 @@ $sourceManifest = Get-Content -LiteralPath $sourceManifestPath -Raw -Encoding UT
 $policySha256 = Get-Sha256Hex $sourceManifestPath
 $rootPackage = Get-Content -LiteralPath (Join-Path $repositoryRoot 'package.json') -Raw -Encoding UTF8 | ConvertFrom-Json
 $desktopPackage = Get-Content -LiteralPath (Join-Path $repositoryRoot 'apps/desktop/package.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+$verifiedProductVersion = & node (Join-Path $PSScriptRoot 'verify-product-versions.mjs') $repositoryRoot
+if ($LASTEXITCODE -ne 0) {
+    throw "product version verification failed with exit code $LASTEXITCODE"
+}
 $lockVersionsJson = & node -e @'
 const lock = require('./package-lock.json');
 process.stdout.write(JSON.stringify({
@@ -59,8 +63,7 @@ function Assert-ExactValue {
     }
 }
 
-Assert-ExactValue $rootPackage.version $sourceManifest.productVersion 'root package'
-Assert-ExactValue $desktopPackage.version $sourceManifest.productVersion 'desktop package'
+Assert-ExactValue $verifiedProductVersion $sourceManifest.productVersion 'verified product'
 Assert-ExactValue $desktopPackage.devDependencies.electron $sourceManifest.versions.electron 'Electron'
 Assert-ExactValue $desktopPackage.devDependencies.'electron-builder' $sourceManifest.versions.electronBuilder 'electron-builder'
 Assert-ExactValue $rootPackage.dependencies.'@openai/codex' $sourceManifest.versions.codex 'Codex'
@@ -79,6 +82,20 @@ function Invoke-CheckedNpm {
     & npm @Arguments
     if ($LASTEXITCODE -ne 0) {
         throw "npm $($Arguments -join ' ') failed with exit code $LASTEXITCODE"
+    }
+}
+
+function Invoke-CheckedMinecraftComponentStage {
+    $avatarProject = Join-Path $repositoryRoot 'subprojects/whitelily-avatar'
+    $gradleWrapper = Join-Path $avatarProject 'gradlew.bat'
+    & $gradleWrapper `
+        '-p' $avatarProject `
+        ':stageMinecraftComponents' `
+        '--offline' `
+        '--no-daemon' `
+        '--max-workers=1'
+    if ($LASTEXITCODE -ne 0) {
+        throw "Minecraft component staging failed with exit code $LASTEXITCODE"
     }
 }
 
@@ -101,10 +118,74 @@ function Assert-ReviewedFile {
         throw "reviewed source dependency is missing: $($Entry.source)"
     }
     $file = Get-Item -LiteralPath $path
+    if (($file.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "reviewed source dependency cannot be a link or reparse point: $($Entry.source)"
+    }
     $hash = Get-Sha256Hex $path
     if ($file.Length -ne [long]$Entry.bytes -or -not [StringComparer]::Ordinal.Equals($hash, [string]$Entry.sha256)) {
         throw "reviewed source dependency hash mismatch: $($Entry.source)"
     }
+}
+
+function Assert-ExactMinecraftComponentPack {
+    $componentTargetPrefix = 'minecraft-components/'
+    $componentEntries = @(
+        $sourceManifest.allowlist.exactFiles |
+            Where-Object { $null -ne $_.target -and ([string]$_.target).StartsWith($componentTargetPrefix, [StringComparison]::Ordinal) }
+    )
+    if ($componentEntries.Count -ne 7) {
+        throw 'reviewed Minecraft component pack must declare exactly seven files'
+    }
+
+    $componentRoot = Join-Path $repositoryRoot 'build/minecraft-components'
+    if (-not (Test-Path -LiteralPath $componentRoot -PathType Container)) {
+        throw 'reviewed Minecraft component pack is missing'
+    }
+    $componentRootItem = Get-Item -LiteralPath $componentRoot -Force
+    if (($componentRootItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw 'reviewed Minecraft component pack cannot be a link or reparse point'
+    }
+
+    [string[]]$expectedNames = @(
+        $componentEntries |
+            ForEach-Object { [System.IO.Path]::GetFileName(([string]$_.source).Replace('/', [System.IO.Path]::DirectorySeparatorChar)) }
+    )
+    [string[]]$actualNames = @(
+        Get-ChildItem -LiteralPath $componentRoot -Force |
+            ForEach-Object {
+                if (-not $_.PSIsContainer -and ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq 0) {
+                    return $_.Name
+                }
+                throw "reviewed Minecraft component pack contains a non-file entry: $($_.Name)"
+            }
+    )
+    [Array]::Sort($expectedNames, [StringComparer]::Ordinal)
+    [Array]::Sort($actualNames, [StringComparer]::Ordinal)
+    if (-not [System.Linq.Enumerable]::SequenceEqual([string[]]$actualNames, [string[]]$expectedNames)) {
+        throw 'reviewed Minecraft component pack contains a missing or unreviewed file'
+    }
+}
+
+Invoke-CheckedMinecraftComponentStage
+Assert-ExactMinecraftComponentPack
+$nodeExecutable = (Get-Command node -ErrorAction Stop).Source
+$componentVerificationOutput = @(
+    & (Join-Path $PSScriptRoot 'invoke-bounded-component-verifier.ps1') `
+        -NodeExecutable $nodeExecutable `
+        -VerifierPath (Join-Path $PSScriptRoot 'verify-minecraft-component-pack.mjs') `
+        -RepositoryRoot $repositoryRoot `
+        -ManifestPath $sourceManifestPath `
+        -TimeoutMilliseconds 15000 `
+        -MaximumOutputBytes 256
+)
+if (
+    $componentVerificationOutput.Count -ne 1 -or
+    -not [StringComparer]::Ordinal.Equals(
+        [string]$componentVerificationOutput[0],
+        '{"status":"ok","files":7}'
+    )
+) {
+    throw 'Minecraft component pack verification failed'
 }
 
 foreach ($entry in $sourceManifest.allowlist.exactFiles) {
@@ -152,6 +233,16 @@ function Copy-AllowlistedDirectory {
 }
 
 try {
+    $managedWorkspaceRoot = Join-Path $staging ([string]$sourceManifest.managedWorkspace.root)
+    New-Item -ItemType Directory -Path $managedWorkspaceRoot | Out-Null
+    & node `
+        (Join-Path $PSScriptRoot 'build-codex-workspace.mjs') `
+        (Join-Path $repositoryRoot 'codex-workspace') `
+        $managedWorkspaceRoot
+    if ($LASTEXITCODE -ne 0) {
+        throw "managed Codex workspace build failed with exit code $LASTEXITCODE"
+    }
+
     $coreRoot = Join-Path $staging 'core'
     foreach ($rule in $sourceManifest.allowlist.generatedRoots) {
         Copy-AllowlistedDirectory `
@@ -255,6 +346,7 @@ Package metadata and upstream notices are preserved under codex/package and code
         target = $sourceManifest.target
         versions = $sourceManifest.versions
         paths = $sourceManifest.paths
+        managedWorkspace = $sourceManifest.managedWorkspace
         allowlist = $sourceManifest.allowlist
         policySha256 = $policySha256
         resources = $resources

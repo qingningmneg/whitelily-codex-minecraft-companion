@@ -25,8 +25,10 @@ import type { TaskStopReason } from "../safety/taskBudget.js";
 import type { AccountSnapshot, LoginAttempt } from "../codex/accountService.js";
 import type {
   ModelCatalogSnapshot,
+  ModelCatalogEvent,
   ModelSelection,
   ModelSelectionInput,
+  PreparedModelSelection,
   ResolvedModelSelection,
 } from "../codex/modelCatalog.js";
 import type { ConfirmedRuntimeConnection } from "../config/schema.js";
@@ -54,9 +56,15 @@ import type {
 } from "../diagnostics/diagnosticExporter.js";
 import type { DiagnosticPreview } from "../diagnostics/diagnosticManifest.js";
 import { OwnerIdentityError, type OwnerIdentityAccess } from "../identity/ownerIdentity.js";
+import { ActionCapabilityError } from "../app.js";
+import { MineflayerBridgeError } from "../minecraft/mineflayerConnection.js";
 
 export interface DesktopChildRuntime {
   start(): Promise<void>;
+  switchModel(
+    selection: ResolvedModelSelection,
+    commitPreference: () => Promise<void>,
+  ): Promise<void>;
   stop(reason: TaskStopReason): Promise<void>;
   stopTask(): Promise<void>;
   snapshot(): RuntimeSnapshot;
@@ -111,6 +119,11 @@ interface AcceptedConnectionAuthority {
   readonly generation: number;
 }
 
+interface RecoveryConnectionAuthority {
+  readonly connection: ConfirmedRuntimeConnection;
+  readonly explicitModelRecovery: boolean;
+}
+
 interface RuntimeReplacementOperation {
   readonly generation: number;
   retirementReason?: TaskStopReason;
@@ -122,6 +135,7 @@ interface AuthorityInvalidationPolicy {
   publicReason: ConnectionInvalidationReason;
   preserveWorldBinding: boolean;
   preserveConnectionAuthority: boolean;
+  explicitModelRecovery: boolean;
   finalized: boolean;
 }
 
@@ -140,9 +154,12 @@ export interface DesktopChildAccountService {
 
 export interface DesktopChildModelCatalog {
   listModels(): Promise<ModelCatalogSnapshot>;
+  migrateLegacyPreference(candidate: ModelSelectionInput | null): Promise<ModelCatalogSnapshot>;
   selectModel(selection: ModelSelectionInput): Promise<ModelSelection>;
+  prepareSelection(selection: ModelSelectionInput): Promise<PreparedModelSelection>;
+  commitSelection(prepared: PreparedModelSelection): Promise<ModelSelection>;
   resolveRuntimeSelection(options?: { signal?: AbortSignal }): Promise<ResolvedModelSelection>;
-  subscribeInvalidation(listener: () => void): () => void;
+  subscribe(listener: (event: ModelCatalogEvent) => void): () => void;
   stop(): void;
 }
 
@@ -200,7 +217,10 @@ export interface DesktopChildMemoryStore {
 }
 
 export interface DesktopChildDiagnostics {
-  preview(): Promise<DiagnosticPreview>;
+  preview(
+    actions: RuntimeSnapshot["actions"],
+    lastError: RuntimeSnapshot["lastError"],
+  ): Promise<DiagnosticPreview>;
   createArchive(exportId: string): Promise<PreparedDiagnosticArchive>;
   dispose(): Promise<void>;
 }
@@ -231,6 +251,11 @@ type RetainedMemoryMigration =
 type DesktopErrorCode =
   | "INVALID_REQUEST"
   | "RUNTIME_START_FAILED"
+  | "MINECRAFT_BRIDGE_REQUIRED"
+  | "MINECRAFT_BRIDGE_REJECTED"
+  | "MCP_PORT_UNAVAILABLE"
+  | "MCP_TOOL_CATALOG_INVALID"
+  | "MCP_READINESS_TIMEOUT"
   | "RUNTIME_STOP_FAILED"
   | "EMERGENCY_STOP_FAILED"
   | "ACCOUNT_OPERATION_FAILED"
@@ -256,6 +281,11 @@ class ProfileRuntimeContainmentError extends Error {
 const errorMessages = {
   INVALID_REQUEST: "Invalid desktop request",
   RUNTIME_START_FAILED: "Runtime failed to start",
+  MINECRAFT_BRIDGE_REQUIRED: "Minecraft Bridge is required",
+  MINECRAFT_BRIDGE_REJECTED: "Minecraft Bridge rejected the connection",
+  MCP_PORT_UNAVAILABLE: "Minecraft action port is unavailable",
+  MCP_TOOL_CATALOG_INVALID: "Minecraft action tool catalog is invalid",
+  MCP_READINESS_TIMEOUT: "Minecraft action readiness timed out",
   RUNTIME_STOP_FAILED: "Runtime failed to stop",
   EMERGENCY_STOP_FAILED: "Emergency stop failed",
   ACCOUNT_OPERATION_FAILED: "Account operation failed",
@@ -309,6 +339,8 @@ export class DesktopChildServer {
   ) => ReturnType<typeof setTimeout>;
   readonly #clearModelValidationTimer: (timer: ReturnType<typeof setTimeout>) => void;
   #acceptedConnectionAuthority: AcceptedConnectionAuthority | undefined;
+  #activeRuntimeConnection: ConfirmedRuntimeConnection | undefined;
+  #recoveryConnectionAuthority: RecoveryConnectionAuthority | undefined;
   #currentConfirmedConnectionProof: ConfirmedConnectionProof | undefined;
   #activeWorldBinding: ConfirmedWorldBinding | undefined;
   #authorityContained = true;
@@ -321,6 +353,8 @@ export class DesktopChildServer {
   #started = false;
   #stopping: Promise<void> | undefined;
   #replacementOperation: RuntimeReplacementOperation | undefined;
+  #runtimeStartInFlight: DesktopChildRuntime | undefined;
+  #actionFailureDuringRuntimeStart: DesktopChildRuntime | undefined;
   #authorityInvalidationOperation: AuthorityInvalidationOperation | undefined;
   #runtimeSelection: ResolvedModelSelection | undefined;
   #modelValidationGeneration = 0;
@@ -337,6 +371,7 @@ export class DesktopChildServer {
   #lineBytes = 0;
   #discardingOversizedLine = false;
   #requestTail: Promise<void> = Promise.resolve();
+  #modelSelectionTail: Promise<void> = Promise.resolve();
   #outputTail: Promise<void> = Promise.resolve();
 
   constructor(options: DesktopChildServerOptions) {
@@ -422,7 +457,13 @@ export class DesktopChildServer {
     });
     this.#unsubscribeAccount = this.#account.subscribe((account) => {
       if (account.status !== "signed_in") {
-        void this.#invalidateDesktopAuthority("model_unavailable", "account_lost");
+        void this.#invalidateDesktopAuthority(
+          "model_unavailable",
+          "account_lost",
+          true,
+          true,
+          true,
+        );
       }
       const envelope: DesktopEvent = {
         version: DESKTOP_PROTOCOL_VERSION,
@@ -434,8 +475,9 @@ export class DesktopChildServer {
         // Account state never bypasses the strict desktop event schema.
       }
     });
-    this.#unsubscribeModelInvalidation = this.#models.subscribeInvalidation(() => {
-      void this.#invalidateDesktopAuthority("model_unavailable", "model_unavailable");
+    this.#unsubscribeModelInvalidation = this.#models.subscribe((event) => {
+      if (event.kind !== "selection_invalidated") return;
+      void this.#invalidateDesktopAuthority("model_unavailable", event.reason, true, true, true);
     });
     this.#input.on("data", this.#onData);
     this.#input.once("end", this.#onEnd);
@@ -455,7 +497,20 @@ export class DesktopChildServer {
         return;
       }
       this.#publicRuntimeRevision = event.revision;
-      if (isConnectionInvalidatingRuntimeEvent(event)) {
+      if (
+        runtime === this.#runtimeStartInFlight &&
+        event.kind === "error" &&
+        isActionRecoveryRuntimeError(event.error.code)
+      ) {
+        this.#actionFailureDuringRuntimeStart = runtime;
+      }
+      if (
+        isConnectionInvalidatingRuntimeEvent(event) &&
+        !(
+          runtime === this.#runtimeStartInFlight &&
+          runtime === this.#actionFailureDuringRuntimeStart
+        )
+      ) {
         this.#beginRuntimeInvalidation(
           runtime,
           event.kind === "minecraft"
@@ -490,6 +545,22 @@ export class DesktopChildServer {
           true,
           "model_unavailable",
           true,
+          true,
+          true,
+          true,
+        ).catch(() => undefined);
+        return;
+      }
+      if (event.reason === "action_unavailable") {
+        void this.#beginRuntimeInvalidation(
+          runtime,
+          "process_exit",
+          true,
+          "action_unavailable",
+          true,
+          true,
+          true,
+          false,
         ).catch(() => undefined);
       }
     });
@@ -767,8 +838,11 @@ export class DesktopChildServer {
             current.snapshot().lifecycle === "running";
           let selection = this.#runtimeSelection;
           if (!alreadyRunning) {
+            let connection = this.#acceptedConnectionAuthority
+              ? this.#consumeConnectionAuthority(interruptGeneration)
+              : undefined;
             selection = await this.#models.resolveRuntimeSelection();
-            const connection = this.#consumeConnectionAuthority(interruptGeneration);
+            connection ??= this.#consumeConnectionAuthority(interruptGeneration);
             if (!this.#runtime || this.#needsFreshRuntime) {
               await this.#replaceRuntime(
                 interruptGeneration,
@@ -780,7 +854,16 @@ export class DesktopChildServer {
           }
           if (!selection) throw new Error("Runtime model selection is unavailable");
           const runtime = this.#requireRuntime();
-          await runtime.start();
+          this.#runtimeStartInFlight = runtime;
+          this.#actionFailureDuringRuntimeStart = undefined;
+          try {
+            await runtime.start();
+          } finally {
+            if (this.#runtimeStartInFlight === runtime) this.#runtimeStartInFlight = undefined;
+            if (this.#actionFailureDuringRuntimeStart === runtime) {
+              this.#actionFailureDuringRuntimeStart = undefined;
+            }
+          }
           if (
             this.#shutdownRequested ||
             interruptGeneration !== this.#interruptGeneration ||
@@ -822,10 +905,16 @@ export class DesktopChildServer {
         case "list_models":
           await this.#writeCommandResult(request, await this.#models.listModels());
           return;
+        case "migrate_model_preference":
+          await this.#writeCommandResult(
+            request,
+            await this.#models.migrateLegacyPreference(request.command.candidate),
+          );
+          return;
         case "select_model":
           await this.#writeCommandResult(
             request,
-            await this.#models.selectModel(request.command.selection),
+            await this.#selectModel(request.command.selection, interruptGeneration),
           );
           return;
         case "read_profile":
@@ -917,9 +1006,14 @@ export class DesktopChildServer {
             createRedactedMemoryExport(await this.#requireMemories().export()),
           );
           return;
-        case "preview_diagnostics":
-          await this.#writeCommandResult(request, await this.#requireDiagnostics().preview());
+        case "preview_diagnostics": {
+          const snapshot = this.#snapshot();
+          await this.#writeCommandResult(
+            request,
+            await this.#requireDiagnostics().preview(snapshot.actions, snapshot.lastError),
+          );
           return;
+        }
         case "prepare_diagnostic_archive": {
           const prepared = await this.#requireDiagnostics().createArchive(request.command.exportId);
           await this.#writeCommandResult(request, {
@@ -1097,6 +1191,8 @@ export class DesktopChildServer {
           this.#currentConfirmedConnectionProof = Object.freeze(
             structuredClone(request.command.proof),
           );
+          this.#activeRuntimeConnection = undefined;
+          this.#recoveryConnectionAuthority = undefined;
           this.#acceptedConnectionAuthority = authority;
           this.#authorityContained = false;
           this.#needsFreshRuntime = true;
@@ -1117,22 +1213,48 @@ export class DesktopChildServer {
         await this.#writeProfileRuntimeContainmentError(request.id, error.committed);
         return;
       }
+      const actionRecoveryError =
+        request.command.kind === "start_runtime" ? actionRecoveryDesktopError(error) : undefined;
+      const bridgeError =
+        request.command.kind === "start_runtime" ? minecraftBridgeDesktopError(error) : undefined;
+      const preserveModelRecovery =
+        request.command.kind === "start_runtime" &&
+        this.#currentConfirmedConnectionProof !== undefined &&
+        this.#recoveryConnectionAuthority?.explicitModelRecovery === true;
+      const preserveTrustedInitialRecovery =
+        request.command.kind === "start_runtime" &&
+        this.#currentConfirmedConnectionProof === undefined &&
+        this.#activeRuntimeConnection !== undefined;
       if (
         (request.command.kind === "start_runtime" || request.command.kind === "stop_runtime") &&
         !(error instanceof OwnerIdentityError)
       ) {
         this.#needsFreshRuntime = true;
-        this.#invalidateConnectionAuthority();
+        const preserveActionRecovery =
+          request.command.kind === "start_runtime" &&
+          this.#currentConfirmedConnectionProof !== undefined &&
+          actionRecoveryError !== undefined;
+        const preserveRecovery =
+          preserveModelRecovery || preserveActionRecovery || preserveTrustedInitialRecovery;
+        this.#invalidateConnectionAuthority(
+          preserveRecovery,
+          preserveRecovery,
+          preserveModelRecovery,
+        );
       }
       await this.#writeError(
         request.id,
         error instanceof OwnerIdentityError
           ? error.code
-          : error instanceof DocumentStoreError && error.code === "DOCUMENT_CONFLICT"
-            ? "DOCUMENT_CONFLICT"
-            : error instanceof ConnectionOperationError
-              ? "CONNECTION_OPERATION_FAILED"
-              : errorCodeFor(request.command.kind),
+          : (bridgeError ??
+              actionRecoveryError ??
+              (request.command.kind === "select_model"
+                ? "MODEL_OPERATION_FAILED"
+                : error instanceof DocumentStoreError && error.code === "DOCUMENT_CONFLICT"
+                  ? "DOCUMENT_CONFLICT"
+                  : error instanceof ConnectionOperationError
+                    ? "CONNECTION_OPERATION_FAILED"
+                    : errorCodeFor(request.command.kind))),
       );
     }
   }
@@ -1223,6 +1345,71 @@ export class DesktopChildServer {
     }
   }
 
+  #selectModel(
+    selection: ModelSelectionInput,
+    replacementGeneration: number,
+  ): Promise<ModelSelection> {
+    const operation = this.#modelSelectionTail
+      .catch(() => undefined)
+      .then(() => this.#performModelSelection(selection, replacementGeneration));
+    this.#modelSelectionTail = operation.then(
+      () => undefined,
+      () => undefined,
+    );
+    return operation;
+  }
+
+  async #performModelSelection(
+    selection: ModelSelectionInput,
+    replacementGeneration: number,
+  ): Promise<ModelSelection> {
+    this.#assertModelSelectionGeneration(replacementGeneration);
+    const prepared = await this.#models.prepareSelection(selection);
+    this.#assertModelSelectionGeneration(replacementGeneration);
+    const runtime = this.#runtime;
+    const lifecycle = runtime?.snapshot().lifecycle;
+    if (runtime && !this.#needsFreshRuntime && lifecycle === "running") {
+      let committed: ModelSelection | undefined;
+      await runtime.switchModel(prepared.resolved, async () => {
+        if (committed !== undefined) throw new Error("Model preference was already committed");
+        committed = await this.#models.commitSelection(prepared);
+      });
+      this.#assertModelSelectionGeneration(replacementGeneration, runtime);
+      const snapshot = runtime.snapshot();
+      if (
+        snapshot.lifecycle !== "running" ||
+        snapshot.codex.state !== "ready" ||
+        snapshot.codex.model !== prepared.resolved.modelId ||
+        committed === undefined
+      ) {
+        throw new Error("Runtime model switch did not publish the prepared selection");
+      }
+      this.#runtimeSelection = prepared.resolved;
+      this.#startModelValidation(runtime, prepared.resolved);
+      return committed;
+    }
+    if (runtime && lifecycle !== "idle" && lifecycle !== "stopped" && lifecycle !== "failed") {
+      throw new Error("Runtime model switching is unavailable");
+    }
+    const committed = await this.#models.commitSelection(prepared);
+    this.#assertModelSelectionGeneration(replacementGeneration);
+    this.#runtimeSelection = prepared.resolved;
+    return committed;
+  }
+
+  #assertModelSelectionGeneration(
+    replacementGeneration: number,
+    runtime?: DesktopChildRuntime,
+  ): void {
+    if (
+      this.#shutdownRequested ||
+      replacementGeneration !== this.#interruptGeneration ||
+      (runtime !== undefined && runtime !== this.#runtime)
+    ) {
+      throw new Error("Model selection was interrupted");
+    }
+  }
+
   async #dispatchAuthorityControl(
     request: DesktopRequest,
     invalidation: Promise<void>,
@@ -1243,13 +1430,23 @@ export class DesktopChildServer {
 
   #beginRuntimeInvalidation(
     runtime: DesktopChildRuntime,
-    reason: Exclude<TaskStopReason, "owner_changed">,
+    reason: Exclude<TaskStopReason, "owner_changed" | "model_changed">,
     _interrupt: boolean,
     publicReason: ConnectionInvalidationReason = connectionInvalidationReason(reason),
     synchronousRuntimeStop = false,
+    preserveWorldBinding = false,
+    preserveConnectionAuthority = false,
+    explicitModelRecovery = false,
   ): Promise<void> {
     if (runtime !== this.#runtime) return Promise.resolve();
-    return this.#beginAuthorityInvalidation(reason, publicReason, synchronousRuntimeStop);
+    return this.#beginAuthorityInvalidation(
+      reason,
+      publicReason,
+      synchronousRuntimeStop,
+      preserveWorldBinding,
+      preserveConnectionAuthority,
+      explicitModelRecovery,
+    );
   }
 
   #beginAuthorityInvalidation(
@@ -1258,6 +1455,7 @@ export class DesktopChildServer {
     synchronousRuntimeStop = true,
     preserveWorldBinding = false,
     preserveConnectionAuthority = false,
+    explicitModelRecovery = false,
   ): Promise<void> {
     const existing = this.#authorityInvalidationOperation;
     if (existing) {
@@ -1265,18 +1463,37 @@ export class DesktopChildServer {
       const tightenedWorldBinding = policy.preserveWorldBinding && preserveWorldBinding;
       const tightenedConnectionAuthority =
         policy.preserveConnectionAuthority && preserveConnectionAuthority;
+      const upgradedExplicitModelRecovery =
+        tightenedConnectionAuthority && explicitModelRecovery && !policy.explicitModelRecovery;
+      const validatedAcceptedModelRecovery = upgradedExplicitModelRecovery
+        ? this.#validAcceptedConnectionForRecovery(this.#interruptGeneration)
+        : undefined;
       if (
         tightenedWorldBinding !== policy.preserveWorldBinding ||
-        tightenedConnectionAuthority !== policy.preserveConnectionAuthority
+        tightenedConnectionAuthority !== policy.preserveConnectionAuthority ||
+        upgradedExplicitModelRecovery
       ) {
-        this.#interruptGeneration += 1;
-        this.#invalidateConnectionAuthority(tightenedWorldBinding, tightenedConnectionAuthority);
+        if (
+          tightenedWorldBinding !== policy.preserveWorldBinding ||
+          tightenedConnectionAuthority !== policy.preserveConnectionAuthority
+        ) {
+          this.#interruptGeneration += 1;
+        }
+        const effectiveExplicitModelRecovery =
+          tightenedConnectionAuthority && (policy.explicitModelRecovery || explicitModelRecovery);
+        this.#invalidateConnectionAuthority(
+          tightenedWorldBinding,
+          tightenedConnectionAuthority,
+          effectiveExplicitModelRecovery,
+          validatedAcceptedModelRecovery,
+        );
         this.#rebasePreservedConnectionAuthority(tightenedConnectionAuthority);
         if (policy.finalized) {
           const followUpPolicy: AuthorityInvalidationPolicy = {
             publicReason,
             preserveWorldBinding: tightenedWorldBinding,
             preserveConnectionAuthority: tightenedConnectionAuthority,
+            explicitModelRecovery: effectiveExplicitModelRecovery,
             finalized: false,
           };
           const followUp = existing.operation.then(async () => {
@@ -1284,6 +1501,7 @@ export class DesktopChildServer {
             this.#invalidateConnectionAuthority(
               followUpPolicy.preserveWorldBinding,
               followUpPolicy.preserveConnectionAuthority,
+              followUpPolicy.explicitModelRecovery,
             );
             this.#rebasePreservedConnectionAuthority(followUpPolicy.preserveConnectionAuthority);
             await this.#publishConnectionInvalidated(followUpPolicy.publicReason);
@@ -1291,9 +1509,12 @@ export class DesktopChildServer {
           });
           return this.#trackAuthorityInvalidationOperation(followUpPolicy, followUp);
         }
-        policy.publicReason = publicReason;
+        if (policy.publicReason !== "model_unavailable" && policy.publicReason !== "account_lost") {
+          policy.publicReason = publicReason;
+        }
         policy.preserveWorldBinding = tightenedWorldBinding;
         policy.preserveConnectionAuthority = tightenedConnectionAuthority;
+        policy.explicitModelRecovery = effectiveExplicitModelRecovery;
       }
       return existing.operation;
     }
@@ -1301,15 +1522,20 @@ export class DesktopChildServer {
       publicReason,
       preserveWorldBinding,
       preserveConnectionAuthority,
+      explicitModelRecovery: preserveConnectionAuthority && explicitModelRecovery,
       finalized: false,
     };
+    const validatedAcceptedModelRecovery = policy.explicitModelRecovery
+      ? this.#validAcceptedConnectionForRecovery(this.#interruptGeneration)
+      : undefined;
     const runtime = this.#runtime;
     const replacement = this.#replacementOperation;
     if (
       this.#authorityContained &&
       !runtime &&
       !replacement &&
-      !this.#acceptedConnectionAuthority
+      !this.#acceptedConnectionAuthority &&
+      !this.#activeRuntimeConnection
     ) {
       this.#needsFreshRuntime = true;
       this.#stopModelValidation();
@@ -1317,6 +1543,8 @@ export class DesktopChildServer {
       this.#invalidateConnectionAuthority(
         policy.preserveWorldBinding,
         policy.preserveConnectionAuthority,
+        policy.explicitModelRecovery,
+        validatedAcceptedModelRecovery,
       );
       this.#rebasePreservedConnectionAuthority(policy.preserveConnectionAuthority);
       return Promise.resolve();
@@ -1327,6 +1555,8 @@ export class DesktopChildServer {
     this.#invalidateConnectionAuthority(
       policy.preserveWorldBinding,
       policy.preserveConnectionAuthority,
+      policy.explicitModelRecovery,
+      validatedAcceptedModelRecovery,
     );
     this.#rebasePreservedConnectionAuthority(policy.preserveConnectionAuthority);
     if (replacement && replacement.retirementReason === undefined) {
@@ -1365,6 +1595,7 @@ export class DesktopChildServer {
       this.#invalidateConnectionAuthority(
         policy.preserveWorldBinding,
         policy.preserveConnectionAuthority,
+        policy.explicitModelRecovery,
       );
       this.#rebasePreservedConnectionAuthority(policy.preserveConnectionAuthority);
       await this.#publishConnectionInvalidated(policy.publicReason, safeSnapshot);
@@ -1396,10 +1627,20 @@ export class DesktopChildServer {
   }
 
   #invalidateDesktopAuthority(
-    reason: Exclude<TaskStopReason, "owner_changed">,
+    reason: Exclude<TaskStopReason, "owner_changed" | "model_changed">,
     publicReason: ConnectionInvalidationReason = connectionInvalidationReason(reason),
+    preserveWorldBinding = false,
+    preserveConnectionAuthority = false,
+    explicitModelRecovery = false,
   ): Promise<void> {
-    return this.#beginAuthorityInvalidation(reason, publicReason);
+    return this.#beginAuthorityInvalidation(
+      reason,
+      publicReason,
+      true,
+      preserveWorldBinding,
+      preserveConnectionAuthority,
+      explicitModelRecovery,
+    );
   }
 
   #readContainedSnapshot(runtime: DesktopChildRuntime): RuntimeSnapshot {
@@ -1412,6 +1653,7 @@ export class DesktopChildServer {
       snapshot.minecraft.sessionId !== null ||
       (snapshot.codex.state !== "stopped" && snapshot.codex.state !== "failed") ||
       snapshot.codex.model !== null ||
+      snapshot.actions !== null ||
       snapshot.task !== null
     ) {
       throw new Error("Runtime invalidation cleanup did not reach a safe state");
@@ -1497,7 +1739,13 @@ export class DesktopChildServer {
       return;
     }
     if (!valid) {
-      await this.#invalidateDesktopAuthority("model_unavailable");
+      await this.#invalidateDesktopAuthority(
+        "model_unavailable",
+        "model_unavailable",
+        true,
+        true,
+        true,
+      );
       return;
     }
     scheduleNext();
@@ -1664,18 +1912,28 @@ export class DesktopChildServer {
     const authority = this.#acceptedConnectionAuthority;
     this.#acceptedConnectionAuthority = undefined;
     const now = this.#now();
-    if (
-      !authority ||
-      !Number.isSafeInteger(now) ||
-      now < authority.issuedAt ||
-      now >= authority.expiresAt ||
-      authority.generation !== generation ||
-      generation !== this.#interruptGeneration ||
-      this.#shutdownRequested
-    ) {
+    if (generation !== this.#interruptGeneration || this.#shutdownRequested) {
       throw new ConnectionOperationError("Minecraft connection is not confirmed");
     }
-    return authority.connection;
+    if (authority) {
+      if (
+        !Number.isSafeInteger(now) ||
+        now < authority.issuedAt ||
+        now >= authority.expiresAt ||
+        authority.generation !== generation
+      ) {
+        throw new ConnectionOperationError("Minecraft connection is not confirmed");
+      }
+      this.#activeRuntimeConnection = authority.connection;
+      return authority.connection;
+    }
+    const recovery = this.#recoveryConnectionAuthority;
+    this.#recoveryConnectionAuthority = undefined;
+    if (!recovery) {
+      throw new ConnectionOperationError("Minecraft connection is not confirmed");
+    }
+    this.#activeRuntimeConnection = recovery.connection;
+    return recovery.connection;
   }
 
   #assertConnectionGeneration(generation: number): void {
@@ -1684,11 +1942,48 @@ export class DesktopChildServer {
     }
   }
 
+  #validAcceptedConnectionForRecovery(generation: number): ConfirmedRuntimeConnection | undefined {
+    const authority = this.#acceptedConnectionAuthority;
+    const now = this.#now();
+    if (
+      !authority ||
+      !Number.isSafeInteger(now) ||
+      now < authority.issuedAt ||
+      now >= authority.expiresAt ||
+      authority.generation !== generation
+    ) {
+      return undefined;
+    }
+    return authority.connection;
+  }
+
   #invalidateConnectionAuthority(
     preserveWorldBinding = false,
     preserveConnectionAuthority = false,
+    explicitModelRecovery = false,
+    validatedAcceptedModelRecovery?: ConfirmedRuntimeConnection,
   ): void {
-    if (!preserveConnectionAuthority) this.#acceptedConnectionAuthority = undefined;
+    if (preserveConnectionAuthority) {
+      const existing = this.#recoveryConnectionAuthority;
+      const connection =
+        existing?.connection ??
+        this.#activeRuntimeConnection ??
+        (explicitModelRecovery ? validatedAcceptedModelRecovery : undefined);
+      if (connection) {
+        this.#recoveryConnectionAuthority = Object.freeze({
+          connection,
+          explicitModelRecovery: existing?.explicitModelRecovery === true || explicitModelRecovery,
+        });
+      }
+      if (explicitModelRecovery) {
+        this.#acceptedConnectionAuthority = undefined;
+        this.#activeRuntimeConnection = undefined;
+      }
+    } else {
+      this.#acceptedConnectionAuthority = undefined;
+      this.#activeRuntimeConnection = undefined;
+      this.#recoveryConnectionAuthority = undefined;
+    }
     if (!preserveWorldBinding) {
       this.#currentConfirmedConnectionProof = undefined;
       this.#activeWorldBinding = undefined;
@@ -1981,6 +2276,40 @@ export class DesktopChildServer {
   }
 }
 
+function actionRecoveryDesktopError(error: unknown): DesktopErrorCode | undefined {
+  if (!(error instanceof ActionCapabilityError)) return undefined;
+  switch (error.code) {
+    case "port_conflict":
+    case "server_start_failed":
+      return "MCP_PORT_UNAVAILABLE";
+    case "missing_tools":
+    case "extra_tools":
+    case "duplicate_tools":
+    case "invalid_tool_name":
+      return "MCP_TOOL_CATALOG_INVALID";
+    case "invalid_url":
+    case "invalid_timeout":
+    case "connection_failed":
+    case "timeout":
+    case "aborted":
+    case "server_closed":
+    case "startup_stopped":
+      return "MCP_READINESS_TIMEOUT";
+  }
+}
+
+function minecraftBridgeDesktopError(error: unknown): DesktopErrorCode | undefined {
+  return error instanceof MineflayerBridgeError ? error.code : undefined;
+}
+
+function isActionRecoveryRuntimeError(errorCode: string): boolean {
+  return (
+    errorCode === "MCP_PORT_UNAVAILABLE" ||
+    errorCode === "MCP_TOOL_CATALOG_INVALID" ||
+    errorCode === "MCP_READINESS_TIMEOUT"
+  );
+}
+
 function isConnectionInvalidatingRuntimeEvent(event: RuntimeEvent): boolean {
   return (
     (event.kind === "minecraft" &&
@@ -1991,7 +2320,7 @@ function isConnectionInvalidatingRuntimeEvent(event: RuntimeEvent): boolean {
 }
 
 function connectionInvalidationReason(
-  reason: Exclude<TaskStopReason, "owner_changed">,
+  reason: Exclude<TaskStopReason, "owner_changed" | "model_changed">,
 ): ConnectionInvalidationReason {
   switch (reason) {
     case "owner_stop":
@@ -2095,6 +2424,7 @@ function errorCodeFor(kind: DesktopRequest["command"]["kind"]): DesktopErrorCode
     case "cancel_chatgpt_login":
       return "ACCOUNT_OPERATION_FAILED";
     case "list_models":
+    case "migrate_model_preference":
     case "select_model":
       return "MODEL_OPERATION_FAILED";
     case "set_confirmed_connection":
@@ -2131,6 +2461,8 @@ const idleRuntimeSnapshot: RuntimeSnapshot = {
   lifecycle: "idle",
   minecraft: { state: "disconnected", sessionId: null },
   codex: { state: "stopped", model: null },
+  actions: null,
   task: null,
+  actionQueue: { goal: null, items: [] },
   lastError: null,
 };

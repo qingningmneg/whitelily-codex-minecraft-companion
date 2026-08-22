@@ -1,7 +1,14 @@
 import { ActionExecutor } from "../actions/actionExecutor.js";
+import type { CompanionActionQueue } from "../actions/actionQueue.js";
+import type {
+  QueuedActionExecutionContext,
+  QueuedActionRunner,
+  QueueRunnerEvent,
+} from "../actions/queuedActionRunner.js";
 import type { AutonomyReason } from "../autonomy/autonomyScheduler.js";
 import type { LocalCommand } from "../commands/commandParser.js";
 import type { CodexPort, CodexTurnResult } from "../codex/codexPort.js";
+import type { ResolvedModelSelection } from "../codex/modelCatalog.js";
 import { selectModel } from "../codex/modelSelector.js";
 import type { CompanionMode } from "../domain/types.js";
 import { SafeLogger } from "../logging/safeLogger.js";
@@ -25,6 +32,7 @@ import {
 import type { RuntimeAuthorityLoss } from "../runtime/runtimeEvents.js";
 import { isUnsolicitedActivityAllowed } from "../profile/behaviorPolicy.js";
 import type { CompanionProfile } from "../profile/profileSchema.js";
+import type { FarmingPreferenceAccess } from "../profile/farmingPreferenceStore.js";
 import {
   buildCompanionAutonomousTurn,
   buildCompanionRecoveryTurn,
@@ -42,6 +50,11 @@ import {
   type OwnerIntentDecision,
 } from "./intentRouter.js";
 import { ChatRouter } from "./chatRouter.js";
+import {
+  FarmingPermissionCoordinator,
+  type FarmingPermissionResult,
+} from "./farmingPermissionCoordinator.js";
+import { FarmObservationScheduler } from "./farmObservationScheduler.js";
 import { TaskController, type ActiveTask, type TaskDisclosure } from "./taskController.js";
 
 const repairPrompt = "只返回符合既定结构的 JSON，不要使用 Markdown。";
@@ -71,6 +84,17 @@ const unavailableMessage =
 
 const intentClarificationMessage = "你希望我陪你聊聊天，还是要我在游戏里做一件事？";
 const taskFailureMessage = "这次没能完成，请再试一次。";
+const farmingPermissionQuestion = "我可以在这里种小麦吗？";
+const farmingFallbackConstraint = "不得新建农田，寻找现成的成熟小麦";
+const farmingMutationKinds = new Set(["till_soil", "plant_crop"] as const);
+const wheatObservationDelayMs = 60_000;
+const recoveredIntentOnlyTaskLimits: TaskLimits = Object.freeze({
+  maxToolCalls: 0,
+  maxBlockChanges: 0,
+  maxHorizontalTravel: 0,
+  maxDurationMs: 0,
+  maxDangerousOperations: 0,
+});
 const filteredModelReply = "好，我知道了。";
 const ambiguousNaturalToolNames = new Set<ToolActionKind>(["say", "jump", "wait"]);
 const ambiguousNaturalToolNamePattern = [...ambiguousNaturalToolNames].join("|");
@@ -84,11 +108,56 @@ const ambiguousToolInvocationPattern = new RegExp(
 );
 const internalModelMetadataPattern =
   /任务披露|minecraft_[a-z0-9_]+|工具调用|预算|租约|停止条件|expectedActions|allowedActions|maxToolCalls|maxBlockChanges|maxHorizontalTravel|maxDurationMs|maxDangerousOperations|leaseId|stopCondition/iu;
+const explicitQueueInternalTokenPattern =
+  /QUEUE_SNAPSHOT|minecraft_enqueue_actions|waiting_permission/iu;
+const anyQueueMarkerPattern = /队列|排队|\bqueues?\b|\bqueued\b/iu;
+const queueWorkRelationPatterns = [
+  /队列(?:中|里|内|上)?(?:的)?\s*(?:(?:目前|当前|现在|仍然|仍|正在|正)\s*)*(?:(?:还没有|没有|还有|仍有|剩余|共有|共|包含|有)\s*)?(?:(?:\d+|[零一二两三四五六七八九十百]+)\s*(?:个|条|批|项)?)?\s*(?:(?:待处理|待执行|正在执行|已完成|已取消|失败)\s*)?(?:的\s*)?(?:动作|任务|项|批次|步骤)/u,
+  /(?:动作|任务|批次|步骤)(?:的)?队列/u,
+  /(?:动作|任务|项|批次|步骤)(?:(?:(?:正在|已经|已)?\s*(?:排入|加入|进入))|(?:(?:正|仍)?在)|位于)\s*(?:该|这个)?队列(?:中|里|内)?/u,
+  /(?:动作|任务|项|批次|步骤)(?:正在|仍在|已经|已)?\s*排队|排队(?:中)?(?:的)?\s*(?:动作|任务|项|批次|步骤)/u,
+  /\bqueued\s+(?:actions?|tasks?|items?|batches?|steps?)\b|\b(?:actions?|tasks?|items?|batches?|steps?)\s+(?:(?:is|are|was|were)\s+)?queued\b/iu,
+  /\b(?:actions?|tasks?|items?|batches?|steps?)\s+(?:(?:is|are|was|were|has|have|had|remain|remains|remained)\s+)?(?:(?:currently|still|already|not|never)\s+)*(?:been\s+)?(?:(?:waiting|pending|remaining|running|suspended)\s+)?(?:in|on|inside|within|from)\s+(?:the\s+)?queues?\b/iu,
+  /\b(?:the\s+)?queues?\s+(?:(?:currently|presently|still|already|now|only)\s+)*(?:of|with|contains?|holds?|includes?|has|have)\s+(?:(?:a\s+few|a\s+couple\s+of|more\s+than|at\s+least|up\s+to|the|an?|no|some|many|several|few|all|both|each|every)\s+)?(?:(?:\d+|(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand|million)(?:[-\s]+(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand|million))*)\s+)?(?:(?:currently|still|already)\s+)*(?:(?:waiting|pending|remaining|next|queued|running|completed|failed|cancelled|canceled|suspended)\s+)*(?:actions?|tasks?|items?|batches?|steps?)\b/iu,
+  /\b(?:the\s+)?queues?\s+(?:(?:pending|remaining|next|queued|running|completed|failed|cancelled|canceled|suspended)\s+)?(?:actions?|tasks?|items?|batches?|steps?)\b/iu,
+  /\b(?:action|task|item|batch|step)\s+queues?\b/iu,
+] as const;
+const queueSubjectStatePatterns = [
+  /队列\s*(?:(?:目前|当前|现在)\s*)?(?:(?:正在|正|仍在|已经|已)\s*)?(?:(?:并没有|还没有|还没|没有|没|并未|仍未|尚未|未|不)\s*)?(?:被\s*)?(?:等待|待处理|待执行|运行|执行|完成|失败|取消|暂停|挂起|剩余|还有|下一个|下一项|共)/u,
+  /队列\s*(?:的\s*)?(?:状态|数量|计数)/u,
+  /队列\s*(?:(?:目前|当前|现在)\s*)?(?:正\s*)?处于\s*(?:等待|待处理|待执行|运行|执行|完成|失败|取消|暂停|挂起)/u,
+  /\b(?:the\s+)?queues?\s+(?:(?:is|are|was|were|has|have|had|isn['’]t|aren['’]t|wasn['’]t|weren['’]t|hasn['’]t|haven['’]t|hadn['’]t|remains?|stays?)\s+)?(?:(?:currently|still|already|not|never|no\s+longer)\s+)*(?:been\s+)?(?:waiting|pending|running|completed|failed|cancelled|canceled|suspended|paused|remaining)\b/iu,
+  /\b(?:the\s+)?queues?\s+(?:status|state|counts?)\b/iu,
+] as const;
+const backlogWorkRelationPatterns = [
+  /(?:还有|仍有)\s*(?:\d+|[一二两三四五六七八九十百]+)\s*(?:个|条|批)?\s*(?:动作|任务|项|批次|步骤)/u,
+  /(?:剩余|下一个|下一项|待处理|待执行)\s*(?:\d+\s*(?:个|条|批)?)?\s*(?:动作|任务|项|批次|步骤)/u,
+  /(?:动作|任务|项|批次|步骤)\s*(?:(?:仍然|依然|仍在|还在|正在|尚未|仍|还|正|未)\s*)?(?:待处理|待执行|剩余)/u,
+  /(?:动作|任务|项|批次|步骤)\s*(?:是\s*)?(?:下一个|下一项)\s*$/u,
+  /\b(?:pending|remaining|next)\s+(?:\d+\s+)?(?:actions?|tasks?|items?|batches?|steps?)\b/iu,
+  /\b(?:\d+\s+)?(?:actions?|tasks?|items?|batches?|steps?)\s+(?:(?:is|are|was|were|remain|remains|remained)\s+)?(?:(?:currently|still|already|not|never|no\s+longer)\s+)*(?:pending|remaining)\b/iu,
+  /\b(?:\d+\s+)?(?:actions?|tasks?|items?|batches?|steps?)\s+(?:(?:is|are|was|were)\s+)?next\s*$/iu,
+] as const;
+const sentenceBoundaryPattern = /[\r\n.!?。！？;；]+/u;
 const transportFailureThreshold = 3;
+
+/** Identifies queue implementation state from grammatical relations within one sentence. */
+export function containsQueueStateDisclosure(text: string): boolean {
+  if (explicitQueueInternalTokenPattern.test(text)) return true;
+  return text.split(sentenceBoundaryPattern).some((sentence) => {
+    if (queueWorkRelationPatterns.some((pattern) => pattern.test(sentence))) return true;
+    if (queueSubjectStatePatterns.some((pattern) => pattern.test(sentence))) return true;
+    return (
+      !anyQueueMarkerPattern.test(sentence) &&
+      backlogWorkRelationPatterns.some((pattern) => pattern.test(sentence))
+    );
+  });
+}
 
 function containsInternalModelDisclosure(reply: string): boolean {
   return (
     internalModelMetadataPattern.test(reply) ||
+    containsQueueStateDisclosure(reply) ||
     bareInternalToolNamePattern.test(reply) ||
     ambiguousToolInvocationPattern.test(reply)
   );
@@ -227,8 +296,16 @@ function autonomousMicroTaskDisclosure(reason: AutonomyReason): TaskDisclosure {
 type CompanionTaskExecutionOutcome = ReturnType<typeof companionTaskExecutionOutcomeSchema.parse>;
 type ValidatedTaskDecision = Extract<
   OwnerIntentDecision,
-  { kind: "start_task" | "continue_task" | "replace_task" }
+  { kind: "start_task" | "continue_task" | "priority_task" | "replace_task" }
 >;
+type FarmingPermissionDecision = Extract<
+  OwnerIntentDecision,
+  {
+    kind: "grant_farming_permission" | "deny_farming_permission" | "revoke_farming_permission";
+  }
+>;
+type TaskControlDecision =
+  ValidatedTaskDecision | Extract<OwnerIntentDecision, { kind: "stop_task" }>;
 
 const taskLimitKeys = [
   "maxToolCalls",
@@ -276,6 +353,9 @@ export interface CompanionServiceDependencies {
   state: StateStore;
   confirmations: ConfirmationStore;
   executor: ActionExecutor;
+  actionQueue: CompanionActionQueue;
+  actionRunner: QueuedActionRunner;
+  farmingPreference: FarmingPreferenceAccess;
   budget: TurnToolBudget;
   taskController: TaskController;
   autonomy: CompanionAutonomyScheduler;
@@ -291,6 +371,17 @@ export interface CompanionServiceDependencies {
   logger?: Pick<SafeLogger, "error">;
   setTimer?: (callback: () => void, milliseconds: number) => ReturnType<typeof setTimeout>;
   clearTimer?: (timer: ReturnType<typeof setTimeout>) => void;
+  setFarmingPermissionTimer?: (
+    callback: () => void,
+    milliseconds: number,
+  ) => ReturnType<typeof setTimeout>;
+  clearFarmingPermissionTimer?: (timer: ReturnType<typeof setTimeout>) => void;
+  setFarmObservationTimer?: (
+    callback: () => void,
+    milliseconds: number,
+  ) => ReturnType<typeof setTimeout>;
+  clearFarmObservationTimer?: (timer: ReturnType<typeof setTimeout>) => void;
+  farmObservationNow?: () => number;
   confirmationNow?: () => Date;
   setConfirmationTimer?: (
     callback: () => void,
@@ -320,12 +411,24 @@ interface ActiveTurn {
   cancel(): void;
 }
 
+interface CodexThreadPair {
+  readonly intentThreadId: string;
+  readonly executionThreadId: string;
+}
+
 interface IntentStamp {
   readonly generation: number;
   readonly messageSequence: number;
   readonly ownerRevision: number;
   readonly worldGeneration: number;
   readonly taskLeaseAtDispatch: Readonly<TaskLease> | null;
+  readonly farmingPermissionEpochAtDispatch: number | undefined;
+  readonly threadPair: CodexThreadPair;
+}
+
+interface SuspendedTaskGoal {
+  readonly taskLease: Readonly<TaskLease>;
+  readonly disclosure: TaskDisclosure;
 }
 
 const noOpLogger: Pick<SafeLogger, "error"> = { error: async () => undefined };
@@ -361,6 +464,15 @@ function sameTaskLease(first: TaskLease, second: TaskLease): boolean {
   return first.id === second.id && first.startedAt === second.startedAt;
 }
 
+function cloneTaskDisclosure(disclosure: TaskDisclosure): TaskDisclosure {
+  return {
+    goal: disclosure.goal,
+    expectedActions: [...disclosure.expectedActions],
+    limits: { ...disclosure.limits },
+    stopCondition: disclosure.stopCondition,
+  };
+}
+
 export class CompanionService {
   private readonly logger: Pick<SafeLogger, "error">;
   private readonly setTimer: (
@@ -374,10 +486,19 @@ export class CompanionService {
     milliseconds: number,
   ) => ReturnType<typeof setTimeout>;
   private readonly clearConfirmationTimer: (timer: ReturnType<typeof setTimeout>) => void;
+  private readonly farmingPermissionCoordinator: FarmingPermissionCoordinator;
+  private readonly farmObservationScheduler = new FarmObservationScheduler();
+  private readonly setFarmObservationTimer: (
+    callback: () => void,
+    milliseconds: number,
+  ) => ReturnType<typeof setTimeout>;
+  private readonly clearFarmObservationTimer: (timer: ReturnType<typeof setTimeout>) => void;
+  private readonly farmObservationNow: () => number;
   private unsubscribe: (() => void) | undefined;
   private unsubscribeActionResult: (() => void) | undefined;
   private mergeTimer: ReturnType<typeof setTimeout> | undefined;
   private confirmationExpiryTimer: ReturnType<typeof setTimeout> | undefined;
+  private farmObservationTimer: ReturnType<typeof setTimeout> | undefined;
   private mergedMessages: string[] = [];
   private generation = 0;
   private messageSequence = 0;
@@ -388,6 +509,7 @@ export class CompanionService {
   private intentThreadId: string | undefined;
   private executionThreadId: string | undefined;
   private selectedModel: string | undefined;
+  private selectedReasoningEffort: string | undefined;
   private codexHealthy = true;
   private consecutiveTransportFailures = 0;
   private readonly activeIntentTurns = new Set<ActiveTurn>();
@@ -395,6 +517,7 @@ export class CompanionService {
   private intentTurnTail: Promise<void> = Promise.resolve();
   private executionTurnTail: Promise<void> = Promise.resolve();
   private confirmationTail: Promise<void> = Promise.resolve();
+  private modelSwitchTail: Promise<void> = Promise.resolve();
   private recoveryFlight: Promise<void> | undefined;
   private unfinishedTaskSummary: string | null = null;
   private readonly startupEvents: MinecraftEvent[] = [];
@@ -408,6 +531,9 @@ export class CompanionService {
   };
   private locallyContainedTaskLeaseKey: string | undefined;
   private readonly pendingConfirmationTerminalReasons = new Map<string, "failed" | "owner_stop">();
+  private readonly suspendedTaskGoals: SuspendedTaskGoal[] = [];
+  private preservedTerminalLeaseKey: string | undefined;
+  private pendingExecutionReplans = 0;
 
   constructor(private readonly dependencies: CompanionServiceDependencies) {
     this.logger = dependencies.logger ?? noOpLogger;
@@ -416,13 +542,103 @@ export class CompanionService {
     this.confirmationNow = dependencies.confirmationNow ?? (() => new Date());
     this.setConfirmationTimer = dependencies.setConfirmationTimer ?? setTimeout;
     this.clearConfirmationTimer = dependencies.clearConfirmationTimer ?? clearTimeout;
-    dependencies.taskController.onTerminal((reason, forceCleanup) =>
-      this.handleTaskTerminal(reason, forceCleanup),
+    this.setFarmObservationTimer = dependencies.setFarmObservationTimer ?? setTimeout;
+    this.clearFarmObservationTimer = dependencies.clearFarmObservationTimer ?? clearTimeout;
+    this.farmObservationNow = dependencies.farmObservationNow ?? Date.now;
+    this.farmingPermissionCoordinator = new FarmingPermissionCoordinator({
+      actionQueue: dependencies.actionQueue,
+      executionContext: () => this.queueExecutionContext(),
+      ...(dependencies.setFarmingPermissionTimer === undefined
+        ? {}
+        : { setTimer: dependencies.setFarmingPermissionTimer }),
+      ...(dependencies.clearFarmingPermissionTimer === undefined
+        ? {}
+        : { clearTimer: dependencies.clearFarmingPermissionTimer }),
+    });
+    dependencies.taskController.onTerminal((reason, forceCleanup, task) =>
+      this.handleTaskTerminal(reason, forceCleanup, task.lease),
     );
     dependencies.confirmations.onGameActionsChanged(() => this.scheduleConfirmationExpiry());
     dependencies.confirmations.onGameActionsExpired((taskLease) =>
       this.queueFailedConfirmation(taskLease),
     );
+    dependencies.actionRunner.subscribe((event) => {
+      if (!this.running) return;
+      void this.queueExecutionReplanFromRunner(event).catch((error: unknown) =>
+        this.logger.error("queue_execution_replan_failed", { code: errorName(error) }),
+      );
+    });
+    dependencies.actionRunner.subscribeCompletedAction(({ taskLease, action }) => {
+      const task = this.dependencies.taskController.current();
+      if (
+        !this.running ||
+        !task ||
+        !sameTaskLease(task.lease, taskLease) ||
+        action.kind !== "plant_crop"
+      ) {
+        return;
+      }
+      this.scheduleFarmObservation({
+        position: action.position,
+        earliestAt: this.farmObservationNow() + wheatObservationDelayMs,
+      });
+    });
+  }
+
+  /** Schedules a future AI observation; it never reserves or performs a physical action. */
+  scheduleFarmObservation(input: {
+    position: { x: number; y: number; z: number };
+    earliestAt: number;
+  }): void {
+    this.farmObservationScheduler.schedule({
+      worldGeneration: this.worldGeneration,
+      position: input.position,
+      earliestAt: input.earliestAt,
+      purpose: "wheat_maturity",
+    });
+    this.scheduleFarmObservationTick();
+  }
+
+  /** Converts due crop checks into an observation-and-replan turn, never a direct harvest. */
+  async runDueFarmObservations(now = Date.now()): Promise<number> {
+    try {
+      const due = this.farmObservationScheduler.due(now);
+      for (const observation of due) {
+        if (observation.worldGeneration !== this.worldGeneration) continue;
+        this.pendingExecutionReplans += 1;
+        try {
+          await this.queueExecutionReplanFromCurrent(
+            "小麦成熟时间已到，请先观察后决定是否需要动作。",
+          );
+        } finally {
+          this.pendingExecutionReplans -= 1;
+        }
+      }
+      return due.length;
+    } finally {
+      this.scheduleFarmObservationTick();
+    }
+  }
+
+  private scheduleFarmObservationTick(): void {
+    this.clearFarmObservationTick();
+    const dueAt = this.farmObservationScheduler.nextDueAt();
+    if (dueAt === undefined) return;
+    const milliseconds = Math.max(0, dueAt - this.farmObservationNow());
+    const timer = this.setFarmObservationTimer(() => {
+      if (this.farmObservationTimer === timer) this.farmObservationTimer = undefined;
+      void this.runDueFarmObservations(this.farmObservationNow()).catch((error: unknown) =>
+        this.logger.error("farm_observation_due_failed", { code: errorName(error) }),
+      );
+    }, milliseconds);
+    this.farmObservationTimer = timer;
+    (timer as ReturnType<typeof setTimeout> & { unref?: () => void }).unref?.();
+  }
+
+  private clearFarmObservationTick(): void {
+    if (this.farmObservationTimer === undefined) return;
+    this.clearFarmObservationTimer(this.farmObservationTimer);
+    this.farmObservationTimer = undefined;
   }
 
   /** Memory scope only changes future prompts; it never changes the Minecraft connection. */
@@ -451,36 +667,87 @@ export class CompanionService {
       : memories.search(query);
   }
 
-  private async createThreadPair(generation: number, selectedModel: string): Promise<boolean> {
-    this.intentThreadId = undefined;
-    this.executionThreadId = undefined;
+  private async startThreadPair(selection: ResolvedModelSelection): Promise<CodexThreadPair> {
+    let intentThreadId: string | undefined;
     try {
-      const intentThreadId = await this.dependencies.codex.startThread({
+      intentThreadId = await this.dependencies.codex.startThread({
         cwd: this.dependencies.cwd,
-        model: selectedModel,
-        reasoningEffort: this.dependencies.reasoningEffort,
+        model: selection.modelId,
+        reasoningEffort: selection.reasoningEffort,
+        toolAccess: "none",
       });
-      if (generation !== this.generation) {
-        await this.closeStaleCodex(generation);
-        return false;
-      }
       const executionThreadId = await this.dependencies.codex.startThread({
         cwd: this.dependencies.cwd,
-        model: selectedModel,
-        reasoningEffort: this.dependencies.reasoningEffort,
+        model: selection.modelId,
+        reasoningEffort: selection.reasoningEffort,
+        toolAccess: "minecraft",
       });
-      if (generation !== this.generation) {
-        await this.closeStaleCodex(generation);
-        return false;
-      }
-      this.intentThreadId = intentThreadId;
-      this.executionThreadId = executionThreadId;
-      return true;
+      return Object.freeze({ intentThreadId, executionThreadId });
     } catch (error) {
-      this.intentThreadId = undefined;
-      this.executionThreadId = undefined;
+      if (intentThreadId !== undefined) {
+        await this.rollbackStagedThreads([intentThreadId], error);
+      }
       throw error;
     }
+  }
+
+  private async rollbackStagedThreadPair(pair: CodexThreadPair, cause: unknown): Promise<never> {
+    return this.rollbackStagedThreads([pair.intentThreadId, pair.executionThreadId], cause);
+  }
+
+  private async rollbackStagedThreads(
+    threadIds: readonly string[],
+    cause: unknown,
+  ): Promise<never> {
+    const results = await Promise.allSettled(
+      threadIds.map(async (threadId) => this.dependencies.codex.closeThread(threadId)),
+    );
+    const cleanupFailures = results
+      .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+      .map((result) => result.reason as unknown);
+    if (cleanupFailures.length > 0) {
+      throw new AggregateError(
+        [cause, ...cleanupFailures],
+        "Companion model switch rollback failed",
+      );
+    }
+    throw cause;
+  }
+
+  private async retireThreadPair(pair: CodexThreadPair): Promise<void> {
+    await Promise.all([
+      this.retireThread(pair.intentThreadId),
+      this.retireThread(pair.executionThreadId),
+    ]);
+  }
+
+  private async retireThread(threadId: string): Promise<void> {
+    try {
+      await this.dependencies.codex.closeThread(threadId);
+    } catch (error) {
+      try {
+        await this.logger.error("codex_thread_retire_failed", {
+          code: "thread_archive_failed",
+        });
+      } catch {
+        // Thread retirement diagnostics cannot change the active authority.
+      }
+    }
+  }
+
+  private currentThreadPair(): CodexThreadPair | undefined {
+    if (!this.intentThreadId || !this.executionThreadId) return undefined;
+    return Object.freeze({
+      intentThreadId: this.intentThreadId,
+      executionThreadId: this.executionThreadId,
+    });
+  }
+
+  private publishThreadPair(pair: CodexThreadPair, selection: ResolvedModelSelection): void {
+    this.intentThreadId = pair.intentThreadId;
+    this.executionThreadId = pair.executionThreadId;
+    this.selectedModel = selection.modelId;
+    this.selectedReasoningEffort = selection.reasoningEffort;
   }
 
   async start(preselectedModel?: string): Promise<void> {
@@ -504,6 +771,7 @@ export class CompanionService {
       if (generation !== this.generation) return;
       this.dependencies.confirmations.clear();
       this.dependencies.executor.stopAll();
+      this.dependencies.actionRunner.start();
       this.dependencies.mode.resetModeFromProfile();
       this.dependencies.mode.completeTask();
       this.unfinishedTaskSummary = persisted.unfinishedTaskSummary;
@@ -519,7 +787,17 @@ export class CompanionService {
       } else {
         this.selectedModel = preselectedModel;
       }
-      if (!(await this.createThreadPair(generation, this.selectedModel))) return;
+      const selection = Object.freeze({
+        modelId: this.selectedModel,
+        reasoningEffort: this.dependencies.reasoningEffort,
+      });
+      const pair = await this.startThreadPair(selection);
+      if (generation !== this.generation) {
+        await this.retireThreadPair(pair);
+        await this.closeStaleCodex(generation);
+        return;
+      }
+      this.publishThreadPair(pair, selection);
       this.consecutiveTransportFailures = 0;
       this.codexHealthy = this.unfinishedTaskSummary === null;
       this.running = true;
@@ -532,15 +810,36 @@ export class CompanionService {
         } catch {
           // Scheduler observation must never affect the action result.
         }
-        if (this.dependencies.taskController.current() === null) return;
-        const error = new Error();
-        error.name = "MinecraftToolError";
-        void this.failTaskOnly(this.generation, error, taskFailureMessage).catch(
-          (failure: unknown) =>
-            this.logger.error("task_failure_containment_failed", {
-              code: errorName(failure),
-            }),
-        );
+        const containFailure = () => {
+          // A live execution turn receives the failed tool result and can recover safely.
+          // Fail closed only when no model turn is present to handle the action outcome.
+          if (!this.running || this.activeExecutionTurn !== undefined) return;
+          if (this.dependencies.taskController.current() === null) return;
+          const error = new Error();
+          error.name = "MinecraftToolError";
+          void this.failTaskOnly(this.generation, error, taskFailureMessage).catch(
+            (failure: unknown) =>
+              this.logger.error("task_failure_containment_failed", {
+                code: errorName(failure),
+              }),
+          );
+        };
+        const queuedActionIsRunning = this.dependencies.actionQueue
+          .snapshot()
+          .items.some((item) => item.status === "running");
+        if (!queuedActionIsRunning) {
+          containFailure();
+          return;
+        }
+        // Let QueuedActionRunner publish its failure event before treating an action failure as
+        // task-terminal. A queued failure owns the next observation-and-replan turn.
+        void Promise.resolve()
+          .then(() => undefined)
+          .then(() => undefined)
+          .then(() => {
+            if (this.pendingExecutionReplans > 0) return;
+            containFailure();
+          });
       });
       this.dependencies.autonomy.start();
       while (this.startupEvents.length > 0) {
@@ -567,6 +866,78 @@ export class CompanionService {
       this.starting = false;
       this.ownerChangedDuringStartup = false;
     }
+  }
+
+  switchModel(
+    selection: ResolvedModelSelection,
+    commitPreference: () => Promise<void>,
+  ): Promise<void> {
+    const queued = this.modelSwitchTail.then(() =>
+      this.performModelSwitch(selection, commitPreference),
+    );
+    this.modelSwitchTail = queued.then(
+      () => undefined,
+      () => undefined,
+    );
+    return queued;
+  }
+
+  actionCapabilityLost(): void {
+    if (!this.running || !this.codexHealthy) return;
+    const failedTask = this.dependencies.taskController.current();
+    if (failedTask) this.locallyContainedTaskLeaseKey = taskLeaseKey(failedTask.lease);
+    this.codexHealthy = false;
+    this.dependencies.taskController.stop("failed");
+    this.dependencies.confirmations.clear();
+    this.dependencies.executor.stopAll();
+    this.dependencies.budget.end();
+    this.dependencies.mode.pause();
+    this.dependencies.autonomy.stop();
+    this.invalidateCurrentTurn();
+    this.intentThreadId = undefined;
+    this.executionThreadId = undefined;
+    this.unfinishedTaskSummary = null;
+    void this.persist().catch((error: unknown) =>
+      this.logger.error("action_authority_state_save_failed", { code: errorName(error) }),
+    );
+  }
+
+  private async performModelSwitch(
+    selection: ResolvedModelSelection,
+    commitPreference: () => Promise<void>,
+  ): Promise<void> {
+    if (!this.running) throw new Error("CompanionService is not running");
+    if (!this.codexHealthy) throw new Error("Codex is unavailable");
+    const previousPair = this.currentThreadPair();
+    if (!previousPair || !this.selectedModel || !this.selectedReasoningEffort) {
+      throw new Error("Companion model authority is unavailable");
+    }
+
+    this.dependencies.taskController.stop("model_changed");
+    this.invalidateCurrentTurn();
+    this.dependencies.budget.end();
+    const generation = this.generation;
+    const stagedPair = await this.startThreadPair(selection);
+    if (!this.isCurrent(generation) || !this.codexHealthy) {
+      await this.rollbackStagedThreadPair(
+        stagedPair,
+        new Error("Companion model authority changed during switch"),
+      );
+    }
+    try {
+      await commitPreference();
+    } catch (error) {
+      await this.rollbackStagedThreadPair(stagedPair, error);
+    }
+    if (!this.isCurrent(generation) || !this.codexHealthy) {
+      await this.rollbackStagedThreadPair(
+        stagedPair,
+        new Error("Companion model authority changed during switch"),
+      );
+    }
+
+    this.publishThreadPair(stagedPair, selection);
+    await this.retireThreadPair(previousPair);
   }
 
   async stop(): Promise<void> {
@@ -669,6 +1040,7 @@ export class CompanionService {
 
   private async handleEvent(event: MinecraftEvent): Promise<void> {
     if (!this.running) return;
+    const previousWorldGeneration = this.worldGeneration;
     if (
       event.kind === "connected" ||
       event.kind === "disconnected" ||
@@ -703,6 +1075,8 @@ export class CompanionService {
       return;
     }
     if (event.kind === "world_changed") {
+      this.farmObservationScheduler.cancelWorld(previousWorldGeneration);
+      this.scheduleFarmObservationTick();
       this.worldInvalidated = true;
       this.dependencies.taskController.stop("world_changed");
       this.invalidateCurrentTurn();
@@ -738,6 +1112,9 @@ export class CompanionService {
   }
 
   private onOwnerMessage(message: string): void {
+    const activeTask = this.dependencies.taskController.current();
+    if (activeTask) this.dependencies.actionRunner.suspend(activeTask.lease, "owner_message");
+    if (!this.codexHealthy || this.currentThreadPair() === undefined) return;
     this.mergedMessages.push(message);
     if (this.mergeTimer !== undefined) return;
     const expectedGeneration = this.generation;
@@ -791,14 +1168,84 @@ export class CompanionService {
         await this.persistIntentMemories(decision.memoryCandidates, text, stamp);
         if (this.isIntentCurrent(stamp))
           await this.sendOutcomeReply(decision.reply, stamp.generation, false);
+        if (this.isIntentCurrent(stamp)) this.queueCurrentTaskReplan(stamp);
         return;
       case "clarify":
         if (this.isIntentCurrent(stamp)) {
           await this.sendOutcomeReply(decision.question, stamp.generation, false);
         }
         return;
+      case "grant_farming_permission":
+      case "deny_farming_permission":
+      case "revoke_farming_permission":
+        await this.applyFarmingPermissionDecision(decision, stamp);
+        return;
       default:
         await this.applyTaskDecision(decision, text, stamp);
+    }
+  }
+
+  private async applyFarmingPermissionDecision(
+    decision: FarmingPermissionDecision,
+    stamp: IntentStamp,
+  ): Promise<void> {
+    if (!this.isIntentCurrent(stamp)) return;
+    const permissionEpoch = stamp.farmingPermissionEpochAtDispatch;
+    const answersActiveTicket =
+      permissionEpoch !== undefined &&
+      this.farmingPermissionCoordinator.isPendingEpoch(permissionEpoch);
+    switch (decision.kind) {
+      case "grant_farming_permission":
+        if (
+          !answersActiveTicket &&
+          this.dependencies.farmingPreference.snapshot().status !== "denied"
+        ) {
+          return;
+        }
+        await this.dependencies.farmingPreference.setAllowed(
+          () =>
+            this.isIntentCurrent(stamp) &&
+            (answersActiveTicket
+              ? this.farmingPermissionCoordinator.isPendingEpoch(permissionEpoch!)
+              : this.dependencies.farmingPreference.snapshot().status === "denied"),
+        );
+        if (!this.isIntentCurrent(stamp)) return;
+        if (
+          answersActiveTicket &&
+          !this.farmingPermissionCoordinator.resolve("allowed", permissionEpoch)
+        ) {
+          return;
+        }
+        if (decision.reply) await this.sendOutcomeReply(decision.reply, stamp.generation, false);
+        if (this.isIntentCurrent(stamp)) {
+          this.queueFarmingPermissionReplan(stamp, "小麦种植权限已明确允许，请重新观察后规划。");
+        }
+        return;
+      case "deny_farming_permission":
+        if (!answersActiveTicket) return;
+        if (!this.farmingPermissionCoordinator.resolve("denied", permissionEpoch)) return;
+        if (decision.reply) await this.sendOutcomeReply(decision.reply, stamp.generation, false);
+        if (this.isIntentCurrent(stamp)) {
+          this.queueFarmingPermissionReplan(stamp, farmingFallbackConstraint);
+        }
+        return;
+      case "revoke_farming_permission": {
+        await this.dependencies.farmingPreference.setDenied();
+        if (!this.isIntentCurrent(stamp)) return;
+        this.farmingPermissionCoordinator.cancel("permission revoked");
+        const task = this.dependencies.taskController.current();
+        if (task) {
+          this.dependencies.actionQueue.cancelKinds(
+            task.lease,
+            farmingMutationKinds,
+            "farming permission revoked",
+          );
+        }
+        if (decision.reply) await this.sendOutcomeReply(decision.reply, stamp.generation, false);
+        if (this.isIntentCurrent(stamp)) {
+          this.queueFarmingPermissionReplan(stamp, farmingFallbackConstraint);
+        }
+      }
     }
   }
 
@@ -809,6 +1256,10 @@ export class CompanionService {
     let prompt: string;
     try {
       const activeTask = this.dependencies.taskController.current();
+      const recoveredTaskGoal =
+        activeTask === null && this.unfinishedTaskSummary !== null
+          ? this.dependencies.mode.snapshot().taskId
+          : null;
       prompt = buildOwnerIntentTurn({
         ownerMessage: text,
         mode: this.dependencies.mode.getMode(),
@@ -821,7 +1272,17 @@ export class CompanionService {
               allowedActions: activeTask.disclosure.expectedActions,
               limits: activeTask.disclosure.limits,
             }
-          : null,
+          : recoveredTaskGoal
+            ? {
+                goal: recoveredTaskGoal,
+                allowedActions: [],
+                limits: recoveredIntentOnlyTaskLimits,
+              }
+            : null,
+        farmingPermission: {
+          status: this.dependencies.farmingPreference.snapshot().status,
+          pending: this.farmingPermissionCoordinator.isPending(),
+        },
       });
     } catch (error) {
       if (this.isIntentCurrent(stamp)) {
@@ -839,6 +1300,7 @@ export class CompanionService {
         false,
         undefined,
         () => this.isIntentCurrent(stamp),
+        stamp.threadPair,
       );
       if (!result || !this.isIntentCurrent(stamp)) return undefined;
       try {
@@ -887,23 +1349,30 @@ export class CompanionService {
   }
 
   private async captureIntentStamp(): Promise<IntentStamp> {
+    const messageSequence = this.messageSequence;
+    const ownerRevision = this.dependencies.ownerIdentity?.snapshot().revision ?? 0;
+    const worldGeneration = this.worldGeneration;
     const taskLease = this.dependencies.taskController.current()?.lease ?? null;
+    const taskLeaseAtDispatch =
+      taskLease === null
+        ? null
+        : Object.freeze({ id: taskLease.id, startedAt: taskLease.startedAt });
+    const farmingPermissionEpochAtDispatch = this.farmingPermissionCoordinator.pendingEpoch();
+    await this.modelSwitchTail;
+    const threadPair = this.currentThreadPair();
+    if (!threadPair) throw new Error("Companion model authority is unavailable");
     return Object.freeze({
       generation: this.generation,
-      messageSequence: this.messageSequence,
-      ownerRevision: this.dependencies.ownerIdentity?.snapshot().revision ?? 0,
-      worldGeneration: this.worldGeneration,
-      taskLeaseAtDispatch:
-        taskLease === null
-          ? null
-          : Object.freeze({ id: taskLease.id, startedAt: taskLease.startedAt }),
+      messageSequence,
+      ownerRevision,
+      worldGeneration,
+      taskLeaseAtDispatch,
+      farmingPermissionEpochAtDispatch,
+      threadPair,
     });
   }
 
-  private isTaskDecisionCurrent(
-    decision: Exclude<OwnerIntentDecision, { kind: "chat" | "clarify" }>,
-    stamp: IntentStamp,
-  ): boolean {
+  private isTaskDecisionCurrent(decision: TaskControlDecision, stamp: IntentStamp): boolean {
     if (!this.isIntentCurrent(stamp)) return false;
     if (decision.kind === "start_task") return true;
     const currentLease = this.dependencies.taskController.current()?.lease ?? null;
@@ -914,13 +1383,14 @@ export class CompanionService {
   }
 
   private async applyTaskDecision(
-    decision: Exclude<OwnerIntentDecision, { kind: "chat" | "clarify" }>,
+    decision: TaskControlDecision,
     text: string,
     stamp: IntentStamp,
   ): Promise<void> {
     if (!this.isTaskDecisionCurrent(decision, stamp)) return;
     if (decision.kind === "stop_task") {
       this.revokeCurrentTask("owner_stop");
+      this.clearSuspendedTaskGoals("owner stop");
       this.unfinishedTaskSummary = null;
       if (this.isIntentCurrent(stamp)) await this.persist();
       if (decision.reply && this.isIntentCurrent(stamp)) {
@@ -934,6 +1404,7 @@ export class CompanionService {
       (this.dependencies.taskController.current() !== null || this.autonomousRequestCount > 0)
     ) {
       this.revokeCurrentTask("owner_stop");
+      this.clearSuspendedTaskGoals("task replaced");
       this.unfinishedTaskSummary = null;
       if (this.isIntentCurrent(stamp)) await this.persist();
       if (!this.isIntentCurrent(stamp)) return;
@@ -958,14 +1429,193 @@ export class CompanionService {
       }
       this.interruptExecutionTurn();
     }
+    if (decision.kind === "priority_task") {
+      const currentTask = this.dependencies.taskController.current();
+      if (currentTask) {
+        this.interruptExecutionTurn();
+        this.dependencies.confirmations.clearGameActions();
+        this.suspendedTaskGoals.push({
+          taskLease: Object.freeze({ ...currentTask.lease }),
+          disclosure: cloneTaskDisclosure(currentTask.disclosure),
+        });
+        this.preservedTerminalLeaseKey = taskLeaseKey(currentTask.lease);
+        this.dependencies.taskController.stop("owner_stop");
+        this.dependencies.budget.end();
+        this.dependencies.mode.completeTask();
+      }
+    }
 
+    this.queueValidatedTask(decision, text, stamp);
+  }
+
+  private queueCurrentTaskReplan(stamp: IntentStamp): void {
+    const task = this.dependencies.taskController.current();
+    if (
+      !task ||
+      stamp.taskLeaseAtDispatch === null ||
+      !sameTaskLease(task.lease, stamp.taskLeaseAtDispatch)
+    ) {
+      return;
+    }
+    this.interruptExecutionTurn();
+    const allowedActions = task.disclosure.expectedActions.filter(
+      (action): action is ToolActionKind => TOOL_ACTION_KINDS.includes(action as ToolActionKind),
+    );
+    this.queueValidatedTask(
+      {
+        kind: "continue_task",
+        naturalReply: null,
+        task: {
+          goal: task.disclosure.goal,
+          allowedActions,
+          requestedLimits: { ...task.disclosure.limits },
+        },
+        memoryCandidates: [],
+      },
+      `主人消息已处理，请重新观察当前世界并规划当前目标：${task.disclosure.goal}`,
+      stamp,
+    );
+  }
+
+  private queueFarmingPermissionReplan(stamp: IntentStamp, context: string): Promise<void> {
+    const task = this.dependencies.taskController.current();
+    if (
+      !task ||
+      stamp.taskLeaseAtDispatch === null ||
+      !sameTaskLease(task.lease, stamp.taskLeaseAtDispatch)
+    ) {
+      return Promise.resolve();
+    }
+    this.interruptExecutionTurn();
+    const allowedActions = task.disclosure.expectedActions.filter(
+      (action): action is ToolActionKind => TOOL_ACTION_KINDS.includes(action as ToolActionKind),
+    );
+    return this.queueValidatedTask(
+      {
+        kind: "continue_task",
+        naturalReply: null,
+        task: {
+          goal: task.disclosure.goal,
+          allowedActions,
+          requestedLimits: { ...task.disclosure.limits },
+        },
+        memoryCandidates: [],
+      },
+      context,
+      stamp,
+    );
+  }
+
+  private async queueFarmingPermissionReplanFromCurrent(context: string): Promise<void> {
+    await this.queueExecutionReplanFromCurrent(context);
+  }
+
+  private async queueExecutionReplanFromCurrent(context: string): Promise<void> {
+    if (!this.running || this.dependencies.taskController.current() === null) return;
+    try {
+      const stamp = await this.captureIntentStamp();
+      if (!this.isIntentCurrent(stamp)) return;
+      await this.queueFarmingPermissionReplan(stamp, context);
+    } catch (error) {
+      await this.logger.error("execution_replan_failed", { code: errorName(error) });
+    }
+  }
+
+  private async queueExecutionReplanFromRunner(event: QueueRunnerEvent): Promise<void> {
+    const task = this.dependencies.taskController.current();
+    if (!task || !sameTaskLease(task.lease, event.taskLease)) return;
+    if (
+      event.kind === "action_failed" ||
+      event.kind === "budget_boundary" ||
+      event.kind === "world_stale"
+    ) {
+      this.dependencies.actionQueue.cancelPendingPhysicalActions(
+        task.lease,
+        "discarded before observation replan",
+      );
+    }
+    const context =
+      event.kind === "batch_completed"
+        ? "上一批次已完成，请先观察当前世界再规划下一组动作。"
+        : event.kind === "action_failed"
+          ? "动作批次失败，请先观察当前世界再决定安全的下一步。"
+          : event.kind === "world_stale"
+            ? "世界观察已过期，请先重新观察后规划。"
+            : "预算边界已到，请重新观察并在允许的范围内决定是否继续。";
+    this.pendingExecutionReplans += 1;
+    try {
+      await this.queueExecutionReplanFromCurrent(context);
+    } finally {
+      this.pendingExecutionReplans -= 1;
+    }
+  }
+
+  private beginFarmingPermissionRequest(plotSummary: string): boolean {
+    if (
+      this.dependencies.farmingPreference.snapshot().status !== "unknown" ||
+      this.farmingPermissionCoordinator.isPending()
+    ) {
+      return false;
+    }
+    const result = this.farmingPermissionCoordinator.request({
+      plotSummary,
+      requestedAt: Date.now(),
+    });
+    void result
+      .then((permissionResult) => this.handleFarmingPermissionResult(permissionResult))
+      .catch((error: unknown) =>
+        this.logger.error("farming_permission_result_failed", { code: errorName(error) }),
+      );
+    return true;
+  }
+
+  private async handleFarmingPermissionResult(result: FarmingPermissionResult): Promise<void> {
+    if (result !== "timeout") return;
+    await this.queueFarmingPermissionReplanFromCurrent(farmingFallbackConstraint);
+  }
+
+  private queueValidatedTask(
+    decision: ValidatedTaskDecision,
+    ownerText: string,
+    stamp: IntentStamp,
+  ): Promise<void> {
     const queued = this.executionTurnTail
       .catch(() => undefined)
-      .then(() => this.startValidatedTask(decision, text, stamp))
+      .then(() => this.startValidatedTask(decision, ownerText, stamp))
       .catch((error: unknown) =>
         this.logger.error("companion_task_turn_failed", { code: String(error) }),
       );
     this.executionTurnTail = queued;
+    return queued;
+  }
+
+  private clearSuspendedTaskGoals(reason: string): void {
+    for (const suspended of this.suspendedTaskGoals.splice(0)) {
+      this.dependencies.actionQueue.cancelTask(suspended.taskLease, reason);
+    }
+  }
+
+  private async resumeLatestSuspendedGoal(stamp: IntentStamp): Promise<void> {
+    const suspended = this.suspendedTaskGoals.pop();
+    if (!suspended || !this.isIntentCurrent(stamp)) return;
+    this.dependencies.actionQueue.cancelTask(suspended.taskLease, "priority task replan");
+    const allowedActions = suspended.disclosure.expectedActions.filter(
+      (action): action is ToolActionKind => TOOL_ACTION_KINDS.includes(action as ToolActionKind),
+    );
+    await this.startValidatedTask(
+      {
+        kind: "start_task",
+        naturalReply: null,
+        task: {
+          goal: suspended.disclosure.goal,
+          allowedActions,
+          requestedLimits: { ...suspended.disclosure.limits },
+        },
+        memoryCandidates: [],
+      },
+      `优先帮助任务已完成，请重新观察当前世界并规划原目标：${suspended.disclosure.goal}`,
+      stamp,
+    );
   }
 
   private async startValidatedTask(
@@ -977,6 +1627,8 @@ export class CompanionService {
     let task: ActiveTask | undefined;
     let prepared: TaskDisclosure | undefined;
     let taskStopReason: TaskStopReason = "failed";
+    let keepTaskAlive = false;
+    let resumeSuspendedGoal = false;
     try {
       if (!this.isIntentCurrent(stamp)) return;
       if (decision.kind === "continue_task") {
@@ -1022,6 +1674,11 @@ export class CompanionService {
           memories: (await this.searchMemories(ownerText)).slice(0, 8),
           ownerMessage: ownerText,
           plan,
+          farmingPermission: {
+            status: this.dependencies.farmingPreference.snapshot().status,
+            pending: this.farmingPermissionCoordinator.isPending(),
+          },
+          queueSnapshot: this.dependencies.actionQueue.snapshot(),
         };
         prompt = buildCompanionTaskExecutionTurn(input);
       } catch (error) {
@@ -1056,6 +1713,7 @@ export class CompanionService {
           true,
           decision.task.allowedActions,
           () => this.isIntentCurrent(stamp),
+          stamp.threadPair,
         );
         if (!result || !this.isIntentCurrent(stamp)) return;
         const parsed = companionTaskExecutionOutcomeSchema.safeParse(this.parseJson(result.text));
@@ -1071,10 +1729,29 @@ export class CompanionService {
         return;
       }
 
+      const requestedFarmingPermission =
+        outcome.farmingPermissionRequest == null
+          ? false
+          : this.beginFarmingPermissionRequest(outcome.farmingPermissionRequest.plotSummary);
       taskStopReason = "completed";
       await this.persistTaskExecutionOutcome(task.disclosure.goal, outcome, stamp, ownerText);
       if (!this.isIntentCurrent(stamp)) return;
-      await this.sendOutcomeReply(outcome.reply, stamp.generation, false);
+      if (decision.kind === "continue_task" && outcome.status === "active") {
+        this.dependencies.actionRunner.resumeAfterReplan(task.lease, this.worldGeneration);
+      }
+      keepTaskAlive =
+        outcome.status === "active" &&
+        (this.dependencies.actionQueue.hasActiveTask(task.lease) ||
+          this.pendingExecutionReplans > 0);
+      if (outcome.status !== "active") {
+        this.dependencies.actionQueue.cancelTask(task.lease, "task outcome finished");
+        resumeSuspendedGoal = decision.kind === "priority_task";
+      }
+      if (requestedFarmingPermission) {
+        await this.sendOutcomeReply(farmingPermissionQuestion, stamp.generation, false);
+      } else {
+        await this.sendOutcomeReply(outcome.reply, stamp.generation, false);
+      }
     } catch (error) {
       if (
         task &&
@@ -1094,18 +1771,29 @@ export class CompanionService {
         this.dependencies.taskController.current()?.id === task.id
       ) {
         if (
-          taskStopReason !== "completed" ||
-          !this.dependencies.confirmations.hasGameActions(task.lease)
+          !keepTaskAlive &&
+          (taskStopReason !== "completed" ||
+            !this.dependencies.confirmations.hasGameActions(task.lease))
         ) {
           this.dependencies.taskController.stop(taskStopReason);
         }
       }
       this.turnWorkCount -= 1;
+      if (
+        resumeSuspendedGoal &&
+        this.isIntentCurrent(stamp) &&
+        this.dependencies.taskController.current() === null
+      ) {
+        await this.resumeLatestSuspendedGoal(stamp);
+      }
     }
   }
 
   async requestAutonomousTurn(reason: AutonomyReason): Promise<void> {
+    await this.modelSwitchTail;
     if (!this.running) return;
+    const threadPair = this.currentThreadPair();
+    if (!threadPair) return;
     const state = this.dependencies.mode.snapshot();
     if (state.mode === "friend" || state.paused) return;
     if (this.autonomousRequestCount > 0 || this.hasActiveTask()) return;
@@ -1113,7 +1801,7 @@ export class CompanionService {
     this.autonomousRequestCount += 1;
     const queued = this.executionTurnTail
       .catch(() => undefined)
-      .then(() => this.performAutonomousTurn(reason, generation))
+      .then(() => this.performAutonomousTurn(reason, generation, threadPair))
       .catch((error: unknown) =>
         this.logger.error("companion_autonomous_turn_failed", { code: String(error) }),
       );
@@ -1139,7 +1827,20 @@ export class CompanionService {
     );
   }
 
-  private async performAutonomousTurn(reason: AutonomyReason, generation: number): Promise<void> {
+  queueExecutionContext(): QueuedActionExecutionContext | null {
+    const task = this.dependencies.taskController.current();
+    if (!task) return null;
+    return {
+      taskLease: { ...task.lease },
+      worldGeneration: this.worldGeneration,
+    };
+  }
+
+  private async performAutonomousTurn(
+    reason: AutonomyReason,
+    generation: number,
+    threadPair: CodexThreadPair,
+  ): Promise<void> {
     this.turnWorkCount += 1;
     try {
       if (!this.isCurrent(generation) || !this.executionThreadId) return;
@@ -1208,16 +1909,23 @@ export class CompanionService {
         await this.failTaskOnly(generation, error, taskFailureMessage);
         return;
       }
-      const outcome = await this.resolveOutcome(prompt, generation, undefined, disclosure, {
-        toolsEnabled: permitsTools,
-        taskForbidden: true,
-        repairPrompt:
-          state.mode === "balanced"
-            ? balancedRepairPrompt(allowedProactiveKinds)
-            : autonomousRepairPrompt,
-        ...(state.mode === "balanced" ? { allowedProactiveKinds } : {}),
-        ...(permitsTools ? { allowedToolActions: autonomousMicroToolActions } : {}),
-      });
+      const outcome = await this.resolveOutcome(
+        prompt,
+        generation,
+        undefined,
+        disclosure,
+        {
+          toolsEnabled: permitsTools,
+          taskForbidden: true,
+          repairPrompt:
+            state.mode === "balanced"
+              ? balancedRepairPrompt(allowedProactiveKinds)
+              : autonomousRepairPrompt,
+          ...(state.mode === "balanced" ? { allowedProactiveKinds } : {}),
+          ...(permitsTools ? { allowedToolActions: autonomousMicroToolActions } : {}),
+        },
+        threadPair,
+      );
       if (!outcome || !this.isCurrent(generation)) return;
       await this.persistOutcome(outcome, generation);
       if (!this.isCurrent(generation)) return;
@@ -1239,6 +1947,7 @@ export class CompanionService {
       readonly repairPrompt?: string;
       readonly allowedProactiveKinds?: readonly ProactiveKind[];
     } = {},
+    threadPair?: CodexThreadPair,
   ): Promise<CompanionTurnOutcome | undefined> {
     let outcome: CompanionTurnOutcome | undefined;
     let task: ActiveTask | undefined;
@@ -1262,6 +1971,8 @@ export class CompanionService {
           task,
           options.toolsEnabled ?? true,
           options.allowedToolActions,
+          undefined,
+          threadPair,
         );
         if (!result) return undefined;
         const parsed = companionTurnOutcomeSchema.safeParse(this.parseJson(result.text));
@@ -1342,11 +2053,13 @@ export class CompanionService {
     toolsEnabled: boolean,
     allowedToolActions?: readonly ToolActionKind[],
     isApplicable: () => boolean = () => true,
+    threadPair?: CodexThreadPair,
   ): Promise<CodexTurnResult | undefined> {
     if (role === "intent" && toolsEnabled) {
       throw new Error("intent turns cannot enable tools");
     }
-    const threadId = role === "intent" ? this.intentThreadId : this.executionThreadId;
+    const pair = threadPair ?? this.currentThreadPair();
+    const threadId = role === "intent" ? pair?.intentThreadId : pair?.executionThreadId;
     const isAttemptCurrent = () => this.isCurrent(generation) && isApplicable();
     if (!threadId || !isAttemptCurrent()) return undefined;
     let cancel!: () => void;
@@ -1544,11 +2257,13 @@ export class CompanionService {
       }
       if (this.externallyManagedCodex) {
         const selectedModel = this.selectedModel;
+        const selectedReasoningEffort = this.selectedReasoningEffort;
         const available =
           selectedModel !== undefined &&
+          selectedReasoningEffort !== undefined &&
           (await this.dependencies.codex.validateModelSelection({
             modelId: selectedModel,
-            reasoningEffort: this.dependencies.reasoningEffort,
+            reasoningEffort: selectedReasoningEffort,
           }));
         if (!available) {
           this.reportModelAuthorityLoss(generation);
@@ -1557,11 +2272,24 @@ export class CompanionService {
       } else {
         const models = await this.dependencies.codex.listModels();
         this.selectedModel = selectModel(models, this.dependencies.preferredModel);
+        this.selectedReasoningEffort = this.dependencies.reasoningEffort;
       }
       if (!this.isCurrent(generation)) return;
       const selectedModel = this.selectedModel;
-      if (!selectedModel) throw new Error("Selected live model is unavailable");
-      if (!(await this.createThreadPair(generation, selectedModel))) return;
+      const selectedReasoningEffort = this.selectedReasoningEffort;
+      if (!selectedModel || !selectedReasoningEffort) {
+        throw new Error("Selected live model is unavailable");
+      }
+      const selection = Object.freeze({
+        modelId: selectedModel,
+        reasoningEffort: selectedReasoningEffort,
+      });
+      const pair = await this.startThreadPair(selection);
+      if (!this.isCurrent(generation)) {
+        await this.retireThreadPair(pair);
+        return;
+      }
+      this.publishThreadPair(pair, selection);
       const summary = this.unfinishedTaskSummary ?? "Codex session recovery handshake";
       const prompt = buildCompanionRecoveryTurn({
         mode: this.dependencies.mode.getMode(),
@@ -1976,22 +2704,47 @@ export class CompanionService {
   }
 
   private revokeCurrentTask(reason: TaskStopReason): void {
+    const activeTask = this.dependencies.taskController.current();
     this.interruptExecutionTurn();
     this.dependencies.confirmations.clear();
-    this.dependencies.executor.stopAll();
+    if (activeTask) {
+      try {
+        this.dependencies.actionRunner.cancelTask(activeTask.lease, reason);
+      } catch {
+        this.dependencies.executor.stopAll();
+        this.dependencies.actionQueue.cancelTask(activeTask.lease, reason);
+      }
+    } else {
+      this.dependencies.executor.stopAll();
+    }
     this.dependencies.taskController.stop(reason);
     this.dependencies.budget.end();
     this.dependencies.mode.completeTask();
   }
 
-  private handleTaskTerminal(reason: TaskStopReason, forceCleanup = false): void {
+  private handleTaskTerminal(
+    reason: TaskStopReason,
+    forceCleanup = false,
+    taskLease?: TaskLease,
+  ): void {
+    this.farmObservationScheduler.cancelWorld(this.worldGeneration);
+    this.clearFarmObservationTick();
+    this.farmingPermissionCoordinator.cancel(reason);
+    if (taskLease) {
+      const key = taskLeaseKey(taskLease);
+      if (this.preservedTerminalLeaseKey === key) {
+        this.preservedTerminalLeaseKey = undefined;
+      } else {
+        this.dependencies.actionQueue.cancelTask(taskLease, reason);
+      }
+    }
     this.pendingConfirmationTerminalReasons.clear();
     try {
       this.dependencies.confirmations.clearGameActions();
     } catch (error) {
       void this.logger.error("task_terminal_confirmation_clear_failed", { code: String(error) });
     }
-    const taskOnlyStop = reason === "owner_stop";
+    const taskOnlyStop = reason === "owner_stop" || reason === "model_changed";
     if (!taskOnlyStop && !forceCleanup && reason !== "timeout" && reason !== "budget_exhausted") {
       return;
     }

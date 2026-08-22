@@ -1,0 +1,54 @@
+{
+  "schemaVersion": 1,
+  "artAuthority": [
+    "assets/source/whitelily-turnaround.png",
+    "assets/source/whitelily-armor-themes.png"
+  ],
+  "requiredPalette": ["#F7F6F2", "#E9F1EA", "#CDE2C8", "#D4C7A3", "#A67C52"],
+  "irisSamples": [
+    {
+      "role": "deep",
+      "source": "assets/source/whitelily-turnaround.png",
+      "coordinate": [521, 241],
+      "hex": "#7F815F"
+    },
+    {
+      "role": "mid",
+      "source": "assets/source/whitelily-turnaround.png",
+      "coordinate": [524, 240],
+      "hex": "#909770"
+    },
+    {
+      "role": "highlight",
+      "source": "assets/source/whitelily-turnaround.png",
+      "coordinate": [530, 240],
+      "hex": "#BABA98"
+    }
+  ],
+  "atlas": {
+    "size": [2048, 2048],
+    "colorType": "RGBA",
+    "mipPaddingPx": 16,
+    "embedded": true,
+    "externalUris": [],
+    "albedo": "assets/textures/source/whitelily-base-albedo.png",
+    "control": "assets/textures/source/whitelily-base-control.png"
+  },
+  "uvRegions": {
+    "face": [16, 1040, 496, 2032],
+    "eyes": [528, 1040, 1008, 2032],
+    "hair": [1040, 1040, 2032, 2032],
+    "outfit": [16, 16, 2032, 1008]
+  },
+  "controlChannels": {
+    "r": "cel shadow response",
+    "g": "0.08 edge highlight mask",
+    "b": "unshadowed eye highlight mask",
+    "a": "alpha test coverage"
+  },
+  "alphaTest": {
+    "threshold": 0.5,
+    "scope": "lily edges and sparse hair tips only",
+    "bodyLayers": "opaque"
+  }
+}

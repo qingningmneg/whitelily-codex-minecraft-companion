@@ -59,7 +59,14 @@ function api(overrides: Partial<WhiteLilyTask5Api> = {}): WhiteLilyTask5Api {
       lifecycle: "running" as const,
       minecraft: { state: "connected" as const, sessionId: "session" },
       codex: { state: "ready" as const, model: "live-model" },
+      actions: {
+        state: "ready" as const,
+        workspaceVersion: "workspace-1",
+        mcpListening: true as const,
+        discoveredToolCount: 15,
+      },
       task: null,
+      actionQueue: { goal: null, items: [] },
       lastError: null,
     })),
     previewMemoryMigration: vi.fn(async (scope) => ({
@@ -147,7 +154,14 @@ describe("MemoryPage", () => {
       lifecycle: "running",
       minecraft: { state: "connected", sessionId: "session" },
       codex: { state: "ready", model: "live-model" },
+      actions: {
+        state: "ready",
+        workspaceVersion: "workspace-1",
+        mcpListening: true,
+        discoveredToolCount: 15,
+      },
       task: null,
+      actionQueue: { goal: null, items: [] },
       lastError: null,
     }));
     render(

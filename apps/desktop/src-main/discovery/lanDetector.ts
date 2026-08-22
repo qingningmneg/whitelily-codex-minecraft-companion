@@ -143,6 +143,22 @@ export class LanDetector {
     });
   }
 
+  /** Main-process-only, non-consuming authority for component inspection. */
+  inspectCandidate(candidateId: string): Promise<Readonly<LanObservation>> {
+    return this.#serialize(async () => {
+      this.#assertRunning();
+      const candidate = this.#store.resolve(candidateId);
+      if (!candidate) throw new Error("LAN_CANDIDATE_EXPIRED");
+      const current = normalizeProbeRecords((await this.#probe()).records).find(
+        (observation) =>
+          isSameLanObservation(observation, candidate) && observation.version === candidate.version,
+      );
+      this.#assertRunning();
+      if (!current) throw new Error("LAN_CANDIDATE_CHANGED");
+      return Object.freeze({ ...current });
+    });
+  }
+
   /** Main-process-only proof validation for bound-world authorization. */
   isCurrentConfirmedProof(proof: ConfirmedConnectionProof): boolean {
     return this.#store.isCurrentConfirmedProof(proof);

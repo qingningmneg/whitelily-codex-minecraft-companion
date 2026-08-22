@@ -175,7 +175,7 @@ describe("SafeLogger", () => {
   it("redacts local paths from retained structured fields without dropping safe data", async () => {
     const path = await logPath();
     await new SafeLogger(path).error("filesystem_failed", {
-      windows: String.raw`ENOENT opening C:\Users\Owner Name\AppData\Local\WhiteLily\state.json`,
+      windows: String.raw`ENOENT opening C:\Users\Owner\AppData\Local\White Lily\state.json`,
       unc: String.raw`failed at \\workstation\Owner Share\private\audit.jsonl`,
       unix: "permission denied at /home/owner/.whitelily/private.log",
       counter: 7,
@@ -185,7 +185,7 @@ describe("SafeLogger", () => {
     const output = await readFile(path, "utf8");
     const event = JSON.parse(output) as Record<string, unknown>;
     for (const sensitive of [
-      String.raw`C:\Users\Owner Name`,
+      String.raw`C:\Users\Owner\AppData\Local\White Lily`,
       String.raw`\\workstation\Owner Share`,
       "/home/owner",
     ]) {

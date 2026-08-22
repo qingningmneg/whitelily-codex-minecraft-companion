@@ -60,12 +60,48 @@ it("runs the built preload with only sandbox-approved module access", async () =
     expect(exposedApi).toEqual(
       expect.objectContaining({
         detectLanCandidates: expect.any(Function),
+        getMinecraftComponentStatus: expect.any(Function),
+        installMinecraftComponents: expect.any(Function),
+        importAvatarModel: expect.any(Function),
+        listAvatarModels: expect.any(Function),
+        quitApplication: expect.any(Function),
+        removeMinecraftComponents: expect.any(Function),
         readOwnerIdentity: expect.any(Function),
         updateOwnerIdentity: expect.any(Function),
         subscribeOwnerIdentity: expect.any(Function),
+        subscribeAvatarModels: expect.any(Function),
         subscribeRuntime: expect.any(Function),
+        switchAvatarModel: expect.any(Function),
       }),
     );
+
+    const avatarPreviewBundle = await readFile(join(outDir, "avatar-preview-preload.cjs"), "utf8");
+    let previewListener: ((event: { ports: unknown[] }) => void) | undefined;
+    const transferred: unknown[][] = [];
+    vm.runInNewContext(avatarPreviewBundle, {
+      console,
+      process,
+      require: (moduleId: string) => {
+        if (moduleId !== "electron") {
+          throw new Error(`sandboxed avatar preview preload cannot require ${moduleId}`);
+        }
+        return {
+          ipcRenderer: {
+            on: (_channel: string, listener: (event: { ports: unknown[] }) => void) => {
+              previewListener = listener;
+            },
+          },
+        };
+      },
+      window: {
+        postMessage: (_message: unknown, _target: string, ports: unknown[]) => {
+          transferred.push(ports);
+        },
+      },
+    });
+    const port = {};
+    previewListener?.({ ports: [port] });
+    expect(transferred).toEqual([[port]]);
   } finally {
     await rm(temporaryRoot, { force: true, recursive: true });
   }

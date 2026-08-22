@@ -6,9 +6,15 @@ import type { AgentMessageDeltaNotification } from "./generated/v2/AgentMessageD
 import type { CancelLoginAccountResponse } from "./generated/v2/CancelLoginAccountResponse.js";
 import type { GetAccountResponse } from "./generated/v2/GetAccountResponse.js";
 import type { LoginAccountResponse } from "./generated/v2/LoginAccountResponse.js";
+import type { DynamicToolCallParams } from "./generated/v2/DynamicToolCallParams.js";
+import type { DynamicToolCallResponse } from "./generated/v2/DynamicToolCallResponse.js";
+import type { DynamicToolSpec } from "./generated/v2/DynamicToolSpec.js";
 import type { Model } from "./generated/v2/Model.js";
 import type { ModelListResponse } from "./generated/v2/ModelListResponse.js";
 import type { ModelListParams } from "./generated/v2/ModelListParams.js";
+import type { McpServerRefreshResponse } from "./generated/v2/McpServerRefreshResponse.js";
+import type { ThreadArchiveParams } from "./generated/v2/ThreadArchiveParams.js";
+import type { ThreadArchiveResponse } from "./generated/v2/ThreadArchiveResponse.js";
 import type { ThreadStartParams } from "./generated/v2/ThreadStartParams.js";
 import type { ThreadStartResponse } from "./generated/v2/ThreadStartResponse.js";
 import type { TurnCompletedNotification } from "./generated/v2/TurnCompletedNotification.js";
@@ -17,6 +23,7 @@ import type { TurnInterruptResponse } from "./generated/v2/TurnInterruptResponse
 import type { TurnStartParams } from "./generated/v2/TurnStartParams.js";
 import type { TurnStartResponse } from "./generated/v2/TurnStartResponse.js";
 import type { CodexPort, CodexTurnResult } from "./codexPort.js";
+import type { MinecraftDynamicTools } from "./minecraftDynamicTools.js";
 import type { AccountServerNotification, AccountAppServerPort } from "./accountService.js";
 import {
   JsonRpcProcess,
@@ -24,6 +31,7 @@ import {
   spawnCodexAppServerTransport,
   type JsonRpcLineTransport,
   type JsonRpcMessage,
+  type JsonRpcServerRequest,
   type LoginStatusResult,
 } from "./jsonRpcProcess.js";
 
@@ -34,6 +42,10 @@ const loginRefusal =
 const MAX_MODEL_PAGES = 100;
 const MAX_MODEL_RECORDS = 256;
 const DEFAULT_ACCOUNT_READ_TIMEOUT_MS = 8_000;
+
+type ExperimentalThreadStartParams = ThreadStartParams & {
+  dynamicTools?: Array<DynamicToolSpec> | null;
+};
 
 const wellFormedString = (maxCodePoints: number) =>
   z
@@ -87,6 +99,16 @@ const accountUpdatedNotificationSchema = z
         planType: planTypeSchema.nullable(),
       })
       .strict(),
+  })
+  .strict();
+const dynamicToolCallParamsSchema = z
+  .object({
+    threadId: wellFormedString(512).min(1),
+    turnId: wellFormedString(512).min(1),
+    callId: wellFormedString(512).min(1),
+    namespace: wellFormedString(128).min(1).nullable(),
+    tool: wellFormedString(128).min(1),
+    arguments: z.unknown(),
   })
   .strict();
 
@@ -211,6 +233,7 @@ export class CodexAppServerClient implements CodexPort, AccountAppServerPort {
   private readonly activeTurns = new Map<string, ActiveTurn>();
   private readonly pendingTurnStarts = new Set<PendingTurnStart>();
   private readonly earlyTurnEvents = new Map<string, EarlyTurnEvents>();
+  private readonly dynamicToolThreadIds = new Set<string>();
   private rpc: JsonRpcProcess | undefined;
   private startingRpc: { generation: number; rpc: JsonRpcProcess } | undefined;
   private retiringRpc: RetiringRpc | undefined;
@@ -225,6 +248,7 @@ export class CodexAppServerClient implements CodexPort, AccountAppServerPort {
   private stopping = false;
   private hasGameThreads = false;
   private threadStarting = false;
+  private dynamicTools: MinecraftDynamicTools | undefined;
 
   constructor(config: AppConfig | undefined, dependencies: CodexAppServerClientDependencies = {}) {
     this.loginTimeoutMs = positiveTimeout(dependencies.loginTimeoutMs ?? 10_000, "login timeout");
@@ -257,6 +281,13 @@ export class CodexAppServerClient implements CodexPort, AccountAppServerPort {
     }
     this.workspacePath = resolve(options.workspacePath);
     this.defaultReasoningEffort = options.reasoningEffort;
+  }
+
+  configureDynamicTools(dynamicTools: MinecraftDynamicTools): void {
+    if (this.activeTurns.size > 0 || this.hasGameThreads || this.threadStarting) {
+      throw new Error("Codex dynamic tools cannot change during an active game session");
+    }
+    this.dynamicTools = dynamicTools;
   }
 
   async start(): Promise<void> {
@@ -371,8 +402,9 @@ export class CodexAppServerClient implements CodexPort, AccountAppServerPort {
     try {
       const params: InitializeParams = {
         clientInfo: { name: "whitelily-companion", title: null, version: "0.1.1" },
-        capabilities: { experimentalApi: false, requestAttestation: false },
+        capabilities: { experimentalApi: true, requestAttestation: false },
       };
+      rpc.onRequest((request) => this.handleServerRequest(request));
       rpc.onNotification((notification) => {
         if (this.rpc === rpc && this.isCurrent(generation)) {
           this.handleNotification(notification);
@@ -380,6 +412,7 @@ export class CodexAppServerClient implements CodexPort, AccountAppServerPort {
       });
       rpc.onExit((error) => {
         if (this.rpc === rpc) this.failActiveTurns(error);
+        if (this.rpc === rpc) this.dynamicToolThreadIds.clear();
         if (this.rpc === rpc) this.rpc = undefined;
         if (this.startingRpc?.rpc === rpc) this.startingRpc = undefined;
         this.trackRetiringRpc(rpc);
@@ -406,6 +439,11 @@ export class CodexAppServerClient implements CodexPort, AccountAppServerPort {
 
   async listModels(): Promise<string[]> {
     return (await this.listModelRecords()).map((model) => model.model);
+  }
+
+  async reloadMcpServers(): Promise<void> {
+    await this.startAccountSession();
+    await this.requireRpc().request<McpServerRefreshResponse>("config/mcpServer/reload", {});
   }
 
   async validateModelSelection(selection: {
@@ -479,25 +517,42 @@ export class CodexAppServerClient implements CodexPort, AccountAppServerPort {
     cwd: string;
     model: string;
     reasoningEffort: string;
+    toolAccess?: "none" | "minecraft";
   }): Promise<string> {
     if (this.threadStarting) {
       throw new Error("a Codex thread is already starting for this game session");
     }
     this.threadStarting = true;
-    const params: ThreadStartParams = {
-      model: input.model,
-      cwd: this.workspacePath,
-      sandbox: "read-only",
-      approvalPolicy: "never",
-    };
     try {
+      const dynamicTools =
+        input.toolAccess === "minecraft"
+          ? (this.dynamicTools ??
+            (() => {
+              throw new Error("Minecraft dynamic tools are unavailable");
+            })())
+          : undefined;
+      const params: ExperimentalThreadStartParams = {
+        model: input.model,
+        cwd: this.workspacePath,
+        sandbox: "read-only",
+        approvalPolicy: "never",
+        ...(dynamicTools === undefined ? {} : { dynamicTools: [...dynamicTools.specs] }),
+      };
       const result = await this.requireRpc().request<ThreadStartResponse>("thread/start", params);
       this.hasGameThreads = true;
       this.reasoningEfforts.set(result.thread.id, input.reasoningEffort);
+      if (dynamicTools !== undefined) this.dynamicToolThreadIds.add(result.thread.id);
       return result.thread.id;
     } finally {
       this.threadStarting = false;
     }
+  }
+
+  async closeThread(threadId: string): Promise<void> {
+    const params: ThreadArchiveParams = { threadId };
+    await this.requireRpc().request<ThreadArchiveResponse>("thread/archive", params);
+    this.reasoningEfforts.delete(threadId);
+    this.dynamicToolThreadIds.delete(threadId);
   }
 
   sendTurn(
@@ -599,6 +654,7 @@ export class CodexAppServerClient implements CodexPort, AccountAppServerPort {
     this.startingRpc = undefined;
     this.retiringRpc = undefined;
     this.reasoningEfforts.clear();
+    this.dynamicToolThreadIds.clear();
     this.activeTurns.clear();
     this.pendingTurnStarts.clear();
     this.earlyTurnEvents.clear();
@@ -682,6 +738,24 @@ export class CodexAppServerClient implements CodexPort, AccountAppServerPort {
         this.earlyTurnEvents.set(params.turn.id, early);
       }
     }
+  }
+
+  private async handleServerRequest(request: JsonRpcServerRequest): Promise<unknown> {
+    if (request.method !== "item/tool/call") throw new Error("unsupported app-server request");
+    const parsed = dynamicToolCallParamsSchema.safeParse(request.params);
+    if (!parsed.success) return this.dynamicToolFailure("invalid Minecraft tool request");
+    const params = parsed.data as DynamicToolCallParams;
+    if (!this.dynamicToolThreadIds.has(params.threadId) || !this.dynamicTools) {
+      return this.dynamicToolFailure("Minecraft tool is unavailable");
+    }
+    return this.dynamicTools.call(params);
+  }
+
+  private dynamicToolFailure(message: string): DynamicToolCallResponse {
+    return {
+      contentItems: [{ type: "inputText", text: JSON.stringify({ error: message }) }],
+      success: false,
+    };
   }
 
   private completeTurn(active: ActiveTurn, status: CodexTurnResult["status"]): void {

@@ -1,4 +1,6 @@
+import { spawnSync } from "node:child_process";
 import { access, readFile } from "node:fs/promises";
+import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import { TaskController, type ActiveTask } from "../../src/companion/taskController.js";
 import { RuntimeFacade } from "../../src/runtime/runtimeFacade.js";
@@ -32,7 +34,157 @@ const required = [
   "docs/smartscreen.md",
 ];
 
+interface InstallerLifecycleAttestation {
+  attestationSchemaVersion: number;
+  productVersion: string;
+  packageSourceCommit: string;
+  lifecycleValidationCommit: string;
+  canonicalLifecyclePath: string;
+  lifecycleSha256: string;
+  hostPersistedLastWriteTimeUtc: string;
+  candidate: {
+    filename: string;
+    bytes: number;
+    sha256: string;
+    signature: string;
+    authenticodeStatus: string;
+  };
+  publicBaseline: {
+    releaseTag: string;
+    filename: string;
+    bytes: number;
+    sha256: string;
+  };
+  lifecycle: {
+    schemaVersion: number;
+    success: boolean;
+    stageCount: number;
+    stages: string[];
+    controllerSid: string;
+    candidateReportWriteDenied: boolean;
+    managedWorkspaceResources: number;
+    minecraftComponentResources: number;
+    componentPreferencesFresh: boolean;
+    componentPreferencesUpgradePreserved: boolean;
+    componentPreferencesKeepPreserved: boolean;
+  };
+  zeroResidue: {
+    trackedWindowsSandbox: number;
+    sandboxMappings: number;
+    sandboxRoots: number;
+    lifecycleHivePresent: boolean;
+    candidatePrincipalPresent: boolean;
+    remoteSessionEnumeration: string;
+  };
+}
+
+function assertAttestationShape(value: unknown): asserts value is InstallerLifecycleAttestation {
+  if (!value || typeof value !== "object") throw new Error("attestation object required");
+  const attestation = value as Partial<InstallerLifecycleAttestation>;
+  if (attestation.attestationSchemaVersion !== 1) throw new Error("attestation schema required");
+  if (!/^[0-9a-f]{64}$/u.test(attestation.lifecycleSha256 ?? "")) {
+    throw new Error("attestation lifecycle hash required");
+  }
+  if (
+    attestation.canonicalLifecyclePath !==
+    "build/electron-installer/WhiteLily-0.2.0-beta.2-windows-x64-installer-lifecycle.json"
+  ) {
+    throw new Error("attestation canonical lifecycle path required");
+  }
+  const serialized = JSON.stringify(attestation);
+  if (
+    /candidate(?:Sid|User|Username)|\b(?:pid|processId)\b|S-1-5-21-|[A-Z]:\\|\/Users\//iu.test(
+      serialized,
+    )
+  ) {
+    throw new Error("attestation must not contain personal paths or candidate identity");
+  }
+}
+
 describe("public release readiness", () => {
+  it("attests the canonical installer lifecycle without personal host details", async () => {
+    const attestationPath =
+      "docs/release-evidence/WhiteLily-0.2.0-beta.2-installer-lifecycle.attestation.json";
+    const attestation = JSON.parse(await readFile(attestationPath, "utf8")) as unknown;
+    assertAttestationShape(attestation);
+    const record = attestation as InstallerLifecycleAttestation;
+    expect(Number.isNaN(Date.parse(record.hostPersistedLastWriteTimeUtc))).toBe(false);
+    expect(record).toMatchObject({
+      productVersion: "0.2.0-beta.2",
+      packageSourceCommit: "3df657bdbc30889aead3722edfddaff0fb3ae55d",
+      lifecycleValidationCommit: "3df657bdbc30889aead3722edfddaff0fb3ae55d",
+      lifecycleSha256: "435527808c0dd101967bc8aa77a1218caec5d2dad367a1f72203418b67a79094",
+      hostPersistedLastWriteTimeUtc: "2026-08-13T23:31:20.8672623Z",
+      candidate: {
+        filename: "WhiteLily-0.2.0-beta.2-windows-x64-setup.exe",
+        bytes: 229_360_405,
+        sha256: "1a45c4e7aa4e52fc7fc73b078bd6a9ae63331c1825ead8445762ee040b09678a",
+        signature: "unsigned",
+        authenticodeStatus: "NotSigned",
+      },
+      publicBaseline: {
+        releaseTag: "v0.2.0-beta.1",
+        filename: "WhiteLily-0.2.0-beta.1-windows-x64-setup.exe",
+        bytes: 226_359_624,
+        sha256: "e3ba23e37d62eee8697c7a3af94206357acf3bae0755a61e8b92702aa60a8cd4",
+      },
+      lifecycle: {
+        schemaVersion: 2,
+        success: true,
+        stageCount: 15,
+        controllerSid: "S-1-5-18",
+        candidateReportWriteDenied: true,
+        managedWorkspaceResources: 3,
+        minecraftComponentResources: 9,
+        componentPreferencesFresh: true,
+        componentPreferencesUpgradePreserved: true,
+        componentPreferencesKeepPreserved: true,
+      },
+      zeroResidue: {
+        trackedWindowsSandbox: 0,
+        sandboxMappings: 0,
+        sandboxRoots: 0,
+        lifecycleHivePresent: false,
+        candidatePrincipalPresent: false,
+        remoteSessionEnumeration: "not-performed",
+      },
+    });
+
+    const [rootPackage, desktopPackage, runtimeManifest, baselineContract] = await Promise.all([
+      readFile("package.json", "utf8"),
+      readFile("apps/desktop/package.json", "utf8"),
+      readFile("packaging/electron/runtime-manifest.json", "utf8"),
+      readFile("packaging/electron/public-installer-baselines.json", "utf8"),
+    ]);
+    expect(JSON.parse(rootPackage).version).toBe(record.productVersion);
+    expect(JSON.parse(desktopPackage).version).toBe(record.productVersion);
+    expect(JSON.parse(runtimeManifest).productVersion).toBe(record.productVersion);
+    expect(JSON.parse(baselineContract).baselines).toContainEqual({
+      version: "0.2.0-beta.1",
+      releaseTag: record.publicBaseline.releaseTag,
+      assetName: record.publicBaseline.filename,
+      bytes: record.publicBaseline.bytes,
+      sha256: record.publicBaseline.sha256,
+    });
+
+    const verification = spawnSync(
+      process.execPath,
+      [
+        resolve(
+          import.meta.dirname,
+          "..",
+          "..",
+          "scripts",
+          "verify-installer-lifecycle-attestation.mjs",
+        ),
+        "--repo-root",
+        process.cwd(),
+      ],
+      { encoding: "utf8" },
+    );
+    expect(verification.status, `${verification.stdout}\n${verification.stderr}`).toBe(0);
+  });
+
   it("contains every public distribution file", async () => {
     await Promise.all(required.map((path) => access(path)));
   });
@@ -233,7 +385,7 @@ describe("public release readiness", () => {
     expect(candidate.files).not.toContain(".git/config.from-internal-repo");
     expect(candidate.files.some((file) => file.startsWith(".superpowers/"))).toBe(false);
     expect(candidate.files.some((file) => file.startsWith("docs/superpowers/"))).toBe(false);
-  }, 60_000);
+  }, 120_000);
 
   it("packages a closed README documentation bundle from the produced ZIP", async () => {
     const artifact = await runReleasePackage("0.1.0");
@@ -289,6 +441,30 @@ describe("public release readiness", () => {
     expect(smokeTest).not.toContain("回到安全的朋友模式");
   });
 
+  it("documents the installed Minecraft action acceptance and rollback evidence", async () => {
+    const smokeTest = await readFile("docs/windows-smoke-test.md", "utf8");
+
+    for (const evidence of [
+      String.raw`%LOCALAPPDATA%\WhiteLily\codex-workspace\AGENTS.md`,
+      String.raw`%LOCALAPPDATA%\WhiteLily\codex-workspace\.codex\config.toml`,
+      String.raw`%LOCALAPPDATA%\WhiteLily\codex-workspace\workspace-manifest.json`,
+      "127.0.0.1:32123",
+      "workspaceVersion",
+      "mcpListening",
+      "discoveredToolCount",
+      "toolCalls >= 1",
+      "查看一下你现在的位置",
+      "走到我身边来",
+      "Minecraft Java 1.21.5",
+      "可丢弃",
+      "重启",
+      "回滚",
+    ]) {
+      expect(smokeTest).toContain(evidence);
+    }
+    expect(smokeTest).toMatch(/实际移动[\s\S]{0,120}(?:预算|审计)/u);
+  });
+
   it("documents the first release as same-machine only", async () => {
     await expect(readFile("README.md", "utf8")).resolves.toContain(
       "cross-device deployment is not supported",
@@ -312,12 +488,28 @@ describe("public release readiness", () => {
     "%s prepares deterministic desktop resources before testing",
     async (path) => {
       const workflow = await readFile(path, "utf8");
+      const packageJson = JSON.parse(await readFile("package.json", "utf8")) as {
+        scripts?: Record<string, string>;
+      };
       const runCommands = [...workflow.matchAll(/^\s*-\s+run:\s+(.+)$/gmu)].map(
         (match) => match[1]?.trim() ?? "",
       );
       const testCommand = runCommands.find((command) => command.startsWith("npm test"));
 
+      expect(packageJson.scripts?.["minecraft-components:prepare"]).toBe(
+        "subprojects\\whitelily-avatar\\gradlew.bat -p subprojects\\whitelily-avatar --configure-on-demand :bridge-fabric:jar --no-daemon --max-workers=1 && subprojects\\whitelily-avatar\\gradlew.bat -p subprojects\\whitelily-avatar :stageMinecraftComponents --no-daemon --max-workers=1",
+      );
+      expect(workflow).toContain("- uses: actions/setup-java@v4");
+      expect(workflow).toContain("distribution: temurin");
+      expect(workflow).toContain('java-version: "21"');
+      expect(runCommands).toContain("npm run minecraft-components:prepare");
       expect(runCommands).toContain("npm run desktop:prepare");
+      expect(workflow.indexOf("- uses: actions/setup-java@v4")).toBeLessThan(
+        workflow.indexOf("- run: npm run minecraft-components:prepare"),
+      );
+      expect(runCommands.indexOf("npm run minecraft-components:prepare")).toBeLessThan(
+        runCommands.indexOf("npm run desktop:prepare"),
+      );
       expect(runCommands.indexOf("npm run desktop:prepare")).toBeLessThan(
         runCommands.indexOf(testCommand ?? ""),
       );

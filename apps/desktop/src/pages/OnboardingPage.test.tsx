@@ -6,18 +6,22 @@ import type { ModelCatalogSnapshot, ModelSelection } from "../../../../src/codex
 import type { RuntimeSnapshot } from "../../../../src/runtime/runtimeEvents";
 import type { Pcl2Candidate } from "../../src-main/discovery/pcl2Discovery";
 import type { ConfirmedLanSession, LanCandidate } from "../../src-main/discovery/lanDetector";
+import type { MinecraftComponentStatus } from "../../src-main/minecraftComponents";
 import App from "../App";
 import { LanCandidateCard } from "../components/LanCandidateCard";
 import { ModelPicker } from "../components/ModelPicker";
 import type { WhiteLilyDesktopApi } from "../desktopApi";
 import { ONBOARDING_STORAGE_KEY, OnboardingPage, safeOnboardingErrorKey } from "./OnboardingPage";
+import { translate } from "../i18n/translator";
 
 const stoppedSnapshot: RuntimeSnapshot = {
   revision: 10,
   lifecycle: "stopped",
   minecraft: { state: "disconnected", sessionId: null },
   codex: { state: "stopped", model: null },
+  actions: null,
   task: null,
+  actionQueue: { goal: null, items: [] },
   lastError: null,
 };
 
@@ -26,7 +30,14 @@ const runningSnapshot: RuntimeSnapshot = {
   lifecycle: "running",
   minecraft: { state: "connected", sessionId: "private-session" },
   codex: { state: "ready", model: "gpt-live" },
+  actions: {
+    state: "ready",
+    workspaceVersion: "workspace-1",
+    mcpListening: true,
+    discoveredToolCount: 15,
+  },
   task: null,
+  actionQueue: { goal: null, items: [] },
   lastError: null,
 };
 
@@ -44,6 +55,7 @@ const liveCatalog: ModelCatalogSnapshot = {
     },
   ],
   selection: { mode: "automatic" },
+  legacyMigrationCompleted: true,
 };
 
 const pcl2Candidate: Pcl2Candidate = {
@@ -53,12 +65,13 @@ const pcl2Candidate: Pcl2Candidate = {
   running: true,
 };
 
+const lanCandidateObservedAt = Date.now();
 const lanCandidate: LanCandidate = {
   id: "lan_candidate_0001",
   port: 51_321,
   version: "1.21.5",
-  observedAt: 1_753_603_200_000,
-  expiresAt: 1_753_603_260_000,
+  observedAt: lanCandidateObservedAt,
+  expiresAt: lanCandidateObservedAt + 60_000,
 };
 
 const unknownLanCandidate: LanCandidate = {
@@ -74,6 +87,7 @@ interface ApiHarness {
   startChatGptLogin: ReturnType<typeof vi.fn<WhiteLilyDesktopApi["startChatGptLogin"]>>;
   cancelChatGptLogin: ReturnType<typeof vi.fn<WhiteLilyDesktopApi["cancelChatGptLogin"]>>;
   listModels: ReturnType<typeof vi.fn<WhiteLilyDesktopApi["listModels"]>>;
+  migrateModelPreference: ReturnType<typeof vi.fn<WhiteLilyDesktopApi["migrateModelPreference"]>>;
   selectModel: ReturnType<typeof vi.fn<WhiteLilyDesktopApi["selectModel"]>>;
   discoverPcl2: ReturnType<typeof vi.fn<WhiteLilyDesktopApi["discoverPcl2"]>>;
   detectLanCandidates: ReturnType<typeof vi.fn<WhiteLilyDesktopApi["detectLanCandidates"]>>;
@@ -81,6 +95,12 @@ interface ApiHarness {
   start: ReturnType<typeof vi.fn<WhiteLilyDesktopApi["start"]>>;
   readOwnerIdentity: ReturnType<typeof vi.fn<WhiteLilyDesktopApi["readOwnerIdentity"]>>;
   updateOwnerIdentity: ReturnType<typeof vi.fn<WhiteLilyDesktopApi["updateOwnerIdentity"]>>;
+  getMinecraftComponentStatus: ReturnType<
+    typeof vi.fn<WhiteLilyDesktopApi["getMinecraftComponentStatus"]>
+  >;
+  installMinecraftComponents: ReturnType<
+    typeof vi.fn<WhiteLilyDesktopApi["installMinecraftComponents"]>
+  >;
 }
 
 function deferred<T>(): {
@@ -97,6 +117,18 @@ function deferred<T>(): {
   return { promise, resolve, reject };
 }
 
+async function flushComponentUi(): Promise<void> {
+  await act(async () => {
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      await Promise.resolve();
+    }
+  });
+}
+
+function privateWindowsPath(...segments: string[]): string {
+  return ["C:", "Users", ...segments].join("\\");
+}
+
 function createApiHarness(
   options: {
     status?: RuntimeSnapshot | readonly RuntimeSnapshot[];
@@ -105,9 +137,11 @@ function createApiHarness(
     pcl2?: readonly Pcl2Candidate[];
     lan?: readonly LanCandidate[] | readonly (readonly LanCandidate[])[];
     confirm?: ConfirmedLanSession | Error;
-    start?: RuntimeSnapshot | Error;
+    start?: RuntimeSnapshot | Error | readonly (RuntimeSnapshot | Error)[];
     owner?: Awaited<ReturnType<WhiteLilyDesktopApi["readOwnerIdentity"]>> | Error;
     ownerUpdate?: Error;
+    componentStatus?: MinecraftComponentStatus;
+    componentInstall?: MinecraftComponentStatus;
   } = {},
 ): ApiHarness {
   const statuses = Array.isArray(options.status)
@@ -139,14 +173,36 @@ function createApiHarness(
   const listModels = vi.fn<WhiteLilyDesktopApi["listModels"]>(
     async () => options.catalog ?? liveCatalog,
   );
+  const migrateModelPreference = vi.fn<WhiteLilyDesktopApi["migrateModelPreference"]>(
+    async (candidate) => {
+      const catalog = options.catalog ?? liveCatalog;
+      const validExplicit =
+        candidate?.mode === "explicit" &&
+        catalog.models.some(
+          (model) =>
+            model.id === candidate.modelId &&
+            model.supportedReasoningEfforts.includes(candidate.reasoningEffort),
+        );
+      return {
+        ...catalog,
+        selection: validExplicit ? { ...candidate, available: true } : { mode: "automatic" },
+        legacyMigrationCompleted: true,
+      };
+    },
+  );
   const selectModel = vi.fn<WhiteLilyDesktopApi["selectModel"]>(
     async (selection): Promise<ModelSelection> =>
       selection.mode === "automatic" ? { mode: "automatic" } : { ...selection, available: true },
   );
   const discoverPcl2 = vi.fn<WhiteLilyDesktopApi["discoverPcl2"]>(async () => options.pcl2 ?? []);
-  const detectLanCandidates = vi.fn<WhiteLilyDesktopApi["detectLanCandidates"]>(
-    async () => lanResults.shift() ?? [],
-  );
+  const detectLanCandidates = vi.fn<WhiteLilyDesktopApi["detectLanCandidates"]>(async () => {
+    const observedAt = Date.now();
+    return (lanResults.shift() ?? []).map((candidate) => ({
+      ...candidate,
+      observedAt,
+      expiresAt: observedAt + 60_000,
+    }));
+  });
   const confirmLanCandidate = vi.fn<WhiteLilyDesktopApi["confirmLanCandidate"]>(async () => {
     if (options.confirm instanceof Error) throw options.confirm;
     return (
@@ -158,9 +214,14 @@ function createApiHarness(
       }
     );
   });
+  const startResults = Array.isArray(options.start)
+    ? [...options.start]
+    : [options.start ?? runningSnapshot];
+  const finalStart = startResults.at(-1) ?? runningSnapshot;
   const start = vi.fn<WhiteLilyDesktopApi["start"]>(async () => {
-    if (options.start instanceof Error) throw options.start;
-    return options.start ?? runningSnapshot;
+    const result = startResults.shift() ?? finalStart;
+    if (result instanceof Error) throw result;
+    return result;
   });
   const readOwnerIdentity = vi.fn<WhiteLilyDesktopApi["readOwnerIdentity"]>(async () => {
     if (options.owner instanceof Error) throw options.owner;
@@ -184,6 +245,30 @@ function createApiHarness(
       };
     },
   );
+  const getMinecraftComponentStatus = vi.fn<WhiteLilyDesktopApi["getMinecraftComponentStatus"]>(
+    async () =>
+      structuredClone(
+        options.componentStatus ?? {
+          state: "ready",
+          bridgeInstalled: true,
+          bridgeActive: true,
+          avatarInstalled: true,
+          restartRequired: false,
+        },
+      ),
+  );
+  const installMinecraftComponents = vi.fn<WhiteLilyDesktopApi["installMinecraftComponents"]>(
+    async () =>
+      structuredClone(
+        options.componentInstall ?? {
+          state: "bridge_restart_required",
+          bridgeInstalled: true,
+          bridgeActive: false,
+          avatarInstalled: true,
+          restartRequired: true,
+        },
+      ),
+  );
 
   return {
     api: {
@@ -192,6 +277,7 @@ function createApiHarness(
       stop: vi.fn(async () => stoppedSnapshot),
       stopTask: vi.fn(async () => stoppedSnapshot),
       emergencyStop: vi.fn(async () => stoppedSnapshot),
+      quitApplication: vi.fn(async () => undefined),
       readOwnerIdentity,
       updateOwnerIdentity,
       subscribeOwnerIdentity: () => vi.fn(),
@@ -199,16 +285,21 @@ function createApiHarness(
       startChatGptLogin,
       cancelChatGptLogin,
       listModels,
+      migrateModelPreference,
       selectModel,
       discoverPcl2,
       detectLanCandidates,
       confirmLanCandidate,
+      getMinecraftComponentStatus,
+      installMinecraftComponents,
+      removeMinecraftComponents: vi.fn(),
       subscribeRuntime: () => vi.fn(),
     },
     getAccount,
     startChatGptLogin,
     cancelChatGptLogin,
     listModels,
+    migrateModelPreference,
     selectModel,
     discoverPcl2,
     detectLanCandidates,
@@ -216,6 +307,8 @@ function createApiHarness(
     start,
     readOwnerIdentity,
     updateOwnerIdentity,
+    getMinecraftComponentStatus,
+    installMinecraftComponents,
   };
 }
 
@@ -251,6 +344,26 @@ async function reachLan(harness: ApiHarness): Promise<void> {
   await screen.findByRole("heading", { name: "连接局域网世界" });
 }
 
+async function resumeLanWithFakeTimers(harness: ApiHarness): Promise<ReturnType<typeof render>> {
+  window.localStorage.setItem(
+    ONBOARDING_STORAGE_KEY,
+    JSON.stringify({ version: 3, locale: "en", progressHint: "lan" }),
+  );
+  vi.useFakeTimers();
+  const view = render(<OnboardingPage api={harness.api} locale="en" active onReady={vi.fn()} />);
+  for (
+    let attempt = 0;
+    attempt < 20 && harness.detectLanCandidates.mock.calls.length === 0;
+    attempt += 1
+  ) {
+    await act(async () => {
+      await Promise.resolve();
+    });
+  }
+  expect(screen.getByRole("heading", { name: "Connect to a LAN world" })).toBeTruthy();
+  return view;
+}
+
 afterEach(() => {
   cleanup();
   window.localStorage.clear();
@@ -259,6 +372,164 @@ afterEach(() => {
 });
 
 describe("first-run onboarding", () => {
+  it("submits a bounded v2 model preference once and rewrites storage without model authority", async () => {
+    window.localStorage.setItem(
+      ONBOARDING_STORAGE_KEY,
+      JSON.stringify({
+        version: 2,
+        locale: "zh-CN",
+        progressHint: "model",
+        modelPreference: {
+          mode: "explicit",
+          modelId: "gpt-live",
+          reasoningEffort: "high",
+        },
+      }),
+    );
+    const harness = createApiHarness({
+      catalog: { ...liveCatalog, legacyMigrationCompleted: false },
+    });
+
+    render(<App api={harness.api} />);
+
+    await screen.findByRole("heading", { name: "选择智能模型" });
+    expect(harness.migrateModelPreference).toHaveBeenCalledOnce();
+    expect(harness.migrateModelPreference).toHaveBeenCalledWith({
+      mode: "explicit",
+      modelId: "gpt-live",
+      reasoningEffort: "high",
+    });
+    expect(harness.selectModel).not.toHaveBeenCalled();
+    expect(JSON.parse(window.localStorage.getItem(ONBOARDING_STORAGE_KEY)!)).toEqual({
+      version: 3,
+      locale: "zh-CN",
+      progressHint: "model",
+    });
+  });
+
+  it("shares one migration submission across a locale-triggered catalog reload", async () => {
+    window.localStorage.setItem(
+      ONBOARDING_STORAGE_KEY,
+      JSON.stringify({
+        version: 2,
+        locale: "zh-CN",
+        progressHint: "model",
+        modelPreference: {
+          mode: "explicit",
+          modelId: "gpt-live",
+          reasoningEffort: "high",
+        },
+      }),
+    );
+    const migration = deferred<ModelCatalogSnapshot>();
+    const harness = createApiHarness({
+      catalog: { ...liveCatalog, legacyMigrationCompleted: false },
+    });
+    harness.migrateModelPreference.mockImplementation(() => migration.promise);
+    const user = userEvent.setup();
+    render(<App api={harness.api} />);
+
+    await waitFor(() => expect(harness.migrateModelPreference).toHaveBeenCalledOnce());
+    await user.click(screen.getByRole("button", { name: "English" }));
+    await waitFor(() => expect(harness.listModels).toHaveBeenCalledTimes(2));
+    expect(harness.migrateModelPreference).toHaveBeenCalledOnce();
+
+    await act(async () => {
+      migration.resolve({
+        ...liveCatalog,
+        selection: {
+          mode: "explicit",
+          modelId: "gpt-live",
+          reasoningEffort: "high",
+          available: true,
+        },
+        legacyMigrationCompleted: true,
+      });
+      await migration.promise;
+    });
+    await screen.findByRole("heading", { name: "Choose an AI model" });
+    expect(JSON.parse(window.localStorage.getItem(ONBOARDING_STORAGE_KEY)!)).toEqual({
+      version: 3,
+      locale: "en",
+      progressHint: "model",
+    });
+  });
+
+  it("retains the bounded legacy candidate until backend migration is confirmed complete", async () => {
+    window.localStorage.setItem(
+      ONBOARDING_STORAGE_KEY,
+      JSON.stringify({
+        version: 2,
+        locale: "en",
+        progressHint: "model",
+        modelPreference: {
+          mode: "explicit",
+          modelId: "gpt-live",
+          reasoningEffort: "high",
+        },
+      }),
+    );
+    const harness = createApiHarness({
+      catalog: { ...liveCatalog, legacyMigrationCompleted: false },
+    });
+    harness.migrateModelPreference.mockResolvedValue({
+      ...liveCatalog,
+      legacyMigrationCompleted: false,
+    });
+    render(<App api={harness.api} />);
+
+    await screen.findByRole("heading", { name: "Choose an AI model" });
+    expect(screen.getByRole("alert").textContent).toContain("model catalog");
+    expect(JSON.parse(window.localStorage.getItem(ONBOARDING_STORAGE_KEY)!)).toEqual({
+      version: 2,
+      locale: "en",
+      progressHint: "model",
+      modelPreference: {
+        mode: "explicit",
+        modelId: "gpt-live",
+        reasoningEffort: "high",
+      },
+    });
+  });
+
+  it("cannot let stale v2 model storage overwrite a completed backend selection on restart", async () => {
+    window.localStorage.setItem(
+      ONBOARDING_STORAGE_KEY,
+      JSON.stringify({
+        version: 2,
+        locale: "en",
+        progressHint: "model",
+        modelPreference: {
+          mode: "explicit",
+          modelId: "gpt-live",
+          reasoningEffort: "high",
+        },
+      }),
+    );
+    const backendCatalog: ModelCatalogSnapshot = {
+      ...liveCatalog,
+      selection: {
+        mode: "explicit",
+        modelId: "gpt-calm",
+        reasoningEffort: "medium",
+        available: true,
+      },
+      legacyMigrationCompleted: true,
+    };
+    const harness = createApiHarness({ catalog: backendCatalog });
+
+    render(<App api={harness.api} />);
+
+    await screen.findByRole("heading", { name: "Choose an AI model" });
+    expect(harness.migrateModelPreference).not.toHaveBeenCalled();
+    expect(harness.selectModel).not.toHaveBeenCalled();
+    expect(screen.getByRole("status").textContent).toContain("GPT Calm");
+    expect(JSON.parse(window.localStorage.getItem(ONBOARDING_STORAGE_KEY)!)).toEqual({
+      version: 3,
+      locale: "en",
+      progressHint: "model",
+    });
+  });
   it("adds a seven-step owner confirmation without persisting the exact-case username", async () => {
     const harness = createApiHarness();
     const user = userEvent.setup();
@@ -289,12 +560,7 @@ describe("first-run onboarding", () => {
     });
     const stored = window.localStorage.getItem(ONBOARDING_STORAGE_KEY);
     expect(stored).not.toContain("NewOwner");
-    expect(Object.keys(JSON.parse(stored!)).sort()).toEqual([
-      "locale",
-      "modelPreference",
-      "progressHint",
-      "version",
-    ]);
+    expect(Object.keys(JSON.parse(stored!)).sort()).toEqual(["locale", "progressHint", "version"]);
   });
 
   it("rejects malformed, placeholder, and bot-collision usernames before submission", async () => {
@@ -657,7 +923,7 @@ describe("first-run onboarding", () => {
     expect(harness.readOwnerIdentity).toHaveBeenCalledTimes(1);
     expect(harness.discoverPcl2).not.toHaveBeenCalled();
     expect(JSON.parse(window.localStorage.getItem(ONBOARDING_STORAGE_KEY)!)).toMatchObject({
-      version: 2,
+      version: 3,
       progressHint: "owner",
     });
   });
@@ -824,7 +1090,7 @@ describe("first-run onboarding", () => {
     expect(screen.getByRole("status").textContent).toContain("自动选择");
   });
 
-  it("restores a persisted explicit preference only after the live selection succeeds", async () => {
+  it("migrates a persisted explicit preference through backend authority", async () => {
     window.localStorage.setItem(
       "whitelily.onboarding.v1",
       JSON.stringify({
@@ -838,19 +1104,22 @@ describe("first-run onboarding", () => {
         },
       }),
     );
-    const harness = createApiHarness();
+    const harness = createApiHarness({
+      catalog: { ...liveCatalog, legacyMigrationCompleted: false },
+    });
     render(<App api={harness.api} />);
 
     await screen.findByRole("heading", { name: "选择智能模型" });
-    expect(harness.selectModel).toHaveBeenCalledWith({
+    expect(harness.migrateModelPreference).toHaveBeenCalledWith({
       mode: "explicit",
       modelId: "gpt-live",
       reasoningEffort: "high",
     });
+    expect(harness.selectModel).not.toHaveBeenCalled();
     expect(screen.getByRole("status").textContent).toContain("GPT Live · high");
   });
 
-  it("clears a missing persisted model and applies automatic selection to live authority", async () => {
+  it("lets backend migration replace a missing persisted model with automatic authority", async () => {
     window.localStorage.setItem(
       "whitelily.onboarding.v1",
       JSON.stringify({
@@ -867,6 +1136,7 @@ describe("first-run onboarding", () => {
     const harness = createApiHarness({
       catalog: {
         ...liveCatalog,
+        legacyMigrationCompleted: false,
         selection: {
           mode: "explicit",
           modelId: "gpt-live",
@@ -878,16 +1148,27 @@ describe("first-run onboarding", () => {
     render(<App api={harness.api} />);
 
     await screen.findByRole("heading", { name: "选择智能模型" });
-    expect(harness.selectModel).toHaveBeenCalledWith({ mode: "automatic" });
+    expect(harness.migrateModelPreference).toHaveBeenCalledWith({
+      mode: "explicit",
+      modelId: "gpt-removed",
+      reasoningEffort: "high",
+    });
+    expect(harness.selectModel).not.toHaveBeenCalled();
     expect(screen.getByRole("status").textContent).toContain("自动选择");
-    expect(JSON.parse(window.localStorage.getItem("whitelily.onboarding.v1")!)).toMatchObject({
-      modelPreference: null,
+    expect(JSON.parse(window.localStorage.getItem("whitelily.onboarding.v1")!)).toEqual({
+      version: 3,
+      locale: "zh-CN",
+      progressHint: "model",
     });
   });
 
   it("blocks progress when the live account returns no usable models", async () => {
     const harness = createApiHarness({
-      catalog: { models: [], selection: { mode: "automatic" } },
+      catalog: {
+        models: [],
+        selection: { mode: "automatic" },
+        legacyMigrationCompleted: true,
+      },
     });
     render(<App api={harness.api} />);
 
@@ -901,7 +1182,11 @@ describe("first-run onboarding", () => {
     const retryCatalog = deferred<ModelCatalogSnapshot>();
     const harness = createApiHarness();
     harness.listModels
-      .mockResolvedValueOnce({ models: [], selection: { mode: "automatic" } })
+      .mockResolvedValueOnce({
+        models: [],
+        selection: { mode: "automatic" },
+        legacyMigrationCompleted: true,
+      })
       .mockImplementationOnce(() => retryCatalog.promise);
     render(<App api={harness.api} />);
 
@@ -956,6 +1241,7 @@ describe("first-run onboarding", () => {
           },
         ],
         selection: { mode: "automatic" },
+        legacyMigrationCompleted: true,
       });
       await latest.promise;
     });
@@ -971,108 +1257,20 @@ describe("first-run onboarding", () => {
           },
         ],
         selection: { mode: "automatic" },
+        legacyMigrationCompleted: true,
       });
       await older.promise;
     });
 
     expect(screen.queryByRole("option", { name: "Older Service Model" })).toBeNull();
     expect(screen.getByRole("heading", { name: "Choose an AI model" })).toBeTruthy();
-    expect(harness.selectModel).toHaveBeenLastCalledWith({
-      mode: "explicit",
-      modelId: "latest-model",
-      reasoningEffort: "high",
-    });
-    expect(JSON.parse(window.localStorage.getItem("whitelily.onboarding.v1")!)).toMatchObject({
+    expect(harness.selectModel).not.toHaveBeenCalled();
+    expect(JSON.parse(window.localStorage.getItem("whitelily.onboarding.v1")!)).toEqual({
+      version: 3,
       locale: "en",
       progressHint: "model",
-      modelPreference: {
-        mode: "explicit",
-        modelId: "latest-model",
-        reasoningEffort: "high",
-      },
     });
     expect(harness.discoverPcl2).not.toHaveBeenCalled();
-  });
-
-  it("reapplies the latest model choice after a stale catalog selection was already sent", async () => {
-    const staleSelection = deferred<ModelSelection>();
-    const latestSelection = deferred<ModelSelection>();
-    const harness = createApiHarness();
-    harness.listModels
-      .mockResolvedValueOnce({
-        models: [
-          {
-            id: "older-model",
-            displayName: "Older Service Model",
-            supportedReasoningEfforts: ["low"],
-          },
-        ],
-        selection: { mode: "automatic" },
-      })
-      .mockResolvedValueOnce({
-        models: [
-          {
-            id: "latest-model",
-            displayName: "Latest Service Model",
-            supportedReasoningEfforts: ["high"],
-          },
-        ],
-        selection: { mode: "automatic" },
-      });
-    harness.selectModel
-      .mockImplementationOnce(() => staleSelection.promise)
-      .mockImplementationOnce(() => latestSelection.promise);
-    window.localStorage.setItem(
-      "whitelily.onboarding.v1",
-      JSON.stringify({
-        version: 2,
-        locale: "zh-CN",
-        progressHint: "model",
-        modelPreference: {
-          mode: "explicit",
-          modelId: "latest-model",
-          reasoningEffort: "high",
-        },
-      }),
-    );
-    const user = userEvent.setup();
-    render(<App api={harness.api} />);
-    await waitFor(() => expect(harness.selectModel).toHaveBeenCalledWith({ mode: "automatic" }));
-
-    await user.click(screen.getByRole("button", { name: "English" }));
-    await waitFor(() => expect(harness.listModels).toHaveBeenCalledTimes(2));
-    expect(harness.selectModel).toHaveBeenCalledTimes(1);
-
-    await act(async () => {
-      staleSelection.resolve({ mode: "automatic" });
-      await staleSelection.promise;
-    });
-    await waitFor(() => expect(harness.selectModel).toHaveBeenCalledTimes(2));
-    expect(harness.selectModel).toHaveBeenLastCalledWith({
-      mode: "explicit",
-      modelId: "latest-model",
-      reasoningEffort: "high",
-    });
-
-    await act(async () => {
-      latestSelection.resolve({
-        mode: "explicit",
-        modelId: "latest-model",
-        reasoningEffort: "high",
-        available: true,
-      });
-      await latestSelection.promise;
-    });
-    expect(await screen.findByRole("option", { name: "Latest Service Model" })).toBeTruthy();
-    expect(JSON.parse(window.localStorage.getItem("whitelily.onboarding.v1")!)).toMatchObject({
-      locale: "en",
-      progressHint: "model",
-      modelPreference: {
-        mode: "explicit",
-        modelId: "latest-model",
-        reasoningEffort: "high",
-      },
-    });
   });
 
   it("does not let a persisted ready hint bypass an empty live model catalog", async () => {
@@ -1086,7 +1284,11 @@ describe("first-run onboarding", () => {
       }),
     );
     const harness = createApiHarness({
-      catalog: { models: [], selection: { mode: "automatic" } },
+      catalog: {
+        models: [],
+        selection: { mode: "automatic" },
+        legacyMigrationCompleted: true,
+      },
       pcl2: [pcl2Candidate],
     });
     render(<App api={harness.api} />);
@@ -1097,7 +1299,7 @@ describe("first-run onboarding", () => {
     expect(harness.detectLanCandidates).not.toHaveBeenCalled();
   });
 
-  it("does not resume past model selection when restoring live authority fails", async () => {
+  it("does not resume past model selection when backend migration fails", async () => {
     window.localStorage.setItem(
       "whitelily.onboarding.v1",
       JSON.stringify({
@@ -1107,8 +1309,11 @@ describe("first-run onboarding", () => {
         modelPreference: { mode: "automatic" },
       }),
     );
-    const harness = createApiHarness({ pcl2: [pcl2Candidate] });
-    harness.selectModel.mockRejectedValue(new Error("MODEL_UNAVAILABLE"));
+    const harness = createApiHarness({
+      catalog: { ...liveCatalog, legacyMigrationCompleted: false },
+      pcl2: [pcl2Candidate],
+    });
+    harness.migrateModelPreference.mockRejectedValue(new Error("MODEL_UNAVAILABLE"));
     render(<App api={harness.api} />);
 
     expect(await screen.findByRole("heading", { name: "Choose an AI model" })).toBeTruthy();
@@ -1117,7 +1322,7 @@ describe("first-run onboarding", () => {
     expect(harness.detectLanCandidates).not.toHaveBeenCalled();
   });
 
-  it("applies live automatic authority before using a resumed downstream hint", async () => {
+  it("completes null-candidate backend migration before using a resumed downstream hint", async () => {
     window.localStorage.setItem(
       "whitelily.onboarding.v1",
       JSON.stringify({
@@ -1128,6 +1333,7 @@ describe("first-run onboarding", () => {
       }),
     );
     const harness = createApiHarness({
+      catalog: { ...liveCatalog, legacyMigrationCompleted: false },
       owner: {
         revision: 4,
         ownerUsername: "LiveOwner",
@@ -1139,12 +1345,13 @@ describe("first-run onboarding", () => {
     render(<App api={harness.api} />);
 
     expect(await screen.findByRole("heading", { name: "Check PCL2" })).toBeTruthy();
-    expect(harness.selectModel).toHaveBeenCalledWith({ mode: "automatic" });
+    expect(harness.migrateModelPreference).toHaveBeenCalledWith(null);
+    expect(harness.selectModel).not.toHaveBeenCalled();
     expect(harness.readOwnerIdentity).toHaveBeenCalledTimes(1);
-    expect(harness.selectModel.mock.invocationCallOrder[0]).toBeLessThan(
+    expect(harness.migrateModelPreference.mock.invocationCallOrder[0]).toBeLessThan(
       harness.readOwnerIdentity.mock.invocationCallOrder[0]!,
     );
-    expect(harness.discoverPcl2).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(harness.discoverPcl2).toHaveBeenCalledTimes(1));
   });
 
   it.each([
@@ -1223,42 +1430,48 @@ describe("first-run onboarding", () => {
     [
       "pcl2",
       "config-invalid",
-      new Error("OWNER_IDENTITY_CONFIG_INVALID: C:\\Users\\PrivateOwner\\config.toml"),
+      new Error(
+        `OWNER_IDENTITY_CONFIG_INVALID: ${privateWindowsPath("PrivateOwner", "config.toml")}`,
+      ),
       "Who should WhiteLily listen to?",
       "WhiteLily's owner configuration is invalid. Repair the config, then try again.",
     ],
     [
       "lan",
       "config-invalid",
-      new Error("OWNER_IDENTITY_CONFIG_INVALID: C:\\Users\\PrivateOwner\\config.toml"),
+      new Error(
+        `OWNER_IDENTITY_CONFIG_INVALID: ${privateWindowsPath("PrivateOwner", "config.toml")}`,
+      ),
       "Who should WhiteLily listen to?",
       "WhiteLily's owner configuration is invalid. Repair the config, then try again.",
     ],
     [
       "ready",
       "config-invalid",
-      new Error("OWNER_IDENTITY_CONFIG_INVALID: C:\\Users\\PrivateOwner\\config.toml"),
+      new Error(
+        `OWNER_IDENTITY_CONFIG_INVALID: ${privateWindowsPath("PrivateOwner", "config.toml")}`,
+      ),
       "Who should WhiteLily listen to?",
       "WhiteLily's owner configuration is invalid. Repair the config, then try again.",
     ],
     [
       "pcl2",
       "rejected",
-      new Error("ECONNREFUSED: C:\\Users\\PrivateOwner\\owner-name"),
+      new Error(`ECONNREFUSED: ${privateWindowsPath("PrivateOwner", "owner-name")}`),
       "Who should WhiteLily listen to?",
       "The WhiteLily core is unavailable. Restart WhiteLily, then try again.",
     ],
     [
       "lan",
       "rejected",
-      new Error("ECONNREFUSED: C:\\Users\\PrivateOwner\\owner-name"),
+      new Error(`ECONNREFUSED: ${privateWindowsPath("PrivateOwner", "owner-name")}`),
       "Who should WhiteLily listen to?",
       "The WhiteLily core is unavailable. Restart WhiteLily, then try again.",
     ],
     [
       "ready",
       "rejected",
-      new Error("ECONNREFUSED: C:\\Users\\PrivateOwner\\owner-name"),
+      new Error(`ECONNREFUSED: ${privateWindowsPath("PrivateOwner", "owner-name")}`),
       "Who should WhiteLily listen to?",
       "The WhiteLily core is unavailable. Restart WhiteLily, then try again.",
     ],
@@ -1354,7 +1567,7 @@ describe("first-run onboarding", () => {
     );
   });
 
-  it("clears a restored-model failure after a later live selection succeeds", async () => {
+  it("retries a failed migration before allowing a later live selection", async () => {
     window.localStorage.setItem(
       "whitelily.onboarding.v1",
       JSON.stringify({
@@ -1364,13 +1577,17 @@ describe("first-run onboarding", () => {
         modelPreference: { mode: "automatic" },
       }),
     );
-    const harness = createApiHarness();
-    harness.selectModel.mockRejectedValueOnce(new Error("MODEL_UNAVAILABLE"));
+    const harness = createApiHarness({
+      catalog: { ...liveCatalog, legacyMigrationCompleted: false },
+    });
+    harness.migrateModelPreference.mockRejectedValueOnce(new Error("MODEL_UNAVAILABLE"));
     const user = userEvent.setup();
     render(<App api={harness.api} />);
 
     await screen.findByRole("heading", { name: "选择智能模型" });
     expect(screen.getByRole("alert").textContent).toContain("模型列表");
+    await user.click(screen.getByRole("button", { name: "重试" }));
+    await screen.findByRole("combobox", { name: "模型" });
     await user.selectOptions(screen.getByRole("combobox", { name: "模型" }), "gpt-live");
 
     await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
@@ -1414,14 +1631,14 @@ describe("first-run onboarding", () => {
     await reachLan(harness);
 
     expect(screen.getByText(/请先用 PCL2 启动 Minecraft Java 1\.21\.5/u)).toBeTruthy();
-    expect(await screen.findByText("端口 51321")).toBeTruthy();
+    expect(screen.getByText(/白百合会自动检测/u)).toBeTruthy();
+    expect(screen.getByText(/白百合会自动检测/u).textContent).not.toContain("然后刷新");
+    expect(await screen.findAllByText("检测到本机 Minecraft 实例")).toHaveLength(2);
     expect(screen.getByText("Minecraft 1.21.5")).toBeTruthy();
-    expect(screen.getByText("端口 51322")).toBeTruthy();
     expect(screen.getByText(/无法确认 Minecraft 版本/u)).toBeTruthy();
-    expect(screen.getByRole("heading", { name: /51321/u })).toBeTruthy();
-    expect(screen.getByRole("heading", { name: /51322/u })).toBeTruthy();
-    const verifiedAction = screen.getByRole("button", { name: /51321.*1\.21\.5/u });
-    const unknownAction = screen.getByRole("button", { name: /51322.*unknown|51322.*未知/iu });
+    const [verifiedAction, unknownAction] = screen.getAllByRole("button", {
+      name: "确认并连接这个候选项",
+    });
     expect(verifiedAction.getAttribute("aria-describedby")).toBeTruthy();
     expect(unknownAction.getAttribute("aria-describedby")).toBeTruthy();
     expect(verifiedAction.getAttribute("aria-describedby")).not.toBe(
@@ -1430,6 +1647,540 @@ describe("first-run onboarding", () => {
     expect(document.body.textContent).not.toContain("lan_candidate_0001");
     expect(harness.confirmLanCandidate).not.toHaveBeenCalled();
     expect(harness.start).not.toHaveBeenCalled();
+    expect(translate("zh-CN", "minecraft.components.state.instance_unsupported")).toBe(
+      "这个候选项不是已验证的 PCL2 Fabric 1.21.5 实例，无法安装组件。",
+    );
+  });
+
+  it("keeps an installed outdated Bridge actionable only on a verified instance", async () => {
+    const harness = createApiHarness({
+      pcl2: [pcl2Candidate],
+      lan: [lanCandidate],
+      owner: {
+        revision: 1,
+        ownerUsername: "CurrentOwner",
+        configured: true,
+        presence: "unknown",
+      },
+      componentStatus: {
+        state: "bridge_version_unsupported",
+        bridgeInstalled: true,
+        bridgeActive: false,
+        avatarInstalled: false,
+        restartRequired: false,
+      },
+    });
+    await resumeLanWithFakeTimers(harness);
+    await flushComponentUi();
+
+    expect(screen.getByText("Current verified PCL2 Fabric 1.21.5 instance")).toBeTruthy();
+    expect(
+      screen.getByText(
+        "The installed WhiteLily Bridge version must be updated for Minecraft 1.21.5.",
+      ),
+    ).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Install in this PCL2 instance" })).toBeTruthy();
+    expect(
+      (
+        screen.getByRole("button", {
+          name: "Confirm and connect to this candidate",
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(true);
+    expect(harness.confirmLanCandidate).not.toHaveBeenCalled();
+    expect(harness.start).not.toHaveBeenCalled();
+  });
+
+  it("loads component status automatically but keeps ready behind a separate explicit confirmation", async () => {
+    const harness = createApiHarness({
+      pcl2: [pcl2Candidate],
+      lan: [lanCandidate],
+      owner: {
+        revision: 1,
+        ownerUsername: "CurrentOwner",
+        configured: true,
+        presence: "unknown",
+      },
+    });
+    await resumeLanWithFakeTimers(harness);
+    await flushComponentUi();
+
+    const confirm = screen.getByRole("button", {
+      name: "Confirm and connect to this candidate",
+    });
+    expect(harness.getMinecraftComponentStatus).toHaveBeenCalledWith("lan_candidate_0001");
+    expect(harness.confirmLanCandidate).not.toHaveBeenCalled();
+    expect(harness.start).not.toHaveBeenCalled();
+    expect(document.body.textContent).not.toContain("51321");
+    expect(document.body.textContent).not.toContain("lan_candidate_0001");
+    expect(document.body.textContent).not.toMatch(/[a-f0-9]{64}/u);
+    expect(document.body.textContent).not.toContain(String.raw`C:\Private`);
+
+    fireEvent.click(confirm);
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(harness.confirmLanCandidate).toHaveBeenCalledWith("lan_candidate_0001");
+    expect(harness.start).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps an unsupported or unknown candidate non-actionable without calling it verified", async () => {
+    const harness = createApiHarness({
+      pcl2: [pcl2Candidate],
+      lan: [unknownLanCandidate],
+      owner: {
+        revision: 1,
+        ownerUsername: "CurrentOwner",
+        configured: true,
+        presence: "unknown",
+      },
+      componentStatus: {
+        state: "bridge_version_unsupported",
+        bridgeInstalled: false,
+        bridgeActive: false,
+        avatarInstalled: false,
+        restartRequired: false,
+      },
+    });
+    await resumeLanWithFakeTimers(harness);
+    await flushComponentUi();
+
+    expect(
+      screen.getByText(
+        "This candidate is not a verified PCL2 Fabric 1.21.5 instance. Component installation is unavailable.",
+      ),
+    ).toBeTruthy();
+    expect(screen.queryByText("Current verified PCL2 Fabric 1.21.5 instance")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Install in this PCL2 instance" })).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: "Confirm and connect to this verified instance" }),
+    ).toBeNull();
+    expect(
+      (
+        screen.getByRole("button", {
+          name: "Confirm and connect to this candidate",
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(true);
+    expect(harness.confirmLanCandidate).not.toHaveBeenCalled();
+    expect(harness.start).not.toHaveBeenCalled();
+  });
+
+  it("defaults missing Bridge to checked Bridge and Avatar installation without confirming or starting", async () => {
+    const harness = createApiHarness({
+      pcl2: [pcl2Candidate],
+      lan: [lanCandidate],
+      owner: {
+        revision: 1,
+        ownerUsername: "CurrentOwner",
+        configured: true,
+        presence: "unknown",
+      },
+      componentStatus: {
+        state: "bridge_not_installed",
+        bridgeInstalled: false,
+        bridgeActive: false,
+        avatarInstalled: false,
+        restartRequired: false,
+      },
+    });
+    await resumeLanWithFakeTimers(harness);
+    await flushComponentUi();
+
+    const bridge = screen.getByRole("checkbox", { name: "WhiteLily Bridge" });
+    const avatar = screen.getByRole("checkbox", { name: "WhiteLily Avatar" });
+    expect((bridge as HTMLInputElement).checked).toBe(true);
+    expect((avatar as HTMLInputElement).checked).toBe(true);
+    fireEvent.click(avatar);
+    fireEvent.click(screen.getByRole("button", { name: "Install in this PCL2 instance" }));
+    await flushComponentUi();
+
+    expect(harness.installMinecraftComponents).toHaveBeenCalledWith("lan_candidate_0001", [
+      "bridge",
+    ]);
+    expect(screen.getByText("Restart Minecraft before confirming this LAN world.")).toBeTruthy();
+    expect(
+      (
+        screen.getByRole("button", {
+          name: "Confirm and connect to this candidate",
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(true);
+    expect(harness.confirmLanCandidate).not.toHaveBeenCalled();
+    expect(harness.start).not.toHaveBeenCalled();
+  });
+
+  it("lets a refreshed candidate generation own status when the prior request completes late", async () => {
+    const staleStatus = deferred<MinecraftComponentStatus>();
+    const harness = createApiHarness({
+      pcl2: [pcl2Candidate],
+      lan: [[lanCandidate], [lanCandidate]],
+      owner: {
+        revision: 1,
+        ownerUsername: "CurrentOwner",
+        configured: true,
+        presence: "unknown",
+      },
+      componentStatus: {
+        state: "avatar_not_installed",
+        bridgeInstalled: true,
+        bridgeActive: true,
+        avatarInstalled: false,
+        restartRequired: false,
+      },
+    });
+    harness.getMinecraftComponentStatus.mockImplementationOnce(() => staleStatus.promise);
+    await resumeLanWithFakeTimers(harness);
+    await flushComponentUi();
+
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    for (
+      let attempt = 0;
+      attempt < 20 && harness.getMinecraftComponentStatus.mock.calls.length < 2;
+      attempt += 1
+    ) {
+      await flushComponentUi();
+    }
+    expect(harness.getMinecraftComponentStatus).toHaveBeenCalledTimes(2);
+    expect(screen.getByText(/WhiteLily Avatar is optional/u)).toBeTruthy();
+
+    staleStatus.resolve({
+      state: "ready",
+      bridgeInstalled: true,
+      bridgeActive: true,
+      avatarInstalled: true,
+      restartRequired: false,
+    });
+    await act(async () => {
+      await staleStatus.promise;
+    });
+    expect(screen.getByText(/WhiteLily Avatar is optional/u)).toBeTruthy();
+  });
+
+  it("fences late component status and install completions after candidate expiry", async () => {
+    const lateStatus = deferred<MinecraftComponentStatus>();
+    const lateInstall = deferred<MinecraftComponentStatus>();
+    const harness = createApiHarness({
+      pcl2: [pcl2Candidate],
+      lan: [[lanCandidate], []],
+      owner: {
+        revision: 1,
+        ownerUsername: "CurrentOwner",
+        configured: true,
+        presence: "unknown",
+      },
+      componentStatus: {
+        state: "bridge_not_installed",
+        bridgeInstalled: false,
+        bridgeActive: false,
+        avatarInstalled: false,
+        restartRequired: false,
+      },
+    });
+    harness.getMinecraftComponentStatus.mockImplementationOnce(() => lateStatus.promise);
+    const view = await resumeLanWithFakeTimers(harness);
+    await flushComponentUi();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60_001);
+    });
+    lateStatus.resolve({
+      state: "ready",
+      bridgeInstalled: true,
+      bridgeActive: true,
+      avatarInstalled: true,
+      restartRequired: false,
+    });
+    await act(async () => {
+      await lateStatus.promise;
+    });
+    expect(
+      screen.queryByRole("button", { name: "Confirm and connect to this candidate" }),
+    ).toBeNull();
+
+    view.unmount();
+    window.localStorage.setItem(
+      ONBOARDING_STORAGE_KEY,
+      JSON.stringify({ version: 3, locale: "en", progressHint: "lan" }),
+    );
+    const second = createApiHarness({
+      pcl2: [pcl2Candidate],
+      lan: [[lanCandidate], []],
+      owner: {
+        revision: 1,
+        ownerUsername: "CurrentOwner",
+        configured: true,
+        presence: "unknown",
+      },
+      componentStatus: {
+        state: "bridge_not_installed",
+        bridgeInstalled: false,
+        bridgeActive: false,
+        avatarInstalled: false,
+        restartRequired: false,
+      },
+    });
+    second.installMinecraftComponents.mockImplementationOnce(() => lateInstall.promise);
+    render(<OnboardingPage api={second.api} locale="en" active onReady={vi.fn()} />);
+    await flushComponentUi();
+    const install = screen.getByRole("button", { name: "Install in this PCL2 instance" });
+    fireEvent.click(install);
+    await flushComponentUi();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60_001);
+    });
+    lateInstall.resolve({
+      state: "ready",
+      bridgeInstalled: true,
+      bridgeActive: true,
+      avatarInstalled: true,
+      restartRequired: false,
+    });
+    await act(async () => {
+      await lateInstall.promise;
+    });
+    expect(
+      screen.queryByRole("button", { name: "Confirm and connect to this candidate" }),
+    ).toBeNull();
+    expect(second.confirmLanCandidate).not.toHaveBeenCalled();
+    expect(second.start).not.toHaveBeenCalled();
+  });
+
+  it("polls after an empty LAN scan, reveals a later candidate, then waits for explicit confirmation", async () => {
+    const harness = createApiHarness({
+      pcl2: [pcl2Candidate],
+      lan: [[], [lanCandidate]],
+      owner: {
+        revision: 1,
+        ownerUsername: "CurrentOwner",
+        configured: true,
+        presence: "unknown",
+      },
+    });
+    await resumeLanWithFakeTimers(harness);
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(harness.detectLanCandidates).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText("Detected local Minecraft instance")).toBeNull();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+
+    expect(harness.detectLanCandidates).toHaveBeenCalledTimes(2);
+    expect(screen.getByText("Detected local Minecraft instance")).toBeTruthy();
+    expect(harness.confirmLanCandidate).not.toHaveBeenCalled();
+    expect(harness.start).not.toHaveBeenCalled();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_000);
+    });
+    expect(harness.detectLanCandidates).toHaveBeenCalledTimes(2);
+  });
+
+  it("expires a visible LAN candidate and refreshes its authority before a later confirmation", async () => {
+    const observedAt = Date.now();
+    let scan = 0;
+    const harness = createApiHarness({
+      pcl2: [pcl2Candidate],
+      owner: {
+        revision: 1,
+        ownerUsername: "CurrentOwner",
+        configured: true,
+        presence: "unknown",
+      },
+    });
+    harness.detectLanCandidates.mockImplementation(async () => {
+      scan += 1;
+      const current = observedAt + (scan - 1) * 60_000;
+      return [
+        {
+          ...lanCandidate,
+          id: `lan_candidate_${String(scan).padStart(4, "0")}`,
+          observedAt: current,
+          expiresAt: current + 60_000,
+        },
+      ];
+    });
+    await resumeLanWithFakeTimers(harness);
+
+    expect(harness.detectLanCandidates).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60_001);
+    });
+
+    expect(harness.detectLanCandidates).toHaveBeenCalledTimes(2);
+    expect(harness.confirmLanCandidate).not.toHaveBeenCalled();
+    expect(harness.start).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Confirm and connect to this candidate" }));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(harness.confirmLanCandidate).toHaveBeenCalledWith("lan_candidate_0002");
+  });
+
+  it("throttles repeated scans when the backend returns an already invalid candidate", async () => {
+    const now = Date.now();
+    const harness = createApiHarness({
+      pcl2: [pcl2Candidate],
+      owner: {
+        revision: 1,
+        ownerUsername: "CurrentOwner",
+        configured: true,
+        presence: "unknown",
+      },
+    });
+    harness.detectLanCandidates.mockResolvedValue([
+      {
+        ...lanCandidate,
+        observedAt: now - 60_000,
+        expiresAt: now,
+      },
+    ]);
+    await resumeLanWithFakeTimers(harness);
+
+    expect(harness.detectLanCandidates).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText("Detected local Minecraft instance")).toBeNull();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(999);
+    });
+    expect(harness.detectLanCandidates).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1);
+    });
+    expect(harness.detectLanCandidates).toHaveBeenCalledTimes(2);
+    expect(harness.confirmLanCandidate).not.toHaveBeenCalled();
+    expect(harness.start).not.toHaveBeenCalled();
+  });
+
+  it("never overlaps a slow background scan with a timer or manual refresh", async () => {
+    const first = deferred<readonly LanCandidate[]>();
+    const harness = createApiHarness({
+      pcl2: [pcl2Candidate],
+      owner: {
+        revision: 1,
+        ownerUsername: "CurrentOwner",
+        configured: true,
+        presence: "unknown",
+      },
+    });
+    harness.detectLanCandidates
+      .mockImplementationOnce(() => first.promise)
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([lanCandidate]);
+    await resumeLanWithFakeTimers(harness);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5_000);
+    });
+    expect(harness.detectLanCandidates).toHaveBeenCalledTimes(1);
+    expect((screen.getByRole("button", { name: "Refreshing" }) as HTMLButtonElement).disabled).toBe(
+      true,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Refreshing" }));
+    expect(harness.detectLanCandidates).toHaveBeenCalledTimes(1);
+
+    first.resolve([]);
+    await act(async () => {
+      await first.promise;
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(harness.detectLanCandidates).toHaveBeenCalledTimes(2);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    expect(harness.detectLanCandidates).toHaveBeenCalledTimes(3);
+    expect(screen.getByText("Detected local Minecraft instance")).toBeTruthy();
+  });
+
+  it("cancels LAN polling and fences a late result when onboarding becomes inactive", async () => {
+    const late = deferred<readonly LanCandidate[]>();
+    const harness = createApiHarness({
+      pcl2: [pcl2Candidate],
+      owner: {
+        revision: 1,
+        ownerUsername: "CurrentOwner",
+        configured: true,
+        presence: "unknown",
+      },
+    });
+    harness.detectLanCandidates.mockImplementationOnce(() => late.promise);
+    const view = await resumeLanWithFakeTimers(harness);
+
+    view.rerender(
+      <OnboardingPage api={harness.api} locale="en" active={false} onReady={vi.fn()} />,
+    );
+    late.resolve([lanCandidate]);
+    await act(async () => {
+      await late.promise;
+      await vi.advanceTimersByTimeAsync(5_000);
+    });
+
+    expect(screen.queryByText("Detected local Minecraft instance")).toBeNull();
+    expect(harness.detectLanCandidates).toHaveBeenCalledTimes(1);
+  });
+
+  it("clears its active LAN poll timer on unmount", async () => {
+    const harness = createApiHarness({
+      pcl2: [pcl2Candidate],
+      lan: [],
+      owner: {
+        revision: 1,
+        ownerUsername: "CurrentOwner",
+        configured: true,
+        presence: "unknown",
+      },
+    });
+    const view = await resumeLanWithFakeTimers(harness);
+    await act(async () => {
+      await Promise.resolve();
+    });
+    const timersBeforeUnmount = vi.getTimerCount();
+    expect(timersBeforeUnmount).toBeGreaterThan(0);
+
+    view.unmount();
+    expect(vi.getTimerCount()).toBeLessThan(timersBeforeUnmount);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(harness.detectLanCandidates).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps detecting after the fast-scan window and finds a later candidate without manual refresh", async () => {
+    const harness = createApiHarness({
+      pcl2: [pcl2Candidate],
+      lan: [...Array.from({ length: 60 }, () => [] as readonly LanCandidate[]), [lanCandidate]],
+      owner: {
+        revision: 1,
+        ownerUsername: "CurrentOwner",
+        configured: true,
+        presence: "unknown",
+      },
+    });
+    await resumeLanWithFakeTimers(harness);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(59_000);
+    });
+    expect(harness.detectLanCandidates).toHaveBeenCalledTimes(60);
+    expect(screen.queryByText("Detected local Minecraft instance")).toBeNull();
+    expect(vi.getTimerCount()).toBeGreaterThan(0);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(4_999);
+    });
+    expect(harness.detectLanCandidates).toHaveBeenCalledTimes(60);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1);
+    });
+    expect(harness.detectLanCandidates).toHaveBeenCalledTimes(61);
+    expect(screen.getByText("Detected local Minecraft instance")).toBeTruthy();
+    expect(harness.confirmLanCandidate).not.toHaveBeenCalled();
+    expect(harness.start).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBeGreaterThan(0);
   });
 
   it("connects only after an explicit candidate confirmation and enters Home only when running", async () => {
@@ -1442,7 +2193,7 @@ describe("first-run onboarding", () => {
     const user = userEvent.setup();
     await reachLan(harness);
 
-    await user.click(await screen.findByRole("button", { name: /确认并连接.*51321/u }));
+    await user.click(await screen.findByRole("button", { name: "确认并连接这个候选项" }));
 
     expect(harness.confirmLanCandidate).toHaveBeenCalledWith("lan_candidate_0001");
     expect(harness.start).toHaveBeenCalledTimes(1);
@@ -1460,9 +2211,11 @@ describe("first-run onboarding", () => {
     const user = userEvent.setup();
     await reachLan(harness);
 
-    await user.click(await screen.findByRole("button", { name: /确认并连接.*51321/u }));
+    await user.click(await screen.findByRole("button", { name: "确认并连接这个候选项" }));
 
-    expect(await screen.findByText("候选已过期，请重新开放 LAN 后刷新。")).toBeTruthy();
+    expect(
+      await screen.findByText("候选已过期。请重新开放 LAN，白百合会继续自动检测；也可手动刷新。"),
+    ).toBeTruthy();
     expect(harness.detectLanCandidates).toHaveBeenCalledTimes(2);
     expect(screen.queryByRole("button", { name: /确认并连接/u })).toBeNull();
     expect(document.body.textContent).not.toContain("private://config");
@@ -1478,7 +2231,7 @@ describe("first-run onboarding", () => {
     const user = userEvent.setup();
     await reachLan(harness);
 
-    await user.click(await screen.findByRole("button", { name: /确认并连接.*51321/u }));
+    await user.click(await screen.findByRole("button", { name: "确认并连接这个候选项" }));
 
     expect(
       await screen.findByText("无法连接 Minecraft，请确认世界仍开放 LAN 后重试。"),
@@ -1486,6 +2239,32 @@ describe("first-run onboarding", () => {
     expect(harness.detectLanCandidates).toHaveBeenCalledTimes(2);
     expect(screen.queryByRole("button", { name: /确认并连接/u })).toBeNull();
     expect(document.body.textContent).not.toContain("private://config");
+  });
+
+  it("preserves the confirmed LAN candidate and retries action readiness with a fresh runtime", async () => {
+    const secret = `${privateWindowsPath("Private", "codex-workspace")} token=secret raw MCP body`;
+    const harness = createApiHarness({
+      status: [stoppedSnapshot, runningSnapshot],
+      pcl2: [pcl2Candidate],
+      lan: [lanCandidate],
+      start: [new Error(`MCP_READINESS_TIMEOUT ${secret}`), runningSnapshot],
+    });
+    const user = userEvent.setup();
+    await reachLan(harness);
+
+    await user.click(await screen.findByRole("button", { name: "确认并连接这个候选项" }));
+
+    expect(await screen.findByText("Minecraft 动作组件响应超时。")).toBeTruthy();
+    expect(screen.getByText("检测到本机 Minecraft 实例")).toBeTruthy();
+    expect(harness.confirmLanCandidate).toHaveBeenCalledTimes(1);
+    expect(harness.detectLanCandidates).toHaveBeenCalledTimes(1);
+    expect(document.body.textContent).not.toContain(secret);
+
+    await user.click(screen.getByRole("button", { name: "重试动作组件" }));
+
+    expect(harness.start).toHaveBeenCalledTimes(2);
+    expect(harness.confirmLanCandidate).toHaveBeenCalledTimes(1);
+    expect(await screen.findByRole("heading", { name: "运行概览" })).toBeTruthy();
   });
 
   it("moves focus to each new step heading for keyboard and screen-reader users", async () => {
@@ -1539,10 +2318,9 @@ describe("first-run onboarding", () => {
     await screen.findByRole("heading", { name: "登录 ChatGPT" });
 
     expect(JSON.parse(window.localStorage.getItem("whitelily.onboarding.v1")!)).toEqual({
-      version: 2,
+      version: 3,
       locale: "zh-CN",
       progressHint: "login",
-      modelPreference: null,
     });
     expect(window.localStorage.getItem("whitelily.onboarding.v1")).not.toContain(
       "lan_candidate_0001",
@@ -1586,6 +2364,7 @@ describe("model picker concurrency", () => {
             reasoningEffort: "high",
             available: true,
           },
+          legacyMigrationCompleted: true,
         }}
         onSelect={vi.fn()}
         onApplied={vi.fn()}
@@ -1651,6 +2430,22 @@ describe("model picker concurrency", () => {
 
 describe("safe onboarding error mapping", () => {
   it.each([
+    ["WORKSPACE_RESOURCE_INVALID", "安装资源损坏，建议重新安装 WhiteLily；"],
+    ["WORKSPACE_DEPLOY_FAILED", "工作区修复失败，建议关闭相关占用后重试；"],
+    ["MCP_PORT_UNAVAILABLE", "本地动作端口被占用；"],
+    ["MCP_TOOL_CATALOG_INVALID", "Minecraft 动作组件不完整；"],
+    ["MCP_READINESS_TIMEOUT", "Minecraft 动作组件响应超时。"],
+    ["MINECRAFT_BRIDGE_REQUIRED", "需要安装并启用 WhiteLily Bridge；请安装组件并重启 Minecraft。"],
+    ["MINECRAFT_BRIDGE_REJECTED", "WhiteLily Bridge 拒绝了本次连接；请检查组件并重启 Minecraft。"],
+  ] as const)("renders bounded Chinese-first recovery copy for %s", (code, expected) => {
+    const key = safeOnboardingErrorKey(
+      new Error(`${code} raw response ${String.raw`C:\private\token`}`),
+    );
+    expect(translate("zh-CN", key)).toBe(expected);
+    expect(translate("zh-CN", key)).not.toMatch(/raw response|C:\\private|token/iu);
+  });
+
+  it.each([
     ["CODEX_NOT_LOGGED_IN", "onboarding.error.CODEX_NOT_LOGGED_IN"],
     ["MODEL_UNAVAILABLE", "onboarding.error.MODEL_UNAVAILABLE"],
     ["PCL2_NOT_FOUND", "onboarding.error.PCL2_NOT_FOUND"],
@@ -1658,6 +2453,13 @@ describe("safe onboarding error mapping", () => {
     ["LAN_CANDIDATE_EXPIRED", "onboarding.error.LAN_CANDIDATE_EXPIRED"],
     ["MINECRAFT_VERSION_UNVERIFIED", "onboarding.error.MINECRAFT_VERSION_UNVERIFIED"],
     ["MINECRAFT_CONNECT_FAILED", "onboarding.error.MINECRAFT_CONNECT_FAILED"],
+    ["WORKSPACE_RESOURCE_INVALID", "onboarding.error.WORKSPACE_RESOURCE_INVALID"],
+    ["WORKSPACE_DEPLOY_FAILED", "onboarding.error.WORKSPACE_DEPLOY_FAILED"],
+    ["MCP_PORT_UNAVAILABLE", "onboarding.error.MCP_PORT_UNAVAILABLE"],
+    ["MCP_TOOL_CATALOG_INVALID", "onboarding.error.MCP_TOOL_CATALOG_INVALID"],
+    ["MCP_READINESS_TIMEOUT", "onboarding.error.MCP_READINESS_TIMEOUT"],
+    ["MINECRAFT_BRIDGE_REQUIRED", "onboarding.error.MINECRAFT_BRIDGE_REQUIRED"],
+    ["MINECRAFT_BRIDGE_REJECTED", "onboarding.error.MINECRAFT_BRIDGE_REJECTED"],
   ] as const)("maps %s without returning raw error text", (code, expected) => {
     expect(safeOnboardingErrorKey(new Error(`${code} ${String.raw`C:\private\token`}`))).toBe(
       expected,
@@ -1673,6 +2475,23 @@ describe("safe onboarding error mapping", () => {
 });
 
 describe("LAN candidate presentation", () => {
+  it("does not call an unknown pending candidate a verified instance", () => {
+    render(
+      <LanCandidateCard
+        candidate={unknownLanCandidate}
+        locale="en"
+        pending
+        disabled
+        onConfirm={() => undefined}
+      />,
+    );
+
+    expect(
+      screen.queryByRole("button", { name: "Connecting to this verified instance" }),
+    ).toBeNull();
+    expect(screen.getByRole("button", { name: "Connecting to this candidate" })).toBeTruthy();
+  });
+
   it("does not crash when a validated safe-integer timestamp is outside the JavaScript Date range", () => {
     const extremeTimestampCandidate: LanCandidate = {
       ...lanCandidate,

@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { MinecraftEvent } from "../../src/minecraft/minecraftPort.js";
 import type { OwnerIdentitySnapshot } from "../../src/identity/ownerIdentity.js";
 import { TOOL_ACTION_KINDS } from "../../src/mcp/toolBudget.js";
+import { containsQueueStateDisclosure } from "../../src/companion/companionService.js";
 import {
   createCompanionHarness,
   outcome,
@@ -87,6 +88,12 @@ function taskDecision(input: {
 function taskPlanFromPrompt(prompt: string): unknown {
   const match = /\nTASK_PLAN\n([^\n]+)\nEND_TASK_PLAN\n/u.exec(prompt);
   if (!match?.[1]) throw new Error("expected one TASK_PLAN JSON section");
+  return JSON.parse(match[1]) as unknown;
+}
+
+function ownerIntentContextFromPrompt(prompt: string): unknown {
+  const match = /\nCONTEXT\n([^\n]+)\nEND_CONTEXT\n/u.exec(prompt);
+  if (!match?.[1]) throw new Error("expected one owner intent CONTEXT JSON section");
   return JSON.parse(match[1]) as unknown;
 }
 
@@ -199,6 +206,66 @@ function activeConfirmationOutcome(reply = "ready", goal = "finish confirmed tra
   return taskExecutionOutcome(reply, "active");
 }
 
+describe("queue state disclosure classifier", () => {
+  it.each([
+    ["There are 2 actions in the queue.", true],
+    ["The queue contains two actions.", true],
+    ["The queue currently contains two tasks.", true],
+    ["The queue has a few tasks.", true],
+    ["The queue contains twenty actions.", true],
+    ["The queue contains completed tasks.", true],
+    ["Tasks are waiting in the queue.", true],
+    ["There are two tasks still waiting in the queue.", true],
+    ["Tasks have been waiting in the queue.", true],
+    ["还有 2 个动作待处理。", true],
+    ["动作仍在队列中。", true],
+    ["队列中共有 2 项。", true],
+    ["队列中有两项任务。", true],
+    ["队列目前有两个任务。", true],
+    ["队列包含待处理的任务。", true],
+    ["队列包含两个待处理的任务。", true],
+    ["队列共 2 项，下一项是采矿。", true],
+    ["Queue status: 2 pending actions.", true],
+    ["Queue status: pending.", true],
+    ["队列状态：待处理。", true],
+    ["队列正在等待确认。", true],
+    ["The queue is waiting for approval.", true],
+    ["Queue is suspended.", true],
+    ["The queue is not running.", true],
+    ["队列没有运行。", true],
+    ["队列还没有运行。", true],
+    ["The queue isn't running.", true],
+    ["The queue is no longer running.", true],
+    ["The task is next.", true],
+    ["The task is still pending.", true],
+    ["The task remains pending.", true],
+    ["任务是下一个。", true],
+    ["任务仍然待处理。", true],
+    ["主人，队列中还有 2 项。", true],
+    ["朋友，队列中还有 2 项。", true],
+    ["我在服务器队列里等朋友。", false],
+    ["我在服务器排队 2 分钟了。", false],
+    ["我和朋友排队等了 60 人。", false],
+    ["当前正在排队等朋友。", false],
+    ["我正在排队等朋友。", false],
+    ["我和朋友正在排队挖矿。", false],
+    ["I'm waiting in the server queue to craft with friends.", false],
+    ["排队失败后仍能聊天。", false],
+    ["任务完成了 2 次。", false],
+    ["The task completed 2 times.", false],
+    ["Tasks are next to the server.", false],
+    ["The task is next week.", false],
+    ["The task is next Monday.", false],
+    ["The task is next-door.", false],
+    ["The server queue has ended and the task completed.", false],
+    ["这个任务还有很大改进空间。", false],
+    ["动作还有点慢。", false],
+    ["任务下一个星期再做。", false],
+  ])("classifies %j as %s", (text, expected) => {
+    expect(containsQueueStateDisclosure(text)).toBe(expected);
+  });
+});
+
 afterEach(async () => {
   vi.useRealTimers();
   await Promise.all(
@@ -216,8 +283,14 @@ describe("CompanionService lifecycle", () => {
     await value.start();
 
     expect(value.codex.startedThreads).toHaveLength(2);
-    expect(value.codex.startedThreads[0]).toMatchObject({ model: "gpt-5.6-terra" });
-    expect(value.codex.startedThreads[1]).toMatchObject({ model: "gpt-5.6-terra" });
+    expect(value.codex.startedThreads[0]).toMatchObject({
+      model: "gpt-5.6-terra",
+      toolAccess: "none",
+    });
+    expect(value.codex.startedThreads[1]).toMatchObject({
+      model: "gpt-5.6-terra",
+      toolAccess: "minecraft",
+    });
     expect(value.codex.startedThreadIds.intent).not.toBe(value.codex.startedThreadIds.execution);
   });
 
@@ -231,6 +304,462 @@ describe("CompanionService lifecycle", () => {
     expect(value.codex.startedThreads[0]).toMatchObject({ model: "gpt-5.6-terra" });
     expect(value.codex.startedThreads[1]).toMatchObject({ model: "gpt-5.6-terra" });
     expect(value.codex.startedThreadIds.intent).not.toBe(value.codex.startedThreadIds.execution);
+  });
+
+  it("stages both replacement threads before committing and retiring the old authority", async () => {
+    const value = await harness({
+      intentThreadIds: ["terra-intent", "luna-intent"],
+      threadIds: ["terra-execution", "luna-execution"],
+    });
+    await value.service.start("gpt-5.6-terra");
+    const authority = value.service as unknown as {
+      intentThreadId: string;
+      executionThreadId: string;
+      selectedModel: string;
+      selectedReasoningEffort: string;
+    };
+    const commitPreference = vi.fn(async () => {
+      expect(value.codex.startedThreads.slice(2)).toEqual([
+        expect.objectContaining({ model: "gpt-5.6-luna", reasoningEffort: "high" }),
+        expect.objectContaining({ model: "gpt-5.6-luna", reasoningEffort: "high" }),
+      ]);
+      expect(value.codex.closedThreads).toEqual([]);
+      expect(authority).toMatchObject({
+        intentThreadId: "terra-intent",
+        executionThreadId: "terra-execution",
+        selectedModel: "gpt-5.6-terra",
+        selectedReasoningEffort: "low",
+      });
+    });
+
+    await value.service.switchModel(
+      { modelId: "gpt-5.6-luna", reasoningEffort: "high" },
+      commitPreference,
+    );
+
+    expect(commitPreference).toHaveBeenCalledTimes(1);
+    expect(authority).toMatchObject({
+      intentThreadId: "luna-intent",
+      executionThreadId: "luna-execution",
+      selectedModel: "gpt-5.6-luna",
+      selectedReasoningEffort: "high",
+    });
+    expect(value.codex.threadLifecycle).toEqual([
+      "start:terra-intent",
+      "start:terra-execution",
+      "start:luna-intent",
+      "start:luna-execution",
+      "close:terra-intent",
+      "close:terra-execution",
+    ]);
+  });
+
+  it.each([
+    ["a stopped service", "running"],
+    ["unhealthy Codex", "codexHealthy"],
+  ] as const)(
+    "rejects switching for %s before opening replacement threads",
+    async (_label, key) => {
+      const value = await harness({
+        intentThreadIds: ["terra-intent", "must-not-start-intent"],
+        threadIds: ["terra-execution", "must-not-start-execution"],
+      });
+      await value.service.start("gpt-5.6-terra");
+      (value.service as unknown as Record<typeof key, boolean>)[key] = false;
+      const commitPreference = vi.fn(async () => undefined);
+
+      await expect(
+        value.service.switchModel(
+          { modelId: "gpt-5.6-luna", reasoningEffort: "high" },
+          commitPreference,
+        ),
+      ).rejects.toThrow();
+
+      expect(value.codex.startedThreads).toHaveLength(2);
+      expect(value.codex.closedThreads).toEqual([]);
+      expect(commitPreference).not.toHaveBeenCalled();
+    },
+  );
+
+  it("stops active model work with model_changed and keeps the connection healthy", async () => {
+    const value = await harness({
+      intentResponses: [
+        taskDecision({
+          naturalReply: null,
+          goal: "old model task",
+          allowedActions: ["say"],
+        }),
+      ],
+      executionResponses: [taskExecutionOutcome("old model work", "active")],
+      deferredTurns: [0],
+      intentThreadIds: ["terra-intent", "luna-intent"],
+      threadIds: ["terra-execution", "luna-execution"],
+    });
+    await value.service.start("gpt-5.6-terra");
+    await value.emitOwnerText("start old model work");
+    await value.untilCodexTurns(1);
+    const task = value.taskController.current();
+    const turnLease = value.budgetLeases[0];
+    if (!task || !turnLease) throw new Error("expected active task and turn leases");
+
+    await value.service.switchModel(
+      { modelId: "gpt-5.6-luna", reasoningEffort: "medium" },
+      async () => undefined,
+    );
+
+    expect(value.taskController.current()).toBeNull();
+    expect(value.taskController.isLeaseLive(task.lease)).toBe(false);
+    expect(value.budget.consume("say", turnLease)).toEqual({
+      ok: false,
+      reason: "tool turn has ended",
+    });
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:model_changed"]);
+    expect(value.taskTerminalReasons).toContain("model_changed");
+    expect(value.codex.interruptions).toContainEqual({
+      threadId: "terra-execution",
+      turnId: "turn-1",
+    });
+    expect(value.codex.stopCalls).toBe(0);
+    expect(value.mode.snapshot().paused).toBe(false);
+    expect(value.service).toMatchObject({ running: true, codexHealthy: true });
+  });
+
+  it("revokes active action authority and refuses new dispatch after MCP loss", async () => {
+    const value = await harness({
+      intentResponses: [
+        taskDecision({
+          naturalReply: null,
+          goal: "active action task",
+          allowedActions: ["say"],
+        }),
+      ],
+      executionResponses: [taskExecutionOutcome("这条成功消息绝不能出现", "completed")],
+      deferredTurns: [0],
+    });
+    await value.service.start("gpt-5.6-terra");
+    await value.emitOwnerText("start action task");
+    await value.untilCodexTurns(1);
+    const task = value.taskController.current();
+    const turnLease = value.budgetLeases[0];
+    if (!task || !turnLease) throw new Error("expected active task and turn leases");
+    const turnsBeforeLoss = value.codex.turns.length;
+
+    value.service.actionCapabilityLost();
+
+    expect(value.taskController.current()).toBeNull();
+    expect(value.taskController.isLeaseLive(task.lease)).toBe(false);
+    expect(value.budget.consume("say", turnLease)).toEqual({
+      ok: false,
+      reason: "tool turn has ended",
+    });
+    expect(value.codex.interruptions).toContainEqual({
+      threadId: value.codex.startedThreadIds.execution,
+      turnId: "turn-1",
+    });
+    expect(value.service).toMatchObject({ codexHealthy: false });
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:failed"]);
+    expect(value.taskTerminalReasons).toEqual(["failed"]);
+    expect(value.budget.snapshot()).toMatchObject({ active: false, ended: true });
+
+    const rejectedAfterLoss = await value.executeRawTool("minecraft_say", {
+      message: "must not reach Minecraft",
+      turnLease,
+    });
+    expect(rejectedAfterLoss).toEqual({
+      text: '{"error":"tool turn has ended"}',
+      isError: true,
+    });
+    expect(value.minecraft.calls).toEqual([]);
+
+    value.codex.releaseTurnResult(0);
+    await value.untilTurnSettled();
+    expect(value.minecraft.chatLog).not.toContain("这条成功消息绝不能出现");
+
+    value.minecraft.emit({
+      kind: "chat",
+      username: "TestOwner",
+      message: "start another task",
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(value.codex.turns).toHaveLength(turnsBeforeLoss);
+    expect(value.pendingMergeTimers()).toBe(0);
+    expect(value.minecraft.calls).toEqual([]);
+  });
+
+  it("archives a staged intent thread when replacement execution creation fails", async () => {
+    const value = await harness({
+      intentThreadIds: ["terra-intent", "failed-luna-intent"],
+      threadIds: ["terra-execution", "failed-luna-execution"],
+      codexThreadStartErrors: [undefined, undefined, undefined, new Error("luna failed")],
+    });
+    await value.service.start("gpt-5.6-terra");
+    const authority = value.service as unknown as {
+      intentThreadId: string;
+      executionThreadId: string;
+      selectedModel: string;
+      selectedReasoningEffort: string;
+    };
+    const commitPreference = vi.fn(async () => undefined);
+
+    await expect(
+      value.service.switchModel(
+        { modelId: "gpt-5.6-luna", reasoningEffort: "high" },
+        commitPreference,
+      ),
+    ).rejects.toThrow("luna failed");
+
+    expect(commitPreference).not.toHaveBeenCalled();
+    expect(value.codex.closedThreads).toEqual(["failed-luna-intent"]);
+    expect(authority).toMatchObject({
+      intentThreadId: "terra-intent",
+      executionThreadId: "terra-execution",
+      selectedModel: "gpt-5.6-terra",
+      selectedReasoningEffort: "low",
+    });
+  });
+
+  it("surfaces a staged intent rollback failure while preserving the old authority", async () => {
+    const value = await harness({
+      intentThreadIds: ["terra-intent", "failed-luna-intent"],
+      threadIds: ["terra-execution", "failed-luna-execution"],
+      codexThreadStartErrors: [undefined, undefined, undefined, new Error("luna failed")],
+      codexThreadCloseErrors: [new Error("PRIVATE_staged_intent_close_failure")],
+    });
+    await value.service.start("gpt-5.6-terra");
+
+    await expect(
+      value.service.switchModel(
+        { modelId: "gpt-5.6-luna", reasoningEffort: "high" },
+        async () => undefined,
+      ),
+    ).rejects.toMatchObject({
+      name: "AggregateError",
+      message: "Companion model switch rollback failed",
+    });
+
+    expect(value.codex.closedThreads).toEqual(["failed-luna-intent"]);
+    expect(value.service).toMatchObject({
+      intentThreadId: "terra-intent",
+      executionThreadId: "terra-execution",
+      selectedModel: "gpt-5.6-terra",
+      selectedReasoningEffort: "low",
+    });
+  });
+
+  it("archives both replacement threads when preference persistence fails", async () => {
+    const value = await harness({
+      intentThreadIds: ["terra-intent", "luna-intent"],
+      threadIds: ["terra-execution", "luna-execution"],
+    });
+    await value.service.start("gpt-5.6-terra");
+    const authority = value.service as unknown as {
+      intentThreadId: string;
+      executionThreadId: string;
+      selectedModel: string;
+      selectedReasoningEffort: string;
+    };
+
+    await expect(
+      value.service.switchModel({ modelId: "gpt-5.6-luna", reasoningEffort: "high" }, async () => {
+        throw new Error("preference persistence failed");
+      }),
+    ).rejects.toThrow("preference persistence failed");
+
+    expect(value.codex.closedThreads).toEqual(["luna-intent", "luna-execution"]);
+    expect(authority).toMatchObject({
+      intentThreadId: "terra-intent",
+      executionThreadId: "terra-execution",
+      selectedModel: "gpt-5.6-terra",
+      selectedReasoningEffort: "low",
+    });
+  });
+
+  it("surfaces replacement-pair rollback failure after preference persistence fails", async () => {
+    const value = await harness({
+      intentThreadIds: ["terra-intent", "luna-intent"],
+      threadIds: ["terra-execution", "luna-execution"],
+      codexThreadCloseErrors: [new Error("PRIVATE_staged_pair_close_failure"), undefined],
+    });
+    await value.service.start("gpt-5.6-terra");
+
+    await expect(
+      value.service.switchModel({ modelId: "gpt-5.6-luna", reasoningEffort: "high" }, async () => {
+        throw new Error("preference persistence failed");
+      }),
+    ).rejects.toMatchObject({
+      name: "AggregateError",
+      message: "Companion model switch rollback failed",
+    });
+
+    expect(value.codex.closedThreads).toEqual(["luna-intent", "luna-execution"]);
+    expect(value.service).toMatchObject({
+      intentThreadId: "terra-intent",
+      executionThreadId: "terra-execution",
+      selectedModel: "gpt-5.6-terra",
+      selectedReasoningEffort: "low",
+    });
+  });
+
+  it("keeps the new authority when old thread archival fails and logs only redacted data", async () => {
+    const privateFailure = "PRIVATE_terra-intent_archive_failure";
+    const archiveFailure = new Error(privateFailure);
+    archiveFailure.name = "PRIVATE_ArchiveFailureName";
+    const value = await harness({
+      intentThreadIds: ["terra-intent", "luna-intent"],
+      threadIds: ["terra-execution", "luna-execution"],
+      codexThreadCloseErrors: [archiveFailure, undefined],
+    });
+    await value.service.start("gpt-5.6-terra");
+    const authority = value.service as unknown as {
+      intentThreadId: string;
+      executionThreadId: string;
+      selectedModel: string;
+    };
+
+    await expect(
+      value.service.switchModel(
+        { modelId: "gpt-5.6-luna", reasoningEffort: "medium" },
+        async () => undefined,
+      ),
+    ).resolves.toBeUndefined();
+
+    expect(authority).toMatchObject({
+      intentThreadId: "luna-intent",
+      executionThreadId: "luna-execution",
+      selectedModel: "gpt-5.6-luna",
+    });
+    expect(value.codex.closedThreads).toEqual(["terra-intent", "terra-execution"]);
+    expect(value.diagnostics).toContainEqual({
+      event: "codex_thread_retire_failed",
+      fields: { code: "thread_archive_failed" },
+    });
+    expect(JSON.stringify(value.diagnostics)).not.toContain(privateFailure);
+    expect(JSON.stringify(value.diagnostics)).not.toContain(archiveFailure.name);
+    expect(JSON.stringify(value.diagnostics)).not.toContain("terra-intent");
+  });
+
+  it("serializes rapid switches so the final successful request owns both threads", async () => {
+    const value = await harness({
+      intentThreadIds: ["terra-intent", "luna-intent", "final-intent"],
+      threadIds: ["terra-execution", "luna-execution", "final-execution"],
+      gatedThreadStarts: [2],
+    });
+    await value.service.start("gpt-5.6-terra");
+    const firstCommit = vi.fn(async () => undefined);
+    const finalCommit = vi.fn(async () => undefined);
+
+    const first = value.service.switchModel(
+      { modelId: "gpt-5.6-luna", reasoningEffort: "medium" },
+      firstCommit,
+    );
+    await value.untilThreadStart(2);
+    const final = value.service.switchModel(
+      { modelId: "gpt-5.6-final", reasoningEffort: "high" },
+      finalCommit,
+    );
+
+    expect(value.codex.startedThreads).toHaveLength(2);
+    expect(firstCommit).not.toHaveBeenCalled();
+    expect(finalCommit).not.toHaveBeenCalled();
+    value.releaseThreadStart(2);
+    await Promise.all([first, final]);
+
+    expect(firstCommit).toHaveBeenCalledTimes(1);
+    expect(finalCommit).toHaveBeenCalledTimes(1);
+    expect(value.service).toMatchObject({
+      intentThreadId: "final-intent",
+      executionThreadId: "final-execution",
+      selectedModel: "gpt-5.6-final",
+      selectedReasoningEffort: "high",
+    });
+    expect(value.codex.threadLifecycle).toEqual([
+      "start:terra-intent",
+      "start:terra-execution",
+      "start:luna-intent",
+      "start:luna-execution",
+      "close:terra-intent",
+      "close:terra-execution",
+      "start:final-intent",
+      "start:final-execution",
+      "close:luna-intent",
+      "close:luna-execution",
+    ]);
+  });
+
+  it("holds owner task dispatch behind the switch tail and uses one replacement pair", async () => {
+    const value = await harness({
+      intentResponses: [
+        taskDecision({
+          naturalReply: null,
+          goal: "new model task",
+          allowedActions: ["get_state"],
+        }),
+      ],
+      executionResponses: [taskExecutionOutcome("new pair ready")],
+      intentThreadIds: ["terra-intent", "luna-intent"],
+      threadIds: ["terra-execution", "luna-execution"],
+      gatedThreadStarts: [3],
+    });
+    await value.service.start("gpt-5.6-terra");
+    const switching = value.service.switchModel(
+      { modelId: "gpt-5.6-luna", reasoningEffort: "medium" },
+      async () => undefined,
+    );
+    await value.untilThreadStart(3);
+
+    const ownerTurn = value.emitOwnerText("start on the new model");
+    await value.untilMergeTimer();
+    expect(value.codex.turnsFor("intent")).toEqual([]);
+    value.releaseThreadStart(3);
+    await switching;
+    await ownerTurn;
+    await value.untilCodexTurns(1);
+
+    expect(value.codex.turnsFor("intent")).toEqual([
+      expect.objectContaining({ threadId: "luna-intent" }),
+    ]);
+    expect(value.codex.turnsFor("execution")).toEqual([
+      expect.objectContaining({ threadId: "luna-execution" }),
+    ]);
+  });
+
+  it("keeps only the latest separately merged owner intent while a model switch is blocked", async () => {
+    const latestReply = "latest intent only";
+    const value = await harness({
+      intentResponses: [JSON.stringify({ kind: "chat", reply: latestReply, memoryCandidates: [] })],
+      intentThreadIds: ["terra-intent", "luna-intent"],
+      threadIds: ["terra-execution", "luna-execution"],
+      gatedThreadStarts: [3],
+    });
+    await value.service.start("gpt-5.6-terra");
+    const switching = value.service.switchModel(
+      { modelId: "gpt-5.6-luna", reasoningEffort: "medium" },
+      async () => undefined,
+    );
+    await value.untilThreadStart(3);
+    const budgetEventsBeforeOwnerMessages = [...value.budgetEvents];
+
+    value.minecraft.emit({ kind: "chat", username: "TestOwner", message: "OWNER_STALE_A" });
+    await value.untilMergeTimer();
+    value.fireMergeTimers();
+    value.minecraft.emit({ kind: "chat", username: "TestOwner", message: "OWNER_LATEST_B" });
+    await value.untilMergeTimer();
+    value.fireMergeTimers();
+    expect(value.codex.turnsFor("intent")).toEqual([]);
+
+    value.releaseThreadStart(3);
+    await switching;
+    await value.untilChat(latestReply);
+    await value.untilTurnSettled();
+
+    expect(value.codex.turnsFor("intent")).toHaveLength(1);
+    expect(value.codex.turnsFor("intent")[0]).toMatchObject({ threadId: "luna-intent" });
+    expect(value.codex.turnsFor("intent")[0]?.text).toContain("OWNER_LATEST_B");
+    expect(value.codex.turnsFor("intent")[0]?.text).not.toContain("OWNER_STALE_A");
+    expect(value.codex.turnsFor("execution")).toEqual([]);
+    expect(value.taskController.current()).toBeNull();
+    expect(value.taskAuditEvents).toEqual([]);
+    expect(value.budgetEvents).toEqual(budgetEventsBeforeOwnerMessages);
   });
 
   it("recovery recreates two independent threads before its execution handshake", async () => {
@@ -501,9 +1030,9 @@ describe("CompanionService lifecycle", () => {
     });
   });
 
-  it("routes chat during an active task without pre-cancelling its deferred execution", async () => {
+  it("routes chat without revoking the task and replans its suspended work", async () => {
     const value = await harness({
-      deferredTurns: [0],
+      deferredTurns: [0, 1],
       intentResponses: [
         JSON.stringify({
           kind: "start_task",
@@ -525,20 +1054,119 @@ describe("CompanionService lifecycle", () => {
     const activeTask = value.taskController.current();
     if (!activeTask) throw new Error("expected an active task");
     const auditBeforeChat = [...value.taskAuditEvents];
-    const budgetBeforeChat = [...value.budgetEvents];
 
     await value.emitOwnerText("tell me something while you wait");
     await value.untilChat("今天天气确实不错。");
+    await vi.waitFor(() => expect(value.codex.turnsFor("execution")).toHaveLength(2));
 
     expect(value.taskController.current()?.id).toBe(activeTask.id);
     expect(value.taskAuditEvents).toEqual(auditBeforeChat);
-    expect(value.budgetEvents).toEqual(budgetBeforeChat);
-    expect(value.codex.interruptions).not.toContainEqual({
+    expect(value.codex.interruptions).toContainEqual({
       threadId: value.codex.startedThreadIds.execution,
       turnId: "turn-1",
     });
-    expect(value.codex.turnsFor("execution")).toHaveLength(1);
-    expect(value.minecraft.chatLog.at(-1)).toBe("今天天气确实不错。");
+    expect(value.codex.turnsFor("execution")[1]?.text).toContain("重新观察当前世界");
+    expect(value.minecraft.chatLog).toContain("今天天气确实不错。");
+  });
+
+  it("stops physical work before the owner intent turn resolves", async () => {
+    const value = await harness({
+      activeMinecraftWait: true,
+      deferredTurns: [0],
+      deferredIntentTurns: [1],
+      intentResponses: [
+        JSON.stringify({
+          kind: "start_task",
+          naturalReply: null,
+          task: {
+            goal: "继续等待",
+            allowedActions: ["wait"],
+            requestedLimits: {},
+          },
+          memoryCandidates: [],
+        }),
+        JSON.stringify({ kind: "chat", reply: "稍等，我先回应你。", memoryCandidates: [] }),
+      ],
+      executionResponses: [taskExecutionOutcome("仍在等待", "active")],
+    });
+    await value.start();
+    await value.emitOwnerText("开始等待");
+    await value.untilCodexTurns(1);
+    const activeTask = value.taskController.current();
+    if (!activeTask) throw new Error("expected an active task");
+    const runningAction = value.executor.execute(
+      { kind: "wait", milliseconds: 10_000 },
+      {
+        owner: { x: 0, y: 64, z: 0 },
+        taskLease: activeTask.lease,
+      },
+    );
+    await value.untilActiveWaitStarted();
+
+    await value.emitOwnerText("先听我说一句");
+
+    expect(value.activeWaitWasAborted()).toBe(true);
+    await expect(runningAction).resolves.toEqual({ status: "cancelled" });
+    expect(value.taskController.current()?.id).toBe(activeTask.id);
+    expect(value.codex.turnsFor("intent")).toHaveLength(2);
+  });
+
+  it("runs a priority help task before replanning the suspended goal", async () => {
+    const value = await harness({
+      activeMinecraftWait: true,
+      deferredTurns: [0, 1, 2],
+      intentResponses: [
+        JSON.stringify({
+          kind: "start_task",
+          naturalReply: null,
+          task: {
+            goal: "继续收集煤炭",
+            allowedActions: ["get_state", "wait"],
+            requestedLimits: {},
+          },
+          memoryCandidates: [],
+        }),
+        JSON.stringify({
+          kind: "priority_task",
+          naturalReply: "好，我先来帮你。",
+          task: {
+            goal: "来到主人身边并等待",
+            allowedActions: ["get_state", "follow_owner", "wait"],
+            requestedLimits: {},
+          },
+          memoryCandidates: [],
+        }),
+      ],
+      executionResponses: [taskExecutionOutcome("重新规划原目标。", "active")],
+    });
+    await value.start();
+    await value.emitOwnerText("继续收集煤炭");
+    await value.untilCodexTurns(1);
+    const oldTask = value.taskController.current();
+    if (!oldTask) throw new Error("expected an active task");
+    value.actionQueue.enqueue({
+      taskLease: oldTask.lease,
+      worldGeneration: 0,
+      action: { kind: "wait", milliseconds: 10_000 },
+      summary: "旧目标等待动作",
+      trustedObservationKey: "observation-old",
+    });
+    await value.untilActiveWaitStarted();
+
+    await value.emitOwnerText("先来帮我一下");
+    await vi.waitFor(() => expect(value.codex.turnsFor("execution")).toHaveLength(2));
+    value.codex.releaseTurnResult(1, taskExecutionOutcome("我到你身边了。", "completed"));
+    await vi.waitFor(() => expect(value.codex.turnsFor("execution")).toHaveLength(3));
+
+    const executionTurns = value.codex.turnsFor("execution");
+    expect(executionTurns[1]?.text).toContain("来到主人身边并等待");
+    expect(executionTurns[2]?.text).toContain("继续收集煤炭");
+    expect(executionTurns[2]?.text).toContain("重新观察");
+    expect(value.actionQueue.snapshot().items[0]).toMatchObject({
+      status: "cancelled",
+      reason: "priority task replan",
+    });
+    expect(value.taskController.current()?.disclosure.goal).toBe("继续收集煤炭");
   });
 
   describe("active task intent semantics and fences", () => {
@@ -666,6 +1294,14 @@ describe("CompanionService lifecycle", () => {
         { spawn: { x: 0, y: 64, z: 0 }, owner: { x: 0, y: 64, z: 0 } },
       );
       await value.untilActiveWaitStarted();
+      value.actionQueue.enqueue({
+        taskLease: oldTask.lease,
+        worldGeneration: 0,
+        action: { kind: "jump" },
+        summary: "停止时应清理的动作",
+        trustedObservationKey: "observation-stop",
+      });
+      await vi.waitFor(() => expect(value.actionQueue.snapshot().items[0]?.status).toBe("running"));
 
       await value.emitOwnerText("stop the task");
       await value.untilChat("Stopped as requested.");
@@ -678,6 +1314,10 @@ describe("CompanionService lifecycle", () => {
       });
       expect(value.confirmations.get(genericConfirmation.id)).toBeUndefined();
       expect(value.taskController.isLeaseLive(oldTask.lease)).toBe(false);
+      expect(value.actionQueue.snapshot().items[0]).toMatchObject({
+        status: "cancelled",
+        reason: "owner_stop",
+      });
       expect(value.codex.turnsFor("execution")).toHaveLength(1);
       expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:owner_stop"]);
     });
@@ -685,6 +1325,7 @@ describe("CompanionService lifecycle", () => {
     it("clarify leaves the active task, confirmation, execution, and lease unchanged", async () => {
       const value = await harness({
         deferredTurns: [0],
+        activeMinecraftWait: true,
         intentResponses: [
           initialDecision,
           JSON.stringify({ kind: "clarify", question: "Which direction?" }),
@@ -699,12 +1340,24 @@ describe("CompanionService lifecycle", () => {
         { kind: "look_at", position: { x: 1, y: 64, z: 1 } },
         task.lease,
       );
+      value.actionQueue.enqueue({
+        taskLease: task.lease,
+        worldGeneration: 0,
+        action: { kind: "wait", milliseconds: 10_000 },
+        summary: "等待主人澄清",
+        trustedObservationKey: "observation-clarify",
+      });
+      await value.untilActiveWaitStarted();
 
       await value.emitOwnerText("change it somehow");
       await value.untilChat("Which direction?");
 
       expect(value.taskController.current()).toMatchObject({ id: task.id, lease: task.lease });
       expect(value.confirmations.get(confirmation.id)).toBeDefined();
+      expect(value.actionQueue.snapshot().items[0]).toMatchObject({
+        status: "suspended",
+        reason: "owner_message",
+      });
       expect(value.codex.interruptions).toEqual([]);
       expect(value.taskAuditEvents).toEqual(["task_started"]);
     });
@@ -712,6 +1365,7 @@ describe("CompanionService lifecycle", () => {
     it("continues under the same lease after interrupting only the active execution turn", async () => {
       const value = await harness({
         deferredTurns: [0, 1],
+        activeMinecraftWait: true,
         intentResponses: [initialDecision, replacementDecision("continue_task")],
         executionResponses: [
           taskExecutionOutcome("stale first execution", "active"),
@@ -722,6 +1376,21 @@ describe("CompanionService lifecycle", () => {
       await startPlayerTurn(value, "watch the path");
       const task = value.taskController.current();
       if (!task) throw new Error("expected an active task");
+      value.actionQueue.enqueue({
+        taskLease: task.lease,
+        worldGeneration: 0,
+        action: { kind: "wait", milliseconds: 10_000 },
+        summary: "被消息中断的动作",
+        trustedObservationKey: "observation-continue",
+      });
+      value.actionQueue.enqueue({
+        taskLease: task.lease,
+        worldGeneration: 0,
+        action: { kind: "jump" },
+        summary: "重新规划后可继续的动作",
+        trustedObservationKey: "observation-continue",
+      });
+      await value.untilActiveWaitStarted();
 
       await value.emitOwnerText("continue with only a state check");
       await vi.waitFor(() => expect(value.codex.turnsFor("execution")).toHaveLength(2), {
@@ -733,11 +1402,20 @@ describe("CompanionService lifecycle", () => {
         turnId: "turn-1",
       });
       expect(value.taskController.current()).toMatchObject({ id: task.id, lease: task.lease });
+      expect(value.actionQueue.snapshot().items.map(({ status }) => status)).toEqual([
+        "suspended",
+        "suspended",
+      ]);
       expect(value.budgetTaskLeaseIds).toEqual([task.lease.id, task.lease.id]);
       expect(value.taskAuditEvents).toEqual(["task_started"]);
 
       value.codex.releaseTurnResult(1, taskExecutionOutcome("narrow continuation", "active"));
       await value.untilChat("narrow continuation");
+      await value.actionRunner.waitForIdle();
+      expect(value.actionQueue.snapshot().items.map(({ status }) => status)).toEqual([
+        "cancelled",
+        "completed",
+      ]);
       expect(value.taskAuditEvents.filter((event) => event === "task_started")).toHaveLength(1);
     });
 
@@ -1224,6 +1902,139 @@ describe("CompanionService lifecycle", () => {
     );
   });
 
+  describe("installed action outcome contract", () => {
+    it("uses minecraft_get_state for 查看一下你现在的位置 and accounts the tool call", async () => {
+      const value = await harness({
+        deferredTurns: [0],
+        intentResponses: [
+          taskDecision({
+            naturalReply: null,
+            goal: "查看当前位置",
+            allowedActions: ["get_state"],
+            requestedLimits: { maxToolCalls: 2 },
+          }),
+        ],
+        executionResponses: [taskExecutionOutcome("位置已确认")],
+      });
+      await value.start();
+
+      await startPlayerTurn(value, "查看一下你现在的位置");
+      const result = await value.executeRawTool("minecraft_get_state", {
+        turnLease: value.budgetLeases[0],
+      });
+
+      expect(result.isError).not.toBe(true);
+      expect(JSON.parse(result.text)).toMatchObject({ botPosition: { x: 0, y: 64, z: 0 } });
+      expect(value.budget.snapshot()).toMatchObject({ active: true, totalCalls: 1 });
+      expect(value.taskAuditEvents).toEqual(["task_started"]);
+
+      value.codex.releaseTurnResult(0);
+      await value.untilTurnSettled();
+
+      expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:completed"]);
+      expect(value.taskAuditPayloads).toHaveLength(2);
+    });
+
+    it("executes bounded follow movement for 走到我身边来 with matching budget and audit counts", async () => {
+      const value = await harness({
+        deferredTurns: [0],
+        intentResponses: [
+          taskDecision({
+            naturalReply: null,
+            goal: "走到主人身边",
+            allowedActions: ["follow_owner", "move_to"],
+            requestedLimits: { maxToolCalls: 2, maxHorizontalTravel: 16 },
+          }),
+        ],
+        executionResponses: [taskExecutionOutcome("已到达")],
+      });
+      value.minecraft.world.ownerPosition = { x: 6, y: 64, z: 0 };
+      const executorResults: unknown[] = [];
+      value.executor.onResult((result) => executorResults.push(result));
+      await value.start();
+
+      await startPlayerTurn(value, "走到我身边来");
+      const result = await value.executeRawTool("minecraft_follow_owner", {
+        distance: 3,
+        turnLease: value.budgetLeases[0],
+      });
+
+      expect(result).toEqual({ text: '{"status":"completed"}' });
+      expect(value.minecraft.calls).toContainEqual({
+        method: "followOwner",
+        args: ["TestOwner", 3],
+      });
+      expect(executorResults).toEqual([{ status: "completed" }]);
+      expect(value.budget.snapshot()).toMatchObject({
+        active: true,
+        totalCalls: 1,
+        cumulativeHorizontalTravel: 6,
+      });
+      expect(value.taskAuditEvents).toHaveLength(1);
+
+      value.codex.releaseTurnResult(0);
+      await value.untilTurnSettled();
+
+      expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:completed"]);
+      expect(value.taskAuditPayloads).toHaveLength(2);
+      expect(value.taskAuditPayloads[1]).toMatchObject({
+        event: "task_stopped",
+        data: { reason: "completed", expectedActionCategoryCount: 2 },
+      });
+    });
+
+    it("returns a live action failure to the executor turn so it can recover", async () => {
+      const value = await harness({
+        deferredTurns: [0],
+        intentResponses: [
+          taskDecision({
+            naturalReply: null,
+            goal: "recover from a blocked route",
+            allowedActions: ["move_to"],
+            requestedLimits: { maxToolCalls: 2, maxHorizontalTravel: 20 },
+          }),
+        ],
+        executionResponses: [taskExecutionOutcome("recovered")],
+      });
+      value.minecraft.moveTo = async () => {
+        throw new Error("path blocked");
+      };
+      await value.start();
+      await startPlayerTurn(value, "recover from a blocked route");
+
+      const failed = await value.executeRawTool("minecraft_move_to", {
+        x: 5,
+        y: 64,
+        z: 0,
+        turnLease: value.budgetLeases[0],
+      });
+
+      expect(failed).toEqual({
+        text: '{"status":"failed","reason":"Error: path blocked"}',
+        isError: true,
+      });
+      expect(value.taskController.current()).not.toBeNull();
+      expect(value.codex.interruptions).toEqual([]);
+      expect(value.minecraft.chatLog).toEqual([]);
+      expect(value.taskAuditEvents).toEqual(["task_started"]);
+
+      value.minecraft.moveTo = async () => undefined;
+      const recovered = await value.executeRawTool("minecraft_move_to", {
+        x: 6,
+        y: 64,
+        z: 0,
+        turnLease: value.budgetLeases[0],
+      });
+      expect(recovered).toEqual({ text: '{"status":"completed"}' });
+
+      value.codex.releaseTurnResult(0);
+      await value.untilTurnSettled();
+
+      expect(value.minecraft.chatLog).toEqual(["recovered"]);
+      expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:completed"]);
+    });
+  });
+
   it.each(["friend", "balanced", "autonomous"] as const)(
     "executes a safe owner task in %s mode without an extra confirmation",
     async (mode) => {
@@ -1658,6 +2469,16 @@ describe("CompanionService lifecycle", () => {
     );
     const confirmation = value.confirmations.create("pending", { kind: "memory_clear" });
     await value.untilActiveWaitStarted();
+    const activeTask = value.taskController.current();
+    if (!activeTask) throw new Error("expected an active task");
+    value.actionQueue.enqueue({
+      taskLease: activeTask.lease,
+      worldGeneration: 0,
+      action: { kind: "jump" },
+      summary: "旧世界排队动作",
+      trustedObservationKey: "observation-world",
+    });
+    await vi.waitFor(() => expect(value.actionQueue.snapshot().items[0]?.status).toBe("running"));
 
     value.minecraft.emit({ kind: "world_changed" });
 
@@ -1671,6 +2492,10 @@ describe("CompanionService lifecycle", () => {
     ).toEqual({ ok: false, reason: "task lease is invalid" });
     expect(value.activeWaitWasAborted()).toBe(true);
     expect(value.confirmations.get(confirmation.id)).toBeUndefined();
+    expect(value.actionQueue.snapshot().items[0]).toMatchObject({
+      status: "cancelled",
+      reason: "world_changed",
+    });
     expect(value.mode.snapshot()).toMatchObject({ paused: true, taskId: null });
 
     const savesBeforeReconnectSequence = value.savedStates.length;
@@ -2952,6 +3777,52 @@ describe("CompanionService recovery", () => {
     );
     expect(value.mode.snapshot().paused).toBe(false);
     expect(value.minecraft.chatLog).toEqual(["已恢复。"]);
+  });
+
+  it("exposes a recovered active task to owner intent routing so natural stop clears it", async () => {
+    const value = await harness({
+      persistedState: {
+        lastMode: "friend",
+        paused: true,
+        unfinishedTaskSummary: '{"goal":"继续建造别墅"}',
+      },
+      intentResponses: [JSON.stringify({ kind: "stop_task", reply: "好，我先停下来。" })],
+      executionResponses: [
+        outcome({
+          task: {
+            goal: "继续建造别墅",
+            allowedActions: ["move_to", "place_block"],
+            actionBudget: 12,
+            successCondition: "别墅建造完成",
+            stopCondition: "主人要求停止",
+            status: "active",
+          },
+        }),
+      ],
+    });
+    await value.start();
+    await emitCommand(value, "!resume");
+    expect(value.mode.snapshot()).toMatchObject({ paused: false, taskId: "继续建造别墅" });
+    expect(await value.state.load()).toMatchObject({
+      unfinishedTaskSummary: JSON.stringify({
+        goal: "继续建造别墅",
+        success: "别墅建造完成",
+        stop: "主人要求停止",
+      }),
+    });
+
+    await value.emitOwnerText("先停下来吧");
+    await value.untilChat("好，我先停下来。");
+
+    expect(
+      ownerIntentContextFromPrompt(value.codex.turnsFor("intent")[0]?.text ?? ""),
+    ).toMatchObject({
+      activeTask: {
+        goal: "继续建造别墅",
+      },
+    });
+    expect(value.mode.snapshot()).toMatchObject({ paused: false, taskId: null });
+    expect(await value.state.load()).toMatchObject({ unfinishedTaskSummary: null });
   });
 
   it("recovery prompt keeps hostile Unicode data in exactly eight sections and never labels it as owner speech", async () => {
@@ -4492,6 +5363,7 @@ describe("CompanionService output and commands", () => {
     "disconnect",
     "world_changed",
     "model_unavailable",
+    "model_changed",
     "process_exit",
   ] as const)(
     "invalidates a waiting game capability when the task ends with %s",
@@ -4612,7 +5484,608 @@ describe("CompanionService task state", () => {
   );
 });
 
+describe("CompanionService wheat farming permission", () => {
+  const permissionRequestOutcome = JSON.stringify({
+    reply: "",
+    status: "active",
+    farmingPermissionRequest: { plotSummary: "靠近水源的一小块安全空地" },
+    memoryCandidates: [],
+  });
+
+  const breadTask = () =>
+    taskDecision({
+      naturalReply: null,
+      goal: "取得小麦并制作面包",
+      allowedActions: ["find_blocks", "harvest_crop", "till_soil", "plant_crop"],
+      requestedLimits: { maxBlockChanges: 16 },
+    });
+
+  it("falls back after 30 seconds without changing land", async () => {
+    const value = await harness({
+      farmingPreferenceStatus: "unknown",
+      intentResponses: [
+        breadTask(),
+        JSON.stringify({ kind: "chat", reply: "我会继续找现成小麦。", memoryCandidates: [] }),
+      ],
+      executionResponses: [
+        permissionRequestOutcome,
+        taskExecutionOutcome("我去找现成的成熟小麦。", "active"),
+      ],
+    });
+    await value.start();
+
+    await value.emitOwnerText("做一些面包");
+    await value.untilChat("我可以在这里种小麦吗？");
+    expect(value.actionQueue.snapshot().items[0]).toMatchObject({
+      kind: "wheat_farming_permission",
+      status: "waiting_permission",
+    });
+    expect(value.currentFarmingPreferenceStatus()).toBe("unknown");
+    const timer = value.farmingPermissionTimerRecords()[0];
+    expect(timer).toMatchObject({ milliseconds: 30_000, cleared: false });
+
+    const task = value.taskController.current();
+    if (!task) throw new Error("expected active bread task");
+    const turnLease = value.budget.begin(task.lease, {
+      allowedActions: ["get_state", "till_soil"],
+    });
+    const observed = await value.executeRawTool("minecraft_get_state", { turnLease });
+    const tillAttempt = await value.executeRawTool("minecraft_enqueue_actions", {
+      turnLease,
+      actions: [
+        {
+          kind: "till_soil",
+          x: 1,
+          y: 64,
+          z: 1,
+          summary: "等待许可期间不得执行的耕地",
+        },
+      ],
+    });
+    value.budget.end();
+    expect(observed.isError).not.toBe(true);
+    expect(tillAttempt.isError).toBe(true);
+    expect(tillAttempt.text).toContain("Wheat farming permission is required");
+
+    value.fireFarmingPermissionTimer(timer!.id);
+    await value.untilCodexTurns(2);
+
+    expect(value.actionQueue.snapshot().items[0]).toMatchObject({
+      status: "cancelled",
+      reason: "timeout",
+    });
+    expect(value.codex.turnsFor("execution")[1]?.text).toContain(
+      "不得新建农田，寻找现成的成熟小麦",
+    );
+    expect(value.minecraft.calls.filter((call) => call.method === "tillSoil")).toEqual([]);
+    expect(value.minecraft.calls.filter((call) => call.method === "plantCrop")).toEqual([]);
+    await vi.waitFor(() => expect(value.taskController.current()).toBeNull());
+
+    await value.emitOwnerText("可以");
+    await value.untilIntentSettled();
+    expect(value.currentFarmingPreferenceStatus()).toBe("unknown");
+    expect(value.codex.turnsFor("intent")[1]?.text).toContain(
+      '"farmingPermission":{"status":"unknown","pending":false}',
+    );
+  });
+
+  it("does not persist a delayed ticket approval after its 30-second timeout", async () => {
+    const value = await harness({
+      farmingPreferenceStatus: "unknown",
+      intentResponses: [
+        breadTask(),
+        JSON.stringify({
+          kind: "grant_farming_permission",
+          reply: "好，我会在安全范围内种小麦。",
+        }),
+      ],
+      executionResponses: [
+        permissionRequestOutcome,
+        taskExecutionOutcome("我去寻找现成的小麦。", "active"),
+      ],
+    });
+    await value.start();
+
+    await value.emitOwnerText("做一些面包");
+    await value.untilChat("我可以在这里种小麦吗？");
+    value.fireFarmingPermissionTimer(value.farmingPermissionTimerRecords()[0]!.id);
+    await value.untilCodexTurns(2);
+
+    await value.emitOwnerText("可以");
+    await value.untilIntentSettled();
+
+    expect(value.currentFarmingPreferenceStatus()).toBe("unknown");
+  });
+
+  it("does not persist an approval when task authority becomes stale during the write", async () => {
+    const value = await harness({
+      farmingPreferenceStatus: "unknown",
+      gateFarmingPermissionSetAllowed: true,
+      ownerIdentitySnapshot: {
+        revision: 1,
+        ownerUsername: "TestOwner",
+        configured: true,
+        presence: "online",
+      },
+      intentResponses: [
+        breadTask(),
+        JSON.stringify({
+          kind: "grant_farming_permission",
+          reply: "好，我会在安全范围内种小麦。",
+        }),
+      ],
+      executionResponses: [permissionRequestOutcome],
+    });
+    await value.start();
+
+    await value.emitOwnerText("做一些面包");
+    await value.untilChat("我可以在这里种小麦吗？");
+    await value.emitOwnerText("可以");
+    await value.untilFarmingPermissionSetAllowed();
+    value.service.ownerIdentityChanged({
+      revision: 2,
+      ownerUsername: "NewOwner",
+      configured: true,
+      presence: "online",
+    });
+    value.releaseFarmingPermissionSetAllowed();
+    await value.untilIntentSettled();
+
+    expect(value.currentFarmingPreferenceStatus()).toBe("unknown");
+    expect(value.actionQueue.snapshot().items[0]).toMatchObject({ status: "cancelled" });
+  });
+
+  it("persists one conversational approval and resumes the active task", async () => {
+    const value = await harness({
+      farmingPreferenceStatus: "unknown",
+      intentResponses: [
+        breadTask(),
+        JSON.stringify({
+          kind: "grant_farming_permission",
+          reply: "好，我会在安全范围内种小麦。",
+        }),
+      ],
+      executionResponses: [
+        permissionRequestOutcome,
+        taskExecutionOutcome("我继续准备面包。", "active"),
+      ],
+    });
+    await value.start();
+
+    await value.emitOwnerText("做一些面包");
+    await value.untilChat("我可以在这里种小麦吗？");
+    await value.emitOwnerText("可以");
+    await vi.waitFor(() => expect(value.currentFarmingPreferenceStatus()).toBe("allowed"));
+    await value.untilCodexTurns(2);
+
+    expect(value.actionQueue.snapshot().items[0]).toMatchObject({
+      status: "completed",
+      reason: "allowed",
+    });
+    expect(value.codex.turnsFor("intent")[1]?.text).toContain(
+      '"farmingPermission":{"status":"unknown","pending":true}',
+    );
+    expect(value.codex.turnsFor("execution")[1]?.text).toContain(
+      '"farmingPermission":{"status":"allowed","pending":false}',
+    );
+    expect(value.minecraft.chatLog.filter((message) => message.includes("种小麦吗"))).toEqual([
+      "我可以在这里种小麦吗？",
+    ]);
+  });
+
+  it("cancels a permission timer when the owner stops the task", async () => {
+    const value = await harness({
+      farmingPreferenceStatus: "unknown",
+      intentResponses: [breadTask()],
+      executionResponses: [permissionRequestOutcome],
+    });
+    await value.start();
+    await value.emitOwnerText("做一些面包");
+    await value.untilChat("我可以在这里种小麦吗？");
+
+    await emitCommand(value, "!stop");
+
+    expect(value.farmingPermissionTimerRecords()[0]).toMatchObject({ cleared: true });
+    expect(value.actionQueue.snapshot().items[0]).toMatchObject({
+      status: "cancelled",
+      reason: "owner_stop",
+    });
+  });
+
+  it("treats a refusal as task-local fallback without changing land", async () => {
+    const value = await harness({
+      farmingPreferenceStatus: "unknown",
+      intentResponses: [
+        breadTask(),
+        JSON.stringify({
+          kind: "deny_farming_permission",
+          reply: "好，这次不新建农田。",
+        }),
+      ],
+      executionResponses: [
+        permissionRequestOutcome,
+        taskExecutionOutcome("我去寻找现成的成熟小麦。", "active"),
+      ],
+    });
+    await value.start();
+    await value.emitOwnerText("做一些面包");
+    await value.untilChat("我可以在这里种小麦吗？");
+
+    await value.emitOwnerText("这次不可以");
+    await value.untilCodexTurns(2);
+
+    expect(value.currentFarmingPreferenceStatus()).toBe("unknown");
+    expect(value.actionQueue.snapshot().items[0]).toMatchObject({
+      status: "completed",
+      reason: "denied",
+    });
+    expect(value.codex.turnsFor("execution")[1]?.text).toContain(
+      "不得新建农田，寻找现成的成熟小麦",
+    );
+    expect(value.minecraft.calls.filter((call) => call.method === "tillSoil")).toEqual([]);
+    expect(value.minecraft.calls.filter((call) => call.method === "plantCrop")).toEqual([]);
+  });
+
+  it("accepts an explicit global reauthorization without a pending ticket", async () => {
+    const value = await harness({
+      farmingPreferenceStatus: "denied",
+      intentResponses: [
+        JSON.stringify({
+          kind: "grant_farming_permission",
+          reply: "好，以后可以在安全范围内种小麦。",
+        }),
+      ],
+    });
+    await value.start();
+
+    await value.emitOwnerText("以后可以自己种小麦");
+    await value.untilIntentSettled();
+
+    expect(value.currentFarmingPreferenceStatus()).toBe("allowed");
+    expect(value.actionQueue.snapshot().items).toEqual([]);
+  });
+
+  it("does not ask again when global farming permission is already allowed", async () => {
+    const value = await harness({
+      farmingPreferenceStatus: "allowed",
+      intentResponses: [breadTask()],
+      executionResponses: [permissionRequestOutcome],
+    });
+    await value.start();
+
+    await value.emitOwnerText("做一些面包");
+    await vi.waitFor(() => expect(value.taskController.current()).toBeNull());
+
+    expect(value.codex.turnsFor("execution")[0]?.text).toContain(
+      '"farmingPermission":{"status":"allowed","pending":false}',
+    );
+    expect(value.minecraft.chatLog).not.toContain("我可以在这里种小麦吗？");
+    expect(value.farmingPermissionTimerRecords()).toEqual([]);
+    expect(value.actionQueue.snapshot().items).toEqual([]);
+  });
+
+  it("revokes global permission and cancels only queued farming mutations", async () => {
+    const value = await harness({
+      farmingPreferenceStatus: "allowed",
+      deferredTurns: [0],
+      intentResponses: [
+        JSON.stringify({
+          kind: "revoke_farming_permission",
+          reply: "好，以后不会自己种小麦。",
+        }),
+      ],
+      executionResponses: [taskExecutionOutcome("我会改为寻找现成小麦。", "active")],
+    });
+    await value.start();
+    const task = value.taskController.start({
+      goal: "维护小麦地",
+      expectedActions: ["till_soil", "plant_crop", "wait"],
+      limits: {
+        maxToolCalls: 8,
+        maxBlockChanges: 16,
+        maxHorizontalTravel: 32,
+        maxDurationMs: 60_000,
+        maxDangerousOperations: 0,
+      },
+      stopCondition: "完成维护时停止",
+    });
+    const context = value.service.queueExecutionContext();
+    if (!context) throw new Error("expected queue execution context");
+    value.actionQueue.enqueue({
+      taskLease: task.lease,
+      worldGeneration: context.worldGeneration,
+      action: { kind: "till_soil", position: { x: 1, y: 64, z: 1 } },
+      summary: "耕地",
+      trustedObservationKey: "farm-observation",
+    });
+    value.actionQueue.enqueue({
+      taskLease: task.lease,
+      worldGeneration: context.worldGeneration,
+      action: {
+        kind: "plant_crop",
+        position: { x: 1, y: 64, z: 1 },
+        seedName: "wheat_seeds",
+      },
+      summary: "播种",
+      trustedObservationKey: "farm-observation",
+    });
+    value.actionQueue.enqueue({
+      taskLease: task.lease,
+      worldGeneration: context.worldGeneration,
+      action: { kind: "wait", milliseconds: 500 },
+      summary: "短暂等待",
+      trustedObservationKey: "farm-observation",
+    });
+    value.actionRunner.suspend(task.lease, "owner_message");
+
+    await value.emitOwnerText("以后不要自己种了");
+    await value.untilIntentSettled();
+
+    expect(value.currentFarmingPreferenceStatus()).toBe("denied");
+    expect(value.actionQueue.snapshot().items.map(({ status }) => status)).toEqual([
+      "cancelled",
+      "cancelled",
+      "suspended",
+    ]);
+  });
+});
+
+describe("CompanionService adaptive execution replans", () => {
+  it("starts a fresh execution turn after a queued batch completes", async () => {
+    const value = await harness({
+      deferredTurns: [0],
+      intentResponses: [
+        taskDecision({
+          naturalReply: null,
+          goal: "恢复食物储备",
+          allowedActions: ["get_state", "find_blocks", "craft_item", "smelt_item", "fish"],
+        }),
+      ],
+      executionResponses: [
+        taskExecutionOutcome("第一批已入队", "active"),
+        taskExecutionOutcome("已根据新观察调整", "completed"),
+      ],
+    });
+    await value.start();
+    await value.emitOwnerText("我饿了，帮我准备食物");
+    await value.untilCodexTurns(1);
+    const task = value.taskController.current();
+    if (!task) throw new Error("expected active food task");
+    value.actionQueue.enqueue({
+      taskLease: task.lease,
+      worldGeneration: value.service.queueExecutionContext()!.worldGeneration,
+      action: { kind: "jump" },
+      summary: "food preparation step",
+      trustedObservationKey: "food-observation",
+    });
+
+    value.codex.releaseTurnResult(0, taskExecutionOutcome("第一批已入队", "active"));
+    await vi.waitFor(() => expect(value.codex.turnsFor("execution")).toHaveLength(2));
+
+    expect(value.codex.turnsFor("execution")[1]?.text).toContain("批次已完成");
+  });
+
+  it("replans after a queued action failure instead of containing the task first", async () => {
+    const value = await harness({
+      deferredTurns: [0],
+      intentResponses: [
+        taskDecision({
+          naturalReply: null,
+          goal: "恢复食物储备",
+          allowedActions: ["get_state", "find_blocks", "craft_item", "smelt_item", "fish"],
+        }),
+      ],
+      executionResponses: [
+        taskExecutionOutcome("第一批已入队", "active"),
+        taskExecutionOutcome("改用安全替代方案", "completed"),
+      ],
+    });
+    value.minecraft.jump = async () => {
+      throw new Error("path blocked");
+    };
+    await value.start();
+    await value.emitOwnerText("我饿了，帮我准备食物");
+    await value.untilCodexTurns(1);
+    const task = value.taskController.current();
+    if (!task) throw new Error("expected active food task");
+    value.actionQueue.enqueue({
+      taskLease: task.lease,
+      worldGeneration: value.service.queueExecutionContext()!.worldGeneration,
+      action: { kind: "jump" },
+      summary: "food preparation step",
+      trustedObservationKey: "food-observation",
+    });
+
+    value.codex.releaseTurnResult(0, taskExecutionOutcome("第一批已入队", "active"));
+    await vi.waitFor(() => expect(value.codex.turnsFor("execution")).toHaveLength(2));
+
+    expect(value.codex.turnsFor("execution")[1]?.text).toContain("动作批次失败");
+  });
+
+  it("cancels remaining physical actions before replanning a failed batch", async () => {
+    const value = await harness({
+      deferredTurns: [0],
+      intentResponses: [
+        taskDecision({
+          naturalReply: null,
+          goal: "恢复食物储备",
+          allowedActions: ["get_state", "find_blocks", "craft_item", "smelt_item", "fish"],
+        }),
+      ],
+      executionResponses: [
+        taskExecutionOutcome("第一批已入队", "active"),
+        taskExecutionOutcome("改用安全替代方案", "completed"),
+      ],
+    });
+    value.minecraft.wait = async () => {
+      throw new Error("path blocked");
+    };
+    await value.start();
+    await value.emitOwnerText("我饿了，帮我准备食物");
+    await value.untilCodexTurns(1);
+    const task = value.taskController.current();
+    if (!task) throw new Error("expected active food task");
+    const worldGeneration = value.service.queueExecutionContext()!.worldGeneration;
+    value.actionQueue.enqueue({
+      taskLease: task.lease,
+      worldGeneration,
+      action: { kind: "wait", milliseconds: 1 },
+      summary: "first physical action fails",
+      trustedObservationKey: "food-observation",
+    });
+    value.actionQueue.enqueue({
+      taskLease: task.lease,
+      worldGeneration,
+      action: { kind: "jump" },
+      summary: "must not run after failed batch",
+      trustedObservationKey: "food-observation",
+    });
+
+    value.codex.releaseTurnResult(0, taskExecutionOutcome("第一批已入队", "active"));
+    await vi.waitFor(() => expect(value.codex.turnsFor("execution")).toHaveLength(2));
+
+    expect(value.actionQueue.snapshot().items.map(({ status }) => status)).toEqual([
+      "failed",
+      "cancelled",
+    ]);
+    expect(value.minecraft.calls.filter((call) => call.method === "jump")).toEqual([]);
+  });
+
+  it("cancels an old-world wheat observation without harvesting", async () => {
+    const value = await harness();
+    await value.start();
+    value.service.scheduleFarmObservation({ position: { x: 4, y: 64, z: 1 }, earliestAt: 1_000 });
+
+    value.minecraft.emit({ kind: "world_changed" });
+    await vi.waitFor(() =>
+      expect((value.service as unknown as { worldInvalidated: boolean }).worldInvalidated).toBe(
+        true,
+      ),
+    );
+
+    await expect(value.service.runDueFarmObservations(1_000)).resolves.toBe(0);
+    expect(value.minecraft.calls.filter((call) => call.method === "harvestCrop")).toEqual([]);
+  });
+
+  it("schedules a controlled wheat observation after an allowed plant action", async () => {
+    const value = await harness({
+      farmingPreferenceStatus: "allowed",
+      farmObservationNow: 0,
+      deferredTurns: [0, 1],
+      intentResponses: [
+        taskDecision({
+          naturalReply: null,
+          goal: "补种小麦",
+          allowedActions: ["plant_crop", "find_blocks", "harvest_crop"],
+        }),
+      ],
+      executionResponses: [
+        taskExecutionOutcome("已播种", "active"),
+        taskExecutionOutcome("重新观察作物", "active"),
+        taskExecutionOutcome("已观察", "completed"),
+      ],
+    });
+    await value.start();
+    await value.emitOwnerText("补种一株小麦");
+    await value.untilCodexTurns(1);
+    const task = value.taskController.current();
+    if (!task) throw new Error("expected active farming task");
+    value.actionQueue.enqueue({
+      taskLease: task.lease,
+      worldGeneration: value.service.queueExecutionContext()!.worldGeneration,
+      action: {
+        kind: "plant_crop",
+        position: { x: 100, y: 64, z: 1 },
+        seedName: "wheat_seeds",
+      },
+      summary: "plant one observed wheat seed",
+      trustedObservationKey: "farm-observation",
+    });
+
+    value.codex.releaseTurnResult(0, taskExecutionOutcome("已播种", "active"));
+    await vi.waitFor(() => expect(value.farmObservationTimerRecords()).toHaveLength(1));
+    const timer = value.farmObservationTimerRecords()[0];
+    expect(timer).toMatchObject({ milliseconds: 60_000, cleared: false });
+
+    value.setFarmObservationNow(60_000);
+    value.fireFarmObservationTimer(timer!.id);
+    value.codex.releaseTurnResult(1, taskExecutionOutcome("重新观察作物", "active"));
+    await vi.waitFor(() => expect(value.codex.turnsFor("execution")).toHaveLength(3));
+
+    expect(value.codex.turnsFor("execution")[2]?.text).toContain("小麦成熟时间已到");
+    expect(value.minecraft.calls.filter((call) => call.method === "harvestCrop")).toEqual([]);
+    expect(value.actionQueue.snapshot().items).toHaveLength(1);
+  });
+});
+
 describe("CompanionService zero disclosure privacy regressions", () => {
+  it("filters a model reply that exposes queue counts before Minecraft chat", async () => {
+    const value = await harness({
+      intentResponses: [
+        JSON.stringify({
+          kind: "chat",
+          reply: "队列中还有 2 个待执行动作，当前正在排队。",
+          memoryCandidates: [],
+        }),
+      ],
+    });
+    await value.start();
+
+    await value.emitOwnerText("继续");
+    await value.untilChat(naturalFilteredReply);
+
+    expect(value.minecraft.chatLog).toEqual([naturalFilteredReply]);
+  });
+
+  it("filters a bare queue count and next-action disclosure before Minecraft chat", async () => {
+    const value = await harness({
+      intentResponses: [
+        JSON.stringify({
+          kind: "chat",
+          reply: "队列共 2 项，下一项是采矿。",
+          memoryCandidates: [],
+        }),
+      ],
+    });
+    await value.start();
+
+    await value.emitOwnerText("继续");
+    await value.untilChat(naturalFilteredReply);
+
+    expect(value.minecraft.chatLog).toEqual([naturalFilteredReply]);
+  });
+
+  it("filters an English queue status disclosure before Minecraft chat", async () => {
+    const value = await harness({
+      intentResponses: [
+        JSON.stringify({
+          kind: "chat",
+          reply: "Queue status: 2 pending actions.",
+          memoryCandidates: [],
+        }),
+      ],
+    });
+    await value.start();
+
+    await value.emitOwnerText("continue");
+    await value.untilChat(naturalFilteredReply);
+
+    expect(value.minecraft.chatLog).toEqual([naturalFilteredReply]);
+  });
+
+  it("preserves ordinary chat about waiting in line", async () => {
+    const reply = "我正在排队等朋友。";
+    const value = await harness({
+      intentResponses: [JSON.stringify({ kind: "chat", reply, memoryCandidates: [] })],
+    });
+    await value.start();
+
+    await value.emitOwnerText("你在做什么");
+    await value.untilTurnSettled();
+
+    expect(value.minecraft.chatLog).toEqual([reply]);
+  });
+
   it("replaces a model reply containing internal task vocabulary before Minecraft chat", async () => {
     const rawModelOutput = JSON.stringify({
       kind: "chat",
@@ -5095,7 +6568,7 @@ describe("CompanionService task failure containment", () => {
     expect(value.minecraft.chatLog).toEqual([naturalTaskFailure, "普通聊天仍然可用。"]);
   });
 
-  it("keeps one Minecraft tool failure inside the current task failure", async () => {
+  it("keeps one Minecraft tool failure inside the current execution turn", async () => {
     const toolEntered = deferredValue<void>();
     const releaseToolFailure = deferredValue<void>();
     const value = await harness({
@@ -5133,29 +6606,29 @@ describe("CompanionService task failure containment", () => {
       { spawn: { x: 0, y: 64, z: 0 }, owner: { x: 0, y: 64, z: 0 } },
     );
     releaseToolFailure.resolve();
-    await expect(failingTool).resolves.toMatchObject({ isError: true });
-    await value.untilChat(naturalTaskFailure);
-    await expect(queued).resolves.toEqual({ status: "cancelled" });
+    await expect(failingTool).resolves.toEqual({
+      text: '{"status":"failed","reason":"Error: PRIVATE_MINECRAFT_TOOL_FAILURE"}',
+      isError: true,
+    });
+    await expect(queued).resolves.toEqual({ status: "completed" });
 
-    expect(value.taskController.isLeaseLive(taskLease)).toBe(false);
-    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:failed"]);
-    expect(value.taskTerminalReasons).toEqual(["failed"]);
-    expect(value.confirmations.get(pending.id)).toBeUndefined();
+    expect(value.taskController.isLeaseLive(taskLease)).toBe(true);
+    expect(value.taskAuditEvents).toEqual(["task_started"]);
+    expect(value.taskTerminalReasons).toEqual([]);
+    expect(value.confirmations.get(pending.id)).toBeDefined();
     expect(value.executor.pendingCount()).toBe(0);
-    expect(value.budget.snapshot().active).toBe(false);
-    expect(
-      await value.executeRawTool("minecraft_jump", {
-        turnLease,
-      }),
-    ).toMatchObject({ isError: true });
+    expect(value.budget.snapshot().active).toBe(true);
     expect(value.mode.snapshot().paused).toBe(false);
-    expect(value.minecraft.chatLog).toEqual([naturalTaskFailure]);
+    expect(value.minecraft.chatLog).toEqual([]);
     expect(value.minecraft.chatLog.join("\n")).not.toContain("PRIVATE_MINECRAFT_TOOL_FAILURE");
     expect((value.service as unknown as { codexHealthy: boolean }).codexHealthy).toBe(true);
 
-    await value.emitOwnerText("你好呀");
-    await value.untilChat("工具失败后也能继续聊天。");
-    expect(value.minecraft.chatLog).toEqual([naturalTaskFailure, "工具失败后也能继续聊天。"]);
+    await emitCommand(value, "!stop");
+
+    expect(value.taskController.isLeaseLive(taskLease)).toBe(false);
+    expect(value.taskAuditEvents).toEqual(["task_started", "task_stopped:owner_stop"]);
+    expect(value.confirmations.get(pending.id)).toBeUndefined();
+    expect(value.budget.snapshot().active).toBe(false);
   });
 
   it("contains one failed confirmed action immediately despite multiple confirmation tickets", async () => {

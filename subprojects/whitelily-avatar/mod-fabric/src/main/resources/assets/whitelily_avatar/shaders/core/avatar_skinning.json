@@ -1,0 +1,7 @@
+{
+  "vertex": "whitelily_avatar:avatar_skinning",
+  "fragment": "whitelily_avatar:avatar_skinning",
+  "samplers": [{ "name": "Sampler0" }],
+  "attributes": ["Position", "Normal", "UV0", "Joints", "Weights"],
+  "maximumJointMatrices": 128
+}

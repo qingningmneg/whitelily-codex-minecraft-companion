@@ -24,13 +24,17 @@ import { createMainWindowOptions } from "./main.js";
 import { ChildSupervisor, type ChildProcessPort, type SpawnChild } from "./childSupervisor.js";
 import { ExternalUrlPolicy } from "./externalUrlPolicy.js";
 import { registerIpcHandlers, type IpcMainPort, type IpcSupervisor } from "./ipcRegistry.js";
+import type { MinecraftComponentManager, MinecraftComponentStatus } from "./minecraftComponents.js";
+import { WorldBindingAuthority } from "./discovery/worldBindingAuthority.js";
 
 const idleSnapshot: RuntimeSnapshot = {
   revision: 0,
   lifecycle: "idle",
   minecraft: { state: "disconnected", sessionId: null },
   codex: { state: "stopped", model: null },
+  actions: null,
   task: null,
+  actionQueue: { goal: null, items: [] },
   lastError: null,
 };
 
@@ -41,6 +45,20 @@ const ownerSnapshot: OwnerIdentitySnapshot = {
   presence: "online",
 };
 const ownerAuthoritySnapshot = { ...ownerSnapshot, childGeneration: 7 };
+const avatarSnapshot = {
+  revision: 2,
+  models: [
+    {
+      id: "builtin:whitelily",
+      displayName: "WhiteLily",
+      origin: "builtin",
+      worldRenderer: "minecraft-skin",
+      armModel: "slim",
+      previewDataUrl: "data:image/png;base64,iVBORw0KGgo=",
+    },
+  ],
+  activeModelId: "builtin:whitelily",
+} as const;
 
 const pcl2Candidates = [
   {
@@ -60,6 +78,14 @@ const lanCandidates = [
     expiresAt: 61_000,
   },
 ];
+
+const readyComponentStatus: MinecraftComponentStatus = {
+  state: "ready",
+  bridgeInstalled: true,
+  bridgeActive: true,
+  avatarInstalled: true,
+  restartRequired: false,
+};
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -124,7 +150,15 @@ class LanContainmentChild extends EventEmitter implements ChildProcessPort {
   }
 }
 
-function createRegistryHarness(snapshot: unknown = idleSnapshot) {
+type WorldAuthorityPort = NonNullable<Parameters<typeof registerIpcHandlers>[0]["worldAuthority"]>;
+type AvatarModelsPort = NonNullable<Parameters<typeof registerIpcHandlers>[0]["avatarModels"]>;
+
+function createRegistryHarness(
+  snapshot: unknown = idleSnapshot,
+  worldAuthority?: WorldAuthorityPort,
+  requestApplicationQuit: () => Promise<void> = vi.fn(async () => undefined),
+  avatarModels?: AvatarModelsPort,
+) {
   const loginExpiresAt = Date.now() + 60_000;
   const handlers = new Map<string, (...args: unknown[]) => unknown>();
   const removedChannels: string[] = [];
@@ -157,7 +191,17 @@ function createRegistryHarness(snapshot: unknown = idleSnapshot) {
       case "cancel_chatgpt_login":
         return { status: "cancelled", attemptId: command.attemptId };
       case "list_models":
-        return { models: [], selection: { mode: "automatic" } };
+        return {
+          models: [],
+          selection: { mode: "automatic" },
+          legacyMigrationCompleted: false,
+        };
+      case "migrate_model_preference":
+        return {
+          models: [],
+          selection: { mode: "automatic" },
+          legacyMigrationCompleted: true,
+        };
       case "select_model":
         return command.selection.mode === "automatic"
           ? { mode: "automatic" }
@@ -184,6 +228,7 @@ function createRegistryHarness(snapshot: unknown = idleSnapshot) {
     async () => snapshot as RuntimeSnapshot,
   );
   const stopTask = vi.fn(async () => snapshot as RuntimeSnapshot);
+  const bindConfirmedWorld = vi.fn(async () => snapshot as RuntimeSnapshot);
   const supervisor = {
     request: request as IpcSupervisor["request"],
     stopTask,
@@ -193,9 +238,11 @@ function createRegistryHarness(snapshot: unknown = idleSnapshot) {
       runtimeListener = listener;
       return unsubscribeSupervisor;
     },
+    ...(worldAuthority ? { bindConfirmedWorld } : {}),
   } as IpcSupervisor & { activeChildGeneration(): number };
   const published: DesktopRendererEvent[] = [];
   const publishedOwners: Array<OwnerIdentitySnapshot & { childGeneration: number }> = [];
+  const publishedAvatarModels: unknown[] = [];
   const policy = new ExternalUrlPolicy();
   const openExternal = vi.fn<(url: string) => Promise<unknown>>(async () => undefined);
   const discoverPcl2 = vi.fn(async () => pcl2Candidates);
@@ -221,11 +268,21 @@ function createRegistryHarness(snapshot: unknown = idleSnapshot) {
     },
   );
   const validateConfirmedSession = vi.fn(async () => true);
+  const getMinecraftComponentStatus = vi.fn<MinecraftComponentManager["status"]>(async () =>
+    structuredClone(readyComponentStatus),
+  );
+  const installMinecraftComponents = vi.fn<MinecraftComponentManager["install"]>(async () =>
+    structuredClone(readyComponentStatus),
+  );
+  const removeMinecraftComponents = vi.fn<MinecraftComponentManager["remove"]>(async () =>
+    structuredClone(readyComponentStatus),
+  );
   const cleanup = registerIpcHandlers({
     ipcMain,
     supervisor,
     publishRuntime: (event) => published.push(event),
     publishOwnerIdentity: (owner) => publishedOwners.push(owner),
+    publishAvatarModels: (avatarModelsSnapshot) => publishedAvatarModels.push(avatarModelsSnapshot),
     externalUrlPolicy: policy,
     openExternal,
     pcl2Discovery: { discoverPcl2 },
@@ -235,6 +292,14 @@ function createRegistryHarness(snapshot: unknown = idleSnapshot) {
       validateConfirmedSession,
       stop: vi.fn(),
     },
+    minecraftComponentManager: {
+      status: getMinecraftComponentStatus,
+      install: installMinecraftComponents,
+      remove: removeMinecraftComponents,
+    },
+    requestApplicationQuit,
+    ...(worldAuthority ? { worldAuthority } : {}),
+    ...(avatarModels ? { avatarModels } : {}),
   });
   const invoke = (channel: string, ...args: unknown[]) => {
     const handler = handlers.get(channel);
@@ -249,6 +314,7 @@ function createRegistryHarness(snapshot: unknown = idleSnapshot) {
     invoke,
     published,
     publishedOwners,
+    publishedAvatarModels,
     removedChannels,
     request,
     runtimeEvent: (event: DesktopEvent["event"], childGeneration = 7) =>
@@ -259,11 +325,203 @@ function createRegistryHarness(snapshot: unknown = idleSnapshot) {
     detectLanCandidates,
     confirmLanCandidate,
     validateConfirmedSession,
+    getMinecraftComponentStatus,
+    installMinecraftComponents,
+    removeMinecraftComponents,
+    requestApplicationQuit,
+    bindConfirmedWorld,
     unsubscribeSupervisor,
   };
 }
 
 describe("IPC registry", () => {
+  it("keeps non-avatar IPC registered when avatar composition is unavailable", () => {
+    const harness = createRegistryHarness();
+
+    expect(harness.handlers.has(WHITE_LILY_IPC_CHANNELS.status)).toBe(true);
+    expect(harness.handlers.has(WHITE_LILY_IPC_CHANNELS.stopTask)).toBe(true);
+    expect(harness.handlers.has(WHITE_LILY_IPC_CHANNELS.listAvatarModels)).toBe(false);
+    expect(harness.handlers.has(WHITE_LILY_IPC_CHANNELS.importAvatarModel)).toBe(false);
+    expect(harness.handlers.has(WHITE_LILY_IPC_CHANNELS.switchAvatarModel)).toBe(false);
+
+    harness.cleanup();
+  });
+
+  it("registers path-free avatar handlers and removes their subscription on cleanup", async () => {
+    let publish: Parameters<AvatarModelsPort["subscribe"]>[0] | undefined;
+    const unsubscribeAvatarModels = vi.fn();
+    const list = vi.fn(async () => structuredClone(avatarSnapshot));
+    const importFromPicker = vi.fn(async () => ({ status: "cancelled" as const }));
+    const switchTo = vi.fn(async () => structuredClone(avatarSnapshot));
+    const avatarModels: AvatarModelsPort = {
+      list,
+      importFromPicker,
+      switchTo,
+      subscribe: (listener) => {
+        publish = listener;
+        return unsubscribeAvatarModels;
+      },
+    };
+    const harness = createRegistryHarness(
+      idleSnapshot,
+      undefined,
+      vi.fn(async () => undefined),
+      avatarModels,
+    );
+
+    await expect(harness.invoke(WHITE_LILY_IPC_CHANNELS.listAvatarModels)).resolves.toEqual({
+      status: "success",
+      value: avatarSnapshot,
+    });
+    await expect(harness.invoke(WHITE_LILY_IPC_CHANNELS.importAvatarModel)).resolves.toEqual({
+      status: "success",
+      value: { status: "cancelled" },
+    });
+    await expect(
+      harness.invoke(WHITE_LILY_IPC_CHANNELS.switchAvatarModel, "builtin:whitelily"),
+    ).resolves.toEqual({ status: "success", value: avatarSnapshot });
+    expect(list).toHaveBeenCalledOnce();
+    expect(importFromPicker).toHaveBeenCalledOnce();
+    expect(switchTo).toHaveBeenCalledWith("builtin:whitelily");
+
+    await expect(
+      harness.invoke(WHITE_LILY_IPC_CHANNELS.importAvatarModel, String.raw`C:\secret.glb`),
+    ).rejects.toThrow("invalid IPC input");
+    await expect(
+      harness.invoke(WHITE_LILY_IPC_CHANNELS.switchAvatarModel, String.raw`C:\secret.glb`),
+    ).rejects.toThrow("invalid avatar model selection");
+    expect(importFromPicker).toHaveBeenCalledOnce();
+    expect(switchTo).toHaveBeenCalledOnce();
+
+    publish?.(structuredClone(avatarSnapshot));
+    expect(harness.publishedAvatarModels).toEqual([avatarSnapshot]);
+
+    harness.cleanup();
+    harness.cleanup();
+    expect(unsubscribeAvatarModels).toHaveBeenCalledOnce();
+    expect(harness.handlers.has(WHITE_LILY_IPC_CHANNELS.listAvatarModels)).toBe(false);
+    expect(harness.handlers.has(WHITE_LILY_IPC_CHANNELS.importAvatarModel)).toBe(false);
+    expect(harness.handlers.has(WHITE_LILY_IPC_CHANNELS.switchAvatarModel)).toBe(false);
+  });
+
+  it("keeps ordinary status and stop IPC responsive while avatar recovery is pending", async () => {
+    let rejectSwitch: ((reason: unknown) => void) | undefined;
+    const switchTo = vi.fn(
+      () =>
+        new Promise<Awaited<ReturnType<AvatarModelsPort["switchTo"]>>>((_resolve, reject) => {
+          rejectSwitch = reject;
+        }),
+    );
+    const avatarModels: AvatarModelsPort = {
+      list: async () => structuredClone(avatarSnapshot),
+      importFromPicker: async () => ({ status: "cancelled" }),
+      switchTo,
+      subscribe: () => () => undefined,
+    };
+    const harness = createRegistryHarness(
+      idleSnapshot,
+      undefined,
+      vi.fn(async () => undefined),
+      avatarModels,
+    );
+
+    const avatarSwitch = harness.invoke(
+      WHITE_LILY_IPC_CHANNELS.switchAvatarModel,
+      "builtin:whitelily",
+    );
+    await expect(harness.invoke(WHITE_LILY_IPC_CHANNELS.status)).resolves.toEqual(idleSnapshot);
+    await expect(harness.invoke(WHITE_LILY_IPC_CHANNELS.stopTask)).resolves.toEqual(idleSnapshot);
+    rejectSwitch?.(
+      Object.assign(new Error("avatar recovery timed out"), {
+        code: "AVATAR_SWITCH_RECOVERY_PENDING",
+      }),
+    );
+    await expect(avatarSwitch).resolves.toEqual({
+      status: "error",
+      code: "AVATAR_SWITCH_RECOVERY_PENDING",
+    });
+
+    harness.cleanup();
+  });
+
+  it("returns a safe allowlisted avatar failure envelope instead of forwarding main-process errors", async () => {
+    const importFromPicker = vi.fn(async () => {
+      throw Object.assign(new Error(String.raw`failed to import C:\Users\Other\avatar.glb`), {
+        code: "AVATAR_GLB_INVALID",
+      });
+    });
+    const avatarModels: AvatarModelsPort = {
+      list: vi.fn(async () => structuredClone(avatarSnapshot)),
+      importFromPicker,
+      switchTo: vi.fn(async () => structuredClone(avatarSnapshot)),
+      subscribe: vi.fn(() => vi.fn()),
+    };
+    const harness = createRegistryHarness(
+      idleSnapshot,
+      undefined,
+      vi.fn(async () => undefined),
+      avatarModels,
+    );
+
+    const result = await harness.invoke(WHITE_LILY_IPC_CHANNELS.importAvatarModel);
+
+    expect(result).toEqual({ status: "error", code: "AVATAR_GLB_INVALID" });
+    expect(JSON.stringify(result)).not.toContain(String.raw`C:\Users\Other`);
+  });
+
+  it("replaces unknown avatar failure codes with the operation fallback", async () => {
+    const avatarModels: AvatarModelsPort = {
+      list: vi.fn(async () => structuredClone(avatarSnapshot)),
+      importFromPicker: vi.fn(async () => {
+        throw Object.assign(new Error("private importer detail"), {
+          code: "AVATAR_UNKNOWN_INTERNAL",
+        });
+      }),
+      switchTo: vi.fn(async () => structuredClone(avatarSnapshot)),
+      subscribe: vi.fn(() => vi.fn()),
+    };
+    const harness = createRegistryHarness(
+      idleSnapshot,
+      undefined,
+      vi.fn(async () => undefined),
+      avatarModels,
+    );
+
+    await expect(harness.invoke(WHITE_LILY_IPC_CHANNELS.importAvatarModel)).resolves.toEqual({
+      status: "error",
+      code: "AVATAR_IMPORT_FAILED",
+    });
+  });
+
+  it("does not inspect throwing error properties before returning the safe fallback", async () => {
+    const avatarModels: AvatarModelsPort = {
+      list: vi.fn(async () => structuredClone(avatarSnapshot)),
+      importFromPicker: vi.fn(async () => {
+        throw new Proxy(
+          {},
+          {
+            get() {
+              throw new Error("private error getter");
+            },
+          },
+        );
+      }),
+      switchTo: vi.fn(async () => structuredClone(avatarSnapshot)),
+      subscribe: vi.fn(() => vi.fn()),
+    };
+    const harness = createRegistryHarness(
+      idleSnapshot,
+      undefined,
+      vi.fn(async () => undefined),
+      avatarModels,
+    );
+
+    await expect(harness.invoke(WHITE_LILY_IPC_CHANNELS.importAvatarModel)).resolves.toEqual({
+      status: "error",
+      code: "AVATAR_IMPORT_FAILED",
+    });
+  });
+
   it("registers only the fixed renderer invocation channels", () => {
     const { handlers } = createRegistryHarness();
 
@@ -273,6 +531,7 @@ describe("IPC registry", () => {
         WHITE_LILY_IPC_CHANNELS.start,
         WHITE_LILY_IPC_CHANNELS.stop,
         WHITE_LILY_IPC_CHANNELS.stopTask,
+        WHITE_LILY_IPC_CHANNELS.quitApplication,
         WHITE_LILY_IPC_CHANNELS.emergencyStop,
         WHITE_LILY_IPC_CHANNELS.readOwnerIdentity,
         WHITE_LILY_IPC_CHANNELS.updateOwnerIdentity,
@@ -281,10 +540,14 @@ describe("IPC registry", () => {
         WHITE_LILY_IPC_CHANNELS.cancelChatGptLogin,
         WHITE_LILY_IPC_CHANNELS.commitMemoryMigration,
         WHITE_LILY_IPC_CHANNELS.listModels,
+        WHITE_LILY_IPC_CHANNELS.migrateModelPreference,
         WHITE_LILY_IPC_CHANNELS.selectModel,
         WHITE_LILY_IPC_CHANNELS.discoverPcl2,
         WHITE_LILY_IPC_CHANNELS.detectLanCandidates,
         WHITE_LILY_IPC_CHANNELS.confirmLanCandidate,
+        WHITE_LILY_IPC_CHANNELS.getMinecraftComponentStatus,
+        WHITE_LILY_IPC_CHANNELS.installMinecraftComponents,
+        WHITE_LILY_IPC_CHANNELS.removeMinecraftComponents,
         WHITE_LILY_IPC_CHANNELS.bindConfirmedWorld,
         WHITE_LILY_IPC_CHANNELS.readProfile,
         WHITE_LILY_IPC_CHANNELS.updateProfile,
@@ -311,6 +574,153 @@ describe("IPC registry", () => {
     );
     expect(handlers.has("whitelily:execute")).toBe(false);
     expect(handlers.has("whitelily:open-external")).toBe(false);
+  });
+
+  it("delegates application quit exactly once, rejects input, masks failures, and cleans up", async () => {
+    const requestApplicationQuit = vi.fn(async () => undefined);
+    const harness = createRegistryHarness(idleSnapshot, undefined, requestApplicationQuit);
+
+    await expect(harness.invoke(WHITE_LILY_IPC_CHANNELS.quitApplication)).resolves.toBeUndefined();
+    expect(requestApplicationQuit).toHaveBeenCalledTimes(1);
+    await expect(
+      harness.invoke(WHITE_LILY_IPC_CHANNELS.quitApplication, { force: true }),
+    ).rejects.toThrow("invalid IPC input");
+    expect(requestApplicationQuit).toHaveBeenCalledTimes(1);
+
+    harness.cleanup();
+    expect(harness.handlers.has(WHITE_LILY_IPC_CHANNELS.quitApplication)).toBe(false);
+
+    const sentinel = vi.fn(async () => {
+      throw new Error(String.raw`sentinel PID=1234 C:\private\raw.log`);
+    });
+    const failing = createRegistryHarness(idleSnapshot, undefined, sentinel);
+    let rejection: unknown;
+    try {
+      await failing.invoke(WHITE_LILY_IPC_CHANNELS.quitApplication);
+    } catch (error) {
+      rejection = error;
+    }
+    expect(rejection).toBeInstanceOf(Error);
+    expect((rejection as Error).message).toBe("WhiteLily application quit failed");
+    expect((rejection as Error).cause).toBeUndefined();
+    expect(String(rejection)).not.toContain("sentinel");
+    expect(String(rejection)).not.toContain("1234");
+    expect(String(rejection)).not.toContain("private");
+    expect(sentinel).toHaveBeenCalledTimes(1);
+    failing.cleanup();
+  });
+
+  it("accepts only opaque candidate IDs and duplicate-free bounded component selections", async () => {
+    const harness = createRegistryHarness();
+
+    await expect(
+      harness.invoke(WHITE_LILY_IPC_CHANNELS.getMinecraftComponentStatus, "lan_candidate_1234"),
+    ).resolves.toEqual(readyComponentStatus);
+    await expect(
+      harness.invoke(WHITE_LILY_IPC_CHANNELS.installMinecraftComponents, "lan_candidate_1234", [
+        "bridge",
+        "avatar",
+      ]),
+    ).resolves.toEqual(readyComponentStatus);
+    await expect(
+      harness.invoke(WHITE_LILY_IPC_CHANNELS.removeMinecraftComponents, "lan_candidate_1234", [
+        "avatar",
+        "bridge",
+      ]),
+    ).resolves.toEqual(readyComponentStatus);
+
+    expect(harness.getMinecraftComponentStatus).toHaveBeenCalledWith("lan_candidate_1234");
+    expect(harness.installMinecraftComponents).toHaveBeenCalledWith("lan_candidate_1234", [
+      "bridge",
+      "avatar",
+    ]);
+    expect(harness.removeMinecraftComponents).toHaveBeenCalledWith("lan_candidate_1234", [
+      "avatar",
+      "bridge",
+    ]);
+
+    const selectionWithExtraKey = ["bridge"] as string[] & { path?: string };
+    selectionWithExtraKey.path = String.raw`C:\Private\mods`;
+    let selectionGetterCalls = 0;
+    const accessorSelection: unknown[] = [];
+    Object.defineProperty(accessorSelection, "0", {
+      enumerable: true,
+      get: () => {
+        selectionGetterCalls += 1;
+        return "bridge";
+      },
+    });
+    const invalidStatusInputs: readonly (readonly unknown[])[] = [
+      [],
+      [""],
+      ["short"],
+      ["x".repeat(65)],
+      [String.raw`C:\Private\mods`],
+      ["../mods/lan_candidate_1234"],
+      ["lan_candidate_1234", { path: String.raw`C:\Private\mods` }],
+    ];
+    for (const input of invalidStatusInputs) {
+      await expect(
+        harness.invoke(WHITE_LILY_IPC_CHANNELS.getMinecraftComponentStatus, ...input),
+      ).rejects.toThrow("invalid IPC input");
+    }
+    const invalidSelections: readonly unknown[] = [
+      "bridge",
+      ["bridge", "bridge"],
+      ["avatar", "avatar"],
+      ["bridge", "avatar", "bridge"],
+      ["fabric-api"],
+      [{ path: String.raw`C:\Private\mods` }],
+      selectionWithExtraKey,
+      accessorSelection,
+      Object.setPrototypeOf(["bridge"], null),
+    ];
+    for (const selection of invalidSelections) {
+      await expect(
+        harness.invoke(
+          WHITE_LILY_IPC_CHANNELS.installMinecraftComponents,
+          "lan_candidate_1234",
+          selection,
+        ),
+      ).rejects.toThrow("invalid IPC input");
+    }
+    await expect(
+      harness.invoke(
+        WHITE_LILY_IPC_CHANNELS.installMinecraftComponents,
+        "lan_candidate_1234",
+        ["bridge"],
+        { resourceDirectory: String.raw`C:\Private\resources` },
+      ),
+    ).rejects.toThrow("invalid IPC input");
+    await expect(
+      harness.invoke(
+        WHITE_LILY_IPC_CHANNELS.removeMinecraftComponents,
+        "lan_candidate_1234",
+        ["avatar"],
+        { presenceDirectory: String.raw`C:\Private\presence` },
+      ),
+    ).rejects.toThrow("invalid IPC input");
+    expect(selectionGetterCalls).toBe(0);
+    expect(harness.installMinecraftComponents).toHaveBeenCalledTimes(1);
+    expect(harness.removeMinecraftComponents).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects malformed manager results before they cross the main boundary", async () => {
+    const harness = createRegistryHarness();
+    const malformed: readonly unknown[] = [
+      null,
+      { ...readyComponentStatus, path: String.raw`C:\Private\mods` },
+      { ...readyComponentStatus, state: "arbitrary" },
+      { ...readyComponentStatus, bridgeInstalled: "yes" },
+      { ...readyComponentStatus, restartRequired: true },
+    ];
+
+    for (const value of malformed) {
+      harness.getMinecraftComponentStatus.mockResolvedValueOnce(value as MinecraftComponentStatus);
+      await expect(
+        harness.invoke(WHITE_LILY_IPC_CHANNELS.getMinecraftComponentStatus, "lan_candidate_1234"),
+      ).rejects.toThrow("invalid Minecraft component status");
+    }
   });
 
   it("keeps startup, close-to-tray, and safe export as narrow main-process controls", async () => {
@@ -350,6 +760,13 @@ describe("IPC registry", () => {
       if (command.kind === "preview_diagnostics") {
         return {
           exportId: "diagnostic_1234567890",
+          actionCapability: {
+            workspaceVersion: "workspace-1",
+            state: "ready",
+            mcpListening: true,
+            discoveredToolCount: 16,
+            errorCode: null,
+          },
           files: [
             { logicalName: "app-version.json", size: 20, redactions: 0 },
             { logicalName: "os-summary.json", size: 20, redactions: 0 },
@@ -642,6 +1059,44 @@ describe("IPC registry", () => {
     await expect(
       invoke(WHITE_LILY_IPC_CHANNELS.detectLanCandidates, { host: "127.0.0.1" }),
     ).rejects.toThrow("invalid IPC input");
+  });
+
+  it("keeps raw Java snapshot child failures opaque across bind-confirmed-world IPC", async () => {
+    const sentinel = "SENSITIVE_STDERR ProcessId = 98765 Get-CimInstance";
+    const javaSession = {
+      pid: 1234,
+      processStartedAt: 100,
+      port: 51321,
+      version: "1.21.5",
+    };
+    const authority = new WorldBindingAuthority({
+      configPath: "unused-by-direct-resolution",
+      lanDetector: { redeemConfirmedProof: async () => javaSession },
+      resolveInstancePath: async () => "C:/Minecraft/Instance",
+      snapshotExecFile: async () => {
+        throw new Error(sentinel);
+      },
+    });
+    const harness = createRegistryHarness(idleSnapshot, {
+      redeem: async () => {
+        await authority.resolveJavaInstance(javaSession);
+        throw new Error("unreachable");
+      },
+    });
+    await harness.invoke(WHITE_LILY_IPC_CHANNELS.confirmLanCandidate, "lan_candidate_1234");
+
+    const failure = await Promise.resolve(
+      harness.invoke(WHITE_LILY_IPC_CHANNELS.bindConfirmedWorld, {
+        expectedRevision: 0,
+        label: "Opaque world",
+      }),
+    ).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toBe("Java process snapshot unavailable");
+    expect((failure as Error).message).not.toContain(sentinel);
+    expect((failure as Error).cause).toBeUndefined();
+    expect(harness.bindConfirmedWorld).not.toHaveBeenCalled();
   });
 
   it("invalidates child connection authority when confirmed LAN identity changes", async () => {
@@ -1148,7 +1603,7 @@ describe("IPC registry", () => {
     const signal = {
       kind: "connection_invalidated" as const,
       revision: 8,
-      reason: "lan_changed" as const,
+      reason: "runtime_failed" as const,
       snapshot: {
         ...idleSnapshot,
         revision: 8,
@@ -1224,6 +1679,7 @@ describe("IPC registry", () => {
         WHITE_LILY_IPC_CHANNELS.start,
         WHITE_LILY_IPC_CHANNELS.stop,
         WHITE_LILY_IPC_CHANNELS.stopTask,
+        WHITE_LILY_IPC_CHANNELS.quitApplication,
         WHITE_LILY_IPC_CHANNELS.emergencyStop,
         WHITE_LILY_IPC_CHANNELS.readOwnerIdentity,
         WHITE_LILY_IPC_CHANNELS.updateOwnerIdentity,
@@ -1232,10 +1688,14 @@ describe("IPC registry", () => {
         WHITE_LILY_IPC_CHANNELS.cancelChatGptLogin,
         WHITE_LILY_IPC_CHANNELS.commitMemoryMigration,
         WHITE_LILY_IPC_CHANNELS.listModels,
+        WHITE_LILY_IPC_CHANNELS.migrateModelPreference,
         WHITE_LILY_IPC_CHANNELS.selectModel,
         WHITE_LILY_IPC_CHANNELS.discoverPcl2,
         WHITE_LILY_IPC_CHANNELS.detectLanCandidates,
         WHITE_LILY_IPC_CHANNELS.confirmLanCandidate,
+        WHITE_LILY_IPC_CHANNELS.getMinecraftComponentStatus,
+        WHITE_LILY_IPC_CHANNELS.installMinecraftComponents,
+        WHITE_LILY_IPC_CHANNELS.removeMinecraftComponents,
         WHITE_LILY_IPC_CHANNELS.bindConfirmedWorld,
         WHITE_LILY_IPC_CHANNELS.readProfile,
         WHITE_LILY_IPC_CHANNELS.updateProfile,
@@ -1261,6 +1721,33 @@ describe("IPC registry", () => {
       ].sort(),
     );
     expect(unsubscribeSupervisor).toHaveBeenCalledOnce();
+  });
+
+  it("validates a bounded model migration candidate before forwarding it", async () => {
+    const { handlers, request } = createRegistryHarness();
+    const migrate = handlers.get(WHITE_LILY_IPC_CHANNELS.migrateModelPreference)!;
+
+    await expect(
+      migrate(undefined, {
+        mode: "explicit",
+        modelId: "gpt-live",
+        reasoningEffort: "high",
+      }),
+    ).resolves.toMatchObject({ legacyMigrationCompleted: true });
+    expect(request).toHaveBeenLastCalledWith({
+      kind: "migrate_model_preference",
+      candidate: { mode: "explicit", modelId: "gpt-live", reasoningEffort: "high" },
+    });
+
+    await expect(migrate(undefined, null)).resolves.toMatchObject({
+      legacyMigrationCompleted: true,
+    });
+    await expect(
+      migrate(undefined, { mode: "explicit", modelId: "../private", reasoningEffort: "high" }),
+    ).rejects.toThrow("invalid desktop request");
+    await expect(migrate(undefined, "raw-local-storage-json")).rejects.toThrow(
+      "invalid desktop request",
+    );
   });
 
   it("rolls back earlier handlers when IPC registration throws", () => {
@@ -1334,7 +1821,18 @@ describe("typed preload API", () => {
           return { status: "cancelled", attemptId: "opaque_attempt_1234" };
         }
         if (channel === WHITE_LILY_IPC_CHANNELS.listModels) {
-          return { models: [], selection: { mode: "automatic" } };
+          return {
+            models: [],
+            selection: { mode: "automatic" },
+            legacyMigrationCompleted: false,
+          };
+        }
+        if (channel === WHITE_LILY_IPC_CHANNELS.migrateModelPreference) {
+          return {
+            models: [],
+            selection: { mode: "automatic" },
+            legacyMigrationCompleted: true,
+          };
         }
         if (channel === WHITE_LILY_IPC_CHANNELS.selectModel) {
           return { mode: "automatic" };
@@ -1351,6 +1849,19 @@ describe("typed preload API", () => {
             port: 51321,
             version: "1.21.5",
             confirmedAt: 1_000,
+          };
+        }
+        if (
+          channel === WHITE_LILY_IPC_CHANNELS.getMinecraftComponentStatus ||
+          channel === WHITE_LILY_IPC_CHANNELS.installMinecraftComponents ||
+          channel === WHITE_LILY_IPC_CHANNELS.removeMinecraftComponents
+        ) {
+          return {
+            state: "ready",
+            bridgeInstalled: true,
+            bridgeActive: true,
+            avatarInstalled: true,
+            restartRequired: false,
           };
         }
         if (channel === WHITE_LILY_IPC_CHANNELS.readOwnerIdentity) {
@@ -1372,20 +1883,29 @@ describe("typed preload API", () => {
         "start",
         "stop",
         "stopTask",
+        "quitApplication",
         "emergencyStop",
         "readOwnerIdentity",
         "updateOwnerIdentity",
+        "subscribeAvatarModels",
         "subscribeOwnerIdentity",
         "subscribeRuntime",
+        "switchAvatarModel",
         "getAccount",
         "startChatGptLogin",
         "cancelChatGptLogin",
         "commitMemoryMigration",
+        "importAvatarModel",
+        "listAvatarModels",
         "listModels",
+        "migrateModelPreference",
         "selectModel",
         "discoverPcl2",
         "detectLanCandidates",
         "confirmLanCandidate",
+        "getMinecraftComponentStatus",
+        "installMinecraftComponents",
+        "removeMinecraftComponents",
         "bindConfirmedWorld",
         "readProfile",
         "updateProfile",
@@ -1414,6 +1934,7 @@ describe("typed preload API", () => {
     await api.start();
     await api.stop();
     await api.stopTask();
+    await api.quitApplication();
     await api.emergencyStop();
     await api.readOwnerIdentity();
     await api.updateOwnerIdentity({ expectedRevision: 7, ownerUsername: "NewOwner" });
@@ -1421,6 +1942,7 @@ describe("typed preload API", () => {
     await api.startChatGptLogin();
     await api.cancelChatGptLogin("opaque_attempt_1234");
     await api.listModels();
+    await api.migrateModelPreference(null);
     await api.selectModel({ mode: "automatic" });
     await expect(api.discoverPcl2()).resolves.toEqual(pcl2Candidates);
     await expect(api.detectLanCandidates()).resolves.toEqual(lanCandidates);
@@ -1428,11 +1950,21 @@ describe("typed preload API", () => {
       status: "confirmed",
       port: 51321,
     });
+    await expect(api.getMinecraftComponentStatus("lan_candidate_1234")).resolves.toMatchObject({
+      state: "ready",
+    });
+    await expect(
+      api.installMinecraftComponents("lan_candidate_1234", ["bridge", "avatar"]),
+    ).resolves.toMatchObject({ state: "ready" });
+    await expect(
+      api.removeMinecraftComponents("lan_candidate_1234", ["avatar"]),
+    ).resolves.toMatchObject({ state: "ready" });
     expect(invoked).toEqual([
       WHITE_LILY_IPC_CHANNELS.status,
       WHITE_LILY_IPC_CHANNELS.start,
       WHITE_LILY_IPC_CHANNELS.stop,
       WHITE_LILY_IPC_CHANNELS.stopTask,
+      WHITE_LILY_IPC_CHANNELS.quitApplication,
       WHITE_LILY_IPC_CHANNELS.emergencyStop,
       WHITE_LILY_IPC_CHANNELS.readOwnerIdentity,
       WHITE_LILY_IPC_CHANNELS.updateOwnerIdentity,
@@ -1440,10 +1972,14 @@ describe("typed preload API", () => {
       WHITE_LILY_IPC_CHANNELS.startChatGptLogin,
       WHITE_LILY_IPC_CHANNELS.cancelChatGptLogin,
       WHITE_LILY_IPC_CHANNELS.listModels,
+      WHITE_LILY_IPC_CHANNELS.migrateModelPreference,
       WHITE_LILY_IPC_CHANNELS.selectModel,
       WHITE_LILY_IPC_CHANNELS.discoverPcl2,
       WHITE_LILY_IPC_CHANNELS.detectLanCandidates,
       WHITE_LILY_IPC_CHANNELS.confirmLanCandidate,
+      WHITE_LILY_IPC_CHANNELS.getMinecraftComponentStatus,
+      WHITE_LILY_IPC_CHANNELS.installMinecraftComponents,
+      WHITE_LILY_IPC_CHANNELS.removeMinecraftComponents,
     ]);
     expect(api).not.toHaveProperty("invoke");
     expect(api).not.toHaveProperty("send");
