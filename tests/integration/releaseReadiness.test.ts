@@ -499,8 +499,14 @@ describe("public release readiness", () => {
       expect(packageJson.scripts?.["minecraft-components:prepare"]).toBe(
         "subprojects\\whitelily-avatar\\gradlew.bat -p subprojects\\whitelily-avatar :stageMinecraftComponents --no-daemon --max-workers=1",
       );
+      expect(workflow).toContain("- uses: actions/setup-java@v4");
+      expect(workflow).toContain("distribution: temurin");
+      expect(workflow).toContain('java-version: "21"');
       expect(runCommands).toContain("npm run minecraft-components:prepare");
       expect(runCommands).toContain("npm run desktop:prepare");
+      expect(workflow.indexOf("- uses: actions/setup-java@v4")).toBeLessThan(
+        workflow.indexOf("- run: npm run minecraft-components:prepare"),
+      );
       expect(runCommands.indexOf("npm run minecraft-components:prepare")).toBeLessThan(
         runCommands.indexOf("npm run desktop:prepare"),
       );
