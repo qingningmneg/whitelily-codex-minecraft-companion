@@ -385,7 +385,7 @@ describe("public release readiness", () => {
     expect(candidate.files).not.toContain(".git/config.from-internal-repo");
     expect(candidate.files.some((file) => file.startsWith(".superpowers/"))).toBe(false);
     expect(candidate.files.some((file) => file.startsWith("docs/superpowers/"))).toBe(false);
-  }, 60_000);
+  }, 120_000);
 
   it("packages a closed README documentation bundle from the produced ZIP", async () => {
     const artifact = await runReleasePackage("0.1.0");

@@ -921,6 +921,15 @@ async function createNsisComponentPreferenceFixture(): Promise<{
     ].join("\r\n        ");
   let validatorSource = await readFile(componentPreferenceValidator, "utf8");
   validatorSource = validatorSource
+    .replace(
+      "$ErrorActionPreference = 'Stop'",
+      [
+        "$ErrorActionPreference = 'Stop'",
+        "$startupModePath=[Environment]::GetEnvironmentVariable('WHITELILY_COMPONENT_TEST_MODE_PATH')",
+        "$startupMode=if(Test-Path -LiteralPath $startupModePath){(Get-Content -LiteralPath $startupModePath -Raw).Trim()}else{''}",
+        "if($startupMode -eq 'slow-authority-start'){Start-Sleep -Milliseconds 6000}",
+      ].join("\r\n"),
+    )
     .replace("# WHITELILY_TEST_BEFORE_PUBLISH", invokeHook("before-publish"))
     .replace(
       "# WHITELILY_TEST_AFTER_PUBLISH",
@@ -993,7 +1002,7 @@ async function runNsisComponentPreferenceFixture(
   await rm(fixture.lastErrorPath, { force: true });
   return run(fixture.installer, ["/S"], {
     cwd: fixture.root,
-    timeout: 15_000,
+    timeout: 45_000,
     env: {
       ...process.env,
       WHITELILY_COMPONENT_TEST_ROOT: fixture.root,
@@ -1136,6 +1145,17 @@ describe("WhiteLily installer packaging scripts", () => {
       if (child.exitCode === null) child.kill();
     }
   });
+
+  it("allows a cold component preference authority to take longer than five seconds", async () => {
+    const fixture = await createNsisComponentPreferenceFixture();
+
+    const result = await runNsisComponentPreferenceFixture(fixture, "slow-authority-start");
+
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    await expect(readFile(fixture.preferences, "utf8")).resolves.toBe(
+      '{"schemaVersion":1,"bridgeEnabled":true,"avatarEnabled":true}',
+    );
+  }, 30_000);
 
   it("executes no-clobber component preference publication across collision and cleanup boundaries", async () => {
     const fixture = await createNsisComponentPreferenceFixture();

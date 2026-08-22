@@ -123,7 +123,7 @@
   Function WhiteLilyRunMinecraftComponentPreferenceAuthority
     SetOutPath "$PLUGINSDIR"
     File "/oname=validate-minecraft-component-preferences.ps1" "${WHITELILY_COMPONENT_VALIDATOR_SOURCE}"
-    nsExec::ExecToStack /TIMEOUT=5000 '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$PLUGINSDIR\validate-minecraft-component-preferences.ps1"'
+    nsExec::ExecToStack /TIMEOUT=30000 '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$PLUGINSDIR\validate-minecraft-component-preferences.ps1"'
     Pop $3
     Pop $2
     Call WhiteLilyClearMinecraftComponentPreferenceEnvironment

@@ -329,7 +329,7 @@ describe("WhiteLily assisted Windows installer configuration", () => {
     expect(installer).toContain("WHITELILY_COMPONENT_BRIDGE_ENABLED");
     expect(installer).toContain("WHITELILY_COMPONENT_AVATAR_ENABLED");
     expect(installer).toContain("WHITELILY_COMPONENT_VALIDATOR_SOURCE");
-    expect(installer).toMatch(/nsExec::ExecToStack\s+\/TIMEOUT=5000/u);
+    expect(installer).toMatch(/nsExec::ExecToStack\s+\/TIMEOUT=30000/u);
     expect(installer).not.toMatch(/GetTempFileNameW|FileWrite|\bDelete\s+"\$WhiteLily/u);
     expect(validator).toContain(
       "'{\"schemaVersion\":1,\"bridgeEnabled\":' + $bridge + ',\"avatarEnabled\":' + $avatar + '}'",
